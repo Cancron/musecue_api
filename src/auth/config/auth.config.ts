@@ -4,13 +4,7 @@
 
 export const AUTH_CONFIG = {
   // Password Configuration
-  PASSWORD_MIN_LENGTH: 8,
-  PASSWORD_REQUIREMENTS: {
-    UPPERCASE: true,
-    LOWERCASE: true,
-    NUMBERS: true,
-    SPECIAL_CHARS: true,
-  },
+  PASSWORD_MIN_LENGTH: 6,
 
   // Token Configuration
   TOKEN_EXPIRY: {

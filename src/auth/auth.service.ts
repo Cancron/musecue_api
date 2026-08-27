@@ -60,9 +60,9 @@ export class AuthService {
       ),
     ]);
 
-    // Validate password strength
+    // Validate password length
     if (!this.authUtilsService.validatePassword(password)) {
-      throw AppError.badRequest('Password does not meet security requirements');
+      throw AppError.badRequest('Password must be at least 6 characters');
     }
 
     // Check if user already exists with email or username

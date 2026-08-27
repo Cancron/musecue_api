@@ -31,27 +31,11 @@ describe('AuthUtilsService', () => {
 
   describe('validatePassword', () => {
     it('should return false for password shorter than minimum length', () => {
-      expect(service.validatePassword('Short1!')).toBe(false);
+      expect(service.validatePassword('12345')).toBe(false);
     });
 
-    it('should return false for password without uppercase', () => {
-      expect(service.validatePassword('password1!')).toBe(false);
-    });
-
-    it('should return false for password without lowercase', () => {
-      expect(service.validatePassword('PASSWORD1!')).toBe(false);
-    });
-
-    it('should return false for password without numbers', () => {
-      expect(service.validatePassword('Password!')).toBe(false);
-    });
-
-    it('should return false for password without special characters', () => {
-      expect(service.validatePassword('Password1')).toBe(false);
-    });
-
-    it('should return true for valid password', () => {
-      expect(service.validatePassword('Password1!')).toBe(true);
+    it('should accept a simple six-character password', () => {
+      expect(service.validatePassword('123456')).toBe(true);
     });
   });
 });

@@ -18,7 +18,7 @@ export class CreateAuthDto {
 
   @IsString()
   @IsNotEmpty()
-  @MinLength(8)
+  @MinLength(6)
   password: string;
 
   @Transform(({ value }: { value: unknown }) =>
