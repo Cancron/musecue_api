@@ -1,7 +1,7 @@
 {
-  "name": "face-makeup-guide-api",
+  "name": "musecue-api",
   "version": "0.0.1",
-  "description": "",
+  "description": "MuseCue API — AI makeup guidance, made for your face.",
   "author": "",
   "private": true,
   "license": "UNLICENSED",

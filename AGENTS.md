@@ -1,8 +1,8 @@
-# Face MakeUp Guide API agent instructions
+# MuseCue API agent instructions
 
 ## Purpose
 
-This NestJS service is the application authority for Face MakeUp Guide. It owns authentication, authorization, workflow state, persistence, private media access, and AI orchestration.
+This NestJS service is the application authority for MuseCue — AI makeup guidance, made for your face. It owns authentication, authorization, workflow state, persistence, private media access, and AI orchestration.
 
 The product specification and architecture are in the sibling `face_makeup_app/Blueprint.md` and `face_makeup_app/Architecture.md` files.
 

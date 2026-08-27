@@ -112,7 +112,7 @@ export class EmailService {
 
     await this.sendEmail({
       to: email,
-      subject: 'Verify your email address',
+      subject: 'Verify your MuseCue email address',
       html,
     });
   }
@@ -133,7 +133,7 @@ export class EmailService {
 
     await this.sendEmail({
       to: email,
-      subject: 'Reset your password',
+      subject: 'Reset your MuseCue password',
       html,
     });
   }
@@ -149,7 +149,7 @@ export class EmailService {
 
     await this.sendEmail({
       to: email,
-      subject: 'Welcome to our platform!',
+      subject: 'Welcome to MuseCue!',
       html,
     });
   }

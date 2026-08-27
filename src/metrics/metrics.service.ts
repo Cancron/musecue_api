@@ -25,7 +25,7 @@ export class MetricsService implements OnModuleInit {
     // Set default labels for all metrics
 
     this.register.setDefaultLabels({
-      app: 'nestjs-app',
+      app: 'musecue-api',
       environment: process.env.NODE_ENV || 'development',
     });
 

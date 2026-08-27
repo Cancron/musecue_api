@@ -1,8 +1,8 @@
 services:
   
   backend:
-    container_name: simple_blog_backend
-    # image: thepujon/simple_blog_backend:1.5
+    container_name: musecue_api
+    # image: thepujon/musecue_api:1.5
     build:
       context: ./
       dockerfile: Dockerfile  
@@ -30,4 +30,4 @@ services:
       - pg_admin
       - redis-stack
     networks:
-      - blog_network
+      - musecue_network

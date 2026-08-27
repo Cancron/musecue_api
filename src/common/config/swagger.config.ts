@@ -3,9 +3,9 @@ import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 
 export function setupSwagger(app: INestApplication): void {
   const config = new DocumentBuilder()
-    .setTitle('Face MakeUp Guide API')
+    .setTitle('MuseCue API')
     .setDescription(
-      'Authentication and application API for the Face MakeUp Guide mobile app.',
+      'MuseCue — AI makeup guidance, made for your face. Authentication and application API for the mobile app.',
     )
     .setVersion('1.0.0')
     .setContact('API Support', '', '')
@@ -36,7 +36,7 @@ export function setupSwagger(app: INestApplication): void {
 
   // Customize Swagger UI
   SwaggerModule.setup('docs', app, document, {
-    customSiteTitle: 'Face MakeUp Guide API Documentation',
+    customSiteTitle: 'MuseCue API Documentation',
     customfavIcon: 'https://nestjs.com/img/logo-small.svg',
     customCss: `
       .swagger-ui .topbar { display: none }

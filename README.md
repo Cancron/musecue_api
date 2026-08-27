@@ -1,6 +1,8 @@
-# Face MakeUp Guide API
+# MuseCue API
 
-The Face MakeUp Guide API is the NestJS application authority for authentication, persistent workflow state, private images, and future AI orchestration. AI providers will analyze or generate content; NestJS will validate their output and control all application state transitions.
+**AI makeup guidance, made for your face.**
+
+The MuseCue API is the NestJS application authority for authentication, persistent workflow state, private images, and future AI orchestration. AI providers will analyze or generate content; NestJS will validate their output and control all application state transitions.
 
 The companion mobile application and detailed product architecture live in `../face_makeup_app`.
 
@@ -54,7 +56,7 @@ The API defaults to `http://localhost:5000`. Swagger is available at `http://loc
 Use `.env.example` as the complete starting point. Important values include:
 
 ```env
-DATABASE_URL=postgresql://admin:admin@127.0.0.1:5433/face_makeup_guide
+DATABASE_URL=postgresql://admin:admin@127.0.0.1:5433/musecue
 NODE_ENV=development
 PORT=5000
 CORS_ORIGINS=http://localhost:8081,http://localhost:19006
@@ -64,12 +66,13 @@ JWT_REFRESH_SECRET=replace-with-a-different-strong-secret
 
 REDIS_HOST=localhost
 REDIS_PORT=6379
+REDIS_CACHE_KEY_PREFIX=musecue
 
 EMAIL_HOST=smtp.example.com
 EMAIL_PORT=587
 EMAIL_USER=your-smtp-user
 EMAIL_PASS=your-smtp-password
-EMAIL_FROM=noreply@example.com
+EMAIL_FROM="MuseCue <noreply@example.com>"
 ```
 
 The application also supports `JWT_SECRET` as a development fallback, but separate access and refresh secrets are recommended. Never commit the real `.env` file or include SMTP credentials in logs or documentation.
