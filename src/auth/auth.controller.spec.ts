@@ -6,6 +6,7 @@ import { GoogleOAuthService } from './services/google-oauth.service';
 import { CreateAuthDto } from './dto/create-auth.dto';
 import type { Request } from 'express';
 import { CustomLoggerService } from '../common/services/custom-logger.service';
+import { AuthGuard } from '../common/guards/auth.guard';
 
 describe('AuthController', () => {
   let controller: AuthController;
@@ -60,7 +61,10 @@ describe('AuthController', () => {
           useValue: mockCustomLoggerService,
         },
       ],
-    }).compile();
+    })
+      .overrideGuard(AuthGuard)
+      .useValue({ canActivate: jest.fn().mockReturnValue(true) })
+      .compile();
 
     controller = module.get<AuthController>(AuthController);
   });
@@ -190,7 +194,7 @@ describe('AuthController', () => {
       const mockResponse = { message: 'Email verified successfully' };
       mockAuthService.verifyEmail.mockResolvedValue(mockResponse);
 
-      const result = await controller.verifyEmail(email, code, mockRequest);
+      const result = await controller.verifyEmail({ email, code }, mockRequest);
 
       expect(result).toEqual(mockResponse);
       expect(mockAuthService.verifyEmail).toHaveBeenCalledWith(email, code, {
@@ -210,7 +214,7 @@ describe('AuthController', () => {
       const mockResponse = { message: 'Email verified successfully' };
       mockAuthService.verifyEmail.mockResolvedValue(mockResponse);
 
-      await controller.verifyEmail(email, code, mockRequest);
+      await controller.verifyEmail({ email, code }, mockRequest);
 
       expect(mockAuthService.verifyEmail).toHaveBeenCalledWith(email, code, {
         ip: 'unknown',
@@ -232,7 +236,7 @@ describe('AuthController', () => {
       mockAuthService.verifyEmail.mockRejectedValue(error);
 
       await expect(
-        controller.verifyEmail(email, code, mockRequest),
+        controller.verifyEmail({ email, code }, mockRequest),
       ).rejects.toThrow('Invalid verification code');
       expect(mockAuthService.verifyEmail).toHaveBeenCalledTimes(1);
     });
@@ -251,10 +255,7 @@ describe('AuthController', () => {
       const mockResponse = { message: 'Verification email sent successfully' };
       mockAuthService.resendVerificationEmail.mockResolvedValue(mockResponse);
 
-      const result = await controller.resendVerificationEmail(
-        email,
-        mockRequest,
-      );
+      const result = await controller.resendVerificationEmail({ email }, mockRequest);
 
       expect(result).toEqual(mockResponse);
       expect(mockAuthService.resendVerificationEmail).toHaveBeenCalledWith(
@@ -276,7 +277,7 @@ describe('AuthController', () => {
       const mockResponse = { message: 'Verification email sent successfully' };
       mockAuthService.resendVerificationEmail.mockResolvedValue(mockResponse);
 
-      await controller.resendVerificationEmail(email, mockRequest);
+      await controller.resendVerificationEmail({ email }, mockRequest);
 
       expect(mockAuthService.resendVerificationEmail).toHaveBeenCalledWith(
         email,
@@ -300,7 +301,7 @@ describe('AuthController', () => {
       mockAuthService.resendVerificationEmail.mockRejectedValue(error);
 
       await expect(
-        controller.resendVerificationEmail(email, mockRequest),
+        controller.resendVerificationEmail({ email }, mockRequest),
       ).rejects.toThrow('User not found');
       expect(mockAuthService.resendVerificationEmail).toHaveBeenCalledTimes(1);
     });

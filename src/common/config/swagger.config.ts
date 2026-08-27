@@ -3,16 +3,12 @@ import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 
 export function setupSwagger(app: INestApplication): void {
   const config = new DocumentBuilder()
-    .setTitle('NestJS API')
+    .setTitle('Face MakeUp Guide API')
     .setDescription(
-      'Production-ready NestJS API with Prisma, PostgreSQL, Authentication, Logging, Monitoring, and more.',
+      'Authentication and application API for the Face MakeUp Guide mobile app.',
     )
     .setVersion('1.0.0')
-    .setContact(
-      'API Support',
-      'https://github.com/the-pujon/nestjs-prisma-postgres-starter',
-      '',
-    )
+    .setContact('API Support', '', '')
     .setLicense('MIT', 'https://opensource.org/licenses/MIT')
     // Add JWT Bearer authentication globally
     .addBearerAuth(
@@ -40,7 +36,7 @@ export function setupSwagger(app: INestApplication): void {
 
   // Customize Swagger UI
   SwaggerModule.setup('docs', app, document, {
-    customSiteTitle: 'NestJS API Documentation',
+    customSiteTitle: 'Face MakeUp Guide API Documentation',
     customfavIcon: 'https://nestjs.com/img/logo-small.svg',
     customCss: `
       .swagger-ui .topbar { display: none }

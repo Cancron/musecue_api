@@ -95,7 +95,7 @@ export class AuthGuard implements CanActivate {
     // Cache for 1 hour (or until security event invalidates it)
     await this.redisService.set(cacheKey, user.tokenVersion, 3600);
 
-    return user.tokenVersion as number;
+    return user.tokenVersion;
   }
 
   /**

@@ -8,6 +8,7 @@ import { ActivityLogService } from '../common/services/activity-log.service';
 import { EmailService } from '../common/services/email.service';
 import { RedisService } from '../common/services/redis.service';
 import { QueueModule } from '../common/modules';
+import { AuthGuard } from '../common/guards/auth.guard';
 
 @Module({
   imports: [QueueModule],
@@ -20,6 +21,7 @@ import { QueueModule } from '../common/modules';
     ActivityLogService,
     EmailService,
     RedisService,
+    AuthGuard,
   ],
   exports: [AuthUtilsService, GoogleOAuthService],
 })
