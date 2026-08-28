@@ -2,14 +2,15 @@ import { Injectable } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import AppError from '../common/errors/app.error';
 import { PrismaService } from '../common/services/prisma.service';
+import { PrivateImageStorageService } from '../storage/private-image-storage.service';
 import type {
   AskQuestionDto,
   CompleteStepDto,
   ListSessionsDto,
-  RegisterMockImageDto,
   SavePreferencesDto,
 } from './dto/makeup.dto';
 import { MakeupQueueService } from './queues/makeup.queue';
+import { ImageValidationService } from './services/image-validation.service';
 
 const SESSION_INCLUDE = {
   images: {
@@ -47,6 +48,8 @@ export class MakeupService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly queue: MakeupQueueService,
+    private readonly imageValidation: ImageValidationService,
+    private readonly imageStorage: PrivateImageStorageService,
   ) {}
 
   createSession(authId: string) {
@@ -91,10 +94,10 @@ export class MakeupService {
     return session;
   }
 
-  async registerMockImage(
+  async uploadInitialImage(
     authId: string,
     sessionId: string,
-    dto: RegisterMockImageDto,
+    file?: Express.Multer.File,
   ) {
     const session = await this.getSession(authId, sessionId);
     if (!['CREATED', 'IMAGE_UPLOADED'].includes(session.status)) {
@@ -102,21 +105,49 @@ export class MakeupService {
         'The initial image cannot be replaced after analysis starts',
       );
     }
-    await this.prisma.$transaction([
-      this.prisma.imageAsset.create({
-        data: {
-          sessionId,
-          purpose: 'INITIAL_ANALYSIS',
-          source: 'MOCK_CAPTURE',
-          storageKey: `mock-capture://${sessionId}`,
-          ...dto,
-        },
-      }),
-      this.prisma.makeupSession.update({
-        where: { id: sessionId },
-        data: { status: 'IMAGE_UPLOADED' },
-      }),
-    ]);
+    if (!file) throw AppError.badRequest('An image file is required');
+
+    const image = await this.imageValidation.validate(file);
+    const replacedImages = await this.prisma.imageAsset.findMany({
+      where: { sessionId, purpose: 'INITIAL_ANALYSIS' },
+      select: { storageKey: true },
+    });
+    const storageKey = await this.imageStorage.save(
+      authId,
+      sessionId,
+      image.mimeType,
+      file.buffer,
+    );
+
+    try {
+      await this.prisma.$transaction([
+        this.prisma.imageAsset.deleteMany({
+          where: { sessionId, purpose: 'INITIAL_ANALYSIS' },
+        }),
+        this.prisma.imageAsset.create({
+          data: {
+            sessionId,
+            purpose: 'INITIAL_ANALYSIS',
+            source: 'PRIVATE_UPLOAD',
+            storageKey,
+            ...image,
+          },
+        }),
+        this.prisma.makeupSession.update({
+          where: { id: sessionId },
+          data: { status: 'IMAGE_UPLOADED' },
+        }),
+      ]);
+    } catch (error) {
+      await this.imageStorage.delete(storageKey);
+      throw error;
+    }
+
+    await Promise.all(
+      replacedImages.map((imageAsset) =>
+        this.imageStorage.delete(imageAsset.storageKey),
+      ),
+    );
     return this.getSession(authId, sessionId);
   }
 

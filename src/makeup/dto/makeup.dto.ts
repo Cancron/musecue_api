@@ -9,24 +9,9 @@ import {
   Min,
 } from 'class-validator';
 
-export class RegisterMockImageDto {
-  @IsIn(['image/jpeg', 'image/png', 'image/webp'])
-  mimeType!: string;
-
-  @IsInt()
-  @Min(320)
-  @Max(8192)
-  width!: number;
-
-  @IsInt()
-  @Min(320)
-  @Max(8192)
-  height!: number;
-
-  @IsInt()
-  @Min(1)
-  @Max(20_000_000)
-  sizeBytes!: number;
+export class UploadInitialImageDto {
+  @IsIn(['INITIAL_ANALYSIS'])
+  purpose!: 'INITIAL_ANALYSIS';
 }
 
 export class SavePreferencesDto {

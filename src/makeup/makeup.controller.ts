@@ -8,19 +8,23 @@ import {
   Post,
   Query,
   Req,
+  UploadedFile,
   UseGuards,
+  UseInterceptors,
 } from '@nestjs/common';
-import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { ApiBearerAuth, ApiBody, ApiConsumes, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import type { Request } from 'express';
+import { memoryStorage } from 'multer';
 import { THROTTLER_CONFIG } from '../common/config/throttler.config';
 import { AuthGuard } from '../common/guards/auth.guard';
 import {
   AskQuestionDto,
   CompleteStepDto,
   ListSessionsDto,
-  RegisterMockImageDto,
   SavePreferencesDto,
+  UploadInitialImageDto,
 } from './dto/makeup.dto';
 import type { AuthenticatedUser } from './interfaces/makeup.interface';
 import { MakeupService } from './makeup.service';
@@ -58,13 +62,31 @@ export class MakeupController {
     return this.makeup.getSession(req.user.userId, sessionId);
   }
 
-  @Post('sessions/:sessionId/images/mock')
-  registerMockImage(
+  @Post('sessions/:sessionId/images')
+  @ApiConsumes('multipart/form-data')
+  @ApiBody({
+    schema: {
+      type: 'object',
+      required: ['image', 'purpose'],
+      properties: {
+        image: { type: 'string', format: 'binary' },
+        purpose: { type: 'string', enum: ['INITIAL_ANALYSIS'] },
+      },
+    },
+  })
+  @UseInterceptors(
+    FileInterceptor('image', {
+      storage: memoryStorage(),
+      limits: { files: 1, fileSize: 10_000_000 },
+    }),
+  )
+  uploadInitialImage(
     @Req() req: AuthenticatedRequest,
     @Param('sessionId') sessionId: string,
-    @Body() dto: RegisterMockImageDto,
+    @Body() _dto: UploadInitialImageDto,
+    @UploadedFile() file?: Express.Multer.File,
   ) {
-    return this.makeup.registerMockImage(req.user.userId, sessionId, dto);
+    return this.makeup.uploadInitialImage(req.user.userId, sessionId, file);
   }
 
   @Patch('sessions/:sessionId/preferences')

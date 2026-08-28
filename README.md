@@ -11,7 +11,7 @@ The companion mobile application and detailed product specifications live in `..
 - PostgreSQL/Prisma local accounts, SMTP verification through BullMQ, login auditing, account lockout, and Google OAuth foundations
 - short-lived JWT access tokens and rotating, revocable Redis-backed refresh tokens
 - owner-scoped makeup sessions and the documented workflow state machine
-- image metadata, structured preferences, face analysis, ranked recommendations, saved looks, and selection
+- validated multipart image upload, private filesystem storage, image metadata, structured preferences, face analysis, ranked recommendations, saved looks, and selection
 - generated guides, authoritative step progression, retained visual attempts, contextual questions, completion history, and profile statistics
 - BullMQ jobs for personalization, guide generation, visual checks, and guide questions
 - `AiRun` audit records containing operation, provider, model, prompt version, latency, progress, result/error, and status
@@ -21,7 +21,7 @@ Migration `20260827174107_add_makeup_workflow` adds the makeup aggregate and rem
 
 Intentionally deferred:
 
-- real camera binary upload and production private object storage; the current app registers mock-capture metadata
+- a production cloud object-storage adapter and short-lived signed reads; the current private filesystem adapter is intended for local/self-hosted deployments
 - generated preview images
 - external AI provider calls
 - production retention/deletion automation and AI cost accounting
@@ -45,6 +45,8 @@ The API defaults to `http://localhost:5000`; development Swagger is at `http://l
 
 Important environment variables are documented in `.env.example`. Never commit the real `.env` or log SMTP credentials, tokens, image contents, or future signed URLs.
 
+`PRIVATE_UPLOAD_DIR` controls the private image root and defaults to `.data/private-images`. The directory is ignored by Git and is never mounted as a public static directory.
+
 ## API
 
 Authentication routes:
@@ -66,7 +68,7 @@ Makeup routes require a bearer token:
 | `POST`  | `/v1/sessions`                                                     | Create an owner-scoped session    |
 | `GET`   | `/v1/sessions?scope=active\|completed\|all`                        | List the user's sessions          |
 | `GET`   | `/v1/sessions/:sessionId`                                          | Read the full session aggregate   |
-| `POST`  | `/v1/sessions/:sessionId/images/mock`                              | Register mock-capture metadata    |
+| `POST`  | `/v1/sessions/:sessionId/images`                                   | Upload an initial face image      |
 | `PATCH` | `/v1/sessions/:sessionId/preferences`                              | Save preferences                  |
 | `POST`  | `/v1/sessions/:sessionId/analyze`                                  | Queue mock personalization        |
 | `POST`  | `/v1/sessions/:sessionId/recommendations/:recommendationId/select` | Select a look and queue its guide |
@@ -79,6 +81,8 @@ Makeup routes require a bearer token:
 | `GET`   | `/v1/profile/stats`                                                | Return persisted statistics       |
 
 Queueing mutations accept an `Idempotency-Key`. Every owned record is scoped with the JWT user ID; clients cannot supply another user's owner ID.
+
+The image endpoint accepts `multipart/form-data` fields `image` and `purpose=INITIAL_ANALYSIS`. JPEG, PNG, and WebP files must be 10 MB or smaller and between 320 and 8192 pixels on each axis. The API derives this metadata from the actual bytes.
 
 Successful responses use one envelope:
 
