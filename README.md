@@ -63,26 +63,30 @@ Authentication routes:
 
 Makeup routes require a bearer token:
 
-| Method  | Route                                                              | Purpose                           |
-| ------- | ------------------------------------------------------------------ | --------------------------------- |
-| `POST`  | `/v1/sessions`                                                     | Create an owner-scoped session    |
-| `GET`   | `/v1/sessions?scope=active\|completed\|all`                        | List the user's sessions          |
-| `GET`   | `/v1/sessions/:sessionId`                                          | Read the full session aggregate   |
-| `POST`  | `/v1/sessions/:sessionId/images`                                   | Upload an initial face image      |
-| `PATCH` | `/v1/sessions/:sessionId/preferences`                              | Save preferences                  |
-| `POST`  | `/v1/sessions/:sessionId/analyze`                                  | Queue mock personalization        |
-| `POST`  | `/v1/sessions/:sessionId/recommendations/:recommendationId/select` | Select a look and queue its guide |
-| `POST`  | `/v1/recommendations/:recommendationId/saved`                      | Toggle saved state                |
-| `GET`   | `/v1/saved-recommendations`                                        | List saved recommendations        |
-| `POST`  | `/v1/guide-steps/:stepId/check`                                    | Queue a visual evaluation         |
-| `POST`  | `/v1/guide-steps/:stepId/questions`                                | Queue a contextual answer         |
-| `POST`  | `/v1/guide-steps/:stepId/complete`                                 | Advance the authoritative guide   |
-| `GET`   | `/v1/jobs/:runId`                                                  | Poll an asynchronous AI run       |
-| `GET`   | `/v1/profile/stats`                                                | Return persisted statistics       |
+| Method   | Route                                                              | Purpose                           |
+| -------- | ------------------------------------------------------------------ | --------------------------------- |
+| `POST`   | `/v1/sessions`                                                     | Create an owner-scoped session    |
+| `GET`    | `/v1/sessions?scope=active\|completed\|all`                        | List the user's sessions          |
+| `GET`    | `/v1/sessions/:sessionId`                                          | Read the full session aggregate   |
+| `DELETE` | `/v1/sessions/:sessionId`                                          | Delete a completed session        |
+| `POST`   | `/v1/sessions/:sessionId/images`                                   | Upload an initial face image      |
+| `GET`    | `/v1/images/:imageId/content`                                      | Read an owned private image       |
+| `PATCH`  | `/v1/sessions/:sessionId/preferences`                              | Save preferences                  |
+| `POST`   | `/v1/sessions/:sessionId/analyze`                                  | Queue mock personalization        |
+| `POST`   | `/v1/sessions/:sessionId/recommendations/:recommendationId/select` | Select a look and queue its guide |
+| `POST`   | `/v1/recommendations/:recommendationId/saved`                      | Toggle saved state                |
+| `GET`    | `/v1/saved-recommendations`                                        | List saved recommendations        |
+| `POST`   | `/v1/guide-steps/:stepId/check`                                    | Queue a visual evaluation         |
+| `POST`   | `/v1/guide-steps/:stepId/questions`                                | Queue a contextual answer         |
+| `POST`   | `/v1/guide-steps/:stepId/complete`                                 | Advance the authoritative guide   |
+| `GET`    | `/v1/jobs/:runId`                                                  | Poll an asynchronous AI run       |
+| `GET`    | `/v1/profile/stats`                                                | Return persisted statistics       |
 
 Queueing mutations accept an `Idempotency-Key`. Every owned record is scoped with the JWT user ID; clients cannot supply another user's owner ID.
 
 The image endpoint accepts `multipart/form-data` fields `image` and `purpose=INITIAL_ANALYSIS`. JPEG, PNG, and WebP files must be 10 MB or smaller and between 320 and 8192 pixels on each axis. The API derives this metadata from the actual bytes.
+
+Private image reads require the same bearer token and verify ownership through the image's session. Completed-session deletion cascades through its guide, steps, attempts, questions, recommendations, and image metadata, then removes its private files. Active workflows cannot be deleted through the history endpoint.
 
 Successful responses use one envelope:
 

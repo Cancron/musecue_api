@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
-import { mkdir, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import { dirname, extname, join, relative, resolve, sep } from 'node:path';
 
 const EXTENSIONS_BY_MIME = {
@@ -43,6 +43,10 @@ export class PrivateImageStorageService {
     } catch (error) {
       if (!this.isMissingFile(error)) throw error;
     }
+  }
+
+  read(storageKey: string): Promise<Buffer> {
+    return readFile(this.resolveKey(storageKey));
   }
 
   private resolveKey(storageKey: string): string {

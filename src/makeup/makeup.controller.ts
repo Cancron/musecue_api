@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Headers,
   Param,
@@ -8,6 +9,7 @@ import {
   Post,
   Query,
   Req,
+  Res,
   UploadedFile,
   UseGuards,
   UseInterceptors,
@@ -16,6 +18,7 @@ import { FileInterceptor } from '@nestjs/platform-express';
 import { ApiBearerAuth, ApiBody, ApiConsumes, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import type { Request } from 'express';
+import type { Response } from 'express';
 import { memoryStorage } from 'multer';
 import { THROTTLER_CONFIG } from '../common/config/throttler.config';
 import { AuthGuard } from '../common/guards/auth.guard';
@@ -60,6 +63,28 @@ export class MakeupController {
     @Param('sessionId') sessionId: string,
   ) {
     return this.makeup.getSession(req.user.userId, sessionId);
+  }
+
+  @Delete('sessions/:sessionId')
+  deleteSession(
+    @Req() req: AuthenticatedRequest,
+    @Param('sessionId') sessionId: string,
+  ) {
+    return this.makeup.deleteSession(req.user.userId, sessionId);
+  }
+
+  @Get('images/:imageId/content')
+  @Throttle({ default: THROTTLER_CONFIG.RELAXED })
+  async getImageContent(
+    @Req() req: AuthenticatedRequest,
+    @Param('imageId') imageId: string,
+    @Res() response: Response,
+  ) {
+    const image = await this.makeup.getImageContent(req.user.userId, imageId);
+    response.setHeader('Content-Type', image.mimeType);
+    response.setHeader('Cache-Control', 'private, no-store');
+    response.setHeader('X-Content-Type-Options', 'nosniff');
+    response.send(image.bytes);
   }
 
   @Post('sessions/:sessionId/images')

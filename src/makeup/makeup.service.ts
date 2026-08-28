@@ -35,7 +35,7 @@ const SESSION_INCLUDE = {
       steps: {
         orderBy: { position: 'asc' as const },
         include: {
-          attempts: { orderBy: { createdAt: 'desc' as const }, take: 1 },
+          attempts: { orderBy: { createdAt: 'desc' as const } },
           questions: { orderBy: { createdAt: 'asc' as const } },
         },
       },
@@ -92,6 +92,55 @@ export class MakeupService {
     });
     if (!session) throw AppError.notFound('Makeup session not found');
     return session;
+  }
+
+  async deleteSession(authId: string, sessionId: string) {
+    const session = await this.prisma.makeupSession.findFirst({
+      where: { id: sessionId, authId },
+      select: {
+        id: true,
+        status: true,
+        images: { select: { storageKey: true } },
+      },
+    });
+    if (!session) throw AppError.notFound('Makeup session not found');
+    if (session.status !== 'COMPLETED') {
+      throw AppError.conflict(
+        'Only completed sessions can be deleted from history',
+      );
+    }
+
+    const deletion = await this.prisma.makeupSession.deleteMany({
+      where: { id: sessionId, authId, status: 'COMPLETED' },
+    });
+    if (deletion.count !== 1) {
+      throw AppError.conflict('The session changed and could not be deleted');
+    }
+
+    await Promise.allSettled(
+      session.images.map((image) => this.imageStorage.delete(image.storageKey)),
+    );
+    return { id: sessionId };
+  }
+
+  async getImageContent(authId: string, imageId: string) {
+    const image = await this.prisma.imageAsset.findFirst({
+      where: { id: imageId, session: { authId } },
+      select: { storageKey: true, mimeType: true, source: true },
+    });
+    if (!image) throw AppError.notFound('Image not found');
+    if (image.source !== 'PRIVATE_UPLOAD') {
+      throw AppError.notFound('Image content is unavailable');
+    }
+
+    try {
+      return {
+        mimeType: image.mimeType,
+        bytes: await this.imageStorage.read(image.storageKey),
+      };
+    } catch {
+      throw AppError.notFound('Image content is unavailable');
+    }
   }
 
   async uploadInitialImage(
