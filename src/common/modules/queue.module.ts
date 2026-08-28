@@ -2,7 +2,6 @@ import { BullModule } from '@nestjs/bullmq';
 import { Module } from '@nestjs/common';
 import config from '../config/app.config';
 import { EmailService } from '../services/email.service';
-import { PrismaService } from '../services/prisma.service';
 import { EmailQueueService } from '../queues/email/email.queue';
 import { EmailProcessor } from '../queues/email/email.processor';
 
@@ -21,7 +20,7 @@ import { EmailProcessor } from '../queues/email/email.processor';
       name: 'email',
     }),
   ],
-  providers: [EmailQueueService, EmailProcessor, EmailService, PrismaService],
+  providers: [EmailQueueService, EmailProcessor, EmailService],
   exports: [EmailQueueService],
 })
 export class QueueModule {}

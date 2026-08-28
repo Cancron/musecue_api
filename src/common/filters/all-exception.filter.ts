@@ -17,7 +17,7 @@ export class AllExceptionsFilter implements ExceptionFilter {
     private readonly logger: Logger,
   ) {}
 
-  catch(exception: unknown, host: ArgumentsHost) {
+  catch(exception: unknown, host: ArgumentsHost): void {
     const ctx = host.switchToHttp();
     const response = ctx.getResponse<Response>();
     const request = ctx.getRequest<Request>();
@@ -28,24 +28,9 @@ export class AllExceptionsFilter implements ExceptionFilter {
       return;
     }
 
-    console.log('all exceptions', exception);
-
-    let statusCode = HttpStatus.INTERNAL_SERVER_ERROR;
+    let statusCode: number = HttpStatus.INTERNAL_SERVER_ERROR;
     let message = 'Internal Server Error';
     let error = 'Error';
-
-    // Log the exception
-    this.logger.error('Unhandled exception caught', {
-      context: 'AllExceptionsFilter',
-      statusCode,
-      path: request.url,
-      method: request.method,
-      exception:
-        exception instanceof Error ? exception.message : String(exception),
-      stack: exception instanceof Error ? exception.stack : undefined,
-    });
-    // let errorCode: string | undefined = undefined;
-    // let errorFields: string[] | undefined = undefined;
 
     // Check if exception has a status property
     if (
@@ -62,21 +47,32 @@ export class AllExceptionsFilter implements ExceptionFilter {
       statusCode = exception.getStatus();
       const res = exception.getResponse();
       if (typeof res === 'string') message = res;
-      else if (typeof res === 'object' && res['message']) {
-        const resMessage = res['message'] as string | string[];
+      else if (typeof res === 'object' && res !== null && 'message' in res) {
+        const resMessage = res.message as string | string[];
         message = Array.isArray(resMessage)
           ? resMessage.join(', ')
           : String(resMessage);
       }
       error = exception.name;
-    }
-
-    // Generic JS Error
-    else if (exception instanceof Error) {
-      // statusCode = exception.;
+    } else if (exception instanceof Error) {
       message = exception.message;
       error = exception.name;
     }
+
+    const logContext = {
+      context: 'AllExceptionsFilter',
+      statusCode,
+      path: request.url,
+      method: request.method,
+      exception:
+        exception instanceof Error ? exception.message : String(exception),
+      ...(statusCode >= 500 && exception instanceof Error
+        ? { stack: exception.stack }
+        : {}),
+    };
+    if (statusCode >= 500)
+      this.logger.error('Unhandled exception caught', logContext);
+    else this.logger.warn('Request rejected', logContext);
 
     response.status(statusCode).json({
       success: false,
@@ -85,10 +81,6 @@ export class AllExceptionsFilter implements ExceptionFilter {
       error,
       timestamp: new Date().toISOString(),
       path: request.url,
-      stack:
-        process.env.NODE_ENV === 'development' && exception instanceof Error
-          ? exception.stack
-          : null,
     });
   }
 }

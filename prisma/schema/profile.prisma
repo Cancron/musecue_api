@@ -3,17 +3,17 @@
 // ================================
 
 model userProfile {
-    id        String   @id @default(uuid())
-    authId    String   @unique
-    firstName String?
-    lastName  String?
-    bio       String?
-    avatarUrl String?
-    createdAt DateTime @default(now())
-    updatedAt DateTime @updatedAt
+  id        String   @id @default(uuid())
+  authId    String   @unique
+  firstName String?
+  lastName  String?
+  bio       String?
+  avatarUrl String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
-    // Relations
-    authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
+  // Relations
+  authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
 
-    @@index([authId])
+  @@index([authId])
 }

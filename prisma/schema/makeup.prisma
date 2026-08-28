@@ -1,0 +1,186 @@
+model MakeupSession {
+  id          String              @id @default(uuid())
+  authId      String
+  status      MakeupSessionStatus @default(CREATED)
+  completedAt DateTime?
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+
+  authUser        authUser           @relation(fields: [authId], references: [id], onDelete: Cascade)
+  images          ImageAsset[]
+  preferences     MakeupPreferences?
+  faceAnalysis    FaceAnalysis?
+  recommendations Recommendation[]
+  guide           Guide?
+  aiRuns          AiRun[]
+
+  @@index([authId, createdAt])
+  @@index([authId, status])
+}
+
+model ImageAsset {
+  id         String       @id @default(uuid())
+  sessionId  String
+  purpose    ImagePurpose
+  source     ImageSource
+  storageKey String
+  mimeType   String
+  width      Int
+  height     Int
+  sizeBytes  Int
+  createdAt  DateTime     @default(now())
+
+  session      MakeupSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  stepAttempts StepAttempt[]
+
+  @@index([sessionId, purpose, createdAt])
+}
+
+model MakeupPreferences {
+  id            String   @id @default(uuid())
+  sessionId     String   @unique
+  vibe          String
+  skillLevel    String?
+  occasion      String?
+  desiredEffect String?
+  timeMinutes   Int
+  notes         String?  @db.VarChar(500)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  session MakeupSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+}
+
+model FaceAnalysis {
+  id              String   @id @default(uuid())
+  sessionId       String   @unique
+  faceShape       String
+  skinTone        String
+  undertone       String
+  notableFeatures String[]
+  confidence      Float
+  createdAt       DateTime @default(now())
+
+  session MakeupSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+}
+
+model Recommendation {
+  id         String    @id @default(uuid())
+  sessionId  String
+  rank       Int
+  name       String
+  tagline    String
+  matchScore Int
+  imageUrl   String
+  palette    Json
+  rationale  String    @db.Text
+  selectedAt DateTime?
+  savedAt    DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  session MakeupSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  guide   Guide?
+
+  @@unique([sessionId, rank])
+  @@index([sessionId])
+  @@index([savedAt])
+}
+
+model Guide {
+  id               String      @id @default(uuid())
+  sessionId        String      @unique
+  recommendationId String      @unique
+  status           GuideStatus @default(GENERATING)
+  currentStepIndex Int         @default(0)
+  startedAt        DateTime?
+  completedAt      DateTime?
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+
+  session        MakeupSession  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  recommendation Recommendation @relation(fields: [recommendationId], references: [id], onDelete: Cascade)
+  steps          GuideStep[]
+}
+
+model GuideStep {
+  id               String          @id @default(uuid())
+  guideId          String
+  position         Int
+  status           GuideStepStatus @default(LOCKED)
+  title            String
+  instruction      String          @db.Text
+  area             String
+  technique        String
+  estimatedSeconds Int
+  personalizedTip  String          @db.Text
+  commonMistake    String          @db.Text
+  successCriteria  String          @db.Text
+  completedAt      DateTime?
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  guide     Guide         @relation(fields: [guideId], references: [id], onDelete: Cascade)
+  attempts  StepAttempt[]
+  questions Question[]
+  aiRuns    AiRun[]
+
+  @@unique([guideId, position])
+  @@index([guideId, status])
+}
+
+model StepAttempt {
+  id         String           @id @default(uuid())
+  stepId     String
+  imageId    String?
+  result     EvaluationResult
+  feedback   String           @db.Text
+  confidence Float
+  createdAt  DateTime         @default(now())
+
+  step  GuideStep   @relation(fields: [stepId], references: [id], onDelete: Cascade)
+  image ImageAsset? @relation(fields: [imageId], references: [id], onDelete: SetNull)
+
+  @@index([stepId, createdAt])
+}
+
+model Question {
+  id        String   @id @default(uuid())
+  stepId    String
+  question  String   @db.VarChar(500)
+  answer    String   @db.Text
+  createdAt DateTime @default(now())
+
+  step GuideStep @relation(fields: [stepId], references: [id], onDelete: Cascade)
+
+  @@index([stepId, createdAt])
+}
+
+model AiRun {
+  id             String      @id @default(uuid())
+  authId         String
+  sessionId      String
+  stepId         String?
+  operation      AiOperation
+  status         AiRunStatus @default(QUEUED)
+  progress       Int         @default(0)
+  provider       String      @default("mock")
+  model          String      @default("musecue-deterministic-v1")
+  promptVersion  String
+  idempotencyKey String
+  result         Json?
+  error          String?
+  latencyMs      Int?
+  startedAt      DateTime?
+  completedAt    DateTime?
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  authUser authUser      @relation(fields: [authId], references: [id], onDelete: Cascade)
+  session  MakeupSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  step     GuideStep?    @relation(fields: [stepId], references: [id], onDelete: Cascade)
+
+  @@unique([authId, idempotencyKey])
+  @@index([sessionId, operation, createdAt])
+  @@index([authId, status])
+}

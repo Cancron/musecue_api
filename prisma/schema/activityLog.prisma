@@ -3,23 +3,23 @@
 // ================================
 
 model ActivityLogEvent {
-    id         String     @id @default(uuid())
-    tableName  String
-    recordId   String
-    action     actionType
-    actionedBy String? // user id who did the action
-    ipAddress  String?
-    userAgent  String?
-    device     String?
-    createdAt  DateTime   @default(now())
-    eventType  eventType?
+  id         String     @id @default(uuid())
+  tableName  String
+  recordId   String
+  action     actionType
+  actionedBy String? // user id who did the action
+  ipAddress  String?
+  userAgent  String?
+  device     String?
+  createdAt  DateTime   @default(now())
+  eventType  eventType?
 
-    // Relations
-    details  ActivityLogEventDetail[]
-    authUser authUser?                @relation(fields: [actionedBy], references: [id], onDelete: SetNull)
+  // Relations
+  details  ActivityLogEventDetail[]
+  authUser authUser?                @relation(fields: [actionedBy], references: [id], onDelete: SetNull)
 
-    @@index([tableName, recordId, createdAt]) // fetch history for a record
-    @@index([actionedBy, createdAt]) // fetch actions by user
+  @@index([tableName, recordId, createdAt]) // fetch history for a record
+  @@index([actionedBy, createdAt]) // fetch actions by user
 }
 
 // ================================
@@ -27,14 +27,14 @@ model ActivityLogEvent {
 // ================================
 
 model ActivityLogEventDetail {
-    id        String  @id @default(uuid())
-    eventId   String
-    fieldName String
-    oldValue  String?
-    newValue  String?
+  id        String  @id @default(uuid())
+  eventId   String
+  fieldName String
+  oldValue  String?
+  newValue  String?
 
-    // Relations
-    event ActivityLogEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  // Relations
+  event ActivityLogEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
 
-    @@index([eventId])
+  @@index([eventId])
 }

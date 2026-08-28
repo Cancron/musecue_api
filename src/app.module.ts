@@ -10,6 +10,8 @@ import { MetricsModule } from './metrics/metrics.module';
 import { WinstonModule } from 'nest-winston';
 import { winstonConfig } from './common/config/winston.config';
 import { LoggerModule } from './common/modules/logger.module';
+import { MakeupModule } from './makeup/makeup.module';
+import { DatabaseModule } from './common/modules/database.module';
 
 @Module({
   imports: [
@@ -22,6 +24,7 @@ import { LoggerModule } from './common/modules/logger.module';
     WinstonModule.forRoot(winstonConfig),
     // Custom logger module (global - can be injected anywhere)
     LoggerModule,
+    DatabaseModule,
     // Redis module (global - can be injected anywhere)
     RedisModule,
     // Rate limiting module (global - throttles requests using Redis)
@@ -30,6 +33,7 @@ import { LoggerModule } from './common/modules/logger.module';
     MetricsModule,
     // BlogModule,
     AuthModule,
+    MakeupModule,
   ],
   controllers: [AppController],
   providers: [AppService],

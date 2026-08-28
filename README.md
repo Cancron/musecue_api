@@ -2,44 +2,36 @@
 
 **AI makeup guidance, made for your face.**
 
-The MuseCue API is the NestJS application authority for authentication, persistent workflow state, private images, and future AI orchestration. AI providers will analyze or generate content; NestJS will validate their output and control all application state transitions.
+The MuseCue API is the NestJS authority for authentication, authorization, workflow state, persistence, and AI orchestration. Supabase is not used. AI providers may interpret or generate data, but only NestJS validates results and advances application state.
 
-The companion mobile application and detailed product architecture live in `../face_makeup_app`.
+The companion mobile application and detailed product specifications live in `../face_makeup_app`.
 
-## Current implementation
+## Implemented
 
-Implemented and active:
+- PostgreSQL/Prisma local accounts, SMTP verification through BullMQ, login auditing, account lockout, and Google OAuth foundations
+- short-lived JWT access tokens and rotating, revocable Redis-backed refresh tokens
+- owner-scoped makeup sessions and the documented workflow state machine
+- image metadata, structured preferences, face analysis, ranked recommendations, saved looks, and selection
+- generated guides, authoritative step progression, retained visual attempts, contextual questions, completion history, and profile statistics
+- BullMQ jobs for personalization, guide generation, visual checks, and guide questions
+- `AiRun` audit records containing operation, provider, model, prompt version, latency, progress, result/error, and status
+- a deterministic mock AI gateway with normalized, runtime-validated sample output
 
-- local email/password accounts backed by PostgreSQL and Prisma
-- SMTP email verification through BullMQ
-- login with account lockout and audit history
-- short-lived JWT access tokens
-- rotating, revocable refresh tokens backed by Redis
-- authenticated logout and logout-all-devices operations
-- Google OAuth foundation
-- request validation, rate limiting, Helmet, CORS, Swagger, structured logging, and Prometheus metrics
+Migration `20260827174107_add_makeup_workflow` adds the makeup aggregate and removes the dormant job-tracker and subscription starter domains.
 
-Supabase is not used. The API is the single authentication authority.
+Intentionally deferred:
 
-The old starter user and job-tracker modules remain in the source tree for reference but are not registered in `AppModule` and expose no routes. Their Prisma tables should be removed in a dedicated schema migration when the makeup-session schema is introduced.
+- real camera binary upload and production private object storage; the current app registers mock-capture metadata
+- generated preview images
+- external AI provider calls
+- production retention/deletion automation and AI cost accounting
 
-Not implemented yet:
-
-- private image uploads or object storage
-- makeup sessions and preferences
-- face analyses, recommendations, or preview generation
-- guides, steps, attempts, evaluations, or contextual questions
-- AI provider gateway and AI job workers
-
-## Requirements
+## Requirements and setup
 
 - Node.js 22+
-- npm
 - PostgreSQL 17
 - Redis 7+
-- working SMTP credentials for verification and welcome emails
-
-## Local setup
+- working SMTP credentials
 
 ```bash
 copy .env.example .env
@@ -49,60 +41,46 @@ npx prisma migrate deploy
 npm run start:dev
 ```
 
-The API defaults to `http://localhost:5000`. Swagger is available at `http://localhost:5000/docs` in development.
+The API defaults to `http://localhost:5000`; development Swagger is at `http://localhost:5000/docs`.
 
-## Environment
+Important environment variables are documented in `.env.example`. Never commit the real `.env` or log SMTP credentials, tokens, image contents, or future signed URLs.
 
-Use `.env.example` as the complete starting point. Important values include:
+## API
 
-```env
-DATABASE_URL=postgresql://admin:admin@127.0.0.1:5433/musecue
-NODE_ENV=development
-PORT=5000
-CORS_ORIGINS=http://localhost:8081,http://localhost:19006
+Authentication routes:
 
-JWT_ACCESS_SECRET=replace-with-a-strong-independent-secret
-JWT_REFRESH_SECRET=replace-with-a-different-strong-secret
+| Method | Route                             | Purpose                                      |
+| ------ | --------------------------------- | -------------------------------------------- |
+| `POST` | `/auth`                           | Register and queue a verification email      |
+| `POST` | `/auth/verify-email`              | Verify the six-character code                |
+| `POST` | `/auth/resend-verification-email` | Queue a replacement code                     |
+| `POST` | `/auth/login`                     | Return access token, refresh token, and user |
+| `POST` | `/auth/refresh-token`             | Rotate the refresh token                     |
+| `POST` | `/auth/logout`                    | Revoke the current session                   |
+| `POST` | `/auth/logout-all`                | Revoke all user sessions                     |
 
-REDIS_HOST=localhost
-REDIS_PORT=6379
-REDIS_CACHE_KEY_PREFIX=musecue
+Makeup routes require a bearer token:
 
-EMAIL_HOST=smtp.example.com
-EMAIL_PORT=587
-EMAIL_USER=your-smtp-user
-EMAIL_PASS=your-smtp-password
-EMAIL_FROM="MuseCue <noreply@example.com>"
-```
+| Method  | Route                                                              | Purpose                           |
+| ------- | ------------------------------------------------------------------ | --------------------------------- |
+| `POST`  | `/v1/sessions`                                                     | Create an owner-scoped session    |
+| `GET`   | `/v1/sessions?scope=active\|completed\|all`                        | List the user's sessions          |
+| `GET`   | `/v1/sessions/:sessionId`                                          | Read the full session aggregate   |
+| `POST`  | `/v1/sessions/:sessionId/images/mock`                              | Register mock-capture metadata    |
+| `PATCH` | `/v1/sessions/:sessionId/preferences`                              | Save preferences                  |
+| `POST`  | `/v1/sessions/:sessionId/analyze`                                  | Queue mock personalization        |
+| `POST`  | `/v1/sessions/:sessionId/recommendations/:recommendationId/select` | Select a look and queue its guide |
+| `POST`  | `/v1/recommendations/:recommendationId/saved`                      | Toggle saved state                |
+| `GET`   | `/v1/saved-recommendations`                                        | List saved recommendations        |
+| `POST`  | `/v1/guide-steps/:stepId/check`                                    | Queue a visual evaluation         |
+| `POST`  | `/v1/guide-steps/:stepId/questions`                                | Queue a contextual answer         |
+| `POST`  | `/v1/guide-steps/:stepId/complete`                                 | Advance the authoritative guide   |
+| `GET`   | `/v1/jobs/:runId`                                                  | Poll an asynchronous AI run       |
+| `GET`   | `/v1/profile/stats`                                                | Return persisted statistics       |
 
-The application also supports `JWT_SECRET` as a development fallback, but separate access and refresh secrets are recommended. Never commit the real `.env` file or include SMTP credentials in logs or documentation.
+Queueing mutations accept an `Idempotency-Key`. Every owned record is scoped with the JWT user ID; clients cannot supply another user's owner ID.
 
-## Active API routes
-
-### Authentication
-
-| Method     | Route                             | Authentication | Purpose                                               |
-| ---------- | --------------------------------- | -------------- | ----------------------------------------------------- |
-| `POST`     | `/auth`                           | Public         | Register an account and queue a verification code     |
-| `POST`     | `/auth/verify-email`              | Public         | Verify a six-character email code                     |
-| `POST`     | `/auth/resend-verification-email` | Public         | Send a replacement verification code                  |
-| `POST`     | `/auth/login`                     | Public         | Receive access token, refresh token, and user         |
-| `POST`     | `/auth/refresh-token`             | Refresh token  | Rotate the refresh token and receive a new token pair |
-| `POST`     | `/auth/logout`                    | Bearer token   | Revoke the current refresh token                      |
-| `POST`     | `/auth/logout-all`                | Bearer token   | Revoke all sessions for the authenticated user        |
-| `GET`      | `/auth/google`                    | Public         | Initialize Google OAuth                               |
-| `GET/POST` | `/auth/google/callback`           | Public         | Complete Google OAuth                                 |
-
-### Infrastructure
-
-| Method | Route           | Purpose                      |
-| ------ | --------------- | ---------------------------- |
-| `GET`  | `/`             | Basic application response   |
-| `GET`  | `/metrics`      | Prometheus exposition format |
-| `GET`  | `/metrics/json` | Metrics as JSON              |
-| `GET`  | `/docs`         | Swagger UI when enabled      |
-
-Successful JSON responses use one envelope:
+Successful responses use one envelope:
 
 ```json
 {
@@ -112,53 +90,33 @@ Successful JSON responses use one envelope:
 }
 ```
 
-Errors use:
+## Domain
 
-```json
-{
-  "success": false,
-  "statusCode": 400,
-  "message": "Validation failed",
-  "error": "BadRequestException",
-  "timestamp": "2026-08-27T00:00:00.000Z",
-  "path": "/auth"
-}
+```text
+authUser
+`-- MakeupSession
+    |-- ImageAsset
+    |-- MakeupPreferences
+    |-- FaceAnalysis
+    |-- Recommendation
+    |-- AiRun
+    `-- Guide
+        `-- GuideStep
+            |-- StepAttempt
+            `-- Question
 ```
+
+The mock gateway is behind the same boundary intended for future providers. Workers validate and normalize model-shaped output, services persist it transactionally, and the AI layer never mutates workflow state directly.
 
 ## Commands
 
 ```bash
-npm run start:dev       # Development server
-npm run build           # Production build
-npm run start:prod      # Run compiled application
-npm run lint            # ESLint with fixes
-npm run test            # Unit tests
-npm run test:cov        # Coverage
-npm run test:e2e        # End-to-end tests
-npx prisma generate     # Generate Prisma Client
-npx prisma migrate dev  # Create/apply a development migration
+npm run start:dev
+npm run build
+npm run lint
+npm test
+npm run test:e2e
+npx prisma generate
+npx prisma migrate dev
 npx prisma migrate deploy
 ```
-
-## Target makeup architecture
-
-The first makeup-domain migration should introduce these concepts:
-
-```text
-authUser
-└── MakeupSession
-    ├── ImageAsset
-    ├── MakeupPreferences
-    ├── FaceAnalysis
-    ├── Recommendation
-    │   └── GeneratedPreview
-    └── Guide
-        └── GuideStep
-            ├── StepAttempt
-            │   └── VisualEvaluation
-            └── Question
-```
-
-Long-running analysis and image generation should execute through BullMQ jobs. API mutations should be idempotent, AI outputs must be schema-validated, and each AI result should record provider, model, prompt version, latency, usage, and status.
-
-Face images must use private object storage, short-lived signed URLs, explicit retention/deletion rules, and logs that never include image contents, signed URLs, SMTP credentials, or authentication tokens.
