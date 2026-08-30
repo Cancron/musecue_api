@@ -186,13 +186,16 @@ export class MakeupProcessor extends WorkerHost {
     data: MakeupAiJob,
     startedAt: number,
   ): Promise<void> {
-    if (!data.stepId) throw new Error('Guide step is missing');
+    if (!data.stepId || !data.imageId)
+      throw new Error('Guide step or progress image is missing');
     const step = await this.prisma.guideStep.findFirstOrThrow({
       where: { id: data.stepId, guide: { session: { authId: data.authId } } },
     });
     const result = this.mockAi.evaluateStep(step.position);
     await this.prisma.$transaction([
-      this.prisma.stepAttempt.create({ data: { stepId: step.id, ...result } }),
+      this.prisma.stepAttempt.create({
+        data: { stepId: step.id, imageId: data.imageId, ...result },
+      }),
       this.prisma.aiRun.update({
         where: { id: data.runId },
         data: {

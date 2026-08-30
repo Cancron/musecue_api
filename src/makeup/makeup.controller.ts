@@ -165,15 +165,33 @@ export class MakeupController {
   }
 
   @Post('guide-steps/:stepId/check')
+  @ApiConsumes('multipart/form-data')
+  @ApiBody({
+    schema: {
+      type: 'object',
+      required: ['image'],
+      properties: {
+        image: { type: 'string', format: 'binary' },
+      },
+    },
+  })
+  @UseInterceptors(
+    FileInterceptor('image', {
+      storage: memoryStorage(),
+      limits: { files: 1, fileSize: 10_000_000 },
+    }),
+  )
   checkStep(
     @Req() req: AuthenticatedRequest,
     @Param('stepId') stepId: string,
     @Headers('idempotency-key') key?: string,
+    @UploadedFile() file?: Express.Multer.File,
   ) {
     return this.makeup.checkStep(
       req.user.userId,
       stepId,
       key ?? `check:${stepId}:${Date.now()}`,
+      file,
     );
   }
 

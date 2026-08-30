@@ -7,6 +7,7 @@ export interface MakeupAiJob {
   authId: string;
   sessionId: string;
   stepId?: string;
+  imageId?: string;
   question?: string;
 }
 

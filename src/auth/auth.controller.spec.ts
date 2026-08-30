@@ -255,7 +255,10 @@ describe('AuthController', () => {
       const mockResponse = { message: 'Verification email sent successfully' };
       mockAuthService.resendVerificationEmail.mockResolvedValue(mockResponse);
 
-      const result = await controller.resendVerificationEmail({ email }, mockRequest);
+      const result = await controller.resendVerificationEmail(
+        { email },
+        mockRequest,
+      );
 
       expect(result).toEqual(mockResponse);
       expect(mockAuthService.resendVerificationEmail).toHaveBeenCalledWith(

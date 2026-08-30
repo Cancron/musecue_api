@@ -321,18 +321,62 @@ export class MakeupService {
     });
   }
 
-  async checkStep(authId: string, stepId: string, idempotencyKey: string) {
+  async checkStep(
+    authId: string,
+    stepId: string,
+    idempotencyKey: string,
+    file?: Express.Multer.File,
+  ) {
+    const existing = await this.prisma.aiRun.findUnique({
+      where: { authId_idempotencyKey: { authId, idempotencyKey } },
+    });
+    if (existing) return existing;
+
     const step = await this.getOwnedStep(authId, stepId);
     if (!['CURRENT', 'COMPLETED'].includes(step.status)) {
       throw AppError.conflict('Only the current step can be checked');
     }
-    return this.createRun(
+    if (!file) throw AppError.badRequest('A current makeup image is required');
+
+    const image = await this.imageValidation.validate(file);
+    const storageKey = await this.imageStorage.save(
       authId,
       step.guide.sessionId,
-      'VISION_CHECK',
-      idempotencyKey,
-      stepId,
+      image.mimeType,
+      file.buffer,
     );
+
+    let imageAssetId: string | null = null;
+    try {
+      const imageAsset = await this.prisma.imageAsset.create({
+        data: {
+          sessionId: step.guide.sessionId,
+          purpose: 'STEP_CHECK',
+          source: 'PRIVATE_UPLOAD',
+          storageKey,
+          ...image,
+        },
+      });
+      imageAssetId = imageAsset.id;
+      return await this.createRun(
+        authId,
+        step.guide.sessionId,
+        'VISION_CHECK',
+        idempotencyKey,
+        stepId,
+        undefined,
+        undefined,
+        imageAsset.id,
+      );
+    } catch (error) {
+      if (imageAssetId) {
+        await this.prisma.imageAsset.deleteMany({
+          where: { id: imageAssetId },
+        });
+      }
+      await this.imageStorage.delete(storageKey);
+      throw error;
+    }
   }
 
   async askQuestion(
@@ -445,6 +489,7 @@ export class MakeupService {
     stepId?: string,
     question?: string,
     nextStatus?: 'ANALYZING' | 'GUIDE_GENERATING',
+    imageId?: string,
   ) {
     const existing = await this.prisma.aiRun.findUnique({
       where: { authId_idempotencyKey: { authId, idempotencyKey } },
@@ -473,6 +518,7 @@ export class MakeupService {
         authId,
         sessionId,
         stepId,
+        imageId,
         question,
       });
     } catch (error) {
