@@ -80,4 +80,35 @@ describe('MakeupService history media and deletion', () => {
     ).rejects.toThrow('Only completed sessions can be deleted from history');
     expect(prisma.makeupSession.deleteMany.mock.calls).toHaveLength(0);
   });
+
+  it('promotes the final step check photo to the completion photo', async () => {
+    prisma.guideStep.findFirst.mockResolvedValue({
+      id: 'final-step',
+      guideId: 'guide-id',
+      position: 2,
+      status: 'CURRENT',
+      guide: {
+        sessionId: 'session-id',
+        startedAt: new Date(),
+        steps: [{ id: 'final-step', position: 2 }],
+      },
+    } as never);
+    prisma.stepAttempt.findFirst.mockResolvedValue({
+      imageId: 'final-image',
+    } as never);
+    prisma.makeupSession.findFirst.mockResolvedValue({
+      id: 'session-id',
+      status: 'COMPLETED',
+    } as never);
+    prisma.$transaction.mockImplementation(async (callback) =>
+      (callback as (client: PrismaService) => Promise<unknown>)(prisma),
+    );
+
+    await service.completeStep('owner-id', 'final-step', {});
+
+    expect(prisma.imageAsset.updateMany.mock.calls[0]?.[0]).toEqual({
+      where: { id: 'final-image', sessionId: 'session-id' },
+      data: { purpose: 'COMPLETION' },
+    });
+  });
 });

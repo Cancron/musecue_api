@@ -427,6 +427,20 @@ export class MakeupService {
           data: { status: 'IN_PROGRESS' },
         });
       } else {
+        const finalAttempt = await tx.stepAttempt.findFirst({
+          where: { stepId, imageId: { not: null } },
+          orderBy: { createdAt: 'desc' },
+          select: { imageId: true },
+        });
+        if (finalAttempt?.imageId) {
+          await tx.imageAsset.updateMany({
+            where: {
+              id: finalAttempt.imageId,
+              sessionId: step.guide.sessionId,
+            },
+            data: { purpose: 'COMPLETION' },
+          });
+        }
         await tx.guide.update({
           where: { id: step.guideId },
           data: { status: 'COMPLETED', completedAt: now },
