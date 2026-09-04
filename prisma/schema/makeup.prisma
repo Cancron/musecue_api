@@ -19,21 +19,24 @@ model MakeupSession {
 }
 
 model ImageAsset {
-  id         String       @id @default(uuid())
-  sessionId  String
-  purpose    ImagePurpose
-  source     ImageSource
-  storageKey String
-  mimeType   String
-  width      Int
-  height     Int
-  sizeBytes  Int
-  createdAt  DateTime     @default(now())
+  id          String       @id @default(uuid())
+  sessionId   String
+  guideStepId String?
+  purpose     ImagePurpose
+  source      ImageSource
+  storageKey  String
+  mimeType    String
+  width       Int
+  height      Int
+  sizeBytes   Int
+  createdAt   DateTime     @default(now())
 
   session      MakeupSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  guideStep    GuideStep?    @relation(fields: [guideStepId], references: [id], onDelete: SetNull)
   stepAttempts StepAttempt[]
 
   @@index([sessionId, purpose, createdAt])
+  @@index([guideStepId, createdAt])
 }
 
 model MakeupPreferences {
@@ -122,6 +125,7 @@ model GuideStep {
 
   guide     Guide         @relation(fields: [guideId], references: [id], onDelete: Cascade)
   attempts  StepAttempt[]
+  snapshots ImageAsset[]
   questions Question[]
   aiRuns    AiRun[]
 
@@ -157,24 +161,26 @@ model Question {
 }
 
 model AiRun {
-  id             String      @id @default(uuid())
-  authId         String
-  sessionId      String
-  stepId         String?
-  operation      AiOperation
-  status         AiRunStatus @default(QUEUED)
-  progress       Int         @default(0)
-  provider       String      @default("mock")
-  model          String      @default("musecue-deterministic-v1")
-  promptVersion  String
-  idempotencyKey String
-  result         Json?
-  error          String?
-  latencyMs      Int?
-  startedAt      DateTime?
-  completedAt    DateTime?
-  createdAt      DateTime    @default(now())
-  updatedAt      DateTime    @updatedAt
+  id                 String      @id @default(uuid())
+  authId             String
+  sessionId          String
+  stepId             String?
+  operation          AiOperation
+  status             AiRunStatus @default(QUEUED)
+  progress           Int         @default(0)
+  provider           String      @default("mock")
+  model              String      @default("musecue-deterministic-v1")
+  promptVersion      String
+  idempotencyKey     String
+  result             Json?
+  providerResponseId String?
+  usage              Json?
+  error              String?
+  latencyMs          Int?
+  startedAt          DateTime?
+  completedAt        DateTime?
+  createdAt          DateTime    @default(now())
+  updatedAt          DateTime    @updatedAt
 
   authUser authUser      @relation(fields: [authId], references: [id], onDelete: Cascade)
   session  MakeupSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)

@@ -15,15 +15,14 @@ The companion mobile application and detailed product specifications live in `..
 - generated guides, authoritative step progression, retained visual attempts, contextual questions, completion history, profile statistics, and optional private profile avatars
 - BullMQ jobs for personalization, guide generation, visual checks, and guide questions
 - `AiRun` audit records containing operation, provider, model, prompt version, latency, progress, result/error, and status
-- a deterministic mock AI gateway with normalized, runtime-validated sample output
+- a provider-neutral AI gateway with OpenRouter live mode, multimodal private-image input, strict structured output, runtime validation, bounded retries, and deterministic mock mode
 
 Migration `20260827174107_add_makeup_workflow` adds the makeup aggregate and removes the dormant job-tracker and subscription starter domains.
 
 Intentionally deferred:
 
 - a production cloud object-storage adapter and short-lived signed reads; the current private filesystem adapter is intended for local/self-hosted deployments
-- generated preview images
-- external AI provider calls
+- generated preview images (recommendation reasoning is live, while the existing curated preview-image contract remains in place)
 - production retention/deletion automation and AI cost accounting
 
 ## Requirements and setup
@@ -47,6 +46,41 @@ Important environment variables are documented in `.env.example`. Never commit t
 
 `PRIVATE_UPLOAD_DIR` controls the private image root and defaults to `.data/private-images`. The directory is ignored by Git and is never mounted as a public static directory.
 
+### Live AI with OpenRouter
+
+The backend defaults to live AI outside the test environment. Create a fresh OpenRouter key and add it only to the ignored `.env` file:
+
+```dotenv
+AI_MODE=live
+OPENROUTER_API_KEY=your-new-key
+OPENROUTER_MODEL=openrouter/free
+```
+
+Restart the API and BullMQ worker after changing environment variables. Use `AI_MODE=mock` for deterministic offline development. The optional analysis, guide, vision, and question model variables allow each operation to be routed independently without changing services or mobile API contracts.
+
+Initial analysis and makeup checks read owned images from private storage and send them to OpenRouter as in-request data URLs. They are never exposed through permanent public URLs. Structured responses are validated again by Zod before any transaction changes workflow state. Provider timeouts, rate limits, and server failures use the existing BullMQ job retry budget; invalid credentials and other non-retryable requests fail immediately.
+
+`openrouter/free` is useful for development, but model choice and availability can vary. For face-photo privacy, review the chosen model/provider policy and optionally set `OPENROUTER_DATA_COLLECTION=deny`; that restriction may leave fewer or no free providers. Production should pin evaluated vision/text models rather than rely on the free router.
+
+### Traffic and provider capacity
+
+The makeup worker processes I/O-bound AI jobs concurrently, while Redis-backed global concurrency and rate limits cap aggregate OpenRouter traffic across every running API instance. Interactive vision checks and coach questions receive higher queue priority than initial analysis and guide generation. A short provider `429` pauses the shared queue only for its requested delay and may defer a job twice. Multi-hour quota exhaustion fails immediately so jobs reach a terminal state instead of freezing the queue. Other transient failures use the three-attempt exponential backoff budget with jitter.
+
+Defaults are conservative for development:
+
+```dotenv
+AI_QUEUE_GLOBAL_CONCURRENCY=4
+AI_QUEUE_RATE_LIMIT_MAX=15
+AI_QUEUE_RATE_LIMIT_DURATION_MS=60000
+AI_QUEUE_MAX_BACKLOG=1000
+AI_QUEUE_MAX_PROVIDER_PAUSE_MS=120000
+AI_QUEUE_MAX_RATE_LIMIT_DEFERRALS=2
+```
+
+Increase these only after pinning production models and matching the limits on your OpenRouter account. Multiple backend instances can consume the same queue; the Redis limits remain global. New jobs receive a service-unavailable response once the configurable backlog ceiling is reached instead of growing an unbounded queue. `OPENROUTER_FALLBACK_MODELS` can provide comma-separated capacity fallbacks, and `OPENROUTER_PROVIDER_SORT=throughput` can favor faster providers. Large stored images are resized and JPEG-compressed in memory before provider delivery, while already-small mobile images pass through unchanged.
+
+The free router is intended for development and cannot provide bulk-production capacity. Paid models, explicit account spending caps, production observability, and load testing are required before a public launch.
+
 ## API
 
 Authentication routes:
@@ -63,28 +97,29 @@ Authentication routes:
 
 Makeup routes require a bearer token:
 
-| Method   | Route                                                              | Purpose                            |
-| -------- | ------------------------------------------------------------------ | ---------------------------------- |
-| `POST`   | `/v1/sessions`                                                     | Create an owner-scoped session     |
-| `GET`    | `/v1/sessions?scope=active\|completed\|all`                        | List the user's sessions           |
-| `GET`    | `/v1/sessions/:sessionId`                                          | Read the full session aggregate    |
-| `DELETE` | `/v1/sessions/:sessionId`                                          | Delete a completed session         |
-| `POST`   | `/v1/sessions/:sessionId/images`                                   | Upload an initial face image       |
-| `GET`    | `/v1/images/:imageId/content`                                      | Read an owned private image        |
-| `PATCH`  | `/v1/sessions/:sessionId/preferences`                              | Save preferences                   |
-| `POST`   | `/v1/sessions/:sessionId/analyze`                                  | Queue mock personalization         |
-| `POST`   | `/v1/sessions/:sessionId/recommendations/:recommendationId/select` | Select a look and queue its guide  |
-| `POST`   | `/v1/recommendations/:recommendationId/saved`                      | Toggle saved state                 |
-| `GET`    | `/v1/saved-recommendations`                                        | List saved recommendations         |
-| `POST`   | `/v1/guide-steps/:stepId/check`                                    | Queue a visual evaluation          |
-| `POST`   | `/v1/guide-steps/:stepId/questions`                                | Queue a contextual answer          |
-| `POST`   | `/v1/guide-steps/:stepId/complete`                                 | Advance the authoritative guide    |
-| `GET`    | `/v1/jobs/:runId`                                                  | Poll an asynchronous AI run        |
-| `GET`    | `/v1/profile/stats`                                                | Return persisted statistics        |
-| `GET`    | `/v1/profile`                                                      | Return the current user's profile  |
-| `POST`   | `/v1/profile/avatar`                                               | Upload or replace a private avatar |
-| `GET`    | `/v1/profile/avatar/content`                                       | Read the current user's avatar     |
-| `DELETE` | `/v1/profile/avatar`                                               | Remove the current user's avatar   |
+| Method   | Route                                                              | Purpose                                            |
+| -------- | ------------------------------------------------------------------ | -------------------------------------------------- |
+| `POST`   | `/v1/sessions`                                                     | Create an owner-scoped session                     |
+| `GET`    | `/v1/sessions?scope=active\|completed\|all`                        | List the user's sessions                           |
+| `GET`    | `/v1/sessions/:sessionId`                                          | Read the full session aggregate                    |
+| `DELETE` | `/v1/sessions/:sessionId`                                          | Delete a completed session                         |
+| `POST`   | `/v1/sessions/:sessionId/images`                                   | Upload an initial face image                       |
+| `GET`    | `/v1/images/:imageId/content`                                      | Read an owned private image                        |
+| `PATCH`  | `/v1/sessions/:sessionId/preferences`                              | Save preferences                                   |
+| `POST`   | `/v1/sessions/:sessionId/analyze`                                  | Queue personalization analysis                     |
+| `POST`   | `/v1/sessions/:sessionId/recommendations/:recommendationId/select` | Select a look and queue its guide                  |
+| `POST`   | `/v1/recommendations/:recommendationId/saved`                      | Toggle saved state                                 |
+| `GET`    | `/v1/saved-recommendations`                                        | List saved recommendations                         |
+| `POST`   | `/v1/guide-steps/:stepId/check`                                    | Queue a visual evaluation                          |
+| `POST`   | `/v1/guide-steps/:stepId/snapshot`                                 | Save a step's final photo without an AI evaluation |
+| `POST`   | `/v1/guide-steps/:stepId/questions`                                | Queue a contextual answer                          |
+| `POST`   | `/v1/guide-steps/:stepId/complete`                                 | Advance the authoritative guide                    |
+| `GET`    | `/v1/jobs/:runId`                                                  | Poll an asynchronous AI run                        |
+| `GET`    | `/v1/profile/stats`                                                | Return persisted statistics                        |
+| `GET`    | `/v1/profile`                                                      | Return the current user's profile                  |
+| `POST`   | `/v1/profile/avatar`                                               | Upload or replace a private avatar                 |
+| `GET`    | `/v1/profile/avatar/content`                                       | Read the current user's avatar                     |
+| `DELETE` | `/v1/profile/avatar`                                               | Remove the current user's avatar                   |
 
 Queueing mutations accept an `Idempotency-Key`. Every owned record is scoped with the JWT user ID; clients cannot supply another user's owner ID.
 
@@ -120,7 +155,7 @@ authUser
             `-- Question
 ```
 
-The mock gateway is behind the same boundary intended for future providers. Workers validate and normalize model-shaped output, services persist it transactionally, and the AI layer never mutates workflow state directly.
+Mock and live gateways implement the same application-owned operations. The live gateway delegates transport to an OpenRouter provider adapter, workers validate and normalize model-shaped output, and NestJS alone persists it transactionally and advances workflow state. No frontend or public API contract changes are required to switch modes or add another provider adapter.
 
 ## Commands
 

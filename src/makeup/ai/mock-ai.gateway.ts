@@ -1,10 +1,21 @@
 import { Injectable, InternalServerErrorException } from '@nestjs/common';
 import type {
-  MockEvaluationResult,
-  MockGuideResult,
-  MockPersonalizationResult,
-  MockQuestionResult,
+  AiOperation,
+  EvaluationAiInput,
+  EvaluationResult,
+  GuideAiInput,
+  GuideResult,
+  PersonalizationAiInput,
+  PersonalizationResult,
+  QuestionAiInput,
+  QuestionResult,
 } from '../interfaces/makeup.interface';
+import type {
+  AiGateway,
+  AiGatewayResponse,
+  AiRunDescriptor,
+} from './ai.gateway';
+import { PROMPT_VERSIONS } from './ai.prompts';
 
 const LOOK_IMAGES = [
   'https://images.pexels.com/photos/33334711/pexels-photo-33334711.jpeg?auto=compress&cs=tinysrgb&h=900&w=1200',
@@ -13,9 +24,19 @@ const LOOK_IMAGES = [
 ];
 
 @Injectable()
-export class MockAiGateway {
-  personalize(vibe: string): MockPersonalizationResult {
-    const result: MockPersonalizationResult = {
+export class MockAiGateway implements AiGateway {
+  describe(operation: AiOperation): AiRunDescriptor {
+    return {
+      provider: 'mock',
+      model: 'musecue-deterministic-v1',
+      promptVersion: PROMPT_VERSIONS[operation],
+    };
+  }
+
+  personalize(
+    input: PersonalizationAiInput,
+  ): Promise<AiGatewayResponse<PersonalizationResult>> {
+    const result: PersonalizationResult = {
       analysis: {
         faceShape: 'oval',
         skinTone: 'medium',
@@ -30,7 +51,10 @@ export class MockAiGateway {
       recommendations: [
         {
           rank: 1,
-          name: vibe === 'glam' ? 'Polished Rose Glam' : 'Soft Natural',
+          name:
+            input.preferences.vibe === 'glam'
+              ? 'Polished Rose Glam'
+              : 'Soft Natural',
           tagline: 'Fresh skin, softly defined eyes, effortless balance.',
           matchScore: 94,
           imageUrl: LOOK_IMAGES[0],
@@ -61,12 +85,14 @@ export class MockAiGateway {
       ],
     };
     this.assertPersonalization(result);
-    return result;
+    return Promise.resolve({ data: result });
   }
 
-  generateGuide(lookName: string, timeMinutes: number): MockGuideResult {
+  generateGuide(input: GuideAiInput): Promise<AiGatewayResponse<GuideResult>> {
+    const lookName = input.recommendation.name;
+    const timeMinutes = input.preferences.timeMinutes;
     const perStep = Math.max(60, Math.floor((timeMinutes * 60) / 5));
-    const result: MockGuideResult = {
+    const result: GuideResult = {
       steps: [
         [
           'Prep your canvas',
@@ -120,12 +146,15 @@ export class MockAiGateway {
         'Mock guide output failed validation',
       );
     }
-    return result;
+    return Promise.resolve({ data: result });
   }
 
-  evaluateStep(position: number): MockEvaluationResult {
+  evaluateStep(
+    input: EvaluationAiInput,
+  ): Promise<AiGatewayResponse<EvaluationResult>> {
+    const position = input.step.position;
     const needsAdjustment = position % 3 === 1;
-    const result: MockEvaluationResult = needsAdjustment
+    const result: EvaluationResult = needsAdjustment
       ? {
           result: 'NEEDS_ADJUSTMENT',
           feedback:
@@ -138,16 +167,22 @@ export class MockAiGateway {
             'The placement and blend look balanced. You are ready for the next step.',
           confidence: 0.93,
         };
-    return result;
+    return Promise.resolve({ data: result });
   }
 
-  answerQuestion(question: string, stepTitle: string): MockQuestionResult {
-    return {
-      answer: `For “${stepTitle}”, use a small amount first and build gradually. For your question—“${question}”—keep the pressure light and blend the edge before adding more product.`,
-    };
+  answerQuestion(
+    input: QuestionAiInput,
+  ): Promise<AiGatewayResponse<QuestionResult>> {
+    const { question } = input;
+    const stepTitle = input.step.title;
+    return Promise.resolve({
+      data: {
+        answer: `For “${stepTitle}”, use a small amount first and build gradually. For your question—“${question}”—keep the pressure light and blend the edge before adding more product.`,
+      },
+    });
   }
 
-  private assertPersonalization(result: MockPersonalizationResult): void {
+  private assertPersonalization(result: PersonalizationResult): void {
     const valid =
       result.analysis.confidence >= 0 &&
       result.analysis.confidence <= 1 &&

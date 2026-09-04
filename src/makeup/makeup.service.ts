@@ -1,5 +1,5 @@
-import { Injectable } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
+import { Inject, Injectable } from '@nestjs/common';
+import { Prisma, type AiRun } from '@prisma/client';
 import AppError from '../common/errors/app.error';
 import { PrismaService } from '../common/services/prisma.service';
 import { PrivateImageStorageService } from '../storage/private-image-storage.service';
@@ -11,12 +11,15 @@ import type {
 } from './dto/makeup.dto';
 import { MakeupQueueService } from './queues/makeup.queue';
 import { ImageValidationService } from './services/image-validation.service';
+import { AI_GATEWAY, type AiGateway } from './ai/ai.gateway';
+import type { AiOperation } from './interfaces/makeup.interface';
 
 const SESSION_INCLUDE = {
   images: {
     orderBy: { createdAt: 'desc' as const },
     select: {
       id: true,
+      guideStepId: true,
       purpose: true,
       source: true,
       mimeType: true,
@@ -50,6 +53,7 @@ export class MakeupService {
     private readonly queue: MakeupQueueService,
     private readonly imageValidation: ImageValidationService,
     private readonly imageStorage: PrivateImageStorageService,
+    @Inject(AI_GATEWAY) private readonly aiGateway: AiGateway,
   ) {}
 
   createSession(authId: string) {
@@ -233,7 +237,7 @@ export class MakeupService {
         'This session cannot start analysis from its current state',
       );
     }
-    return this.createRun(
+    const { run } = await this.createRun(
       authId,
       sessionId,
       'PERSONALIZATION',
@@ -242,6 +246,7 @@ export class MakeupService {
       undefined,
       'ANALYZING',
     );
+    return run;
   }
 
   async selectRecommendation(
@@ -292,7 +297,7 @@ export class MakeupService {
         data: { status: 'METHOD_SELECTED' },
       }),
     ]);
-    return this.createRun(
+    const { run } = await this.createRun(
       authId,
       sessionId,
       'GUIDE_GENERATION',
@@ -301,6 +306,7 @@ export class MakeupService {
       undefined,
       'GUIDE_GENERATING',
     );
+    return run;
   }
 
   async toggleSaved(authId: string, recommendationId: string) {
@@ -358,7 +364,7 @@ export class MakeupService {
         },
       });
       imageAssetId = imageAsset.id;
-      return await this.createRun(
+      const runResult = await this.createRun(
         authId,
         step.guide.sessionId,
         'VISION_CHECK',
@@ -368,6 +374,13 @@ export class MakeupService {
         undefined,
         imageAsset.id,
       );
+      if (!runResult.created) {
+        await Promise.allSettled([
+          this.prisma.imageAsset.delete({ where: { id: imageAsset.id } }),
+          this.imageStorage.delete(storageKey),
+        ]);
+      }
+      return runResult.run;
     } catch (error) {
       if (imageAssetId) {
         await this.prisma.imageAsset.deleteMany({
@@ -379,6 +392,46 @@ export class MakeupService {
     }
   }
 
+  async saveStepSnapshot(
+    authId: string,
+    stepId: string,
+    file?: Express.Multer.File,
+  ) {
+    const step = await this.getOwnedStep(authId, stepId);
+    if (step.status !== 'CURRENT') {
+      throw AppError.conflict('Only the current step can save a snapshot');
+    }
+    if (!file) throw AppError.badRequest('A current makeup image is required');
+
+    const image = await this.imageValidation.validate(file);
+    const storageKey = await this.imageStorage.save(
+      authId,
+      step.guide.sessionId,
+      image.mimeType,
+      file.buffer,
+    );
+
+    try {
+      await this.prisma.$transaction(async (tx) => {
+        await tx.imageAsset.create({
+          data: {
+            sessionId: step.guide.sessionId,
+            guideStepId: step.id,
+            purpose: 'STEP_CHECK',
+            source: 'PRIVATE_UPLOAD',
+            storageKey,
+            ...image,
+          },
+        });
+      });
+    } catch (error) {
+      await this.imageStorage.delete(storageKey);
+      throw error;
+    }
+
+    return this.getSession(authId, step.guide.sessionId);
+  }
+
   async askQuestion(
     authId: string,
     stepId: string,
@@ -386,7 +439,7 @@ export class MakeupService {
     idempotencyKey: string,
   ) {
     const step = await this.getOwnedStep(authId, stepId);
-    return this.createRun(
+    const { run } = await this.createRun(
       authId,
       step.guide.sessionId,
       'GUIDE_QUESTION',
@@ -394,6 +447,7 @@ export class MakeupService {
       stepId,
       dto.question,
     );
+    return run;
   }
 
   async completeStep(authId: string, stepId: string, dto: CompleteStepDto) {
@@ -427,15 +481,24 @@ export class MakeupService {
           data: { status: 'IN_PROGRESS' },
         });
       } else {
+        const finalSnapshot = await tx.imageAsset.findFirst({
+          where: {
+            sessionId: step.guide.sessionId,
+            guideStepId: stepId,
+          },
+          orderBy: { createdAt: 'desc' },
+          select: { id: true },
+        });
         const finalAttempt = await tx.stepAttempt.findFirst({
           where: { stepId, imageId: { not: null } },
           orderBy: { createdAt: 'desc' },
           select: { imageId: true },
         });
-        if (finalAttempt?.imageId) {
+        const finalImageId = finalSnapshot?.id ?? finalAttempt?.imageId;
+        if (finalImageId) {
           await tx.imageAsset.updateMany({
             where: {
-              id: finalAttempt.imageId,
+              id: finalImageId,
               sessionId: step.guide.sessionId,
             },
             data: { purpose: 'COMPLETION' },
@@ -494,38 +557,48 @@ export class MakeupService {
   private async createRun(
     authId: string,
     sessionId: string,
-    operation:
-      | 'PERSONALIZATION'
-      | 'GUIDE_GENERATION'
-      | 'VISION_CHECK'
-      | 'GUIDE_QUESTION',
+    operation: AiOperation,
     idempotencyKey: string,
     stepId?: string,
     question?: string,
     nextStatus?: 'ANALYZING' | 'GUIDE_GENERATING',
     imageId?: string,
-  ) {
+  ): Promise<{ run: AiRun; created: boolean }> {
     const existing = await this.prisma.aiRun.findUnique({
       where: { authId_idempotencyKey: { authId, idempotencyKey } },
     });
-    if (existing) return existing;
-    const run = await this.prisma.$transaction(async (tx) => {
-      if (nextStatus)
-        await tx.makeupSession.update({
-          where: { id: sessionId },
-          data: { status: nextStatus },
+    if (existing) return { run: existing, created: false };
+    const descriptor = this.aiGateway.describe(operation);
+    let run: AiRun;
+    try {
+      run = await this.prisma.$transaction(async (tx) => {
+        if (nextStatus)
+          await tx.makeupSession.update({
+            where: { id: sessionId },
+            data: { status: nextStatus },
+          });
+        return tx.aiRun.create({
+          data: {
+            authId,
+            sessionId,
+            stepId,
+            operation,
+            provider: descriptor.provider,
+            model: descriptor.model,
+            promptVersion: descriptor.promptVersion,
+            idempotencyKey,
+          },
         });
-      return tx.aiRun.create({
-        data: {
-          authId,
-          sessionId,
-          stepId,
-          operation,
-          promptVersion: 'musecue-mock-v1',
-          idempotencyKey,
-        },
       });
-    });
+    } catch (error) {
+      if (this.isUniqueConstraintError(error)) {
+        const concurrentRun = await this.prisma.aiRun.findUnique({
+          where: { authId_idempotencyKey: { authId, idempotencyKey } },
+        });
+        if (concurrentRun) return { run: concurrentRun, created: false };
+      }
+      throw error;
+    }
     try {
       await this.queue.enqueue(operation, {
         runId: run.id,
@@ -570,6 +643,15 @@ export class MakeupService {
         'Makeup processing is temporarily unavailable',
       );
     }
-    return run;
+    return { run, created: true };
+  }
+
+  private isUniqueConstraintError(error: unknown): boolean {
+    return (
+      typeof error === 'object' &&
+      error !== null &&
+      'code' in error &&
+      error.code === 'P2002'
+    );
   }
 }

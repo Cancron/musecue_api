@@ -4,17 +4,20 @@ import { PrivateImageStorageService } from '../storage/private-image-storage.ser
 import { MakeupQueueService } from './queues/makeup.queue';
 import { ImageValidationService } from './services/image-validation.service';
 import { MakeupService } from './makeup.service';
+import type { AiGateway } from './ai/ai.gateway';
 
 describe('MakeupService history media and deletion', () => {
   const prisma = mockDeep<PrismaService>();
   const queue = mock<MakeupQueueService>();
   const imageValidation = mock<ImageValidationService>();
   const imageStorage = mock<PrivateImageStorageService>();
+  const aiGateway = mock<AiGateway>();
   const service = new MakeupService(
     prisma,
     queue,
     imageValidation,
     imageStorage,
+    aiGateway,
   );
 
   beforeEach(() => jest.clearAllMocks());
@@ -110,5 +113,91 @@ describe('MakeupService history media and deletion', () => {
       where: { id: 'final-image', sessionId: 'session-id' },
       data: { purpose: 'COMPLETION' },
     });
+  });
+
+  it('deduplicates an idempotency race and removes the duplicate check image', async () => {
+    const existingRun = { id: 'existing-run', status: 'QUEUED' };
+    prisma.aiRun.findUnique
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(existingRun as never);
+    prisma.guideStep.findFirst.mockResolvedValue({
+      id: 'step-id',
+      status: 'CURRENT',
+      guide: { sessionId: 'session-id', steps: [] },
+    } as never);
+    imageValidation.validate.mockResolvedValue({
+      mimeType: 'image/jpeg',
+      width: 640,
+      height: 640,
+      sizeBytes: 100,
+    });
+    imageStorage.save.mockResolvedValue('owner/session/duplicate.jpg');
+    imageStorage.delete.mockResolvedValue();
+    prisma.imageAsset.create.mockResolvedValue({
+      id: 'duplicate-image',
+    } as never);
+    prisma.imageAsset.delete.mockResolvedValue({
+      id: 'duplicate-image',
+    } as never);
+    aiGateway.describe.mockReturnValue({
+      provider: 'openrouter',
+      model: 'model',
+      promptVersion: 'version',
+    });
+    prisma.$transaction.mockRejectedValue({ code: 'P2002' });
+
+    const result = await service.checkStep('owner-id', 'step-id', 'same-key', {
+      buffer: Buffer.from('photo'),
+    } as Express.Multer.File);
+
+    expect(result).toBe(existingRun);
+    expect(prisma.imageAsset.delete.mock.calls).toContainEqual([
+      { where: { id: 'duplicate-image' } },
+    ]);
+    expect(imageStorage.delete.mock.calls).toContainEqual([
+      'owner/session/duplicate.jpg',
+    ]);
+    expect(queue.enqueue.mock.calls).toHaveLength(0);
+  });
+
+  it('stores a final snapshot without requiring an AI result or starting an AI run', async () => {
+    prisma.guideStep.findFirst.mockResolvedValue({
+      id: 'step-id',
+      status: 'CURRENT',
+      guide: { sessionId: 'session-id', steps: [] },
+    } as never);
+    imageValidation.validate.mockResolvedValue({
+      mimeType: 'image/jpeg',
+      width: 640,
+      height: 640,
+      sizeBytes: 100,
+    });
+    imageStorage.save.mockResolvedValue('owner/session/final-step.jpg');
+    prisma.imageAsset.create.mockResolvedValue({
+      id: 'snapshot-image',
+    } as never);
+    prisma.makeupSession.findFirst.mockResolvedValue({
+      id: 'session-id',
+      status: 'IN_PROGRESS',
+    } as never);
+    prisma.$transaction.mockImplementation(async (callback) =>
+      (callback as (client: PrismaService) => Promise<unknown>)(prisma),
+    );
+
+    await service.saveStepSnapshot('owner-id', 'step-id', {
+      buffer: Buffer.from('photo'),
+    } as Express.Multer.File);
+
+    expect(prisma.imageAsset.create.mock.calls[0]?.[0]).toMatchObject({
+      data: {
+        sessionId: 'session-id',
+        guideStepId: 'step-id',
+        purpose: 'STEP_CHECK',
+      },
+    });
+    expect(prisma.stepAttempt.findFirst.mock.calls).toHaveLength(0);
+    expect(queue.enqueue.mock.calls).toHaveLength(0);
+    expect(aiGateway.describe.mock.calls).toHaveLength(0);
   });
 });

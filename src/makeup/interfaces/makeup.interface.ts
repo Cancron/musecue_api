@@ -4,7 +4,18 @@ export interface AuthenticatedUser {
   tokenVersion: number;
 }
 
-export interface MockRecommendation {
+export type AiOperation =
+  | 'PERSONALIZATION'
+  | 'GUIDE_GENERATION'
+  | 'VISION_CHECK'
+  | 'GUIDE_QUESTION';
+
+export interface AiImageInput {
+  bytes: Buffer;
+  mimeType: 'image/jpeg' | 'image/png' | 'image/webp';
+}
+
+export interface RecommendationResult {
   rank: number;
   name: string;
   tagline: string;
@@ -14,7 +25,7 @@ export interface MockRecommendation {
   rationale: string;
 }
 
-export interface MockPersonalizationResult {
+export interface PersonalizationResult {
   analysis: {
     faceShape: string;
     skinTone: string;
@@ -22,10 +33,10 @@ export interface MockPersonalizationResult {
     notableFeatures: string[];
     confidence: number;
   };
-  recommendations: MockRecommendation[];
+  recommendations: RecommendationResult[];
 }
 
-export interface MockGuideStep {
+export interface GuideStepResult {
   position: number;
   title: string;
   instruction: string;
@@ -37,16 +48,56 @@ export interface MockGuideStep {
   successCriteria: string;
 }
 
-export interface MockGuideResult {
-  steps: MockGuideStep[];
+export interface GuideResult {
+  steps: GuideStepResult[];
 }
 
-export interface MockEvaluationResult {
+export interface EvaluationResult {
   result: 'PASS' | 'NEEDS_ADJUSTMENT' | 'UNCERTAIN' | 'CANNOT_EVALUATE';
   feedback: string;
   confidence: number;
 }
 
-export interface MockQuestionResult {
+export interface QuestionResult {
   answer: string;
+}
+
+export interface PersonalizationAiInput {
+  image: AiImageInput;
+  preferences: {
+    vibe: string;
+    skillLevel: string | null;
+    occasion: string | null;
+    desiredEffect: string | null;
+    timeMinutes: number;
+    notes: string | null;
+  };
+}
+
+export interface GuideAiInput {
+  recommendation: RecommendationResult;
+  preferences: PersonalizationAiInput['preferences'];
+  analysis: PersonalizationResult['analysis'] | null;
+}
+
+export interface EvaluationAiInput {
+  image: AiImageInput;
+  step: GuideStepResult;
+  recommendation: Pick<RecommendationResult, 'name' | 'tagline'>;
+  preferences: Pick<
+    PersonalizationAiInput['preferences'],
+    'vibe' | 'desiredEffect'
+  >;
+  previousEvaluation: EvaluationResult | null;
+}
+
+export interface QuestionAiInput {
+  question: string;
+  step: GuideStepResult;
+  recommendation: Pick<RecommendationResult, 'name' | 'tagline'>;
+  preferences: Pick<
+    PersonalizationAiInput['preferences'],
+    'vibe' | 'desiredEffect'
+  >;
+  image?: AiImageInput;
 }

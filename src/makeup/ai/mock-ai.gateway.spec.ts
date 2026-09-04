@@ -2,28 +2,73 @@ import { MockAiGateway } from './mock-ai.gateway';
 
 describe('MockAiGateway', () => {
   const gateway = new MockAiGateway();
+  const preferences = {
+    vibe: 'natural',
+    skillLevel: 'beginner',
+    occasion: 'everyday',
+    desiredEffect: 'soft definition',
+    timeMinutes: 20,
+    notes: null,
+  };
+  const image = {
+    bytes: Buffer.from('image'),
+    mimeType: 'image/jpeg' as const,
+  };
 
-  it('returns normalized personalization data', () => {
-    const result = gateway.personalize('natural');
+  it('returns normalized personalization data', async () => {
+    const result = await gateway.personalize({ preferences, image });
 
-    expect(result.analysis.confidence).toBeGreaterThan(0);
-    expect(result.recommendations).toHaveLength(3);
-    expect(result.recommendations.map((item) => item.rank)).toEqual([1, 2, 3]);
-    expect(result.recommendations.every((item) => item.matchScore <= 100)).toBe(
+    expect(result.data.analysis.confidence).toBeGreaterThan(0);
+    expect(result.data.recommendations).toHaveLength(3);
+    expect(result.data.recommendations.map((item) => item.rank)).toEqual([
+      1, 2, 3,
+    ]);
+    expect(
+      result.data.recommendations.every((item) => item.matchScore <= 100),
+    ).toBe(true);
+  });
+
+  it('returns an ordered five-step guide', async () => {
+    const personalization = await gateway.personalize({ preferences, image });
+    const result = await gateway.generateGuide({
+      recommendation: personalization.data.recommendations[0],
+      preferences,
+      analysis: personalization.data.analysis,
+    });
+
+    expect(result.data.steps).toHaveLength(5);
+    expect(result.data.steps.map((step) => step.position)).toEqual([
+      0, 1, 2, 3, 4,
+    ]);
+    expect(result.data.steps.every((step) => step.estimatedSeconds > 0)).toBe(
       true,
     );
   });
 
-  it('returns an ordered five-step guide', () => {
-    const result = gateway.generateGuide('Soft Natural', 20);
-
-    expect(result.steps).toHaveLength(5);
-    expect(result.steps.map((step) => step.position)).toEqual([0, 1, 2, 3, 4]);
-    expect(result.steps.every((step) => step.estimatedSeconds > 0)).toBe(true);
-  });
-
-  it('returns only supported evaluation states', () => {
-    expect(gateway.evaluateStep(0).result).toBe('PASS');
-    expect(gateway.evaluateStep(1).result).toBe('NEEDS_ADJUSTMENT');
+  it('returns only supported evaluation states', async () => {
+    const personalization = await gateway.personalize({ preferences, image });
+    const guide = await gateway.generateGuide({
+      recommendation: personalization.data.recommendations[0],
+      preferences,
+      analysis: personalization.data.analysis,
+    });
+    await expect(
+      gateway.evaluateStep({
+        image,
+        step: guide.data.steps[0],
+        recommendation: personalization.data.recommendations[0],
+        preferences,
+        previousEvaluation: null,
+      }),
+    ).resolves.toMatchObject({ data: { result: 'PASS' } });
+    await expect(
+      gateway.evaluateStep({
+        image,
+        step: guide.data.steps[1],
+        recommendation: personalization.data.recommendations[0],
+        preferences,
+        previousEvaluation: null,
+      }),
+    ).resolves.toMatchObject({ data: { result: 'NEEDS_ADJUSTMENT' } });
   });
 });

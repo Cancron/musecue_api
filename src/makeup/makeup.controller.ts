@@ -195,6 +195,31 @@ export class MakeupController {
     );
   }
 
+  @Post('guide-steps/:stepId/snapshot')
+  @ApiConsumes('multipart/form-data')
+  @ApiBody({
+    schema: {
+      type: 'object',
+      required: ['image'],
+      properties: {
+        image: { type: 'string', format: 'binary' },
+      },
+    },
+  })
+  @UseInterceptors(
+    FileInterceptor('image', {
+      storage: memoryStorage(),
+      limits: { files: 1, fileSize: 10_000_000 },
+    }),
+  )
+  saveStepSnapshot(
+    @Req() req: AuthenticatedRequest,
+    @Param('stepId') stepId: string,
+    @UploadedFile() file?: Express.Multer.File,
+  ) {
+    return this.makeup.saveStepSnapshot(req.user.userId, stepId, file);
+  }
+
   @Post('guide-steps/:stepId/questions')
   askQuestion(
     @Req() req: AuthenticatedRequest,
