@@ -12,6 +12,7 @@ import { winstonConfig } from './common/config/winston.config';
 import { LoggerModule } from './common/modules/logger.module';
 import { MakeupModule } from './makeup/makeup.module';
 import { DatabaseModule } from './common/modules/database.module';
+import { ProfileModule } from './profile/profile.module';
 
 @Module({
   imports: [
@@ -34,6 +35,7 @@ import { DatabaseModule } from './common/modules/database.module';
     // BlogModule,
     AuthModule,
     MakeupModule,
+    ProfileModule,
   ],
   controllers: [AppController],
   providers: [AppService],

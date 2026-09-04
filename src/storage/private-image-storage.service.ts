@@ -20,13 +20,13 @@ export class PrivateImageStorageService {
 
   async save(
     authId: string,
-    sessionId: string,
+    scopeId: string,
     mimeType: SupportedImageMime,
     bytes: Buffer,
   ): Promise<string> {
     const storageKey = join(
       authId,
-      sessionId,
+      scopeId,
       `${randomUUID()}${EXTENSIONS_BY_MIME[mimeType]}`,
     );
     const absolutePath = this.resolveKey(storageKey);
