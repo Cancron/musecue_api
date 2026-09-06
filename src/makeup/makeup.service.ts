@@ -13,6 +13,8 @@ import { MakeupQueueService } from './queues/makeup.queue';
 import { ImageValidationService } from './services/image-validation.service';
 import { AI_GATEWAY, type AiGateway } from './ai/ai.gateway';
 import type { AiOperation } from './interfaces/makeup.interface';
+import { lockSession, requireSessionStatus } from './workflow-lock';
+import { failRun } from './queues/run-lifecycle';
 
 const SESSION_INCLUDE = {
   images: {
@@ -161,10 +163,7 @@ export class MakeupService {
     if (!file) throw AppError.badRequest('An image file is required');
 
     const image = await this.imageValidation.validate(file);
-    const replacedImages = await this.prisma.imageAsset.findMany({
-      where: { sessionId, purpose: 'INITIAL_ANALYSIS' },
-      select: { storageKey: true },
-    });
+    let replacedImages: Array<{ storageKey: string }> = [];
     const storageKey = await this.imageStorage.save(
       authId,
       sessionId,
@@ -173,11 +172,19 @@ export class MakeupService {
     );
 
     try {
-      await this.prisma.$transaction([
-        this.prisma.imageAsset.deleteMany({
+      await this.prisma.$transaction(async (tx) => {
+        requireSessionStatus(await lockSession(tx, authId, sessionId), [
+          'CREATED',
+          'IMAGE_UPLOADED',
+        ]);
+        replacedImages = await tx.imageAsset.findMany({
           where: { sessionId, purpose: 'INITIAL_ANALYSIS' },
-        }),
-        this.prisma.imageAsset.create({
+          select: { storageKey: true },
+        });
+        await tx.imageAsset.deleteMany({
+          where: { sessionId, purpose: 'INITIAL_ANALYSIS' },
+        });
+        await tx.imageAsset.create({
           data: {
             sessionId,
             purpose: 'INITIAL_ANALYSIS',
@@ -185,12 +192,12 @@ export class MakeupService {
             storageKey,
             ...image,
           },
-        }),
-        this.prisma.makeupSession.update({
+        });
+        await tx.makeupSession.update({
           where: { id: sessionId },
           data: { status: 'IMAGE_UPLOADED' },
-        }),
-      ]);
+        });
+      });
     } catch (error) {
       await this.imageStorage.delete(storageKey);
       throw error;
@@ -213,10 +220,16 @@ export class MakeupService {
     if (!['IMAGE_UPLOADED', 'ANALYSIS_FAILED'].includes(session.status)) {
       throw AppError.conflict('Preferences can only be saved before analysis');
     }
-    await this.prisma.makeupPreferences.upsert({
-      where: { sessionId },
-      create: { sessionId, ...dto },
-      update: dto,
+    await this.prisma.$transaction(async (tx) => {
+      requireSessionStatus(await lockSession(tx, authId, sessionId), [
+        'IMAGE_UPLOADED',
+        'ANALYSIS_FAILED',
+      ]);
+      await tx.makeupPreferences.upsert({
+        where: { sessionId },
+        create: { sessionId, ...dto },
+        update: dto,
+      });
     });
     return this.getSession(authId, sessionId);
   }
@@ -230,11 +243,6 @@ export class MakeupService {
     if (!session.images.length || !session.preferences) {
       throw AppError.badRequest(
         'An image and preferences are required before analysis',
-      );
-    }
-    if (!['IMAGE_UPLOADED', 'ANALYSIS_FAILED'].includes(session.status)) {
-      throw AppError.conflict(
-        'This session cannot start analysis from its current state',
       );
     }
     const { run } = await this.createRun(
@@ -283,20 +291,6 @@ export class MakeupService {
     if (!['RECOMMENDATIONS_READY', 'GUIDE_FAILED'].includes(session.status)) {
       throw AppError.conflict('Recommendations are not ready for selection');
     }
-    await this.prisma.$transaction([
-      this.prisma.recommendation.updateMany({
-        where: { sessionId },
-        data: { selectedAt: null },
-      }),
-      this.prisma.recommendation.update({
-        where: { id: recommendationId },
-        data: { selectedAt: new Date() },
-      }),
-      this.prisma.makeupSession.update({
-        where: { id: sessionId },
-        data: { status: 'METHOD_SELECTED' },
-      }),
-    ]);
     const { run } = await this.createRun(
       authId,
       sessionId,
@@ -305,18 +299,27 @@ export class MakeupService {
       undefined,
       undefined,
       'GUIDE_GENERATING',
+      undefined,
+      recommendationId,
     );
     return run;
   }
 
-  async toggleSaved(authId: string, recommendationId: string) {
+  async toggleSaved(authId: string, recommendationId: string, saved?: boolean) {
     const recommendation = await this.prisma.recommendation.findFirst({
       where: { id: recommendationId, session: { authId } },
     });
     if (!recommendation) throw AppError.notFound('Recommendation not found');
-    return this.prisma.recommendation.update({
-      where: { id: recommendationId },
-      data: { savedAt: recommendation.savedAt ? null : new Date() },
+    return this.prisma.$transaction(async (tx) => {
+      await lockSession(tx, authId, recommendation.sessionId);
+      const current = await tx.recommendation.findUniqueOrThrow({
+        where: { id: recommendationId },
+      });
+      const shouldSave = saved ?? !current.savedAt;
+      return tx.recommendation.update({
+        where: { id: recommendationId },
+        data: { savedAt: shouldSave ? (current.savedAt ?? new Date()) : null },
+      });
     });
   }
 
@@ -336,7 +339,14 @@ export class MakeupService {
     const existing = await this.prisma.aiRun.findUnique({
       where: { authId_idempotencyKey: { authId, idempotencyKey } },
     });
-    if (existing) return existing;
+    if (existing) {
+      if (existing.operation !== 'VISION_CHECK' || existing.stepId !== stepId) {
+        throw AppError.conflict(
+          'Idempotency key was already used for another action',
+        );
+      }
+      return existing;
+    }
 
     const step = await this.getOwnedStep(authId, stepId);
     if (!['CURRENT', 'COMPLETED'].includes(step.status)) {
@@ -413,6 +423,13 @@ export class MakeupService {
 
     try {
       await this.prisma.$transaction(async (tx) => {
+        await lockSession(tx, authId, step.guide.sessionId);
+        const current = await tx.guideStep.findUnique({
+          where: { id: stepId },
+          select: { status: true },
+        });
+        if (current?.status !== 'CURRENT')
+          throw AppError.conflict('Only the current step can save a snapshot');
         await tx.imageAsset.create({
           data: {
             sessionId: step.guide.sessionId,
@@ -451,14 +468,20 @@ export class MakeupService {
   }
 
   async completeStep(authId: string, stepId: string, dto: CompleteStepDto) {
-    const step = await this.getOwnedStep(authId, stepId);
-    if (step.status !== 'CURRENT')
-      throw AppError.conflict('Only the current step can be completed');
-    const next = step.guide.steps.find(
-      (item) => item.position === step.position + 1,
-    );
+    const owned = await this.getOwnedStep(authId, stepId);
     const now = new Date();
     await this.prisma.$transaction(async (tx) => {
+      await lockSession(tx, authId, owned.guide.sessionId);
+      const step = await tx.guideStep.findUniqueOrThrow({
+        where: { id: stepId },
+        include: { guide: { include: { steps: true } } },
+      });
+      if (step.status === 'COMPLETED' || step.status === 'SKIPPED') return;
+      if (step.status !== 'CURRENT')
+        throw AppError.conflict('Only the current step can be completed');
+      const next = step.guide.steps.find(
+        (item) => item.position === step.position + 1,
+      );
       await tx.guideStep.update({
         where: { id: stepId },
         data: { status: dto.outcome ?? 'COMPLETED', completedAt: now },
@@ -514,7 +537,7 @@ export class MakeupService {
         });
       }
     });
-    return this.getSession(authId, step.guide.sessionId);
+    return this.getSession(authId, owned.guide.sessionId);
   }
 
   async getRun(authId: string, runId: string) {
@@ -563,20 +586,62 @@ export class MakeupService {
     question?: string,
     nextStatus?: 'ANALYZING' | 'GUIDE_GENERATING',
     imageId?: string,
+    recommendationId?: string,
   ): Promise<{ run: AiRun; created: boolean }> {
     const existing = await this.prisma.aiRun.findUnique({
       where: { authId_idempotencyKey: { authId, idempotencyKey } },
     });
-    if (existing) return { run: existing, created: false };
+    if (existing) {
+      this.assertRunAction(existing, sessionId, operation, stepId);
+      return { run: existing, created: false };
+    }
     const descriptor = this.aiGateway.describe(operation);
     let run: AiRun;
+    let created = false;
     try {
       run = await this.prisma.$transaction(async (tx) => {
+        const status = await lockSession(tx, authId, sessionId);
+        const duplicate = await tx.aiRun.findUnique({
+          where: { authId_idempotencyKey: { authId, idempotencyKey } },
+        });
+        if (duplicate) {
+          this.assertRunAction(duplicate, sessionId, operation, stepId);
+          return duplicate;
+        }
+        if (operation === 'PERSONALIZATION')
+          requireSessionStatus(status, ['IMAGE_UPLOADED', 'ANALYSIS_FAILED']);
+        if (operation === 'GUIDE_GENERATION') {
+          requireSessionStatus(status, [
+            'RECOMMENDATIONS_READY',
+            'GUIDE_FAILED',
+          ]);
+          const selected = await tx.recommendation.findFirst({
+            where: { id: recommendationId, sessionId },
+          });
+          if (!selected) throw AppError.notFound('Recommendation not found');
+          await tx.recommendation.updateMany({
+            where: { sessionId },
+            data: { selectedAt: null },
+          });
+          await tx.recommendation.update({
+            where: { id: selected.id },
+            data: { selectedAt: new Date() },
+          });
+        }
+        if (stepId) {
+          const step = await tx.guideStep.findFirst({
+            where: { id: stepId, guide: { sessionId } },
+            select: { status: true },
+          });
+          if (!step || !['CURRENT', 'COMPLETED'].includes(step.status))
+            throw AppError.conflict('This step is not available for coaching');
+        }
         if (nextStatus)
           await tx.makeupSession.update({
             where: { id: sessionId },
             data: { status: nextStatus },
           });
+        created = true;
         return tx.aiRun.create({
           data: {
             authId,
@@ -595,10 +660,14 @@ export class MakeupService {
         const concurrentRun = await this.prisma.aiRun.findUnique({
           where: { authId_idempotencyKey: { authId, idempotencyKey } },
         });
-        if (concurrentRun) return { run: concurrentRun, created: false };
+        if (concurrentRun) {
+          this.assertRunAction(concurrentRun, sessionId, operation, stepId);
+          return { run: concurrentRun, created: false };
+        }
       }
       throw error;
     }
+    if (!created) return { run, created: false };
     try {
       await this.queue.enqueue(operation, {
         runId: run.id,
@@ -613,32 +682,7 @@ export class MakeupService {
         error instanceof Error
           ? error.message
           : 'Unable to queue makeup processing';
-      await this.prisma.$transaction([
-        this.prisma.aiRun.update({
-          where: { id: run.id },
-          data: {
-            status: 'FAILED',
-            progress: 100,
-            error: message,
-            completedAt: new Date(),
-          },
-        }),
-        ...(operation === 'PERSONALIZATION'
-          ? [
-              this.prisma.makeupSession.update({
-                where: { id: sessionId },
-                data: { status: 'ANALYSIS_FAILED' as const },
-              }),
-            ]
-          : operation === 'GUIDE_GENERATION'
-            ? [
-                this.prisma.makeupSession.update({
-                  where: { id: sessionId },
-                  data: { status: 'GUIDE_FAILED' as const },
-                }),
-              ]
-            : []),
-      ]);
+      await failRun(this.prisma, run.id, message);
       throw AppError.serviceUnavailable(
         'Makeup processing is temporarily unavailable',
       );
@@ -653,5 +697,22 @@ export class MakeupService {
       'code' in error &&
       error.code === 'P2002'
     );
+  }
+
+  private assertRunAction(
+    run: AiRun,
+    sessionId: string,
+    operation: AiOperation,
+    stepId?: string,
+  ): void {
+    if (
+      run.sessionId !== sessionId ||
+      run.operation !== operation ||
+      (run.stepId ?? undefined) !== stepId
+    ) {
+      throw AppError.conflict(
+        'Idempotency key was already used for another action',
+      );
+    }
   }
 }

@@ -1,5 +1,6 @@
 import {
   IsIn,
+  IsBoolean,
   IsInt,
   IsNotEmpty,
   IsOptional,
@@ -62,4 +63,10 @@ export class ListSessionsDto {
   @IsOptional()
   @IsIn(['active', 'completed', 'all'])
   scope?: 'active' | 'completed' | 'all';
+}
+
+export class SaveRecommendationDto {
+  @IsOptional()
+  @IsBoolean()
+  saved?: boolean;
 }

@@ -20,6 +20,8 @@ import type {
   RecommendationResult,
 } from '../interfaces/makeup.interface';
 import type { MakeupAiJob } from './makeup.queue';
+import { canPublishRun, failRun } from './run-lifecycle';
+import { lockSession } from '../workflow-lock';
 
 @Processor('makeup-ai', {
   concurrency: 8,
@@ -42,20 +44,29 @@ export class MakeupProcessor extends WorkerHost {
       where: { id: job.data.runId },
       select: { status: true },
     });
-    if (existingRun?.status === 'COMPLETED') return;
+    if (
+      !existingRun ||
+      existingRun.status === 'COMPLETED' ||
+      existingRun.status === 'FAILED'
+    )
+      return;
     const descriptor = this.ai.describe(job.name as AiOperation);
-    await this.prisma.aiRun.update({
-      where: { id: job.data.runId },
-      data: {
-        status: 'PROCESSING',
-        progress: 20,
-        startedAt: new Date(),
-        provider: descriptor.provider,
-        model: descriptor.model,
-        promptVersion: descriptor.promptVersion,
-        error: null,
-      },
+    const claim = await this.prisma.$transaction(async (tx) => {
+      await lockSession(tx, job.data.authId, job.data.sessionId);
+      return tx.aiRun.updateMany({
+        where: { id: job.data.runId, status: { in: ['QUEUED', 'PROCESSING'] } },
+        data: {
+          status: 'PROCESSING',
+          progress: 20,
+          startedAt: new Date(startedAt),
+          provider: descriptor.provider,
+          model: descriptor.model,
+          promptVersion: descriptor.promptVersion,
+          error: null,
+        },
+      });
     });
+    if (!claim.count) return;
 
     try {
       switch (job.name) {
@@ -109,6 +120,7 @@ export class MakeupProcessor extends WorkerHost {
     });
     const result = response.data;
     await this.prisma.$transaction(async (tx) => {
+      if (!(await canPublishRun(tx, data, startedAt))) return;
       await tx.faceAnalysis.upsert({
         where: { sessionId: data.sessionId },
         create: { sessionId: data.sessionId, ...result.analysis },
@@ -180,6 +192,7 @@ export class MakeupProcessor extends WorkerHost {
     });
     const result = response.data;
     await this.prisma.$transaction(async (tx) => {
+      if (!(await canPublishRun(tx, data, startedAt))) return;
       const existing = await tx.guide.findUnique({
         where: { sessionId: data.sessionId },
       });
@@ -249,6 +262,7 @@ export class MakeupProcessor extends WorkerHost {
     });
     const result = response.data;
     await this.prisma.$transaction(async (tx) => {
+      if (!(await canPublishRun(tx, data, startedAt))) return;
       await tx.stepAttempt.create({
         data: { stepId: step.id, imageId: data.imageId, ...result },
       });
@@ -301,6 +315,7 @@ export class MakeupProcessor extends WorkerHost {
     });
     const result = response.data;
     await this.prisma.$transaction(async (tx) => {
+      if (!(await canPublishRun(tx, data, startedAt))) return;
       await tx.question.create({
         data: {
           stepId: step.id,
@@ -415,8 +430,12 @@ export class MakeupProcessor extends WorkerHost {
           rateLimitDeferrals: deferrals + 1,
         });
         await this.worker.rateLimit(error.retryAfterMs);
-        await this.prisma.aiRun.update({
-          where: { id: job.data.runId },
+        await this.prisma.aiRun.updateMany({
+          where: {
+            id: job.data.runId,
+            status: 'PROCESSING',
+            startedAt: new Date(startedAt),
+          },
           data: { status: 'QUEUED', progress: 0, error: null, startedAt: null },
         });
         this.logger.warn(
@@ -450,8 +469,12 @@ export class MakeupProcessor extends WorkerHost {
 
     if (!retryable) job.discard();
     if (!finalAttempt) {
-      await this.prisma.aiRun.update({
-        where: { id: job.data.runId },
+      await this.prisma.aiRun.updateMany({
+        where: {
+          id: job.data.runId,
+          status: 'PROCESSING',
+          startedAt: new Date(startedAt),
+        },
         data: { status: 'QUEUED', progress: 0, error: null, startedAt: null },
       });
       this.logger.warn('Makeup AI job will retry', {
@@ -471,33 +494,13 @@ export class MakeupProcessor extends WorkerHost {
       return error instanceof Error ? error : new Error(message);
     }
 
-    await this.prisma.$transaction([
-      this.prisma.aiRun.update({
-        where: { id: job.data.runId },
-        data: {
-          status: 'FAILED',
-          error: message,
-          progress: 100,
-          latencyMs: Date.now() - startedAt,
-          completedAt: new Date(),
-        },
-      }),
-      ...(job.name === 'PERSONALIZATION'
-        ? [
-            this.prisma.makeupSession.update({
-              where: { id: job.data.sessionId },
-              data: { status: 'ANALYSIS_FAILED' as const },
-            }),
-          ]
-        : job.name === 'GUIDE_GENERATION'
-          ? [
-              this.prisma.makeupSession.update({
-                where: { id: job.data.sessionId },
-                data: { status: 'GUIDE_FAILED' as const },
-              }),
-            ]
-          : []),
-    ]);
+    await failRun(
+      this.prisma,
+      job.data.runId,
+      message,
+      undefined,
+      new Date(startedAt),
+    );
     this.logger.error('Makeup AI job failed', {
       context: 'MakeupProcessor',
       runId: job.data.runId,

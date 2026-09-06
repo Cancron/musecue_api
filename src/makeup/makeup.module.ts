@@ -15,6 +15,7 @@ import { MakeupService } from './makeup.service';
 import { MakeupProcessor } from './queues/makeup.processor';
 import { MakeupQueueService } from './queues/makeup.queue';
 import { ImageValidationService } from './services/image-validation.service';
+import { MakeupRecoveryService } from './queues/makeup-recovery.service';
 
 @Module({
   imports: [
@@ -27,6 +28,7 @@ import { ImageValidationService } from './services/image-validation.service';
     MakeupService,
     MakeupQueueService,
     MakeupProcessor,
+    MakeupRecoveryService,
     MockAiGateway,
     OpenRouterProvider,
     { provide: STRUCTURED_AI_PROVIDER, useExisting: OpenRouterProvider },

@@ -11,11 +11,32 @@ import { MockAiGateway } from '../ai/mock-ai.gateway';
 import { MakeupProcessor } from './makeup.processor';
 import type { MakeupAiJob } from './makeup.queue';
 
+function workflowPrisma() {
+  const prisma = mockDeep<PrismaService>();
+  prisma.$queryRaw.mockResolvedValue([{ status: 'GUIDE_GENERATING' }]);
+  prisma.aiRun.findUnique.mockResolvedValue({
+    id: 'run',
+    authId: 'owner',
+    sessionId: 'session',
+    operation: 'GUIDE_GENERATION',
+    status: 'PROCESSING',
+    startedAt: new Date(1000),
+    createdAt: new Date(0),
+  } as never);
+  prisma.aiRun.updateMany.mockResolvedValue({ count: 1 });
+  prisma.$transaction.mockImplementation(async (callback) =>
+    (callback as (tx: Prisma.TransactionClient) => Promise<unknown>)(prisma),
+  );
+  return prisma;
+}
+
 describe('MakeupProcessor delivery semantics', () => {
+  beforeEach(() => jest.spyOn(Date, 'now').mockReturnValue(1000));
+  afterEach(() => jest.restoreAllMocks());
   it.each([false, true])(
     'preserves guide failure/retry semantics (retryable=%s) and logs diagnostics',
     async (retryable) => {
-      const prisma = mockDeep<PrismaService>();
+      const prisma = workflowPrisma();
       const ai = mock<AiGateway>();
       const logger = mock<Logger>();
       const error = new AiProviderError(
@@ -56,12 +77,12 @@ describe('MakeupProcessor delivery semantics', () => {
         } as unknown as Job<MakeupAiJob>),
       ).rejects.toBe(error);
       expect(discard).toHaveBeenCalledTimes(retryable ? 0 : 1);
-      expect(prisma.aiRun.update.mock.calls.at(-1)?.[0].data.status).toBe(
+      expect(prisma.aiRun.updateMany.mock.calls.at(-1)?.[0].data.status).toBe(
         retryable ? 'QUEUED' : 'FAILED',
       );
       if (!retryable) {
-        expect(prisma.makeupSession.update.mock.calls[0]?.[0]).toEqual({
-          where: { id: 'session' },
+        expect(prisma.makeupSession.updateMany.mock.calls[0]?.[0]).toEqual({
+          where: { id: 'session', status: 'GUIDE_GENERATING' },
           data: { status: 'GUIDE_FAILED' },
         });
       }
@@ -78,7 +99,7 @@ describe('MakeupProcessor delivery semantics', () => {
   );
 
   it('persists spoken guide content without changing main-step statuses', async () => {
-    const prisma = mockDeep<PrismaService>();
+    const prisma = workflowPrisma();
     const gateway = new MockAiGateway();
     const ai = mock<AiGateway>();
     const preferences = {
@@ -137,7 +158,7 @@ describe('MakeupProcessor delivery semantics', () => {
   });
 
   it('stores spoken feedback alongside evaluation without advancing the guide', async () => {
-    const prisma = mockDeep<PrismaService>();
+    const prisma = workflowPrisma();
     const ai = mock<AiGateway>();
     const storage = mock<PrivateImageStorageService>();
     const evaluation = {
@@ -200,7 +221,7 @@ describe('MakeupProcessor delivery semantics', () => {
     expect(ai.evaluateStep.mock.calls).toHaveLength(1);
   });
   it('does not call the provider again when BullMQ redelivers a completed run', async () => {
-    const prisma = mockDeep<PrismaService>();
+    const prisma = workflowPrisma();
     const ai = mock<AiGateway>();
     const storage = mock<PrivateImageStorageService>();
     const logger = mock<Logger>();
@@ -229,7 +250,7 @@ describe('MakeupProcessor delivery semantics', () => {
   });
 
   it('terminates immediately when a provider quota reset is too far away', async () => {
-    const prisma = mockDeep<PrismaService>();
+    const prisma = workflowPrisma();
     const ai = mock<AiGateway>();
     const storage = mock<PrivateImageStorageService>();
     const logger = mock<Logger>();
@@ -240,7 +261,15 @@ describe('MakeupProcessor delivery semantics', () => {
       logger,
       new ConfigService({ AI_QUEUE_MAX_PROVIDER_PAUSE_MS: '120000' }),
     );
-    prisma.aiRun.findUnique.mockResolvedValue({ status: 'QUEUED' } as never);
+    prisma.aiRun.findUnique.mockResolvedValue({
+      id: 'run-id',
+      authId: 'auth-id',
+      sessionId: 'session-id',
+      operation: 'PERSONALIZATION',
+      status: 'PROCESSING',
+      startedAt: new Date(1000),
+      createdAt: new Date(0),
+    } as never);
     prisma.makeupSession.findFirstOrThrow.mockResolvedValue({
       preferences: {
         vibe: 'natural',
@@ -290,7 +319,7 @@ describe('MakeupProcessor delivery semantics', () => {
 
     expect(discard).toHaveBeenCalledTimes(1);
     expect(
-      prisma.aiRun.update.mock.calls.some(
+      prisma.aiRun.updateMany.mock.calls.some(
         ([args]) =>
           args.where.id === 'run-id' &&
           args.data.status === 'FAILED' &&

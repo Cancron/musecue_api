@@ -623,11 +623,12 @@ export class AuthService {
       // Execute critical Redis operations with detailed error handling and rollback
       try {
         // CRITICAL: Store refresh token hash in Redis
-        await this.redisService.set(
+        const stored = await this.redisService.set(
           refreshTokenKey,
           storedTokenData,
           refreshTokenTTL,
         );
+        if (!stored) throw new Error('Refresh token persistence failed');
       } catch (error) {
         console.error('Failed to store refresh token in Redis:', {
           userId: user.id,
@@ -760,13 +761,21 @@ export class AuthService {
 
     // Get stored token data from Redis
     const refreshTokenKey = `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.REFRESH_TOKEN}:${userId}:${jti}`;
-    const storedData =
-      await this.redisService.get<IStoredRefreshToken>(refreshTokenKey);
+    let storedData: IStoredRefreshToken | null;
+    try {
+      storedData =
+        await this.redisService.getRequired<IStoredRefreshToken>(
+          refreshTokenKey,
+        );
+    } catch {
+      throw AppError.serviceUnavailable(
+        'Authentication is temporarily unavailable',
+      );
+    }
 
     if (!storedData) {
-      // Token not found - possibly already rotated or revoked
-      // This could indicate a replay attack - revoke all user tokens
-      await this.revokeAllUserTokens(userId);
+      // A concurrent request may already have rotated it. Reject this token,
+      // without revoking the successful request's replacement or other devices.
       throw AppError.unauthorized(
         'Refresh token has been revoked. Please login again.',
       );
@@ -825,17 +834,27 @@ export class AuthService {
       rotatedFrom: jti, // Track rotation chain
     };
 
-    // Atomic rotation: delete old token and create new one
-    await Promise.all([
-      // Delete old refresh token
-      this.redisService.del(refreshTokenKey),
-      // Remove old JTI from session list
-      this.removeUserSession(userId, jti),
-      // Store new refresh token
-      this.redisService.set(newRefreshTokenKey, newStoredData, refreshTokenTTL),
-      // Add new JTI to session list
-      this.addUserSession(userId, newJti, refreshTokenTTL),
-    ]);
+    let rotated: boolean;
+    try {
+      rotated = await this.redisService.rotateRefreshToken({
+        oldKey: refreshTokenKey,
+        newKey: newRefreshTokenKey,
+        sessionsKey: `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.USER_SESSIONS}:${userId}`,
+        expectedHash: tokenHash,
+        oldJti: jti,
+        newJti,
+        newData: newStoredData,
+        ttlSeconds: refreshTokenTTL,
+      });
+    } catch {
+      throw AppError.serviceUnavailable(
+        'Authentication is temporarily unavailable',
+      );
+    }
+    if (!rotated)
+      throw AppError.unauthorized(
+        'Refresh token has already been used or revoked',
+      );
 
     return {
       accessToken: newAccessToken,
@@ -897,15 +916,7 @@ export class AuthService {
   ): Promise<void> {
     const userSessionsKey = `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.USER_SESSIONS}:${userId}`;
 
-    // Get current sessions
-    const sessions =
-      (await this.redisService.get<string[]>(userSessionsKey)) || [];
-
-    // Add new session
-    sessions.push(jti);
-
-    // Store updated sessions
-    await this.redisService.set(userSessionsKey, sessions, ttl);
+    await this.redisService.updateSessionList(userSessionsKey, jti, true, ttl);
   }
 
   /**
@@ -914,16 +925,8 @@ export class AuthService {
   private async removeUserSession(userId: string, jti: string): Promise<void> {
     const userSessionsKey = `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.USER_SESSIONS}:${userId}`;
 
-    const sessions =
-      (await this.redisService.get<string[]>(userSessionsKey)) || [];
-    const updatedSessions = sessions.filter((s) => s !== jti);
-
-    if (updatedSessions.length > 0) {
-      const ttl = this.parseExpiryToSeconds(AUTH_CONFIG.TOKEN_EXPIRY.REFRESH);
-      await this.redisService.set(userSessionsKey, updatedSessions, ttl);
-    } else {
-      await this.redisService.del(userSessionsKey);
-    }
+    const ttl = this.parseExpiryToSeconds(AUTH_CONFIG.TOKEN_EXPIRY.REFRESH);
+    await this.redisService.updateSessionList(userSessionsKey, jti, false, ttl);
   }
 
   /**
@@ -936,30 +939,13 @@ export class AuthService {
   ): Promise<void> {
     const userSessionsKey = `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.USER_SESSIONS}:${userId}`;
 
-    const sessions =
-      (await this.redisService.get<string[]>(userSessionsKey)) || [];
-
-    if (sessions.length <= maxDevices) {
-      return;
-    }
-
-    // Remove oldest sessions (first in list)
-    const sessionsToRemove = sessions.slice(
-      0,
-      sessions.length - maxDevices + 1,
-    );
-
-    await Promise.all(
-      sessionsToRemove.map(async (jti) => {
-        const tokenKey = `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.REFRESH_TOKEN}:${userId}:${jti}`;
-        await this.redisService.del(tokenKey);
-      }),
-    );
-
-    // Keep only the most recent sessions
-    const updatedSessions = sessions.slice(sessions.length - maxDevices + 1);
     const ttl = this.parseExpiryToSeconds(AUTH_CONFIG.TOKEN_EXPIRY.REFRESH);
-    await this.redisService.set(userSessionsKey, updatedSessions, ttl);
+    await this.redisService.pruneRefreshSessions(
+      userSessionsKey,
+      `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.REFRESH_TOKEN}:${userId}:`,
+      maxDevices,
+      ttl,
+    );
   }
 
   /**
@@ -968,17 +954,12 @@ export class AuthService {
   private async revokeAllUserTokens(userId: string): Promise<void> {
     const userSessionsKey = `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.USER_SESSIONS}:${userId}`;
 
-    const sessions =
-      (await this.redisService.get<string[]>(userSessionsKey)) || [];
-
-    // Delete all refresh tokens
-    await Promise.all([
-      ...sessions.map((jti) => {
-        const tokenKey = `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.REFRESH_TOKEN}:${userId}:${jti}`;
-        return this.redisService.del(tokenKey);
-      }),
-      this.redisService.del(userSessionsKey),
-    ]);
+    await this.redisService.pruneRefreshSessions(
+      userSessionsKey,
+      `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.REFRESH_TOKEN}:${userId}:`,
+      0,
+      1,
+    );
   }
 
   /**

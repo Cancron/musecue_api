@@ -101,6 +101,15 @@ Increase these only after pinning production models and matching the limits on y
 
 The free router is intended for development and cannot provide bulk-production capacity. Paid models, explicit account spending caps, production observability, and load testing are required before a public launch.
 
+### Workflow and authentication reliability
+
+- Session writes and AI result publication share a PostgreSQL row lock. Repeated completion requests do not reopen an earlier step. AI-run idempotency keys are scoped to their owner, session, operation, and step.
+- Every 30 seconds, recovery checks pending runs older than `AI_JOB_RECOVERY_GRACE_MS` (default/minimum 120000 ms), in batches of 100. Missing or terminal BullMQ jobs become terminal `FAILED` runs so clients stop polling and can retry. Healthy waiting, prioritized, delayed, or active jobs are left alone. A Redis outage postpones recovery; it is not evidence that jobs are missing.
+- Terminal runs and superseded worker attempts cannot publish late AI results. Recovery uses existing PostgreSQL/BullMQ state, not another queue. Restart the API/workers to activate it; no migration is required.
+- Refresh-token rotation compares and replaces the token hash and updates the Redis session index in one Lua operation. Temporary Redis failures return 503 instead of invalidating authentication. These scripts use the existing single Redis instance, not Redis Cluster.
+- Rate-limit exemptions match documentation/metrics paths only. Query-string text cannot disable throttling.
+- `POST /v1/recommendations/:recommendationId/saved` accepts `{ "saved": true }` or `{ "saved": false }` for retry-safe state changes. A body without `saved` retains the legacy toggle behavior.
+
 ## API
 
 Authentication routes:
@@ -128,7 +137,7 @@ Makeup routes require a bearer token:
 | `PATCH`  | `/v1/sessions/:sessionId/preferences`                              | Save preferences                                   |
 | `POST`   | `/v1/sessions/:sessionId/analyze`                                  | Queue personalization analysis                     |
 | `POST`   | `/v1/sessions/:sessionId/recommendations/:recommendationId/select` | Select a look and queue its guide                  |
-| `POST`   | `/v1/recommendations/:recommendationId/saved`                      | Toggle saved state                                 |
+| `POST`   | `/v1/recommendations/:recommendationId/saved`                      | Set saved state; legacy bodyless toggle supported   |
 | `GET`    | `/v1/saved-recommendations`                                        | List saved recommendations                         |
 | `POST`   | `/v1/guide-steps/:stepId/check`                                    | Queue a visual evaluation                          |
 | `POST`   | `/v1/guide-steps/:stepId/snapshot`                                 | Save a step's final photo without an AI evaluation |

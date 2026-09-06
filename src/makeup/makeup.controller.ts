@@ -27,6 +27,7 @@ import {
   CompleteStepDto,
   ListSessionsDto,
   SavePreferencesDto,
+  SaveRecommendationDto,
   UploadInitialImageDto,
 } from './dto/makeup.dto';
 import type { AuthenticatedUser } from './interfaces/makeup.interface';
@@ -155,8 +156,13 @@ export class MakeupController {
   toggleSaved(
     @Req() req: AuthenticatedRequest,
     @Param('recommendationId') recommendationId: string,
+    @Body() dto: SaveRecommendationDto,
   ) {
-    return this.makeup.toggleSaved(req.user.userId, recommendationId);
+    return this.makeup.toggleSaved(
+      req.user.userId,
+      recommendationId,
+      dto.saved,
+    );
   }
 
   @Get('saved-recommendations')

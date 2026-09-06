@@ -20,7 +20,13 @@ describe('MakeupService history media and deletion', () => {
     aiGateway,
   );
 
-  beforeEach(() => jest.clearAllMocks());
+  beforeEach(() => {
+    jest.clearAllMocks();
+    prisma.$queryRaw.mockResolvedValue([{ status: 'IN_PROGRESS' }]);
+    prisma.guideStep.findUnique.mockResolvedValue({
+      status: 'CURRENT',
+    } as never);
+  });
 
   it('returns private image bytes only after the ownership query succeeds', async () => {
     const bytes = Buffer.from('private-image');
@@ -106,6 +112,13 @@ describe('MakeupService history media and deletion', () => {
     prisma.$transaction.mockImplementation(async (callback) =>
       (callback as (client: PrismaService) => Promise<unknown>)(prisma),
     );
+    prisma.guideStep.findUniqueOrThrow.mockResolvedValue({
+      id: 'final-step',
+      guideId: 'guide-id',
+      position: 2,
+      status: 'CURRENT',
+      guide: { sessionId: 'session-id', steps: [] },
+    } as never);
 
     await service.completeStep('owner-id', 'final-step', {});
 
@@ -116,7 +129,13 @@ describe('MakeupService history media and deletion', () => {
   });
 
   it('deduplicates an idempotency race and removes the duplicate check image', async () => {
-    const existingRun = { id: 'existing-run', status: 'QUEUED' };
+    const existingRun = {
+      id: 'existing-run',
+      status: 'QUEUED',
+      operation: 'VISION_CHECK',
+      sessionId: 'session-id',
+      stepId: 'step-id',
+    };
     prisma.aiRun.findUnique
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce(null)
