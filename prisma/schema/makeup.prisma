@@ -113,6 +113,7 @@ model GuideStep {
   status           GuideStepStatus @default(LOCKED)
   title            String
   instruction      String          @db.Text
+  substeps         String[]        @default([])
   area             String
   technique        String
   estimatedSeconds Int

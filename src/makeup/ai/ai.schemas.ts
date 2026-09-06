@@ -30,6 +30,7 @@ export const guideModelSchema = z.object({
       z.object({
         title: trimmedText,
         instruction: trimmedText,
+        substeps: z.array(trimmedText.max(180)).min(2).max(6),
         area: trimmedText,
         technique: trimmedText,
         estimatedSeconds: z.number().int().min(30).max(1800),

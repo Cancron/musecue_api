@@ -25,6 +25,7 @@ import {
 } from './ai.schemas';
 import {
   MAKEUP_AI_SYSTEM_INSTRUCTION,
+  GUIDE_TASK,
   PERSONALIZATION_TASK,
   PROMPT_VERSIONS,
 } from './ai.prompts';
@@ -99,9 +100,7 @@ export class LiveAiGateway implements AiGateway {
       'GUIDE_GENERATION',
       'musecue_guide',
       guideModelSchema,
-      `The user already selected a makeup method. Do not recommend a different method.
-Create a practical sequential guide customized to the selected technique, skill level, preferences, visible analysis, and available time.
-Each step must be independently understandable and visually checkable. Success criteria must be concise and observable.`,
+      GUIDE_TASK,
       input,
     );
     return {

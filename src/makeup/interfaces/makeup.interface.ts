@@ -40,6 +40,7 @@ export interface GuideStepResult {
   position: number;
   title: string;
   instruction: string;
+  substeps: string[];
   area: string;
   technique: string;
   estimatedSeconds: number;

@@ -1,6 +1,6 @@
 export const PROMPT_VERSIONS = {
   PERSONALIZATION: 'ANALYZE_AND_RECOMMEND_V1',
-  GUIDE_GENERATION: 'GUIDE_V1',
+  GUIDE_GENERATION: 'GUIDE_V2_SUBSTEPS',
   VISION_CHECK: 'MAKEUP_CHECK_V1',
   GUIDE_QUESTION: 'QUESTION_V1',
 } as const;
@@ -20,6 +20,10 @@ Recommendation names, palettes, and explanations must be concise enough for a mo
 export const GUIDE_TASK = `The user already selected a makeup method. Do not replace or reconsider it.
 Create a practical sequential guide customized to that method, the supplied preferences, relevant visible analysis, and available time.
 Every step must be independently understandable and visually checkable. successCriteria must be a concise observable condition.
+For each main step, return substeps: an ordered array of 2 to 6 short instructions. Each substep is a single concrete action, ideally 8 to 20 words and at most 180 characters.
+The app speaks one substep and waits for the user before continuing. Do not combine multiple actions in a long paragraph or include numbering, headings, markdown, or encouragement-only entries.
+Explain the amount, placement, or movement when relevant. Incorporate essential personalized advice into the relevant substep; do not require the user to hear a separate long tip.
+Keep instruction as a readable summary of the same actions for history and older app versions. Substeps must cover the complete step in execution order without contradicting that summary.
 The sum of estimatedSeconds should be reasonably close to the available time.`;
 
 export const EVALUATION_TASK = `Evaluate only the user's visible progress for the current guide step.

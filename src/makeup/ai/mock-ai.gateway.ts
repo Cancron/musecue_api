@@ -92,6 +92,30 @@ export class MockAiGateway implements AiGateway {
     const lookName = input.recommendation.name;
     const timeMinutes = input.preferences.timeMinutes;
     const perStep = Math.max(60, Math.floor((timeMinutes * 60) / 5));
+    const substeps = [
+      [
+        'Press a small amount of moisturizer into clean skin.',
+        'Smooth a thin layer of primer through the center of your face.',
+      ],
+      [
+        'Place a little base at the center of your face.',
+        'Blend outward with light pressure.',
+        'Soften the edges so the coverage stays sheer.',
+      ],
+      [
+        'Place a small amount of blush on the apples of your cheeks.',
+        'Sweep the color upward toward your temples.',
+        'Diffuse the edges with a clean brush.',
+      ],
+      [
+        'Place a little soft brown shadow close to the lash line.',
+        'Blend the shadow at the outer corner using light pressure.',
+      ],
+      [
+        'Tap a small amount of lip color into the center of your lips.',
+        'Soften the color outward toward the lip line.',
+      ],
+    ];
     const result: GuideResult = {
       steps: [
         [
@@ -128,6 +152,7 @@ export class MockAiGateway implements AiGateway {
         position: index,
         title: String(title),
         instruction: String(instruction),
+        substeps: substeps[index],
         area: String(area),
         technique: String(technique),
         estimatedSeconds: perStep,

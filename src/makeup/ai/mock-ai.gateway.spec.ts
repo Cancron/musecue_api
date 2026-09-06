@@ -1,4 +1,5 @@
 import { MockAiGateway } from './mock-ai.gateway';
+import { guideModelSchema } from './ai.schemas';
 
 describe('MockAiGateway', () => {
   const gateway = new MockAiGateway();
@@ -37,6 +38,10 @@ describe('MockAiGateway', () => {
     });
 
     expect(result.data.steps).toHaveLength(5);
+    expect(guideModelSchema.safeParse(result.data).success).toBe(true);
+    expect(result.data.steps.every((step) => step.substeps.length >= 2)).toBe(
+      true,
+    );
     expect(result.data.steps.map((step) => step.position)).toEqual([
       0, 1, 2, 3, 4,
     ]);

@@ -340,6 +340,7 @@ export class MakeupProcessor extends WorkerHost {
       position: step.position,
       title: step.title,
       instruction: step.instruction,
+      substeps: step.substeps,
       area: step.area,
       technique: step.technique,
       estimatedSeconds: step.estimatedSeconds,
