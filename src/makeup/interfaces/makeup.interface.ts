@@ -41,6 +41,8 @@ export interface GuideStepResult {
   title: string;
   instruction: string;
   substeps: string[];
+  spokenIntro?: string | null;
+  spokenSubsteps?: string[];
   area: string;
   technique: string;
   estimatedSeconds: number;
@@ -56,6 +58,7 @@ export interface GuideResult {
 export interface EvaluationResult {
   result: 'PASS' | 'NEEDS_ADJUSTMENT' | 'UNCERTAIN' | 'CANNOT_EVALUATE';
   feedback: string;
+  spokenFeedback?: string | null;
   confidence: number;
 }
 

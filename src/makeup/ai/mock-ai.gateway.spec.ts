@@ -1,5 +1,5 @@
 import { MockAiGateway } from './mock-ai.gateway';
-import { guideModelSchema } from './ai.schemas';
+import { guideModelSchema, evaluationModelSchema } from './ai.schemas';
 
 describe('MockAiGateway', () => {
   const gateway = new MockAiGateway();
@@ -39,6 +39,13 @@ describe('MockAiGateway', () => {
 
     expect(result.data.steps).toHaveLength(5);
     expect(guideModelSchema.safeParse(result.data).success).toBe(true);
+    expect(
+      result.data.steps.every(
+        (step) =>
+          step.spokenIntro &&
+          step.spokenSubsteps?.length === step.substeps.length,
+      ),
+    ).toBe(true);
     expect(result.data.steps.every((step) => step.substeps.length >= 2)).toBe(
       true,
     );
@@ -57,6 +64,14 @@ describe('MockAiGateway', () => {
       preferences,
       analysis: personalization.data.analysis,
     });
+    const evaluation = await gateway.evaluateStep({
+      image,
+      step: guide.data.steps[0],
+      recommendation: personalization.data.recommendations[0],
+      preferences,
+      previousEvaluation: null,
+    });
+    expect(evaluationModelSchema.safeParse(evaluation.data).success).toBe(true);
     await expect(
       gateway.evaluateStep({
         image,

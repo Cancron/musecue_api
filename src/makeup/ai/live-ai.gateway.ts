@@ -25,7 +25,8 @@ import {
 } from './ai.schemas';
 import {
   MAKEUP_AI_SYSTEM_INSTRUCTION,
-  GUIDE_TASK,
+  GUIDE_SPEECH_TASK,
+  EVALUATION_SPEECH_TASK,
   PERSONALIZATION_TASK,
   PROMPT_VERSIONS,
 } from './ai.prompts';
@@ -100,9 +101,20 @@ export class LiveAiGateway implements AiGateway {
       'GUIDE_GENERATION',
       'musecue_guide',
       guideModelSchema,
-      GUIDE_TASK,
+      GUIDE_SPEECH_TASK,
       input,
     );
+    if (
+      response.data.steps.some(
+        (step) => step.substeps.length !== step.spokenSubsteps.length,
+      )
+    ) {
+      throw new AiProviderError(
+        'AI_SCHEMA_VALIDATION_FAILED',
+        'Spoken instructions do not match guide substeps',
+        true,
+      );
+    }
     return {
       data: {
         steps: response.data.steps.map((step, position) => ({
@@ -121,9 +133,7 @@ export class LiveAiGateway implements AiGateway {
       'VISION_CHECK',
       'musecue_makeup_check',
       evaluationModelSchema,
-      `Evaluate only progress for the supplied current guide step. Do not restart facial analysis or change the selected makeup method.
-Compare visible makeup with this step's success criteria. Use PASS, NEEDS_ADJUSTMENT, UNCERTAIN, or CANNOT_EVALUATE.
-If adjustment is needed, identify only the most important issue and give one short actionable correction. If visibility is insufficient, do not guess.`,
+      EVALUATION_SPEECH_TASK,
       {
         step: input.step,
         recommendation: input.recommendation,

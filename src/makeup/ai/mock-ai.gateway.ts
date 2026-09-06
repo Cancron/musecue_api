@@ -153,6 +153,37 @@ export class MockAiGateway implements AiGateway {
         title: String(title),
         instruction: String(instruction),
         substeps: substeps[index],
+        spokenIntro: [
+          "Let's start by preparing your skin.",
+          "Now, let's even out your complexion.",
+          "Let's add a little color to your cheeks.",
+          "Now, let's softly define your eyes.",
+          "Let's finish with a little lip color.",
+        ][index],
+        spokenSubsteps: [
+          [
+            'Start with a little moisturizer, pressing it gently into clean skin.',
+            'Now smooth a thin layer of primer through the center of your face.',
+          ],
+          [
+            'Start with a little base in the center of your face.',
+            'Gently blend outward, keeping your pressure light.',
+            'Now soften those edges so the coverage stays sheer.',
+          ],
+          [
+            'Place a little blush on the apples of your cheeks.',
+            'Gently sweep the color upward toward your temples.',
+            'Now soften the edges with a clean brush.',
+          ],
+          [
+            'Start with a little soft brown shadow close to the lash line.',
+            'Gently blend the outer corner, keeping your pressure light.',
+          ],
+          [
+            'Tap a little color into the center of your lips.',
+            'Now soften it outward toward the lip line.',
+          ],
+        ][index],
         area: String(area),
         technique: String(technique),
         estimatedSeconds: perStep,
@@ -184,12 +215,16 @@ export class MockAiGateway implements AiGateway {
           result: 'NEEDS_ADJUSTMENT',
           feedback:
             'Soften the outer edge with a clean brush using small circular motions, then check again.',
+          spokenFeedback:
+            "The outer edge could use a little more blending. Gently soften it with a clean brush in small circles, then check again when you're ready.",
           confidence: 0.86,
         }
       : {
           result: 'PASS',
           feedback:
             'The placement and blend look balanced. You are ready for the next step.',
+          spokenFeedback:
+            "The placement and blend look balanced. You can move on whenever you're ready.",
           confidence: 0.93,
         };
     return Promise.resolve({ data: result });

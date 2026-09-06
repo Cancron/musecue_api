@@ -459,6 +459,14 @@ export class MakeupProcessor extends WorkerHost {
         runId: job.data.runId,
         operation: job.name,
         attempt: job.attemptsMade + 1,
+        code:
+          handledError instanceof AiProviderError
+            ? handledError.code
+            : undefined,
+        diagnostics:
+          handledError instanceof AiProviderError
+            ? handledError.diagnostics
+            : undefined,
       });
       return error instanceof Error ? error : new Error(message);
     }
@@ -495,6 +503,12 @@ export class MakeupProcessor extends WorkerHost {
       runId: job.data.runId,
       operation: job.name,
       error: message,
+      code:
+        handledError instanceof AiProviderError ? handledError.code : undefined,
+      diagnostics:
+        handledError instanceof AiProviderError
+          ? handledError.diagnostics
+          : undefined,
     });
     return handledError instanceof Error ? handledError : new Error(message);
   }

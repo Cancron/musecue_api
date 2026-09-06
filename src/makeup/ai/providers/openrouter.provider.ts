@@ -3,7 +3,10 @@ import { ConfigService } from '@nestjs/config';
 import sharp from 'sharp';
 import { z } from 'zod';
 import type { AiOperation } from '../../interfaces/makeup.interface';
-import { AiProviderError } from '../ai-provider.error';
+import {
+  AiProviderError,
+  type AiFailureDiagnostics,
+} from '../ai-provider.error';
 import type {
   StructuredAiProvider,
   StructuredGenerationRequest,
@@ -17,7 +20,7 @@ const openRouterEnvelopeSchema = z.object({
     .array(
       z.object({
         finish_reason: z.string().nullable().optional(),
-        message: z.object({ content: z.string().nullable() }),
+        message: z.object({ content: z.string().nullish() }).optional(),
       }),
     )
     .min(1),
@@ -28,6 +31,59 @@ const openRouterEnvelopeSchema = z.object({
       total_tokens: z.number().optional(),
     })
     .optional(),
+});
+
+// Parse only metadata; never retain upstream messages or reasoning text.
+const responseMetadataSchema = z.object({
+  error: z
+    .object({
+      code: z.number().int().min(100).max(599).optional().catch(undefined),
+    })
+    .nullish(),
+  choices: z
+    .array(
+      z.object({
+        finish_reason: z.string().nullish().catch(undefined),
+        error: z
+          .object({
+            code: z
+              .number()
+              .int()
+              .min(100)
+              .max(599)
+              .optional()
+              .catch(undefined),
+          })
+          .nullish(),
+        message: z
+          .object({ content: z.string().nullish() })
+          .nullish()
+          .catch(undefined),
+      }),
+    )
+    .optional(),
+  usage: z
+    .object({
+      completion_tokens: z
+        .number()
+        .int()
+        .nonnegative()
+        .optional()
+        .catch(undefined),
+      completion_tokens_details: z
+        .object({
+          reasoning_tokens: z
+            .number()
+            .int()
+            .nonnegative()
+            .optional()
+            .catch(undefined),
+        })
+        .nullish()
+        .catch(undefined),
+    })
+    .nullish()
+    .catch(undefined),
 });
 
 @Injectable()
@@ -129,6 +185,10 @@ export class OpenRouterProvider implements StructuredAiProvider {
   ): Promise<StructuredGenerationResponse> {
     this.validateConfiguration();
 
+    const diagnostics: AiFailureDiagnostics = {
+      maxTokens: this.maxTokensFor(request.operation),
+      timeoutMs: this.timeoutFor(request.operation),
+    };
     const controller = new AbortController();
     const timeout = setTimeout(
       () => controller.abort(),
@@ -152,7 +212,8 @@ export class OpenRouterProvider implements StructuredAiProvider {
             },
           ],
           temperature: 0.2,
-          max_tokens: this.maxTokensFor(request.operation),
+          max_tokens: diagnostics.maxTokens,
+          ...this.reasoningOptions(request.operation),
           response_format: {
             type: 'json_schema',
             json_schema: {
@@ -172,8 +233,9 @@ export class OpenRouterProvider implements StructuredAiProvider {
         }),
       });
 
+      diagnostics.httpStatus = response.status;
       if (!response.ok) {
-        throw this.httpError(response);
+        throw this.httpError(response.status, response.headers);
       }
 
       const declaredLength = Number(response.headers.get('content-length'));
@@ -205,8 +267,63 @@ export class OpenRouterProvider implements StructuredAiProvider {
           true,
         );
       }
+      const metadata = responseMetadataSchema.safeParse(responseBody);
+      if (metadata.success) {
+        const choice = metadata.data.choices?.[0];
+        const finishReason = choice?.finish_reason;
+        diagnostics.finishReason = finishReason
+          ? [
+              'stop',
+              'length',
+              'error',
+              'content_filter',
+              'tool_calls',
+            ].includes(finishReason)
+            ? (finishReason as AiFailureDiagnostics['finishReason'])
+            : 'other'
+          : undefined;
+        diagnostics.completionTokens = metadata.data.usage?.completion_tokens;
+        diagnostics.reasoningTokens =
+          metadata.data.usage?.completion_tokens_details?.reasoning_tokens;
+        diagnostics.contentCharacters = choice?.message?.content?.length ?? 0;
+        const providerError = metadata.data.error ?? choice?.error;
+        if (providerError) {
+          diagnostics.providerErrorCode = providerError.code;
+          if (providerError.code)
+            throw this.httpError(providerError.code, response.headers);
+          throw new AiProviderError(
+            'AI_PROVIDER_ERROR',
+            'OpenRouter could not complete the generation',
+            true,
+          );
+        }
+      }
+
+      // Check stop reasons before content: reasoning may exhaust the budget
+      // without producing a message at all. Identical retries cannot fix limits.
+      if (diagnostics.finishReason === 'length') {
+        throw new AiProviderError(
+          'AI_OUTPUT_TRUNCATED',
+          'OpenRouter exhausted the configured output token budget; increase the operation token limit or reduce reasoning before retrying',
+          false,
+        );
+      }
+      if (diagnostics.finishReason === 'content_filter') {
+        throw new AiProviderError(
+          'AI_CONTENT_FILTERED',
+          'OpenRouter could not generate this content',
+          false,
+        );
+      }
+      if (diagnostics.finishReason === 'error') {
+        throw new AiProviderError(
+          'AI_PROVIDER_ERROR',
+          'OpenRouter could not complete the generation',
+          true,
+        );
+      }
       const envelope = openRouterEnvelopeSchema.safeParse(responseBody);
-      if (!envelope.success || !envelope.data.choices[0].message.content) {
+      if (!envelope.success) {
         throw new AiProviderError(
           'AI_INVALID_RESPONSE',
           'OpenRouter returned an invalid response envelope',
@@ -214,17 +331,18 @@ export class OpenRouterProvider implements StructuredAiProvider {
         );
       }
 
-      if (envelope.data.choices[0].finish_reason === 'length') {
+      const content = envelope.data.choices[0].message?.content;
+      if (!content?.trim()) {
         throw new AiProviderError(
-          'AI_OUTPUT_TRUNCATED',
-          'OpenRouter exhausted the configured output token budget',
+          'AI_EMPTY_RESPONSE',
+          'OpenRouter returned no structured output',
           true,
         );
       }
 
       let value: unknown;
       try {
-        value = JSON.parse(envelope.data.choices[0].message.content) as unknown;
+        value = JSON.parse(content) as unknown;
       } catch {
         throw new AiProviderError(
           'AI_INVALID_JSON',
@@ -246,19 +364,26 @@ export class OpenRouterProvider implements StructuredAiProvider {
           : undefined,
       };
     } catch (error) {
-      if (error instanceof AiProviderError) throw error;
+      if (error instanceof AiProviderError) {
+        error.diagnostics = diagnostics;
+        throw error;
+      }
       if (error instanceof Error && error.name === 'AbortError') {
-        throw new AiProviderError(
+        const timeoutError = new AiProviderError(
           'AI_TIMEOUT',
           'OpenRouter request timed out',
           true,
         );
+        timeoutError.diagnostics = diagnostics;
+        throw timeoutError;
       }
-      throw new AiProviderError(
+      const transportError = new AiProviderError(
         'AI_TRANSPORT_ERROR',
         'Unable to reach OpenRouter',
         true,
       );
+      transportError.diagnostics = diagnostics;
+      throw transportError;
     } finally {
       clearTimeout(timeout);
     }
@@ -290,8 +415,7 @@ export class OpenRouterProvider implements StructuredAiProvider {
     };
   }
 
-  private httpError(response: Response): AiProviderError {
-    const { status } = response;
+  private httpError(status: number, headers: Headers): AiProviderError {
     const retryable = status === 408 || status === 429 || status >= 500;
     return new AiProviderError(
       `AI_HTTP_${status}`,
@@ -299,7 +423,7 @@ export class OpenRouterProvider implements StructuredAiProvider {
         ? 'OpenRouter is temporarily unavailable'
         : 'OpenRouter rejected the request',
       retryable,
-      status === 429 ? this.retryAfterMs(response.headers) : undefined,
+      status === 429 ? this.retryAfterMs(headers) : undefined,
     );
   }
 
@@ -380,6 +504,28 @@ export class OpenRouterProvider implements StructuredAiProvider {
     );
   }
 
+  private reasoningOptions(operation: AiOperation): {
+    reasoning?: { effort: string; exclude: boolean };
+  } {
+    if (operation !== 'GUIDE_GENERATION') return {};
+    const effort = this.config
+      .get<string>('OPENROUTER_GUIDE_REASONING_EFFORT')
+      ?.trim();
+    if (!effort) return {};
+    if (
+      !['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(
+        effort,
+      )
+    ) {
+      throw new AiProviderError(
+        'AI_CONFIGURATION_INVALID',
+        'OPENROUTER_GUIDE_REASONING_EFFORT is invalid',
+        false,
+      );
+    }
+    return { reasoning: { effort, exclude: true } };
+  }
+
   private maxTokensFor(operation: AiOperation): number {
     const configByOperation: Record<
       AiOperation,
@@ -389,7 +535,7 @@ export class OpenRouterProvider implements StructuredAiProvider {
         key: 'OPENROUTER_ANALYSIS_MAX_TOKENS',
         fallback: 4_000,
       },
-      GUIDE_GENERATION: { key: 'OPENROUTER_GUIDE_MAX_TOKENS', fallback: 2_500 },
+      GUIDE_GENERATION: { key: 'OPENROUTER_GUIDE_MAX_TOKENS', fallback: 8_000 },
       VISION_CHECK: { key: 'OPENROUTER_VISION_MAX_TOKENS', fallback: 600 },
       GUIDE_QUESTION: { key: 'OPENROUTER_QUESTION_MAX_TOKENS', fallback: 500 },
     };

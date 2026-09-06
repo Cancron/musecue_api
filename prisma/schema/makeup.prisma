@@ -114,6 +114,8 @@ model GuideStep {
   title            String
   instruction      String          @db.Text
   substeps         String[]        @default([])
+  spokenIntro      String?         @db.Text
+  spokenSubsteps   String[]        @default([])
   area             String
   technique        String
   estimatedSeconds Int
@@ -140,6 +142,7 @@ model StepAttempt {
   imageId    String?
   result     EvaluationResult
   feedback   String           @db.Text
+  spokenFeedback String?      @db.Text
   confidence Float
   createdAt  DateTime         @default(now())
 

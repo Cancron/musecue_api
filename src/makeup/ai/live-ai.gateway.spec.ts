@@ -1,7 +1,7 @@
 import { mock } from 'jest-mock-extended';
 import type { StructuredAiProvider } from './providers/structured-ai.provider';
 import { LiveAiGateway } from './live-ai.gateway';
-import { GUIDE_TASK } from './ai.prompts';
+import { GUIDE_SPEECH_TASK, EVALUATION_SPEECH_TASK } from './ai.prompts';
 
 describe('LiveAiGateway', () => {
   const provider = mock<StructuredAiProvider>();
@@ -103,6 +103,11 @@ describe('LiveAiGateway', () => {
   });
 
   const guideStep = {
+    spokenIntro: "Let's prepare your skin.",
+    spokenSubsteps: [
+      'Gently press in a little moisturizer.',
+      'Now smooth a thin layer of primer over the center of your face.',
+    ],
     title: 'Prepare the skin',
     instruction: 'Apply moisturizer, then a thin layer of primer.',
     substeps: [
@@ -140,12 +145,86 @@ describe('LiveAiGateway', () => {
     expect(response.data.steps.map((step) => step.position)).toEqual([0, 1, 2]);
     expect(provider.generateStructured.mock.calls[0]?.[0]).toMatchObject({
       operation: 'GUIDE_GENERATION',
-      taskInstruction: GUIDE_TASK,
+      taskInstruction: GUIDE_SPEECH_TASK,
     });
     expect(gateway.describe('GUIDE_GENERATION').promptVersion).toBe(
-      'GUIDE_V2_SUBSTEPS',
+      'GUIDE_V4_PAIRED_COACHING',
     );
   });
+
+  it('preserves both written and spoken guide text in one provider call', async () => {
+    provider.generateStructured.mockResolvedValue({
+      model: 'text-model',
+      value: { steps: [guideStep, guideStep, guideStep] },
+    });
+    const response = await gateway.generateGuide(guideInput);
+    expect(response.data.steps[0]).toMatchObject(guideStep);
+    expect(provider.generateStructured.mock.calls).toHaveLength(1);
+    const prompt =
+      provider.generateStructured.mock.calls[0]?.[0].taskInstruction;
+    expect(prompt).toContain(
+      'Written substep: "Blend outward with light pressure."',
+    );
+    expect(prompt).toContain(
+      'Spoken counterpart: "Gently blend toward the outside, keeping your touch light."',
+    );
+    expect(prompt).toContain('not a required sequence or extra actions');
+    expect(prompt).toContain(
+      'never change the advice just to make the wording different',
+    );
+  });
+
+  it.each([
+    { spokenIntro: '' },
+    { spokenIntro: 'a'.repeat(141) },
+    { spokenSubsteps: ['One.', 'Two.', 'Extra.'] },
+    { spokenSubsteps: ['', 'Two.'] },
+    { spokenSubsteps: ['a'.repeat(221), 'Two.'] },
+  ])(
+    'rejects invalid or misaligned spoken guide content (%j)',
+    async (override) => {
+      provider.generateStructured.mockResolvedValue({
+        model: 'text-model',
+        value: { steps: [{ ...guideStep, ...override }, guideStep, guideStep] },
+      });
+      await expect(gateway.generateGuide(guideInput)).rejects.toMatchObject({
+        code: 'AI_SCHEMA_VALIDATION_FAILED',
+      });
+    },
+  );
+
+  it.each([
+    'PASS',
+    'NEEDS_ADJUSTMENT',
+    'UNCERTAIN',
+    'CANNOT_EVALUATE',
+  ] as const)(
+    'keeps the %s result unchanged while returning spoken feedback',
+    async (result) => {
+      const value = {
+        result,
+        feedback: 'Written evaluation.',
+        spokenFeedback: 'Spoken evaluation.',
+        confidence: 0.7,
+      };
+      provider.generateStructured.mockResolvedValue({
+        model: 'vision-model',
+        value,
+      });
+      const response = await gateway.evaluateStep({
+        image: input.image,
+        step: { ...guideStep, position: 0 },
+        recommendation: guideInput.recommendation,
+        preferences: input.preferences,
+        previousEvaluation: null,
+      });
+      expect(response.data).toEqual(value);
+      expect(provider.generateStructured.mock.calls).toHaveLength(1);
+      expect(provider.generateStructured.mock.calls[0]?.[0]).toMatchObject({
+        taskInstruction: EVALUATION_SPEECH_TASK,
+      });
+    },
+  );
 
   it.each(
     [
