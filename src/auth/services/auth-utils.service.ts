@@ -228,35 +228,10 @@ export class AuthUtilsService {
   }
 
   /**
-   * Validates password strength
+   * Validates the minimum password length
    */
   validatePassword(password: string): boolean {
-    const { PASSWORD_MIN_LENGTH, PASSWORD_REQUIREMENTS } = AUTH_CONFIG;
-
-    if (password.length < PASSWORD_MIN_LENGTH) {
-      return false;
-    }
-
-    if (PASSWORD_REQUIREMENTS.UPPERCASE && !/[A-Z]/.test(password)) {
-      return false;
-    }
-
-    if (PASSWORD_REQUIREMENTS.LOWERCASE && !/[a-z]/.test(password)) {
-      return false;
-    }
-
-    if (PASSWORD_REQUIREMENTS.NUMBERS && !/\d/.test(password)) {
-      return false;
-    }
-
-    if (
-      PASSWORD_REQUIREMENTS.SPECIAL_CHARS &&
-      !/[!@#$%^&*(),.?":{}|<>]/.test(password)
-    ) {
-      return false;
-    }
-
-    return true;
+    return password.length >= AUTH_CONFIG.PASSWORD_MIN_LENGTH;
   }
 
   /**

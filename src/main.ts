@@ -80,6 +80,16 @@ async function bootstrap() {
 
   app.use(helmet(helmetConfig));
 
+  const configuredOrigins = process.env.CORS_ORIGINS?.split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+  app.enableCors({
+    origin: configuredOrigins?.length
+      ? configuredOrigins
+      : ['http://localhost:8081', 'http://localhost:19006'],
+    credentials: true,
+  });
+
   // Setup Swagger documentation
   // In production, you may want to disable or protect this endpoint
   if (!isProduction || enableSwagger) {

@@ -7,9 +7,10 @@ import {
   Query,
   Res,
   Logger,
+  UseGuards,
 } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
-import { Throttle, SkipThrottle } from '@nestjs/throttler';
+import { Throttle } from '@nestjs/throttler';
 import { AuthService } from './auth.service';
 import { GoogleOAuthService } from './services/google-oauth.service';
 import { CreateAuthDto } from './dto/create-auth.dto';
@@ -21,6 +22,21 @@ import {
 import type { Request, Response } from 'express';
 import { CustomLoggerService } from '../common/services/custom-logger.service';
 import { THROTTLER_CONFIG } from '../common/config/throttler.config';
+import { AuthGuard } from '../common/guards/auth.guard';
+import { LoginDto } from './dto/login.dto';
+import { RefreshTokenDto } from './dto/refresh-token.dto';
+import {
+  ResendVerificationEmailDto,
+  VerifyEmailDto,
+} from './dto/verify-email.dto';
+
+interface AuthenticatedRequest extends Request {
+  user: {
+    userId: string;
+    role: string;
+    tokenVersion: number;
+  };
+}
 
 @ApiTags('auth')
 @Controller('auth')
@@ -59,31 +75,30 @@ export class AuthController {
   // Strict rate limit for verification: 5 requests per 15 minutes
   @Throttle({ default: THROTTLER_CONFIG.AUTH })
   @Post('verify-email')
-  verifyEmail(
-    @Body('email') email: string,
-    @Body('code') code: string,
-    @Req() req: Request,
-  ) {
+  verifyEmail(@Body() payload: VerifyEmailDto, @Req() req: Request) {
     this.customLogger.log(
-      `Email verification attempt for: ${email}`,
+      `Email verification attempt for: ${payload.email}`,
       'AuthController',
     );
     const meta = {
       ip: req.ip || 'unknown',
       userAgent: req.headers['user-agent'] || 'unknown',
     };
-    return this.authService.verifyEmail(email, code, meta);
+    return this.authService.verifyEmail(payload.email, payload.code, meta);
   }
 
   // Strict rate limit: 5 requests per 15 minutes
   @Throttle({ default: THROTTLER_CONFIG.AUTH })
   @Post('resend-verification-email')
-  resendVerificationEmail(@Body('email') email: string, @Req() req: Request) {
+  resendVerificationEmail(
+    @Body() payload: ResendVerificationEmailDto,
+    @Req() req: Request,
+  ) {
     const meta = {
       ip: req.ip || 'unknown',
       userAgent: req.headers['user-agent'] || 'unknown',
     };
-    return this.authService.resendVerificationEmail(email, meta);
+    return this.authService.resendVerificationEmail(payload.email, meta);
   }
 
   // ==========================================
@@ -138,7 +153,7 @@ export class AuthController {
     @Query('error') error: string,
     @Query('error_description') errorDescription: string,
     @Req() req: Request,
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+
     @Res({ passthrough: true }) res: Response,
   ) {
     // Handle OAuth errors
@@ -269,13 +284,9 @@ export class AuthController {
   // Strict rate limit for login: 5 requests per 15 minutes per IP
   @Throttle({ default: THROTTLER_CONFIG.AUTH })
   @Post('login')
-  async login(
-    @Body('email') email: string,
-    @Body('password') password: string,
-    @Req() req: Request,
-  ) {
+  async login(@Body() payload: LoginDto, @Req() req: Request) {
     this.customLogger.log(
-      `Login attempt for email: ${email}`,
+      `Login attempt for email: ${payload.email}`,
       'AuthController',
     );
 
@@ -294,23 +305,14 @@ export class AuthController {
           : req.headers['sec-ch-ua-platform']),
     };
 
-    const result = await this.authService.login({ email, password }, meta);
-
-    return {
-      success: true,
-      message: 'Login successful',
-      data: result,
-    };
+    return this.authService.login(payload, meta);
   }
 
   /**
    * Refresh access token using refresh token
    */
   @Post('refresh-token')
-  async refreshToken(
-    @Body('refreshToken') refreshToken: string,
-    @Req() req: Request,
-  ) {
+  async refreshToken(@Body() payload: RefreshTokenDto, @Req() req: Request) {
     this.customLogger.log('Token refresh requested', 'AuthController');
 
     const meta = {
@@ -328,50 +330,34 @@ export class AuthController {
           : req.headers['sec-ch-ua-platform']),
     };
 
-    const result = await this.authService.refreshToken(refreshToken, meta);
-
-    return {
-      success: true,
-      message: 'Token refreshed successfully',
-      data: result,
-    };
+    return this.authService.refreshToken(payload.refreshToken, meta);
   }
 
   /**
    * Logout current session
    */
   @Post('logout')
+  @UseGuards(AuthGuard)
   async logout(
-    @Body('refreshToken') refreshToken: string,
-    @Body('userId') userId: string,
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    @Req() req: Request,
+    @Body() payload: RefreshTokenDto,
+    @Req() req: AuthenticatedRequest,
   ) {
     this.customLogger.log('Logout requested', 'AuthController');
 
-    const result = await this.authService.logout(refreshToken, userId);
-
-    return {
-      success: true,
-      ...result,
-    };
+    return this.authService.logout(payload.refreshToken, req.user.userId);
   }
 
   /**
    * Logout from all devices
    */
   @Post('logout-all')
-  async logoutAll(@Body('userId') userId: string) {
+  @UseGuards(AuthGuard)
+  async logoutAll(@Req() req: AuthenticatedRequest) {
     this.customLogger.log(
-      `Logout all devices requested for user: ${userId}`,
+      `Logout all devices requested for user: ${req.user.userId}`,
       'AuthController',
     );
 
-    const result = await this.authService.logoutAllDevices(userId);
-
-    return {
-      success: true,
-      ...result,
-    };
+    return this.authService.logoutAllDevices(req.user.userId);
   }
 }

@@ -23,26 +23,16 @@ import { CustomThrottlerGuard } from '../guards/custom-throttler.guard';
         });
 
         return {
+          // Register one global throttler. Route-level @Throttle decorators
+          // override this named `default` policy where a different limit is
+          // appropriate. Registering STRICT/AUTH/RELAXED here as additional
+          // named throttlers would make every request pass every policy and
+          // would therefore impose the 5-per-15-minute auth limit globally.
           throttlers: [
             {
               name: 'default',
               ttl: THROTTLER_CONFIG.DEFAULT.ttl,
               limit: THROTTLER_CONFIG.DEFAULT.limit,
-            },
-            {
-              name: 'strict',
-              ttl: THROTTLER_CONFIG.STRICT.ttl,
-              limit: THROTTLER_CONFIG.STRICT.limit,
-            },
-            {
-              name: 'auth',
-              ttl: THROTTLER_CONFIG.AUTH.ttl,
-              limit: THROTTLER_CONFIG.AUTH.limit,
-            },
-            {
-              name: 'relaxed',
-              ttl: THROTTLER_CONFIG.RELAXED.ttl,
-              limit: THROTTLER_CONFIG.RELAXED.limit,
             },
           ],
           storage: new ThrottlerStorageRedisService(redisClient),

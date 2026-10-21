@@ -13,7 +13,7 @@ services:
     volumes:
       - db_data:/var/lib/postgresql/data
     networks:
-      - blog_network
+      - musecue_network
 
   pg_admin:
     image: dpage/pgadmin4:latest
@@ -27,7 +27,7 @@ services:
     depends_on:
       - postgres_db
     networks:
-      - blog_network
+      - musecue_network
 
   # redis:
   #   image: redis:7.0-alpine
@@ -38,7 +38,7 @@ services:
   #   volumes:
   #     - redis_data:/data
   #   networks:
-  #     - blog_network
+  #     - musecue_network
   redis-stack:
     image: redis/redis-stack:latest
     container_name: redis_cache
@@ -64,7 +64,7 @@ services:
     depends_on:
       - postgres_db
     networks:
-      - blog_network
+      - musecue_network
   # RabbitMQ - Uncomment if you need message broker for microservices
   # rabbitmq:
   #   image: rabbitmq:3.11-management-alpine
@@ -75,7 +75,7 @@ services:
   #   volumes:
   #     - rabbitmq_data:/var/lib/rabbitmq
   #   networks:
-  #     - blog_network
+  #     - musecue_network
 
   # Prometheus - Metrics collection
   prometheus:
@@ -96,7 +96,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
-      - blog_network
+      - musecue_network
     restart: unless-stopped
 
   # Loki - Log aggregation
@@ -110,7 +110,7 @@ services:
       - loki_data:/loki
     command: -config.file=/etc/loki/loki-config.yml
     networks:
-      - blog_network
+      - musecue_network
     restart: unless-stopped
 
   # Grafana - Monitoring and visualization
@@ -130,11 +130,11 @@ services:
       - prometheus
       - loki
     networks:
-      - blog_network
+      - musecue_network
     restart: unless-stopped
 
 networks:
-  blog_network:
+  musecue_network:
     driver: bridge
 
 volumes:

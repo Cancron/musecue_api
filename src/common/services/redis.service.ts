@@ -16,6 +16,108 @@ import { Logger } from 'winston';
  */
 @Injectable()
 export class RedisService implements OnModuleInit {
+  /** Security reads must distinguish infrastructure failure from missing data. */
+  async getRequired<T>(key: string): Promise<T | null> {
+    const raw = await this.client.get(key);
+    return raw === null ? null : (JSON.parse(raw) as T);
+  }
+
+  async rotateRefreshToken(input: {
+    oldKey: string;
+    newKey: string;
+    sessionsKey: string;
+    expectedHash: string;
+    oldJti: string;
+    newJti: string;
+    newData: unknown;
+    ttlSeconds: number;
+  }): Promise<boolean> {
+    const result: unknown = await this.client.eval(
+      `
+      local raw = redis.call('GET', KEYS[1])
+      if not raw then return 0 end
+      local old = cjson.decode(raw)
+      if old.tokenHash ~= ARGV[1] then return 0 end
+      local sessions = cjson.decode(redis.call('GET', KEYS[3]) or '[]')
+      local updated = {}
+      for _, jti in ipairs(sessions) do
+        if jti ~= ARGV[2] then table.insert(updated, jti) end
+      end
+      table.insert(updated, ARGV[3])
+      redis.call('SET', KEYS[2], ARGV[4], 'EX', ARGV[5])
+      redis.call('SET', KEYS[3], cjson.encode(updated), 'EX', ARGV[5])
+      redis.call('DEL', KEYS[1])
+      return 1
+    `,
+      3,
+      input.oldKey,
+      input.newKey,
+      input.sessionsKey,
+      input.expectedHash,
+      input.oldJti,
+      input.newJti,
+      JSON.stringify(input.newData),
+      input.ttlSeconds,
+    );
+    return result === 1;
+  }
+
+  async updateSessionList(
+    key: string,
+    jti: string,
+    add: boolean,
+    ttl: number,
+  ): Promise<void> {
+    await this.client.eval(
+      `
+      local sessions = cjson.decode(redis.call('GET', KEYS[1]) or '[]')
+      local updated = {}
+      for _, value in ipairs(sessions) do
+        if value ~= ARGV[1] then table.insert(updated, value) end
+      end
+      if ARGV[2] == '1' then table.insert(updated, ARGV[1]) end
+      if #updated == 0 then redis.call('DEL', KEYS[1])
+      else redis.call('SET', KEYS[1], cjson.encode(updated), 'EX', ARGV[3]) end
+      return 1
+    `,
+      1,
+      key,
+      jti,
+      add ? '1' : '0',
+      ttl,
+    );
+  }
+
+  async pruneRefreshSessions(
+    key: string,
+    tokenPrefix: string,
+    maxDevices: number,
+    ttl: number,
+  ): Promise<void> {
+    // Called after login registers its token. maxDevices=0 revokes all sessions.
+    await this.client.eval(
+      `
+      local sessions = cjson.decode(redis.call('GET', KEYS[1]) or '[]')
+      local maximum = tonumber(ARGV[2])
+      if maximum > 0 and #sessions <= maximum then return 0 end
+      local keep = math.max(0, maximum)
+      local updated = {}
+      for index, jti in ipairs(sessions) do
+        if index <= #sessions - keep then redis.call('DEL', ARGV[1] .. jti)
+        else table.insert(updated, jti) end
+      end
+      if #updated == 0 then redis.call('DEL', KEYS[1])
+      else redis.call('SET', KEYS[1], cjson.encode(updated), 'EX', ARGV[3]) end
+      return 1
+    `,
+      1,
+      key,
+      tokenPrefix,
+      maxDevices,
+      ttl,
+    );
+  }
+
   constructor(
     @Inject(REDIS_CLIENT) private readonly client: RedisType,
     @Inject(WINSTON_MODULE_PROVIDER) private readonly logger: Logger,

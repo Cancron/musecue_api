@@ -3,31 +3,31 @@
 // ================================
 
 model authUser {
-    id           String     @id @default(uuid())
-    email        String     @unique
-    password     String
-    username     String     @unique
-    role         userRole   @default(USER)
-    verified     Boolean    @default(false)
-    status       userStatus @default(ACTIVE)
-    tokenVersion Int        @default(1) // For immediate JWT revocation on security events
-    deletedAt    DateTime?
-    provider     String     @default("local")
-    providerId   String?
-    createdAt    DateTime   @default(now())
-    updatedAt    DateTime   @updatedAt
+  id           String     @id @default(uuid())
+  email        String     @unique
+  password     String
+  username     String     @unique
+  role         userRole   @default(USER)
+  verified     Boolean    @default(false)
+  status       userStatus @default(ACTIVE)
+  tokenVersion Int        @default(1) // For immediate JWT revocation on security events
+  deletedAt    DateTime?
+  provider     String     @default("local")
+  providerId   String?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
 
-    // Relations
-    userProfile       userProfile?
-    authSecurity      authSecurity?
-    loginHistory      loginHistory[]
-    emailHistory      emailHistory[]
-    activityLogEvents ActivityLogEvent[]
-    subscriptions     Subscription[]
-    jobs              Job[]
+  // Relations
+  userProfile       userProfile?
+  authSecurity      authSecurity?
+  loginHistory      loginHistory[]
+  emailHistory      emailHistory[]
+  activityLogEvents ActivityLogEvent[]
+  makeupSessions    MakeupSession[]
+  aiRuns            AiRun[]
 
-    @@index([email, id, providerId])
-    @@index([username])
+  @@index([email, id, providerId])
+  @@index([username])
 }
 
 // ================================
@@ -35,20 +35,20 @@ model authUser {
 // ================================
 
 model authSecurity {
-    id                 String     @id @default(uuid())
-    authId             String     @unique
-    failedAttempts     Int        @default(0)
-    lastFailedAt       DateTime?
-    lockExpiresAt      DateTime?
-    mfaEnabled         Boolean    @default(false)
-    mfaMethod          mfaMethod?
-    mfaSecret          String?
-    createdAt          DateTime   @default(now())
-    updatedAt          DateTime   @updatedAt
-    lastPasswordChange DateTime?
+  id                 String     @id @default(uuid())
+  authId             String     @unique
+  failedAttempts     Int        @default(0)
+  lastFailedAt       DateTime?
+  lockExpiresAt      DateTime?
+  mfaEnabled         Boolean    @default(false)
+  mfaMethod          mfaMethod?
+  mfaSecret          String?
+  createdAt          DateTime   @default(now())
+  updatedAt          DateTime   @updatedAt
+  lastPasswordChange DateTime?
 
-    // Relations
-    authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
+  // Relations
+  authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
 
-    @@index([authId])
+  @@index([authId])
 }

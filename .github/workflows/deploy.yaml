@@ -24,12 +24,12 @@ jobs:
       # build docker image
       - name: Build Docker Image
         run: |
-          docker build -t thepujon/simple_blog_backend:latest .
+          docker build -t thepujon/musecue_api:latest .
 
       # push docker image
       - name: Push Docker Image
         run: |
-          docker push thepujon/simple_blog_backend:latest
+          docker push thepujon/musecue_api:latest
 
         # deploy to EC2
       - name: Deploy to EC2

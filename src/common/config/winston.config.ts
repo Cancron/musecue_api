@@ -33,7 +33,7 @@ if (lokiEnabled) {
       new LokiTransport({
         host: lokiHost,
         labels: {
-          app: 'nestjs-app',
+          app: 'musecue-api',
           environment: process.env.NODE_ENV || 'development',
         },
         json: true,

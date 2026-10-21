@@ -74,7 +74,7 @@
       "pluginVersion": "9.0.0",
       "targets": [
         {
-          "expr": "rate(process_cpu_seconds_total{app=\"nestjs-app\"}[1m]) * 100",
+          "expr": "rate(process_cpu_seconds_total{app=\"musecue-api\"}[1m]) * 100",
           "refId": "A"
         }
       ],
@@ -132,7 +132,7 @@
       },
       "targets": [
         {
-          "expr": "process_resident_memory_bytes{app=\"nestjs-app\"}",
+          "expr": "process_resident_memory_bytes{app=\"musecue-api\"}",
           "refId": "A"
         }
       ],
@@ -190,7 +190,7 @@
       },
       "targets": [
         {
-          "expr": "nodejs_eventloop_lag_seconds{app=\"nestjs-app\"}",
+          "expr": "nodejs_eventloop_lag_seconds{app=\"musecue-api\"}",
           "refId": "A"
         }
       ],
@@ -241,7 +241,7 @@
       },
       "targets": [
         {
-          "expr": "rate(http_requests_total{app=\"nestjs-app\"}[1m])",
+          "expr": "rate(http_requests_total{app=\"musecue-api\"}[1m])",
           "refId": "A"
         }
       ],
@@ -296,7 +296,7 @@
       },
       "targets": [
         {
-          "expr": "rate(http_request_errors_total{app=\"nestjs-app\"}[1m])",
+          "expr": "rate(http_request_errors_total{app=\"musecue-api\"}[1m])",
           "refId": "A"
         }
       ],
@@ -393,22 +393,22 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket{app=\"nestjs-app\"}[5m])) by (le))",
+          "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket{app=\"musecue-api\"}[5m])) by (le))",
           "legendFormat": "p50",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.90, sum(rate(http_request_duration_seconds_bucket{app=\"nestjs-app\"}[5m])) by (le))",
+          "expr": "histogram_quantile(0.90, sum(rate(http_request_duration_seconds_bucket{app=\"musecue-api\"}[5m])) by (le))",
           "legendFormat": "p90",
           "refId": "B"
         },
         {
-          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{app=\"nestjs-app\"}[5m])) by (le))",
+          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{app=\"musecue-api\"}[5m])) by (le))",
           "legendFormat": "p95",
           "refId": "C"
         },
         {
-          "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{app=\"nestjs-app\"}[5m])) by (le))",
+          "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{app=\"musecue-api\"}[5m])) by (le))",
           "legendFormat": "p99",
           "refId": "D"
         }
@@ -493,7 +493,7 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(http_requests_total{app=\"nestjs-app\"}[1m])) by (method)",
+          "expr": "sum(rate(http_requests_total{app=\"musecue-api\"}[1m])) by (method)",
           "legendFormat": "{{method}}",
           "refId": "A"
         }
@@ -578,7 +578,7 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(http_requests_total{app=\"nestjs-app\"}[1m])) by (status_code)",
+          "expr": "sum(rate(http_requests_total{app=\"musecue-api\"}[1m])) by (status_code)",
           "legendFormat": "{{status_code}}",
           "refId": "A"
         }
@@ -663,7 +663,7 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(http_requests_total{app=\"nestjs-app\"}[1m])) by (route)",
+          "expr": "sum(rate(http_requests_total{app=\"musecue-api\"}[1m])) by (route)",
           "legendFormat": "{{route}}",
           "refId": "A"
         }
@@ -761,17 +761,17 @@
       },
       "targets": [
         {
-          "expr": "process_resident_memory_bytes{app=\"nestjs-app\"}",
+          "expr": "process_resident_memory_bytes{app=\"musecue-api\"}",
           "legendFormat": "RSS Memory",
           "refId": "A"
         },
         {
-          "expr": "process_virtual_memory_bytes{app=\"nestjs-app\"}",
+          "expr": "process_virtual_memory_bytes{app=\"musecue-api\"}",
           "legendFormat": "Virtual Memory",
           "refId": "B"
         },
         {
-          "expr": "process_heap_bytes{app=\"nestjs-app\"}",
+          "expr": "process_heap_bytes{app=\"musecue-api\"}",
           "legendFormat": "Heap",
           "refId": "C"
         }
@@ -856,17 +856,17 @@
       },
       "targets": [
         {
-          "expr": "nodejs_heap_size_total_bytes{app=\"nestjs-app\"}",
+          "expr": "nodejs_heap_size_total_bytes{app=\"musecue-api\"}",
           "legendFormat": "Heap Total",
           "refId": "A"
         },
         {
-          "expr": "nodejs_heap_size_used_bytes{app=\"nestjs-app\"}",
+          "expr": "nodejs_heap_size_used_bytes{app=\"musecue-api\"}",
           "legendFormat": "Heap Used",
           "refId": "B"
         },
         {
-          "expr": "nodejs_external_memory_bytes{app=\"nestjs-app\"}",
+          "expr": "nodejs_external_memory_bytes{app=\"musecue-api\"}",
           "legendFormat": "External Memory",
           "refId": "C"
         }
@@ -949,7 +949,7 @@
       },
       "targets": [
         {
-          "expr": "nodejs_heap_space_size_used_bytes{app=\"nestjs-app\"}",
+          "expr": "nodejs_heap_space_size_used_bytes{app=\"musecue-api\"}",
           "legendFormat": "{{space}}",
           "refId": "A"
         }
@@ -1047,27 +1047,27 @@
       },
       "targets": [
         {
-          "expr": "nodejs_eventloop_lag_seconds{app=\"nestjs-app\"}",
+          "expr": "nodejs_eventloop_lag_seconds{app=\"musecue-api\"}",
           "legendFormat": "Current",
           "refId": "A"
         },
         {
-          "expr": "nodejs_eventloop_lag_mean_seconds{app=\"nestjs-app\"}",
+          "expr": "nodejs_eventloop_lag_mean_seconds{app=\"musecue-api\"}",
           "legendFormat": "Mean",
           "refId": "B"
         },
         {
-          "expr": "nodejs_eventloop_lag_p50_seconds{app=\"nestjs-app\"}",
+          "expr": "nodejs_eventloop_lag_p50_seconds{app=\"musecue-api\"}",
           "legendFormat": "p50",
           "refId": "C"
         },
         {
-          "expr": "nodejs_eventloop_lag_p90_seconds{app=\"nestjs-app\"}",
+          "expr": "nodejs_eventloop_lag_p90_seconds{app=\"musecue-api\"}",
           "legendFormat": "p90",
           "refId": "D"
         },
         {
-          "expr": "nodejs_eventloop_lag_p99_seconds{app=\"nestjs-app\"}",
+          "expr": "nodejs_eventloop_lag_p99_seconds{app=\"musecue-api\"}",
           "legendFormat": "p99",
           "refId": "E"
         }
@@ -1150,7 +1150,7 @@
       },
       "targets": [
         {
-          "expr": "nodejs_active_resources{app=\"nestjs-app\"}",
+          "expr": "nodejs_active_resources{app=\"musecue-api\"}",
           "legendFormat": "{{type}}",
           "refId": "A"
         }
@@ -1233,7 +1233,7 @@
       },
       "targets": [
         {
-          "expr": "nodejs_active_resources_total{app=\"nestjs-app\"}",
+          "expr": "nodejs_active_resources_total{app=\"musecue-api\"}",
           "legendFormat": "Total Resources",
           "refId": "A"
         }
@@ -1316,7 +1316,7 @@
       },
       "targets": [
         {
-          "expr": "nodejs_active_handles_total{app=\"nestjs-app\"}",
+          "expr": "nodejs_active_handles_total{app=\"musecue-api\"}",
           "legendFormat": "Total Handles",
           "refId": "A"
         }
@@ -1399,7 +1399,7 @@
       },
       "targets": [
         {
-          "expr": "nodejs_active_requests_total{app=\"nestjs-app\"}",
+          "expr": "nodejs_active_requests_total{app=\"musecue-api\"}",
           "legendFormat": "Total Requests",
           "refId": "A"
         }
@@ -1497,17 +1497,17 @@
       },
       "targets": [
         {
-          "expr": "rate(process_cpu_user_seconds_total{app=\"nestjs-app\"}[1m]) * 100",
+          "expr": "rate(process_cpu_user_seconds_total{app=\"musecue-api\"}[1m]) * 100",
           "legendFormat": "User CPU",
           "refId": "A"
         },
         {
-          "expr": "rate(process_cpu_system_seconds_total{app=\"nestjs-app\"}[1m]) * 100",
+          "expr": "rate(process_cpu_system_seconds_total{app=\"musecue-api\"}[1m]) * 100",
           "legendFormat": "System CPU",
           "refId": "B"
         },
         {
-          "expr": "rate(process_cpu_seconds_total{app=\"nestjs-app\"}[1m]) * 100",
+          "expr": "rate(process_cpu_seconds_total{app=\"musecue-api\"}[1m]) * 100",
           "legendFormat": "Total CPU",
           "refId": "C"
         }
@@ -1592,12 +1592,12 @@
       },
       "targets": [
         {
-          "expr": "process_open_fds{app=\"nestjs-app\"}",
+          "expr": "process_open_fds{app=\"musecue-api\"}",
           "legendFormat": "Open FDs",
           "refId": "A"
         },
         {
-          "expr": "process_max_fds{app=\"nestjs-app\"}",
+          "expr": "process_max_fds{app=\"musecue-api\"}",
           "legendFormat": "Max FDs",
           "refId": "B"
         }
@@ -1695,7 +1695,7 @@
       },
       "targets": [
         {
-          "expr": "rate(nodejs_gc_duration_seconds_count{app=\"nestjs-app\"}[1m])",
+          "expr": "rate(nodejs_gc_duration_seconds_count{app=\"musecue-api\"}[1m])",
           "legendFormat": "{{kind}} GC",
           "refId": "A"
         }
@@ -1780,7 +1780,7 @@
       },
       "targets": [
         {
-          "expr": "rate(nodejs_gc_duration_seconds_sum{app=\"nestjs-app\"}[1m]) / rate(nodejs_gc_duration_seconds_count{app=\"nestjs-app\"}[1m])",
+          "expr": "rate(nodejs_gc_duration_seconds_sum{app=\"musecue-api\"}[1m]) / rate(nodejs_gc_duration_seconds_count{app=\"musecue-api\"}[1m])",
           "legendFormat": "{{kind}} GC Duration",
           "refId": "A"
         }
@@ -1876,7 +1876,7 @@
       },
       "targets": [
         {
-          "expr": "active_users_total{app=\"nestjs-app\"}",
+          "expr": "active_users_total{app=\"musecue-api\"}",
           "legendFormat": "Active Users",
           "refId": "A"
         }
@@ -1920,7 +1920,7 @@
       },
       "targets": [
         {
-          "expr": "{app=\"nestjs-app\"}",
+          "expr": "{app=\"musecue-api\"}",
           "refId": "A"
         }
       ],
@@ -2002,7 +2002,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (level) (count_over_time({app=\"nestjs-app\"} [1m]))",
+          "expr": "sum by (level) (count_over_time({app=\"musecue-api\"} [1m]))",
           "legendFormat": "{{level}}",
           "refId": "A"
         }
@@ -2085,7 +2085,7 @@
       },
       "targets": [
         {
-          "expr": "sum(count_over_time({app=\"nestjs-app\", level=\"error\"} [5m]))",
+          "expr": "sum(count_over_time({app=\"musecue-api\", level=\"error\"} [5m]))",
           "legendFormat": "Error Count",
           "refId": "A"
         }
@@ -2116,7 +2116,7 @@
       },
       "targets": [
         {
-          "expr": "{app=\"nestjs-app\", level=\"error\"}",
+          "expr": "{app=\"musecue-api\", level=\"error\"}",
           "refId": "A"
         }
       ],
@@ -2146,7 +2146,7 @@
       },
       "targets": [
         {
-          "expr": "{app=\"nestjs-app\", level=\"warn\"}",
+          "expr": "{app=\"musecue-api\", level=\"warn\"}",
           "refId": "A"
         }
       ],
@@ -2176,7 +2176,7 @@
       },
       "targets": [
         {
-          "expr": "{app=\"nestjs-app\"} |~ \"(?i)(auth|login|register|token)\"",
+          "expr": "{app=\"musecue-api\"} |~ \"(?i)(auth|login|register|token)\"",
           "refId": "A"
         }
       ],
@@ -2188,7 +2188,7 @@
   "schemaVersion": 38,
   "style": "dark",
   "tags": [
-    "nestjs",
+    "musecue",
     "nodejs",
     "prometheus",
     "monitoring"
@@ -2202,7 +2202,7 @@
   },
   "timepicker": {},
   "timezone": "browser",
-  "title": "NestJS Complete Monitoring Dashboard",
-  "uid": "nestjs-complete-monitoring",
+  "title": "MuseCue API Monitoring Dashboard",
+  "uid": "musecue-api-monitoring",
   "version": 1
 }

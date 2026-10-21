@@ -12,13 +12,7 @@ import * as bcrypt from 'bcryptjs';
 // Mock the AUTH_CONFIG to use numeric values for VERIFICATION
 jest.mock('./config/auth.config', () => ({
   AUTH_CONFIG: {
-    PASSWORD_MIN_LENGTH: 8,
-    PASSWORD_REQUIREMENTS: {
-      UPPERCASE: true,
-      LOWERCASE: true,
-      NUMBERS: true,
-      SPECIAL_CHARS: true,
-    },
+    PASSWORD_MIN_LENGTH: 6,
     TOKEN_EXPIRY: {
       ACCESS: '15m',
       REFRESH: '7d',
@@ -238,7 +232,7 @@ describe('AuthService', () => {
       authUtilsService.validatePassword.mockReturnValue(false);
 
       await expect(service.create(createAuthDto, meta)).rejects.toThrow(
-        'Password does not meet security requirements',
+        'Password must be at least 6 characters',
       );
 
       expect(authUtilsService.validatePassword).toHaveBeenCalledWith(

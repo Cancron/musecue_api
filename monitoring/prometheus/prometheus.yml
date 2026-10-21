@@ -9,7 +9,7 @@ scrape_configs:
       - targets: ['localhost:9090']
 
   # NestJS application metrics
-  - job_name: 'nestjs-app'
+  - job_name: 'musecue-api'
     static_configs:
       - targets: ['host.docker.internal:5000']
     metrics_path: '/metrics'

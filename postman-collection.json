@@ -1,1150 +1,1058 @@
 {
-    "info": {
-        "name": "NestJS Prisma Postgres API",
-        "_postman_id": "nestjs-prisma-postgres-api",
-        "description": "Complete API collection for NestJS Prisma Postgres Starter with Google OAuth support",
-        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
-    },
-    "auth": {
-        "type": "bearer",
-        "bearer": [
-            {
-                "key": "token",
-                "value": "{{access_token}}",
-                "type": "string"
-            }
-        ]
-    },
-    "variable": [
-        {
-            "key": "base_url",
-            "value": "http://localhost:5000",
-            "type": "string"
-        },
-        {
-            "key": "access_token",
-            "value": "",
-            "type": "string"
-        },
-        {
-            "key": "refresh_token",
-            "value": "",
-            "type": "string"
-        },
-        {
-            "key": "user_id",
-            "value": "",
-            "type": "string"
-        },
-        {
-            "key": "test_email",
-            "value": "test@example.com",
-            "type": "string"
-        },
-        {
-            "key": "test_username",
-            "value": "testuser",
-            "type": "string"
-        },
-        {
-            "key": "test_password",
-            "value": "Test@123456",
-            "type": "string"
-        },
-        {
-            "key": "verification_code",
-            "value": "",
-            "type": "string"
-        },
-        {
-            "key": "google_auth_url",
-            "value": "",
-            "type": "string"
-        },
-        {
-            "key": "google_state",
-            "value": "",
-            "type": "string"
-        },
-        {
-            "key": "google_code",
-            "value": "",
-            "type": "string"
-        }
-    ],
-    "item": [
-        {
-            "name": "Root",
-            "item": [
-                {
-                    "name": "Health Check",
-                    "event": [
-                        {
-                            "listen": "test",
-                            "script": {
-                                "exec": [
-                                    "pm.test('Status code is 200', function () {",
-                                    "    pm.response.to.have.status(200);",
-                                    "});",
-                                    "",
-                                    "pm.test('Response contains hello message', function () {",
-                                    "    var jsonData = pm.response.json();",
-                                    "    pm.expect(jsonData).to.have.property('data');",
-                                    "});"
-                                ],
-                                "type": "text/javascript"
-                            }
-                        }
-                    ],
-                    "request": {
-                        "auth": {
-                            "type": "noauth"
-                        },
-                        "method": "GET",
-                        "header": [],
-                        "url": {
-                            "raw": "{{base_url}}/",
-                            "host": [
-                                "{{base_url}}"
-                            ],
-                            "path": [
-                                ""
-                            ]
-                        },
-                        "description": "Basic health check endpoint to verify API is running"
-                    },
-                    "response": []
-                }
-            ]
-        },
-        {
-            "name": "Auth",
-            "item": [
-                {
-                    "name": "Local Auth",
-                    "item": [
-                        {
-                            "name": "Register User",
-                            "event": [
-                                {
-                                    "listen": "test",
-                                    "script": {
-                                        "exec": [
-                                            "pm.test('Status code is 200 or 201', function () {",
-                                            "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
-                                            "});",
-                                            "",
-                                            "if (pm.response.code === 200 || pm.response.code === 201) {",
-                                            "    var jsonData = pm.response.json();",
-                                            "    ",
-                                            "    pm.test('Response contains success', function () {",
-                                            "        pm.expect(jsonData).to.have.property('success');",
-                                            "    });",
-                                            "    ",
-                                            "    if (jsonData.data && jsonData.data.id) {",
-                                            "        pm.collectionVariables.set('user_id', jsonData.data.id);",
-                                            "    }",
-                                            "}"
-                                        ],
-                                        "type": "text/javascript"
-                                    }
-                                },
-                                {
-                                    "listen": "prerequest",
-                                    "script": {
-                                        "exec": [
-                                            "// Generate random email for testing",
-                                            "const timestamp = Date.now();",
-                                            "const randomEmail = `test${timestamp}@example.com`;",
-                                            "const randomUsername = `testuser${timestamp}`;",
-                                            "pm.collectionVariables.set('test_email', randomEmail);",
-                                            "pm.collectionVariables.set('test_username', randomUsername);"
-                                        ],
-                                        "type": "text/javascript"
-                                    }
-                                }
-                            ],
-                            "request": {
-                                "auth": {
-                                    "type": "noauth"
-                                },
-                                "method": "POST",
-                                "header": [
-                                    {
-                                        "key": "Content-Type",
-                                        "value": "application/json"
-                                    },
-                                    {
-                                        "key": "x-device",
-                                        "value": "postman-test",
-                                        "type": "text"
-                                    }
-                                ],
-                                "body": {
-                                    "mode": "raw",
-                                    "raw": "{\n  \"username\": \"{{test_username}}\",\n  \"password\": \"{{test_password}}\",\n  \"email\": \"{{test_email}}\"\n}"
-                                },
-                                "url": {
-                                    "raw": "{{base_url}}/auth",
-                                    "host": [
-                                        "{{base_url}}"
-                                    ],
-                                    "path": [
-                                        "auth"
-                                    ]
-                                },
-                                "description": "Register a new user account. Password must meet security requirements: min 8 characters, uppercase, lowercase, number, special character."
-                            },
-                            "response": []
-                        },
-                        {
-                            "name": "Verify Email",
-                            "event": [
-                                {
-                                    "listen": "test",
-                                    "script": {
-                                        "exec": [
-                                            "pm.test('Status code is 200 or 201', function () {",
-                                            "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
-                                            "});",
-                                            "",
-                                            "if (pm.response.code === 200 || pm.response.code === 201) {",
-                                            "    var jsonData = pm.response.json();",
-                                            "    ",
-                                            "    pm.test('Response contains success', function () {",
-                                            "        pm.expect(jsonData).to.have.property('success');",
-                                            "    });",
-                                            "}"
-                                        ],
-                                        "type": "text/javascript"
-                                    }
-                                }
-                            ],
-                            "request": {
-                                "auth": {
-                                    "type": "noauth"
-                                },
-                                "method": "POST",
-                                "header": [
-                                    {
-                                        "key": "Content-Type",
-                                        "value": "application/json"
-                                    }
-                                ],
-                                "body": {
-                                    "mode": "raw",
-                                    "raw": "{\n  \"email\": \"{{test_email}}\",\n  \"code\": \"{{verification_code}}\"\n}"
-                                },
-                                "url": {
-                                    "raw": "{{base_url}}/auth/verify-email",
-                                    "host": [
-                                        "{{base_url}}"
-                                    ],
-                                    "path": [
-                                        "auth",
-                                        "verify-email"
-                                    ]
-                                },
-                                "description": "Verify user email with verification code. Note: You need to check your email or logs for the verification code and update the 'verification_code' variable."
-                            },
-                            "response": []
-                        },
-                        {
-                            "name": "Resend Verification Email",
-                            "event": [
-                                {
-                                    "listen": "test",
-                                    "script": {
-                                        "exec": [
-                                            "pm.test('Status code is 200 or 201', function () {",
-                                            "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
-                                            "});",
-                                            "",
-                                            "pm.test('Response contains success', function () {",
-                                            "    var jsonData = pm.response.json();",
-                                            "    pm.expect(jsonData).to.have.property('success');",
-                                            "});"
-                                        ],
-                                        "type": "text/javascript"
-                                    }
-                                }
-                            ],
-                            "request": {
-                                "auth": {
-                                    "type": "noauth"
-                                },
-                                "method": "POST",
-                                "header": [
-                                    {
-                                        "key": "Content-Type",
-                                        "value": "application/json"
-                                    }
-                                ],
-                                "body": {
-                                    "mode": "raw",
-                                    "raw": "{\n  \"email\": \"{{test_email}}\"\n}"
-                                },
-                                "url": {
-                                    "raw": "{{base_url}}/auth/resend-verification-email",
-                                    "host": [
-                                        "{{base_url}}"
-                                    ],
-                                    "path": [
-                                        "auth",
-                                        "resend-verification-email"
-                                    ]
-                                },
-                                "description": "Resend verification email to user. Rate limited to 3 attempts per 15 minutes."
-                            },
-                            "response": []
-                        },
-                        {
-                            "name": "Login",
-                            "event": [
-                                {
-                                    "listen": "test",
-                                    "script": {
-                                        "exec": [
-                                            "pm.test('Status code is 200 or 201', function () {",
-                                            "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
-                                            "});",
-                                            "",
-                                            "if (pm.response.code === 200 || pm.response.code === 201) {",
-                                            "    var jsonData = pm.response.json();",
-                                            "    ",
-                                            "    pm.test('Response contains success', function () {",
-                                            "        pm.expect(jsonData).to.have.property('success');",
-                                            "    });",
-                                            "    ",
-                                            "    pm.test('Response contains tokens', function () {",
-                                            "        pm.expect(jsonData.data).to.have.property('accessToken');",
-                                            "        pm.expect(jsonData.data).to.have.property('refreshToken');",
-                                            "    });",
-                                            "    ",
-                                            "    if (jsonData.data) {",
-                                            "        pm.collectionVariables.set('access_token', jsonData.data.accessToken);",
-                                            "        pm.collectionVariables.set('refresh_token', jsonData.data.refreshToken);",
-                                            "        if (jsonData.data.user && jsonData.data.user.id) {",
-                                            "            pm.collectionVariables.set('user_id', jsonData.data.user.id);",
-                                            "        }",
-                                            "    }",
-                                            "}"
-                                        ],
-                                        "type": "text/javascript"
-                                    }
-                                }
-                            ],
-                            "request": {
-                                "auth": {
-                                    "type": "noauth"
-                                },
-                                "method": "POST",
-                                "header": [
-                                    {
-                                        "key": "Content-Type",
-                                        "value": "application/json"
-                                    },
-                                    {
-                                        "key": "x-device",
-                                        "value": "postman-test",
-                                        "type": "text"
-                                    }
-                                ],
-                                "body": {
-                                    "mode": "raw",
-                                    "raw": "{\n  \"email\": \"{{test_email}}\",\n  \"password\": \"{{test_password}}\"\n}"
-                                },
-                                "url": {
-                                    "raw": "{{base_url}}/auth/login",
-                                    "host": [
-                                        "{{base_url}}"
-                                    ],
-                                    "path": [
-                                        "auth",
-                                        "login"
-                                    ]
-                                },
-                                "description": "Login with email and password. Returns access token (15 min) and refresh token (7 days). Automatically saves tokens to collection variables."
-                            },
-                            "response": []
-                        },
-                        {
-                            "name": "Refresh Token",
-                            "event": [
-                                {
-                                    "listen": "test",
-                                    "script": {
-                                        "exec": [
-                                            "pm.test('Status code is 200 or 201', function () {",
-                                            "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
-                                            "});",
-                                            "",
-                                            "if (pm.response.code === 200 || pm.response.code === 201) {",
-                                            "    var jsonData = pm.response.json();",
-                                            "    ",
-                                            "    pm.test('Response contains new tokens', function () {",
-                                            "        pm.expect(jsonData.data).to.have.property('accessToken');",
-                                            "        pm.expect(jsonData.data).to.have.property('refreshToken');",
-                                            "    });",
-                                            "    ",
-                                            "    if (jsonData.data) {",
-                                            "        pm.collectionVariables.set('access_token', jsonData.data.accessToken);",
-                                            "        pm.collectionVariables.set('refresh_token', jsonData.data.refreshToken);",
-                                            "    }",
-                                            "}"
-                                        ],
-                                        "type": "text/javascript"
-                                    }
-                                }
-                            ],
-                            "request": {
-                                "auth": {
-                                    "type": "noauth"
-                                },
-                                "method": "POST",
-                                "header": [
-                                    {
-                                        "key": "Content-Type",
-                                        "value": "application/json"
-                                    },
-                                    {
-                                        "key": "x-device",
-                                        "value": "postman-test",
-                                        "type": "text"
-                                    }
-                                ],
-                                "body": {
-                                    "mode": "raw",
-                                    "raw": "{\n  \"refreshToken\": \"{{refresh_token}}\"\n}"
-                                },
-                                "url": {
-                                    "raw": "{{base_url}}/auth/refresh-token",
-                                    "host": [
-                                        "{{base_url}}"
-                                    ],
-                                    "path": [
-                                        "auth",
-                                        "refresh-token"
-                                    ]
-                                },
-                                "description": "Refresh access token using refresh token. Implements token rotation - old refresh token is invalidated and new one is issued."
-                            },
-                            "response": []
-                        },
-                        {
-                            "name": "Logout",
-                            "event": [
-                                {
-                                    "listen": "test",
-                                    "script": {
-                                        "exec": [
-                                            "pm.test('Status code is 200', function () {",
-                                            "    pm.response.to.have.status(200);",
-                                            "});",
-                                            "",
-                                            "pm.test('Response contains success', function () {",
-                                            "    var jsonData = pm.response.json();",
-                                            "    pm.expect(jsonData).to.have.property('success');",
-                                            "});",
-                                            "",
-                                            "// Clear tokens after logout",
-                                            "pm.collectionVariables.set('access_token', '');",
-                                            "pm.collectionVariables.set('refresh_token', '');"
-                                        ],
-                                        "type": "text/javascript"
-                                    }
-                                }
-                            ],
-                            "request": {
-                                "auth": {
-                                    "type": "noauth"
-                                },
-                                "method": "POST",
-                                "header": [
-                                    {
-                                        "key": "Content-Type",
-                                        "value": "application/json"
-                                    }
-                                ],
-                                "body": {
-                                    "mode": "raw",
-                                    "raw": "{\n  \"refreshToken\": \"{{refresh_token}}\"\n}"
-                                },
-                                "url": {
-                                    "raw": "{{base_url}}/auth/logout",
-                                    "host": [
-                                        "{{base_url}}"
-                                    ],
-                                    "path": [
-                                        "auth",
-                                        "logout"
-                                    ]
-                                },
-                                "description": "Logout current session. Invalidates the refresh token."
-                            },
-                            "response": []
-                        },
-                        {
-                            "name": "Logout All Devices",
-                            "event": [
-                                {
-                                    "listen": "test",
-                                    "script": {
-                                        "exec": [
-                                            "pm.test('Status code is 200', function () {",
-                                            "    pm.response.to.have.status(200);",
-                                            "});",
-                                            "",
-                                            "pm.test('Response contains success', function () {",
-                                            "    var jsonData = pm.response.json();",
-                                            "    pm.expect(jsonData).to.have.property('success');",
-                                            "});",
-                                            "",
-                                            "// Clear tokens after logout",
-                                            "pm.collectionVariables.set('access_token', '');",
-                                            "pm.collectionVariables.set('refresh_token', '');"
-                                        ],
-                                        "type": "text/javascript"
-                                    }
-                                }
-                            ],
-                            "request": {
-                                "auth": {
-                                    "type": "noauth"
-                                },
-                                "method": "POST",
-                                "header": [
-                                    {
-                                        "key": "Content-Type",
-                                        "value": "application/json"
-                                    }
-                                ],
-                                "body": {
-                                    "mode": "raw",
-                                    "raw": "{\n  \"userId\": \"{{user_id}}\"\n}"
-                                },
-                                "url": {
-                                    "raw": "{{base_url}}/auth/logout-all",
-                                    "host": [
-                                        "{{base_url}}"
-                                    ],
-                                    "path": [
-                                        "auth",
-                                        "logout-all"
-                                    ]
-                                },
-                                "description": "Logout from all devices. Invalidates all refresh tokens for the user."
-                            },
-                            "response": []
-                        }
-                    ]
-                },
-                {
-                    "name": "Google OAuth",
-                    "item": [
-                        {
-                            "name": "1. Get Google Auth URL",
-                            "event": [
-                                {
-                                    "listen": "test",
-                                    "script": {
-                                        "exec": [
-                                            "pm.test('Status code is 200', function () {",
-                                            "    pm.response.to.have.status(200);",
-                                            "});",
-                                            "",
-                                            "var jsonData = pm.response.json();",
-                                            "",
-                                            "pm.test('Response contains url', function () {",
-                                            "    pm.expect(jsonData).to.have.property('url');",
-                                            "});",
-                                            "",
-                                            "pm.test('Response contains state', function () {",
-                                            "    pm.expect(jsonData).to.have.property('state');",
-                                            "});",
-                                            "",
-                                            "pm.test('URL is Google OAuth URL', function () {",
-                                            "    pm.expect(jsonData.url).to.include('accounts.google.com');",
-                                            "});",
-                                            "",
-                                            "// Save state and URL for next step",
-                                            "if (jsonData.url) {",
-                                            "    pm.collectionVariables.set('google_auth_url', jsonData.url);",
-                                            "}",
-                                            "if (jsonData.state) {",
-                                            "    pm.collectionVariables.set('google_state', jsonData.state);",
-                                            "}",
-                                            "",
-                                            "console.log('\\n=== NEXT STEPS ===' );",
-                                            "console.log('1. Copy the URL from response');",
-                                            "console.log('2. Open it in browser');",
-                                            "console.log('3. Sign in with Google');",
-                                            "console.log('4. Copy the \"code\" parameter from redirect URL');",
-                                            "console.log('5. Set \"google_code\" variable with the code');",
-                                            "console.log('6. Run \"2. Google OAuth Callback\" request');"
-                                        ],
-                                        "type": "text/javascript"
-                                    }
-                                }
-                            ],
-                            "request": {
-                                "auth": {
-                                    "type": "noauth"
-                                },
-                                "method": "GET",
-                                "header": [],
-                                "url": {
-                                    "raw": "{{base_url}}/auth/google",
-                                    "host": [
-                                        "{{base_url}}"
-                                    ],
-                                    "path": [
-                                        "auth",
-                                        "google"
-                                    ]
-                                },
-                                "description": "Initiates Google OAuth flow. Returns authorization URL that user should be redirected to.\n\n**How to test:**\n1. Send this request\n2. Copy the `url` from response\n3. Open URL in browser\n4. Sign in with Google account\n5. Google will redirect to callback URL with `code` and `state` parameters\n6. Copy the `code` parameter from the redirect URL\n7. Use the \"Google OAuth Callback (POST)\" request with the code"
-                            },
-                            "response": []
-                        },
-                        {
-                            "name": "1b. Get Google Auth URL (with redirect)",
-                            "event": [
-                                {
-                                    "listen": "test",
-                                    "script": {
-                                        "exec": [
-                                            "pm.test('Status code is 200', function () {",
-                                            "    pm.response.to.have.status(200);",
-                                            "});",
-                                            "",
-                                            "var jsonData = pm.response.json();",
-                                            "",
-                                            "pm.test('Response contains url', function () {",
-                                            "    pm.expect(jsonData).to.have.property('url');",
-                                            "});",
-                                            "",
-                                            "pm.test('Response contains state', function () {",
-                                            "    pm.expect(jsonData).to.have.property('state');",
-                                            "});",
-                                            "",
-                                            "// Save state and URL for next step",
-                                            "if (jsonData.url) {",
-                                            "    pm.collectionVariables.set('google_auth_url', jsonData.url);",
-                                            "}",
-                                            "if (jsonData.state) {",
-                                            "    pm.collectionVariables.set('google_state', jsonData.state);",
-                                            "}"
-                                        ],
-                                        "type": "text/javascript"
-                                    }
-                                }
-                            ],
-                            "request": {
-                                "auth": {
-                                    "type": "noauth"
-                                },
-                                "method": "GET",
-                                "header": [],
-                                "url": {
-                                    "raw": "{{base_url}}/auth/google?redirectUrl=http://localhost:3000/dashboard",
-                                    "host": [
-                                        "{{base_url}}"
-                                    ],
-                                    "path": [
-                                        "auth",
-                                        "google"
-                                    ],
-                                    "query": [
-                                        {
-                                            "key": "redirectUrl",
-                                            "value": "http://localhost:3000/dashboard",
-                                            "description": "Optional: URL to redirect user after successful authentication"
-                                        }
-                                    ]
-                                },
-                                "description": "Initiates Google OAuth flow with custom redirect URL. The redirectUrl is stored and can be used by your frontend after successful authentication."
-                            },
-                            "response": []
-                        },
-                        {
-                            "name": "2. Google OAuth Callback (POST)",
-                            "event": [
-                                {
-                                    "listen": "test",
-                                    "script": {
-                                        "exec": [
-                                            "pm.test('Status code is 200 or 201', function () {",
-                                            "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
-                                            "});",
-                                            "",
-                                            "var jsonData = pm.response.json();",
-                                            "",
-                                            "pm.test('Response contains success', function () {",
-                                            "    pm.expect(jsonData).to.have.property('success');",
-                                            "});",
-                                            "",
-                                            "if (jsonData.success && jsonData.data) {",
-                                            "    pm.test('Response contains tokens', function () {",
-                                            "        pm.expect(jsonData.data).to.have.property('accessToken');",
-                                            "        pm.expect(jsonData.data).to.have.property('refreshToken');",
-                                            "    });",
-                                            "    ",
-                                            "    pm.test('Response contains user', function () {",
-                                            "        pm.expect(jsonData.data).to.have.property('user');",
-                                            "        pm.expect(jsonData.data.user).to.have.property('provider', 'google');",
-                                            "    });",
-                                            "    ",
-                                            "    pm.test('Response indicates if new user', function () {",
-                                            "        pm.expect(jsonData.data).to.have.property('isNewUser');",
-                                            "    });",
-                                            "    ",
-                                            "    // Save tokens",
-                                            "    pm.collectionVariables.set('access_token', jsonData.data.accessToken);",
-                                            "    pm.collectionVariables.set('refresh_token', jsonData.data.refreshToken);",
-                                            "    if (jsonData.data.user && jsonData.data.user.id) {",
-                                            "        pm.collectionVariables.set('user_id', jsonData.data.user.id);",
-                                            "    }",
-                                            "    ",
-                                            "    console.log('User: ' + JSON.stringify(jsonData.data.user, null, 2));",
-                                            "    console.log('Is New User: ' + jsonData.data.isNewUser);",
-                                            "}"
-                                        ],
-                                        "type": "text/javascript"
-                                    }
-                                }
-                            ],
-                            "request": {
-                                "auth": {
-                                    "type": "noauth"
-                                },
-                                "method": "POST",
-                                "header": [
-                                    {
-                                        "key": "Content-Type",
-                                        "value": "application/json"
-                                    },
-                                    {
-                                        "key": "x-device",
-                                        "value": "postman-test",
-                                        "type": "text"
-                                    }
-                                ],
-                                "body": {
-                                    "mode": "raw",
-                                    "raw": "{\n  \"code\": \"{{google_code}}\",\n  \"state\": \"{{google_state}}\"\n}"
-                                },
-                                "url": {
-                                    "raw": "{{base_url}}/auth/google/callback",
-                                    "host": [
-                                        "{{base_url}}"
-                                    ],
-                                    "path": [
-                                        "auth",
-                                        "google",
-                                        "callback"
-                                    ]
-                                },
-                                "description": "Exchange Google authorization code for tokens. Use this after user authenticates with Google.\n\n**Before running:**\n1. Run \"Get Google Auth URL\" first\n2. Open the returned URL in browser\n3. Sign in with Google\n4. Copy the `code` from the redirect URL\n5. Set the `google_code` collection variable\n6. The `google_state` is automatically set from step 1\n\n**Response:**\n- `accessToken`: Short-lived JWT for API access (15 min)\n- `refreshToken`: Long-lived token for getting new access tokens (7 days)\n- `user`: User profile data\n- `isNewUser`: true if account was just created"
-                            },
-                            "response": []
-                        },
-                        {
-                            "name": "2b. Google OAuth Callback (GET)",
-                            "event": [
-                                {
-                                    "listen": "test",
-                                    "script": {
-                                        "exec": [
-                                            "pm.test('Status code is 200 or 201', function () {",
-                                            "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
-                                            "});",
-                                            "",
-                                            "var jsonData = pm.response.json();",
-                                            "",
-                                            "if (jsonData.success && jsonData.data) {",
-                                            "    pm.collectionVariables.set('access_token', jsonData.data.accessToken);",
-                                            "    pm.collectionVariables.set('refresh_token', jsonData.data.refreshToken);",
-                                            "    if (jsonData.data.user && jsonData.data.user.id) {",
-                                            "        pm.collectionVariables.set('user_id', jsonData.data.user.id);",
-                                            "    }",
-                                            "}"
-                                        ],
-                                        "type": "text/javascript"
-                                    }
-                                }
-                            ],
-                            "request": {
-                                "auth": {
-                                    "type": "noauth"
-                                },
-                                "method": "GET",
-                                "header": [
-                                    {
-                                        "key": "x-device",
-                                        "value": "postman-test",
-                                        "type": "text"
-                                    }
-                                ],
-                                "url": {
-                                    "raw": "{{base_url}}/auth/google/callback?code={{google_code}}&state={{google_state}}",
-                                    "host": [
-                                        "{{base_url}}"
-                                    ],
-                                    "path": [
-                                        "auth",
-                                        "google",
-                                        "callback"
-                                    ],
-                                    "query": [
-                                        {
-                                            "key": "code",
-                                            "value": "{{google_code}}",
-                                            "description": "Authorization code from Google"
-                                        },
-                                        {
-                                            "key": "state",
-                                            "value": "{{google_state}}",
-                                            "description": "State parameter for CSRF protection"
-                                        }
-                                    ]
-                                },
-                                "description": "GET endpoint for Google OAuth callback. This is the URL Google redirects to after user authentication. Typically used in browser-based flows."
-                            },
-                            "response": []
-                        }
-                    ],
-                    "description": "Google OAuth 2.0 authentication flow with PKCE (Proof Key for Code Exchange) support.\n\n**Flow:**\n1. Call \"Get Google Auth URL\" to get authorization URL\n2. Redirect user to the URL (or open in browser for testing)\n3. User signs in with Google\n4. Google redirects back with `code` and `state` parameters\n5. Call callback endpoint with code and state to get tokens"
-                }
-            ]
-        },
-        {
-            "name": "User",
-            "item": [
-                {
-                    "name": "Create User",
-                    "event": [
-                        {
-                            "listen": "test",
-                            "script": {
-                                "exec": [
-                                    "pm.test('Status code is 200 or 201', function () {",
-                                    "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
-                                    "});",
-                                    "",
-                                    "if (pm.response.code === 200 || pm.response.code === 201) {",
-                                    "    var jsonData = pm.response.json();",
-                                    "    ",
-                                    "    pm.test('Response contains data', function () {",
-                                    "        pm.expect(jsonData).to.have.property('data');",
-                                    "    });",
-                                    "    ",
-                                    "    if (jsonData.data && jsonData.data.id) {",
-                                    "        pm.collectionVariables.set('user_id', jsonData.data.id);",
-                                    "    }",
-                                    "}"
-                                ],
-                                "type": "text/javascript"
-                            }
-                        }
-                    ],
-                    "request": {
-                        "method": "POST",
-                        "header": [
-                            {
-                                "key": "Content-Type",
-                                "value": "application/json"
-                            }
-                        ],
-                        "body": {
-                            "mode": "raw",
-                            "raw": "{}"
-                        },
-                        "url": {
-                            "raw": "{{base_url}}/user",
-                            "host": [
-                                "{{base_url}}"
-                            ],
-                            "path": [
-                                "user"
-                            ]
-                        },
-                        "description": "Create a new user"
-                    },
-                    "response": []
-                },
-                {
-                    "name": "Get All Users",
-                    "event": [
-                        {
-                            "listen": "test",
-                            "script": {
-                                "exec": [
-                                    "pm.test('Status code is 200', function () {",
-                                    "    pm.response.to.have.status(200);",
-                                    "});",
-                                    "",
-                                    "pm.test('Response contains data', function () {",
-                                    "    var jsonData = pm.response.json();",
-                                    "    pm.expect(jsonData).to.have.property('data');",
-                                    "});",
-                                    "",
-                                    "// Save first user ID for subsequent requests if available",
-                                    "if (pm.response.code === 200) {",
-                                    "    var jsonData = pm.response.json();",
-                                    "    if (jsonData.data && Array.isArray(jsonData.data) && jsonData.data.length > 0) {",
-                                    "        if (jsonData.data[0].id) {",
-                                    "            pm.collectionVariables.set('user_id', jsonData.data[0].id);",
-                                    "        }",
-                                    "    }",
-                                    "}"
-                                ],
-                                "type": "text/javascript"
-                            }
-                        }
-                    ],
-                    "request": {
-                        "method": "GET",
-                        "header": [],
-                        "url": {
-                            "raw": "{{base_url}}/user",
-                            "host": [
-                                "{{base_url}}"
-                            ],
-                            "path": [
-                                "user"
-                            ]
-                        },
-                        "description": "Get all users"
-                    },
-                    "response": []
-                },
-                {
-                    "name": "Get User by ID",
-                    "event": [
-                        {
-                            "listen": "test",
-                            "script": {
-                                "exec": [
-                                    "pm.test('Status code is 200', function () {",
-                                    "    pm.response.to.have.status(200);",
-                                    "});",
-                                    "",
-                                    "pm.test('Response contains user data', function () {",
-                                    "    var jsonData = pm.response.json();",
-                                    "    pm.expect(jsonData).to.have.property('data');",
-                                    "});"
-                                ],
-                                "type": "text/javascript"
-                            }
-                        }
-                    ],
-                    "request": {
-                        "method": "GET",
-                        "header": [],
-                        "url": {
-                            "raw": "{{base_url}}/user/{{user_id}}",
-                            "host": [
-                                "{{base_url}}"
-                            ],
-                            "path": [
-                                "user",
-                                "{{user_id}}"
-                            ]
-                        },
-                        "description": "Get a specific user by ID. Make sure 'user_id' variable is set."
-                    },
-                    "response": []
-                },
-                {
-                    "name": "Update User",
-                    "event": [
-                        {
-                            "listen": "test",
-                            "script": {
-                                "exec": [
-                                    "pm.test('Status code is 200', function () {",
-                                    "    pm.response.to.have.status(200);",
-                                    "});",
-                                    "",
-                                    "pm.test('Response contains updated data', function () {",
-                                    "    var jsonData = pm.response.json();",
-                                    "    pm.expect(jsonData).to.have.property('data');",
-                                    "});"
-                                ],
-                                "type": "text/javascript"
-                            }
-                        }
-                    ],
-                    "request": {
-                        "method": "PATCH",
-                        "header": [
-                            {
-                                "key": "Content-Type",
-                                "value": "application/json"
-                            }
-                        ],
-                        "body": {
-                            "mode": "raw",
-                            "raw": "{}"
-                        },
-                        "url": {
-                            "raw": "{{base_url}}/user/{{user_id}}",
-                            "host": [
-                                "{{base_url}}"
-                            ],
-                            "path": [
-                                "user",
-                                "{{user_id}}"
-                            ]
-                        },
-                        "description": "Update a user by ID. Make sure 'user_id' variable is set."
-                    },
-                    "response": []
-                },
-                {
-                    "name": "Delete User",
-                    "event": [
-                        {
-                            "listen": "test",
-                            "script": {
-                                "exec": [
-                                    "pm.test('Status code is 200', function () {",
-                                    "    pm.response.to.have.status(200);",
-                                    "});",
-                                    "",
-                                    "pm.test('Response confirms deletion', function () {",
-                                    "    var jsonData = pm.response.json();",
-                                    "    pm.expect(jsonData).to.have.property('success');",
-                                    "});"
-                                ],
-                                "type": "text/javascript"
-                            }
-                        }
-                    ],
-                    "request": {
-                        "method": "DELETE",
-                        "header": [],
-                        "url": {
-                            "raw": "{{base_url}}/user/{{user_id}}",
-                            "host": [
-                                "{{base_url}}"
-                            ],
-                            "path": [
-                                "user",
-                                "{{user_id}}"
-                            ]
-                        },
-                        "description": "Delete a user by ID. Make sure 'user_id' variable is set."
-                    },
-                    "response": []
-                }
-            ]
-        },
-        {
-            "name": "Metrics",
-            "item": [
-                {
-                    "name": "Get Metrics (Prometheus Format)",
-                    "event": [
-                        {
-                            "listen": "test",
-                            "script": {
-                                "exec": [
-                                    "pm.test('Status code is 200', function () {",
-                                    "    pm.response.to.have.status(200);",
-                                    "});",
-                                    "",
-                                    "pm.test('Content-Type is text/plain', function () {",
-                                    "    pm.response.to.have.header('Content-Type');",
-                                    "    pm.expect(pm.response.headers.get('Content-Type')).to.include('text/plain');",
-                                    "});"
-                                ],
-                                "type": "text/javascript"
-                            }
-                        }
-                    ],
-                    "request": {
-                        "auth": {
-                            "type": "noauth"
-                        },
-                        "method": "GET",
-                        "header": [],
-                        "url": {
-                            "raw": "{{base_url}}/metrics",
-                            "host": [
-                                "{{base_url}}"
-                            ],
-                            "path": [
-                                "metrics"
-                            ]
-                        },
-                        "description": "Get Prometheus metrics in text format"
-                    },
-                    "response": []
-                },
-                {
-                    "name": "Get Metrics (JSON Format)",
-                    "event": [
-                        {
-                            "listen": "test",
-                            "script": {
-                                "exec": [
-                                    "pm.test('Status code is 200', function () {",
-                                    "    pm.response.to.have.status(200);",
-                                    "});",
-                                    "",
-                                    "pm.test('Response is JSON', function () {",
-                                    "    pm.response.to.be.json;",
-                                    "});"
-                                ],
-                                "type": "text/javascript"
-                            }
-                        }
-                    ],
-                    "request": {
-                        "auth": {
-                            "type": "noauth"
-                        },
-                        "method": "GET",
-                        "header": [],
-                        "url": {
-                            "raw": "{{base_url}}/metrics/json",
-                            "host": [
-                                "{{base_url}}"
-                            ],
-                            "path": [
-                                "metrics",
-                                "json"
-                            ]
-                        },
-                        "description": "Get metrics in JSON format"
-                    },
-                    "response": []
-                }
-            ]
-        }
-    ],
-    "event": [
-        {
-            "listen": "prerequest",
-            "script": {
-                "type": "text/javascript",
-                "exec": [
-                    "// Global pre-request script",
-                    "console.log('Request to: ' + pm.request.url.toString());"
-                ]
-            }
-        },
-        {
-            "listen": "test",
-            "script": {
-                "type": "text/javascript",
-                "exec": [
-                    "// Global test script",
-                    "console.log('Response status: ' + pm.response.code);"
-                ]
-            }
-        }
+  "info": {
+    "name": "NestJS Prisma Postgres API",
+    "_postman_id": "nestjs-prisma-postgres-api",
+    "description": "Complete API collection for NestJS Prisma Postgres Starter with Google OAuth support",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{access_token}}",
+        "type": "string"
+      }
     ]
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:5000",
+      "type": "string"
+    },
+    {
+      "key": "access_token",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "refresh_token",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "user_id",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "test_email",
+      "value": "test@example.com",
+      "type": "string"
+    },
+    {
+      "key": "test_username",
+      "value": "testuser",
+      "type": "string"
+    },
+    {
+      "key": "test_password",
+      "value": "Test@123456",
+      "type": "string"
+    },
+    {
+      "key": "verification_code",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "google_auth_url",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "google_state",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "google_code",
+      "value": "",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "Root",
+      "item": [
+        {
+          "name": "Health Check",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test('Response contains hello message', function () {",
+                  "    var jsonData = pm.response.json();",
+                  "    pm.expect(jsonData).to.have.property('data');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/",
+              "host": ["{{base_url}}"],
+              "path": [""]
+            },
+            "description": "Basic health check endpoint to verify API is running"
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "Local Auth",
+          "item": [
+            {
+              "name": "Register User",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "exec": [
+                      "pm.test('Status code is 200 or 201', function () {",
+                      "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
+                      "});",
+                      "",
+                      "if (pm.response.code === 200 || pm.response.code === 201) {",
+                      "    var jsonData = pm.response.json();",
+                      "    ",
+                      "    pm.test('Response contains success', function () {",
+                      "        pm.expect(jsonData).to.have.property('success');",
+                      "    });",
+                      "    ",
+                      "    if (jsonData.data && jsonData.data.id) {",
+                      "        pm.collectionVariables.set('user_id', jsonData.data.id);",
+                      "    }",
+                      "}"
+                    ],
+                    "type": "text/javascript"
+                  }
+                },
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "exec": [
+                      "// Generate random email for testing",
+                      "const timestamp = Date.now();",
+                      "const randomEmail = `test${timestamp}@example.com`;",
+                      "const randomUsername = `testuser${timestamp}`;",
+                      "pm.collectionVariables.set('test_email', randomEmail);",
+                      "pm.collectionVariables.set('test_username', randomUsername);"
+                    ],
+                    "type": "text/javascript"
+                  }
+                }
+              ],
+              "request": {
+                "auth": {
+                  "type": "noauth"
+                },
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "x-device",
+                    "value": "postman-test",
+                    "type": "text"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"username\": \"{{test_username}}\",\n  \"password\": \"{{test_password}}\",\n  \"email\": \"{{test_email}}\"\n}"
+                },
+                "url": {
+                  "raw": "{{base_url}}/auth",
+                  "host": ["{{base_url}}"],
+                  "path": ["auth"]
+                },
+                "description": "Register a new user account. Password must be at least 6 characters."
+              },
+              "response": []
+            },
+            {
+              "name": "Verify Email",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "exec": [
+                      "pm.test('Status code is 200 or 201', function () {",
+                      "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
+                      "});",
+                      "",
+                      "if (pm.response.code === 200 || pm.response.code === 201) {",
+                      "    var jsonData = pm.response.json();",
+                      "    ",
+                      "    pm.test('Response contains success', function () {",
+                      "        pm.expect(jsonData).to.have.property('success');",
+                      "    });",
+                      "}"
+                    ],
+                    "type": "text/javascript"
+                  }
+                }
+              ],
+              "request": {
+                "auth": {
+                  "type": "noauth"
+                },
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"email\": \"{{test_email}}\",\n  \"code\": \"{{verification_code}}\"\n}"
+                },
+                "url": {
+                  "raw": "{{base_url}}/auth/verify-email",
+                  "host": ["{{base_url}}"],
+                  "path": ["auth", "verify-email"]
+                },
+                "description": "Verify user email with verification code. Note: You need to check your email or logs for the verification code and update the 'verification_code' variable."
+              },
+              "response": []
+            },
+            {
+              "name": "Resend Verification Email",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "exec": [
+                      "pm.test('Status code is 200 or 201', function () {",
+                      "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
+                      "});",
+                      "",
+                      "pm.test('Response contains success', function () {",
+                      "    var jsonData = pm.response.json();",
+                      "    pm.expect(jsonData).to.have.property('success');",
+                      "});"
+                    ],
+                    "type": "text/javascript"
+                  }
+                }
+              ],
+              "request": {
+                "auth": {
+                  "type": "noauth"
+                },
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"email\": \"{{test_email}}\"\n}"
+                },
+                "url": {
+                  "raw": "{{base_url}}/auth/resend-verification-email",
+                  "host": ["{{base_url}}"],
+                  "path": ["auth", "resend-verification-email"]
+                },
+                "description": "Resend verification email to user. Rate limited to 3 attempts per 15 minutes."
+              },
+              "response": []
+            },
+            {
+              "name": "Login",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "exec": [
+                      "pm.test('Status code is 200 or 201', function () {",
+                      "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
+                      "});",
+                      "",
+                      "if (pm.response.code === 200 || pm.response.code === 201) {",
+                      "    var jsonData = pm.response.json();",
+                      "    ",
+                      "    pm.test('Response contains success', function () {",
+                      "        pm.expect(jsonData).to.have.property('success');",
+                      "    });",
+                      "    ",
+                      "    pm.test('Response contains tokens', function () {",
+                      "        pm.expect(jsonData.data).to.have.property('accessToken');",
+                      "        pm.expect(jsonData.data).to.have.property('refreshToken');",
+                      "    });",
+                      "    ",
+                      "    if (jsonData.data) {",
+                      "        pm.collectionVariables.set('access_token', jsonData.data.accessToken);",
+                      "        pm.collectionVariables.set('refresh_token', jsonData.data.refreshToken);",
+                      "        if (jsonData.data.user && jsonData.data.user.id) {",
+                      "            pm.collectionVariables.set('user_id', jsonData.data.user.id);",
+                      "        }",
+                      "    }",
+                      "}"
+                    ],
+                    "type": "text/javascript"
+                  }
+                }
+              ],
+              "request": {
+                "auth": {
+                  "type": "noauth"
+                },
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "x-device",
+                    "value": "postman-test",
+                    "type": "text"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"email\": \"{{test_email}}\",\n  \"password\": \"{{test_password}}\"\n}"
+                },
+                "url": {
+                  "raw": "{{base_url}}/auth/login",
+                  "host": ["{{base_url}}"],
+                  "path": ["auth", "login"]
+                },
+                "description": "Login with email and password. Returns access token (15 min) and refresh token (7 days). Automatically saves tokens to collection variables."
+              },
+              "response": []
+            },
+            {
+              "name": "Refresh Token",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "exec": [
+                      "pm.test('Status code is 200 or 201', function () {",
+                      "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
+                      "});",
+                      "",
+                      "if (pm.response.code === 200 || pm.response.code === 201) {",
+                      "    var jsonData = pm.response.json();",
+                      "    ",
+                      "    pm.test('Response contains new tokens', function () {",
+                      "        pm.expect(jsonData.data).to.have.property('accessToken');",
+                      "        pm.expect(jsonData.data).to.have.property('refreshToken');",
+                      "    });",
+                      "    ",
+                      "    if (jsonData.data) {",
+                      "        pm.collectionVariables.set('access_token', jsonData.data.accessToken);",
+                      "        pm.collectionVariables.set('refresh_token', jsonData.data.refreshToken);",
+                      "    }",
+                      "}"
+                    ],
+                    "type": "text/javascript"
+                  }
+                }
+              ],
+              "request": {
+                "auth": {
+                  "type": "noauth"
+                },
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "x-device",
+                    "value": "postman-test",
+                    "type": "text"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"refreshToken\": \"{{refresh_token}}\"\n}"
+                },
+                "url": {
+                  "raw": "{{base_url}}/auth/refresh-token",
+                  "host": ["{{base_url}}"],
+                  "path": ["auth", "refresh-token"]
+                },
+                "description": "Refresh access token using refresh token. Implements token rotation - old refresh token is invalidated and new one is issued."
+              },
+              "response": []
+            },
+            {
+              "name": "Logout",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "exec": [
+                      "pm.test('Status code is 200', function () {",
+                      "    pm.response.to.have.status(200);",
+                      "});",
+                      "",
+                      "pm.test('Response contains success', function () {",
+                      "    var jsonData = pm.response.json();",
+                      "    pm.expect(jsonData).to.have.property('success');",
+                      "});",
+                      "",
+                      "// Clear tokens after logout",
+                      "pm.collectionVariables.set('access_token', '');",
+                      "pm.collectionVariables.set('refresh_token', '');"
+                    ],
+                    "type": "text/javascript"
+                  }
+                }
+              ],
+              "request": {
+                "auth": {
+                  "type": "noauth"
+                },
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"refreshToken\": \"{{refresh_token}}\"\n}"
+                },
+                "url": {
+                  "raw": "{{base_url}}/auth/logout",
+                  "host": ["{{base_url}}"],
+                  "path": ["auth", "logout"]
+                },
+                "description": "Logout current session. Invalidates the refresh token."
+              },
+              "response": []
+            },
+            {
+              "name": "Logout All Devices",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "exec": [
+                      "pm.test('Status code is 200', function () {",
+                      "    pm.response.to.have.status(200);",
+                      "});",
+                      "",
+                      "pm.test('Response contains success', function () {",
+                      "    var jsonData = pm.response.json();",
+                      "    pm.expect(jsonData).to.have.property('success');",
+                      "});",
+                      "",
+                      "// Clear tokens after logout",
+                      "pm.collectionVariables.set('access_token', '');",
+                      "pm.collectionVariables.set('refresh_token', '');"
+                    ],
+                    "type": "text/javascript"
+                  }
+                }
+              ],
+              "request": {
+                "auth": {
+                  "type": "noauth"
+                },
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"userId\": \"{{user_id}}\"\n}"
+                },
+                "url": {
+                  "raw": "{{base_url}}/auth/logout-all",
+                  "host": ["{{base_url}}"],
+                  "path": ["auth", "logout-all"]
+                },
+                "description": "Logout from all devices. Invalidates all refresh tokens for the user."
+              },
+              "response": []
+            }
+          ]
+        },
+        {
+          "name": "Google OAuth",
+          "item": [
+            {
+              "name": "1. Get Google Auth URL",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "exec": [
+                      "pm.test('Status code is 200', function () {",
+                      "    pm.response.to.have.status(200);",
+                      "});",
+                      "",
+                      "var jsonData = pm.response.json();",
+                      "",
+                      "pm.test('Response contains url', function () {",
+                      "    pm.expect(jsonData).to.have.property('url');",
+                      "});",
+                      "",
+                      "pm.test('Response contains state', function () {",
+                      "    pm.expect(jsonData).to.have.property('state');",
+                      "});",
+                      "",
+                      "pm.test('URL is Google OAuth URL', function () {",
+                      "    pm.expect(jsonData.url).to.include('accounts.google.com');",
+                      "});",
+                      "",
+                      "// Save state and URL for next step",
+                      "if (jsonData.url) {",
+                      "    pm.collectionVariables.set('google_auth_url', jsonData.url);",
+                      "}",
+                      "if (jsonData.state) {",
+                      "    pm.collectionVariables.set('google_state', jsonData.state);",
+                      "}",
+                      "",
+                      "console.log('\\n=== NEXT STEPS ===' );",
+                      "console.log('1. Copy the URL from response');",
+                      "console.log('2. Open it in browser');",
+                      "console.log('3. Sign in with Google');",
+                      "console.log('4. Copy the \"code\" parameter from redirect URL');",
+                      "console.log('5. Set \"google_code\" variable with the code');",
+                      "console.log('6. Run \"2. Google OAuth Callback\" request');"
+                    ],
+                    "type": "text/javascript"
+                  }
+                }
+              ],
+              "request": {
+                "auth": {
+                  "type": "noauth"
+                },
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{base_url}}/auth/google",
+                  "host": ["{{base_url}}"],
+                  "path": ["auth", "google"]
+                },
+                "description": "Initiates Google OAuth flow. Returns authorization URL that user should be redirected to.\n\n**How to test:**\n1. Send this request\n2. Copy the `url` from response\n3. Open URL in browser\n4. Sign in with Google account\n5. Google will redirect to callback URL with `code` and `state` parameters\n6. Copy the `code` parameter from the redirect URL\n7. Use the \"Google OAuth Callback (POST)\" request with the code"
+              },
+              "response": []
+            },
+            {
+              "name": "1b. Get Google Auth URL (with redirect)",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "exec": [
+                      "pm.test('Status code is 200', function () {",
+                      "    pm.response.to.have.status(200);",
+                      "});",
+                      "",
+                      "var jsonData = pm.response.json();",
+                      "",
+                      "pm.test('Response contains url', function () {",
+                      "    pm.expect(jsonData).to.have.property('url');",
+                      "});",
+                      "",
+                      "pm.test('Response contains state', function () {",
+                      "    pm.expect(jsonData).to.have.property('state');",
+                      "});",
+                      "",
+                      "// Save state and URL for next step",
+                      "if (jsonData.url) {",
+                      "    pm.collectionVariables.set('google_auth_url', jsonData.url);",
+                      "}",
+                      "if (jsonData.state) {",
+                      "    pm.collectionVariables.set('google_state', jsonData.state);",
+                      "}"
+                    ],
+                    "type": "text/javascript"
+                  }
+                }
+              ],
+              "request": {
+                "auth": {
+                  "type": "noauth"
+                },
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{base_url}}/auth/google?redirectUrl=http://localhost:3000/dashboard",
+                  "host": ["{{base_url}}"],
+                  "path": ["auth", "google"],
+                  "query": [
+                    {
+                      "key": "redirectUrl",
+                      "value": "http://localhost:3000/dashboard",
+                      "description": "Optional: URL to redirect user after successful authentication"
+                    }
+                  ]
+                },
+                "description": "Initiates Google OAuth flow with custom redirect URL. The redirectUrl is stored and can be used by your frontend after successful authentication."
+              },
+              "response": []
+            },
+            {
+              "name": "2. Google OAuth Callback (POST)",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "exec": [
+                      "pm.test('Status code is 200 or 201', function () {",
+                      "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
+                      "});",
+                      "",
+                      "var jsonData = pm.response.json();",
+                      "",
+                      "pm.test('Response contains success', function () {",
+                      "    pm.expect(jsonData).to.have.property('success');",
+                      "});",
+                      "",
+                      "if (jsonData.success && jsonData.data) {",
+                      "    pm.test('Response contains tokens', function () {",
+                      "        pm.expect(jsonData.data).to.have.property('accessToken');",
+                      "        pm.expect(jsonData.data).to.have.property('refreshToken');",
+                      "    });",
+                      "    ",
+                      "    pm.test('Response contains user', function () {",
+                      "        pm.expect(jsonData.data).to.have.property('user');",
+                      "        pm.expect(jsonData.data.user).to.have.property('provider', 'google');",
+                      "    });",
+                      "    ",
+                      "    pm.test('Response indicates if new user', function () {",
+                      "        pm.expect(jsonData.data).to.have.property('isNewUser');",
+                      "    });",
+                      "    ",
+                      "    // Save tokens",
+                      "    pm.collectionVariables.set('access_token', jsonData.data.accessToken);",
+                      "    pm.collectionVariables.set('refresh_token', jsonData.data.refreshToken);",
+                      "    if (jsonData.data.user && jsonData.data.user.id) {",
+                      "        pm.collectionVariables.set('user_id', jsonData.data.user.id);",
+                      "    }",
+                      "    ",
+                      "    console.log('User: ' + JSON.stringify(jsonData.data.user, null, 2));",
+                      "    console.log('Is New User: ' + jsonData.data.isNewUser);",
+                      "}"
+                    ],
+                    "type": "text/javascript"
+                  }
+                }
+              ],
+              "request": {
+                "auth": {
+                  "type": "noauth"
+                },
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "x-device",
+                    "value": "postman-test",
+                    "type": "text"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"code\": \"{{google_code}}\",\n  \"state\": \"{{google_state}}\"\n}"
+                },
+                "url": {
+                  "raw": "{{base_url}}/auth/google/callback",
+                  "host": ["{{base_url}}"],
+                  "path": ["auth", "google", "callback"]
+                },
+                "description": "Exchange Google authorization code for tokens. Use this after user authenticates with Google.\n\n**Before running:**\n1. Run \"Get Google Auth URL\" first\n2. Open the returned URL in browser\n3. Sign in with Google\n4. Copy the `code` from the redirect URL\n5. Set the `google_code` collection variable\n6. The `google_state` is automatically set from step 1\n\n**Response:**\n- `accessToken`: Short-lived JWT for API access (15 min)\n- `refreshToken`: Long-lived token for getting new access tokens (7 days)\n- `user`: User profile data\n- `isNewUser`: true if account was just created"
+              },
+              "response": []
+            },
+            {
+              "name": "2b. Google OAuth Callback (GET)",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "exec": [
+                      "pm.test('Status code is 200 or 201', function () {",
+                      "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
+                      "});",
+                      "",
+                      "var jsonData = pm.response.json();",
+                      "",
+                      "if (jsonData.success && jsonData.data) {",
+                      "    pm.collectionVariables.set('access_token', jsonData.data.accessToken);",
+                      "    pm.collectionVariables.set('refresh_token', jsonData.data.refreshToken);",
+                      "    if (jsonData.data.user && jsonData.data.user.id) {",
+                      "        pm.collectionVariables.set('user_id', jsonData.data.user.id);",
+                      "    }",
+                      "}"
+                    ],
+                    "type": "text/javascript"
+                  }
+                }
+              ],
+              "request": {
+                "auth": {
+                  "type": "noauth"
+                },
+                "method": "GET",
+                "header": [
+                  {
+                    "key": "x-device",
+                    "value": "postman-test",
+                    "type": "text"
+                  }
+                ],
+                "url": {
+                  "raw": "{{base_url}}/auth/google/callback?code={{google_code}}&state={{google_state}}",
+                  "host": ["{{base_url}}"],
+                  "path": ["auth", "google", "callback"],
+                  "query": [
+                    {
+                      "key": "code",
+                      "value": "{{google_code}}",
+                      "description": "Authorization code from Google"
+                    },
+                    {
+                      "key": "state",
+                      "value": "{{google_state}}",
+                      "description": "State parameter for CSRF protection"
+                    }
+                  ]
+                },
+                "description": "GET endpoint for Google OAuth callback. This is the URL Google redirects to after user authentication. Typically used in browser-based flows."
+              },
+              "response": []
+            }
+          ],
+          "description": "Google OAuth 2.0 authentication flow with PKCE (Proof Key for Code Exchange) support.\n\n**Flow:**\n1. Call \"Get Google Auth URL\" to get authorization URL\n2. Redirect user to the URL (or open in browser for testing)\n3. User signs in with Google\n4. Google redirects back with `code` and `state` parameters\n5. Call callback endpoint with code and state to get tokens"
+        }
+      ]
+    },
+    {
+      "name": "User",
+      "item": [
+        {
+          "name": "Create User",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200 or 201', function () {",
+                  "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);",
+                  "});",
+                  "",
+                  "if (pm.response.code === 200 || pm.response.code === 201) {",
+                  "    var jsonData = pm.response.json();",
+                  "    ",
+                  "    pm.test('Response contains data', function () {",
+                  "        pm.expect(jsonData).to.have.property('data');",
+                  "    });",
+                  "    ",
+                  "    if (jsonData.data && jsonData.data.id) {",
+                  "        pm.collectionVariables.set('user_id', jsonData.data.id);",
+                  "    }",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            },
+            "url": {
+              "raw": "{{base_url}}/user",
+              "host": ["{{base_url}}"],
+              "path": ["user"]
+            },
+            "description": "Create a new user"
+          },
+          "response": []
+        },
+        {
+          "name": "Get All Users",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test('Response contains data', function () {",
+                  "    var jsonData = pm.response.json();",
+                  "    pm.expect(jsonData).to.have.property('data');",
+                  "});",
+                  "",
+                  "// Save first user ID for subsequent requests if available",
+                  "if (pm.response.code === 200) {",
+                  "    var jsonData = pm.response.json();",
+                  "    if (jsonData.data && Array.isArray(jsonData.data) && jsonData.data.length > 0) {",
+                  "        if (jsonData.data[0].id) {",
+                  "            pm.collectionVariables.set('user_id', jsonData.data[0].id);",
+                  "        }",
+                  "    }",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/user",
+              "host": ["{{base_url}}"],
+              "path": ["user"]
+            },
+            "description": "Get all users"
+          },
+          "response": []
+        },
+        {
+          "name": "Get User by ID",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test('Response contains user data', function () {",
+                  "    var jsonData = pm.response.json();",
+                  "    pm.expect(jsonData).to.have.property('data');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/user/{{user_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["user", "{{user_id}}"]
+            },
+            "description": "Get a specific user by ID. Make sure 'user_id' variable is set."
+          },
+          "response": []
+        },
+        {
+          "name": "Update User",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test('Response contains updated data', function () {",
+                  "    var jsonData = pm.response.json();",
+                  "    pm.expect(jsonData).to.have.property('data');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            },
+            "url": {
+              "raw": "{{base_url}}/user/{{user_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["user", "{{user_id}}"]
+            },
+            "description": "Update a user by ID. Make sure 'user_id' variable is set."
+          },
+          "response": []
+        },
+        {
+          "name": "Delete User",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test('Response confirms deletion', function () {",
+                  "    var jsonData = pm.response.json();",
+                  "    pm.expect(jsonData).to.have.property('success');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/user/{{user_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["user", "{{user_id}}"]
+            },
+            "description": "Delete a user by ID. Make sure 'user_id' variable is set."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Metrics",
+      "item": [
+        {
+          "name": "Get Metrics (Prometheus Format)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test('Content-Type is text/plain', function () {",
+                  "    pm.response.to.have.header('Content-Type');",
+                  "    pm.expect(pm.response.headers.get('Content-Type')).to.include('text/plain');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/metrics",
+              "host": ["{{base_url}}"],
+              "path": ["metrics"]
+            },
+            "description": "Get Prometheus metrics in text format"
+          },
+          "response": []
+        },
+        {
+          "name": "Get Metrics (JSON Format)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test('Response is JSON', function () {",
+                  "    pm.response.to.be.json;",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/metrics/json",
+              "host": ["{{base_url}}"],
+              "path": ["metrics", "json"]
+            },
+            "description": "Get metrics in JSON format"
+          },
+          "response": []
+        }
+      ]
+    }
+  ],
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Global pre-request script",
+          "console.log('Request to: ' + pm.request.url.toString());"
+        ]
+      }
+    },
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Global test script",
+          "console.log('Response status: ' + pm.response.code);"
+        ]
+      }
+    }
+  ]
 }

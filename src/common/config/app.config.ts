@@ -22,7 +22,7 @@ const config: AppConfig = {
     process.env.JWT_ACCESS_SECRET || process.env.JWT_SECRET || '',
   jwt_refresh_secret:
     process.env.JWT_REFRESH_SECRET || process.env.JWT_SECRET || '',
-  redis_cache_key_prefix: process.env.REDIS_CACHE_KEY_PREFIX || 'app',
+  redis_cache_key_prefix: process.env.REDIS_CACHE_KEY_PREFIX || 'musecue',
   node_env: process.env.NODE_ENV || 'development',
   port: parseInt(process.env.PORT || '5000', 10),
   email_host: process.env.EMAIL_HOST || 'smtp.gmail.com',
