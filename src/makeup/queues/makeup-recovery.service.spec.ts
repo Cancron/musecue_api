@@ -67,8 +67,8 @@ describe('AI job recovery', () => {
     prisma.aiRun.findMany
       .mockResolvedValueOnce(healthy as never)
       .mockResolvedValueOnce([run] as never);
-    queue.getJob.mockImplementation(async (id) =>
-      id === 'run' ? undefined : job,
+    queue.getJob.mockImplementation((id) =>
+      Promise.resolve(id === 'run' ? undefined : job),
     );
     job.getState.mockResolvedValue('prioritized');
     await service.reconcile();

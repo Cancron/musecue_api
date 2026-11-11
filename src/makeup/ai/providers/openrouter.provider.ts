@@ -536,7 +536,7 @@ export class OpenRouterProvider implements StructuredAiProvider {
         fallback: 4_000,
       },
       GUIDE_GENERATION: { key: 'OPENROUTER_GUIDE_MAX_TOKENS', fallback: 8_000 },
-      VISION_CHECK: { key: 'OPENROUTER_VISION_MAX_TOKENS', fallback: 600 },
+      VISION_CHECK: { key: 'OPENROUTER_VISION_MAX_TOKENS', fallback: 2000 },
       GUIDE_QUESTION: { key: 'OPENROUTER_QUESTION_MAX_TOKENS', fallback: 500 },
     };
     const operationConfig = configByOperation[operation];

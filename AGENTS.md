@@ -4,8 +4,6 @@
 
 This NestJS service is the application authority for MuseCue — AI makeup guidance, made for your face. It owns authentication, authorization, workflow state, persistence, private media access, and AI orchestration.
 
-The product specification and architecture are in the sibling `face_makeup_app/Blueprint.md` and `face_makeup_app/Architecture.md` files.
-
 ## Architecture rules
 
 - Supabase is not used. NestJS is the only authentication and application backend.
@@ -17,6 +15,7 @@ The product specification and architecture are in the sibling `face_makeup_app/B
 - Never log image content, signed URLs, passwords, SMTP credentials, access tokens, refresh tokens, or raw AI prompts containing sensitive user data.
 - Validate all request DTOs with `class-validator` and all AI outputs against explicit runtime schemas.
 - Successful API responses are wrapped once by `TransformInterceptor`; controllers return domain data directly.
+- Pro feature endpoints must use `@UseGuards(AuthGuard, ProAccessGuard)` (import `SubscriptionModule`). Do not decide Pro access in feature services or read `UserSubscription` directly for it; use the decision on `req.proAccess` or `SubscriptionAccessService`.
 
 ## Authentication
 

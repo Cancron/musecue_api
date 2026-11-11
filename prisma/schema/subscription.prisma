@@ -1,0 +1,118 @@
+// ================================
+// Subscription Plan Configuration
+// ================================
+
+// One row per plan, keyed by its code. MuseCue currently sells a single Pro
+// plan, so the only row is `PRO`. Prices are integer US cents to avoid
+// floating-point rounding. Defaults must match SUBSCRIPTION_PLAN_DEFAULTS in
+// src/subscription/subscription-plan.constants.ts.
+model SubscriptionPlan {
+  code                 PlanCode @id
+  planEnabled          Boolean  @default(true)
+  monthlyPriceUsdCents Int      @default(1900)
+  yearlyPriceUsdCents  Int      @default(19000)
+  trialEnabled         Boolean  @default(true)
+  trialDays            Int      @default(7)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+}
+
+// One subscription record per user, created when the user first starts a
+// trial or buys Pro (a user without a record is FREE). The free trial and the
+// paid Pro subscription are tracked separately on the same record: the trial
+// fields are written once, while the Pro fields describe the current or most
+// recent paid term and are replaced on renewal or repurchase. Pro fields are
+// never cleared: a non-null proStartedAt is the record of paid-Pro history
+// that makes the user ineligible for the free trial. A paid term can only be
+// created or extended when one SUCCEEDED PaymentTransaction of this
+// subscription covers the newly granted range and ends at proExpiresAt
+// (database trigger): a new term may not start before its paid period and a
+// renewal may not bridge an unpaid gap. Pending, failed or refunded payments
+// never grant or renew Pro access.
+//
+// Pro access is derived from the date windows by
+// src/subscription/subscription-access.policy.ts; `status` is a stored
+// snapshot for reporting and must not be used on its own to grant access.
+// Consistency rules are enforced by CHECK constraints in the migration.
+model UserSubscription {
+  id     String             @id @default(uuid())
+  authId String             @unique
+  status SubscriptionStatus @default(FREE)
+
+  // Free trial (usable once)
+  trialUsed      Boolean   @default(false)
+  trialStartedAt DateTime?
+  trialExpiresAt DateTime?
+
+  // Paid Pro subscription (renewable)
+  billingInterval BillingInterval?
+  proStartedAt    DateTime?
+  proExpiresAt    DateTime?
+  // Set when the user cancels: no renewal, access continues until proExpiresAt.
+  proCanceledAt   DateTime?
+
+  // Link to the payment provider's recurring subscription (set by checkout).
+  paymentProvider        String? @db.VarChar(50)
+  providerSubscriptionId String? @db.VarChar(255)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  authUser authUser             @relation(fields: [authId], references: [id], onDelete: Cascade)
+  payments PaymentTransaction[]
+  events   SubscriptionEvent[]
+
+  @@unique([paymentProvider, providerSubscriptionId])
+  @@index([status])
+}
+
+// One charge attempt for one billing period of the Pro plan. Payments are
+// financial records: they are never deleted, their amount, currency, provider
+// IDs and period never change, and their status only moves forward
+// (PENDING -> SUCCEEDED | FAILED; SUCCEEDED -> PARTIALLY_REFUNDED | REFUNDED).
+// Only a SUCCEEDED payment can create or extend a paid term on
+// UserSubscription (enforced by a database trigger).
+model PaymentTransaction {
+  id                  String          @id @default(uuid())
+  subscriptionId      String
+  provider            String          @db.VarChar(50)
+  providerPaymentId   String          @db.VarChar(255)
+  status              PaymentStatus   @default(PENDING)
+  amountCents         Int
+  currency            String          @default("USD") @db.Char(3)
+  billingInterval     BillingInterval
+  periodStart         DateTime
+  periodEnd           DateTime
+  paidAt              DateTime?
+  failedAt            DateTime?
+  failureCode         String?         @db.VarChar(100)
+  failureMessage      String?         @db.VarChar(500)
+  refundedAmountCents Int             @default(0)
+  refundedAt          DateTime?
+  createdAt           DateTime        @default(now())
+  updatedAt           DateTime        @updatedAt
+
+  subscription UserSubscription   @relation(fields: [subscriptionId], references: [id], onDelete: Restrict)
+  event        SubscriptionEvent?
+
+  @@unique([provider, providerPaymentId])
+  @@index([subscriptionId, createdAt])
+  @@index([status])
+}
+
+// Append-only lifecycle log of a subscription. CREATED and RENEWED events
+// reference the SUCCEEDED payment that paid for the period (one event per
+// payment); other events have no payment.
+model SubscriptionEvent {
+  id             String                @id @default(uuid())
+  subscriptionId String
+  type           SubscriptionEventType
+  paymentId      String?               @unique
+  occurredAt     DateTime
+  createdAt      DateTime              @default(now())
+
+  subscription UserSubscription    @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  payment      PaymentTransaction? @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+
+  @@index([subscriptionId, occurredAt])
+}

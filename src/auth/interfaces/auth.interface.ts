@@ -2,12 +2,15 @@
  * Authentication-related interfaces and types
  */
 
-export enum UserRole {
-  CUSTOMER = 'CUSTOMER',
-  MODERATOR = 'MODERATOR',
-  ADMIN = 'ADMIN',
-  SUPER_ADMIN = 'SUPER_ADMIN',
-}
+import { userRole } from '@prisma/client';
+
+/**
+ * Application roles. Derived from the Prisma `userRole` enum so the names used
+ * in code are exactly the values stored in the database and carried in access
+ * tokens (`USER`, `MODERATOR`, `ADMIN`, `SUPERADMIN`).
+ */
+export const UserRole = userRole;
+export type UserRole = userRole;
 
 /**
  * Access token payload - minimal for stateless auth

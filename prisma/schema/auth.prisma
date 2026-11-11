@@ -25,6 +25,7 @@ model authUser {
   activityLogEvents ActivityLogEvent[]
   makeupSessions    MakeupSession[]
   aiRuns            AiRun[]
+  subscription      UserSubscription?
 
   @@index([email, id, providerId])
   @@index([username])
