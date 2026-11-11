@@ -16,6 +16,7 @@ The companion mobile application and detailed product specifications live in `..
 - BullMQ jobs for personalization, guide generation, visual checks, and guide questions
 - `AiRun` audit records containing operation, provider, model, prompt version, latency, progress, result/error, and status
 - a provider-neutral AI gateway with OpenRouter live mode, multimodal private-image input, strict structured output, runtime validation, bounded retries, and deterministic mock mode
+- a single Pro subscription plan: admin-configured monthly/yearly pricing and free trial, one-time trial activation, date-based Pro access through `ProAccessGuard`, and payment/lifecycle records protected by database rules (see "Subscriptions" under API); checkout, webhooks and billing endpoints are not implemented yet
 
 Migration `20260827174107_add_makeup_workflow` adds the makeup aggregate and removes the dormant job-tracker and subscription starter domains.
 
@@ -168,10 +169,104 @@ Successful responses use one envelope:
 }
 ```
 
+### Subscriptions
+
+Administration routes require a bearer token for an `ADMIN` or `SUPERADMIN` account; other roles, including `MODERATOR`, receive `403`. The role is read from the verified access token (no extra database lookup), so a role change applies once the user's access token is replaced or revoked through `tokenVersion`. Role names are the Prisma `userRole` values (`USER`, `MODERATOR`, `ADMIN`, `SUPERADMIN`); the TypeScript `UserRole` is derived from that enum.
+
+| Method  | Route                         | Purpose                                |
+| ------- | ----------------------------- | -------------------------------------- |
+| `GET`   | `/v1/admin/subscription-plan` | Read the Pro plan configuration        |
+| `PATCH` | `/v1/admin/subscription-plan` | Change any subset of the configuration |
+
+MuseCue has a single Pro plan stored in the `SubscriptionPlan` table, so its settings survive restarts. Before an administrator saves anything, the API serves these defaults:
+
+| Field                  | Type    | Default         | Accepted values                             |
+| ---------------------- | ------- | --------------- | ------------------------------------------- |
+| `planEnabled`          | boolean | `true`          | `true` / `false`                            |
+| `monthlyPriceUsdCents` | integer | `1900` ($19)    | `1`–`999999` US cents                       |
+| `yearlyPriceUsdCents`  | integer | `19000` ($190)  | `1`–`999999` US cents                       |
+| `trialEnabled`         | boolean | `true`          | `true` / `false`                            |
+| `trialDays`            | integer | `7`             | `1`–`365`; kept while the trial is disabled |
+
+`PATCH` accepts any subset of these fields; omitted fields are unchanged. Empty bodies, `null`, fractional numbers, numeric or boolean strings, and unknown fields are rejected with `400`. The trial is switched off with `trialEnabled: false`, not with a zero length. Every change is recorded in `ActivityLogEvent` (old value, new value, administrator ID) in the same transaction as the plan update.
+
+```json
+{
+  "code": "PRO",
+  "currency": "USD",
+  "planEnabled": true,
+  "monthlyPriceUsdCents": 1900,
+  "yearlyPriceUsdCents": 19000,
+  "trialEnabled": true,
+  "trialDays": 7,
+  "updatedAt": null
+}
+```
+
+Migration `20260912120000_plan_billing_intervals_and_toggles` upgrades configurations saved by `20260910120000_add_subscription_plan_config`: the former single `priceUsdCents` becomes the monthly price (or `1900` if it was never set), the yearly price starts at `19000`, and a former `trialDays: 0` becomes `trialEnabled: false` with `trialDays: 7`. Earlier audit entries keep the old `priceUsdCents` field name.
+
+Each user has at most one `UserSubscription` record (migration `20260914120000_add_user_subscription`). A user without a record is `FREE`. The record tracks the one-time free trial (`trialUsed`, `trialStartedAt`, `trialExpiresAt`) separately from the renewable paid term (`billingInterval`, `proStartedAt`, `proExpiresAt`, `proCanceledAt`). Pro access is decided only in `src/subscription/subscription-access.policy.ts`, exposed through `SubscriptionAccessService`. Access is granted while the trial or the paid term is within its `[startedAt, expiresAt)` window, including a canceled term until it expires. The stored `status` (`FREE`, `TRIAL`, `PRO`, `EXPIRED`) is a snapshot and is not used on its own to grant access. A trial can be started only once, only while the plan and its trial are enabled, and never by a user with any paid Pro history (active, canceled or expired). Pro fields are never cleared, so `proStartedAt` serves as that history. CHECK constraints keep the record's fields and status consistent.
+
+Subscription history is permanent at the database level (migration `20260916120000_protect_subscription_history`, a trigger that Prisma does not model). Once a trial has started, its dates never change and `trialUsed` stays `true`. A paid term can be renewed or replaced but never cleared, and the record cannot be deleted while its user exists; deleting the user still cascades. As a result, no code path can re-open trial eligibility or extend a trial.
+
+Billing records for the future payment integration (migration `20260918120000_add_payments_and_subscription_events`; no checkout, webhooks or billing endpoints yet):
+
+- `PaymentTransaction` records one charge attempt for one billing period. It stores the amount in cents, currency, status (`PENDING`, `SUCCEEDED`, `FAILED`, `PARTIALLY_REFUNDED`, `REFUNDED`), `provider` + `providerPaymentId`, the period, timestamps, and failure and refund details.
+  - `(provider, providerPaymentId)` is unique, and only one verified payment may cover a given period.
+  - Payments are never deleted. Amount, currency, provider IDs and period never change, and status only moves forward.
+  - A user with payments cannot be hard-deleted.
+- `SubscriptionEvent` is an append-only lifecycle log: `TRIAL_STARTED`, `CREATED`, `RENEWED`, `CANCELED`, `EXPIRED`. `CREATED` and `RENEWED` reference the `SUCCEEDED` payment for the period, and each payment backs at most one event.
+- `UserSubscription` gains `paymentProvider` and `providerSubscriptionId` (unique together) to link the provider's recurring subscription.
+- A paid term (`proStartedAt`/`proExpiresAt`) can only be created or extended by a `SUCCEEDED` payment of the same subscription and interval that covers the newly granted range and ends exactly at `proExpiresAt`. A new term may not start before its paid period, and a renewal's period must start no later than the current expiry, so it cannot bridge an unpaid gap. Early renewals and monthly-to-yearly changes may overlap. Pending, failed and refunded payments never grant or renew Pro access. Cancelling keeps access until `proExpiresAt`.
+- A billing period ends exactly one calendar month or year after it starts, using PostgreSQL calendar arithmetic (migration `20260920120000_calendar_billing_periods_and_gap_free_terms`). Month-ends clamp: Jan 31 → Feb 28, or Feb 29 in a leap year. Feb 29 + 1 year → Feb 28. `src/subscription/billing.validation.ts` (`addBillingInterval`, `isValidBillingPeriod`, `getPaidTermRejection`, pricing and status-transition checks) applies the same rules for future checkout and webhook code.
+
+`GET /v1/subscription` (bearer token) returns the caller's own subscription. The user comes only from the access token; query parameters cannot select another user. `status` is evaluated at request time from the stored dates, not the stored `status` column. Expiry therefore needs no background job, and reads never rewrite the record or its trial history.
+
+| `status`  | When                                                                |
+| --------- | ------------------------------------------------------------------- |
+| `FREE`    | No trial and no paid term (including users without a record)      |
+| `TRIAL`   | `trialStartedAt <= now < trialExpiresAt`                            |
+| `PRO`     | `proStartedAt <= now < proExpiresAt` (also wins during a trial)     |
+| `EXPIRED` | A trial or paid term existed and none is running (from the exact expiry instant) |
+
+The response also contains `hasProAccess`, `accessSource`, `accessExpiresAt`, and two objects:
+
+- `trial`: `eligible`, `ineligibleReason` (`ACCOUNT_INACTIVE`, `PLAN_DISABLED`, `TRIAL_DISABLED`, `TRIAL_ALREADY_USED`, `HAS_PRO_HISTORY`), `used`, `active`, `startedAt`, `expiresAt`.
+- `pro`: `active`, `billingInterval`, `startedAt`, `expiresAt`, `canceledAt`.
+
+`POST /v1/subscription/trial` (bearer token, no body) starts the caller's free trial. It stores `trialStartedAt` = now and `trialExpiresAt` = now + the plan's `trialDays`, and returns `201` with the access summary and trial dates. Rejections:
+
+| Status | Message                                                                          |
+| ------ | -------------------------------------------------------------------------------- |
+| `403`  | `Only active accounts can start a free trial` (status `ACTIVE`, verified email, not soft-deleted) |
+| `403`  | `The free trial is not currently available` (plan or trial disabled)             |
+| `409`  | `The free trial has already been used`                                           |
+| `409`  | `The free trial is only available to accounts that have never subscribed to Pro` |
+
+Activation runs in one transaction: the account check, plan settings, trial write and audit event all succeed or fail together, so a failed activation never uses up the trial. Repeated or concurrent requests cannot create a second trial or change an existing trial's dates.
+
+Pro feature endpoints are protected by `ProAccessGuard`, applied after `AuthGuard` in any module that imports `SubscriptionModule`:
+
+```ts
+@UseGuards(AuthGuard, ProAccessGuard)
+@Get('some-pro-feature')
+handler(@Req() req: ProAccessRequest) { /* req.proAccess: status, accessSource, accessExpiresAt */ }
+```
+
+The guard delegates to `SubscriptionAccessService`, the single Pro access decision. An active free trial and an active paid term unlock the same features, each within its own `[startedAt, expiresAt)` window. Without access, the guard returns `403` with `An active Pro subscription or free trial is required` and the handler does not run. Requests that did not pass `AuthGuard` are rejected with `401`, and lookup errors never grant access. No makeup endpoint uses the guard yet.
+
+Database tests (`test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
+
+```bash
+TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json test/subscription-plan test/user-subscription test/subscription-trial test/subscription-status test/pro-access test/trial-lifecycle test/billing test/subscription-security
+```
+
+
 ## Domain
 
 ```text
 authUser
+|-- UserSubscription (0..1)
 `-- MakeupSession
     |-- ImageAsset
     |-- MakeupPreferences

@@ -33,10 +33,10 @@ jest.mock('./config/auth.config', () => ({
       MAX_DEVICES_PER_USER: 5,
     },
     ROLE_HIERARCHY: {
-      CUSTOMER: 1,
+      USER: 1,
       MODERATOR: 2,
       ADMIN: 3,
-      SUPER_ADMIN: 4,
+      SUPERADMIN: 4,
     },
     CACHE_PREFIXES: {
       VERIFICATION_TOKEN: 'verification',

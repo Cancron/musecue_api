@@ -136,3 +136,39 @@ enum EvaluationResult {
   UNCERTAIN
   CANNOT_EVALUATE
 }
+
+// ================================
+// Subscription Related Enums
+// ================================
+
+enum PlanCode {
+  PRO
+}
+
+enum SubscriptionStatus {
+  FREE
+  TRIAL
+  PRO
+  EXPIRED
+}
+
+enum BillingInterval {
+  MONTHLY
+  YEARLY
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  PARTIALLY_REFUNDED
+  REFUNDED
+}
+
+enum SubscriptionEventType {
+  TRIAL_STARTED
+  CREATED
+  RENEWED
+  CANCELED
+  EXPIRED
+}

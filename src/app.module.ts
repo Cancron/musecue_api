@@ -13,6 +13,7 @@ import { LoggerModule } from './common/modules/logger.module';
 import { MakeupModule } from './makeup/makeup.module';
 import { DatabaseModule } from './common/modules/database.module';
 import { ProfileModule } from './profile/profile.module';
+import { SubscriptionModule } from './subscription/subscription.module';
 
 @Module({
   imports: [
@@ -36,6 +37,7 @@ import { ProfileModule } from './profile/profile.module';
     AuthModule,
     MakeupModule,
     ProfileModule,
+    SubscriptionModule,
   ],
   controllers: [AppController],
   providers: [AppService],

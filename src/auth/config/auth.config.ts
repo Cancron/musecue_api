@@ -2,6 +2,8 @@
  * Authentication Configuration Constants
  */
 
+import type { UserRole } from '../interfaces/auth.interface';
+
 export const AUTH_CONFIG = {
   // Password Configuration
   PASSWORD_MIN_LENGTH: 6,
@@ -35,11 +37,11 @@ export const AUTH_CONFIG = {
 
   // Role Hierarchy (higher number = more permissions)
   ROLE_HIERARCHY: {
-    CUSTOMER: 1,
+    USER: 1,
     MODERATOR: 2,
     ADMIN: 3,
-    SUPER_ADMIN: 4,
-  },
+    SUPERADMIN: 4,
+  } satisfies Record<UserRole, number>,
 
   // Cache Prefixes (improved naming convention)
   CACHE_PREFIXES: {
