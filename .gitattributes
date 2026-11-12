@@ -1,0 +1,5 @@
+* text=auto
+
+# Shell scripts must remain executable on Linux, even when checked out or
+# archived from Windows with core.autocrlf enabled.
+*.sh text eol=lf
