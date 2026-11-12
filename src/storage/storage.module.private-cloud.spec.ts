@@ -149,8 +149,20 @@ class FakeSupabaseStorage {
       const { expiresIn } = JSON.parse(body.toString()) as {
         expiresIn: number;
       };
-      const token = `t-${randomUUID()}`;
-      this.tokens.set(token, { key, exp: this.nowSeconds() + expiresIn });
+      const iat = this.nowSeconds();
+      const token = [
+        Buffer.from('{"alg":"HS256","typ":"JWT"}').toString('base64url'),
+        Buffer.from(
+          JSON.stringify({
+            url: `${BUCKET}/${key}`,
+            iat,
+            exp: iat + expiresIn,
+            jti: randomUUID(),
+          }),
+        ).toString('base64url'),
+        'loopback-signature',
+      ].join('.');
+      this.tokens.set(token, { key, exp: iat + expiresIn });
       return json(200, {
         signedURL: `/object/sign/${BUCKET}/${key}?token=${token}`,
       });
@@ -308,6 +320,21 @@ describe('StorageModule wiring (private cloud storage)', () => {
       Buffer.from('legacy-jpeg'),
     );
     await expect(storage.read(fresh)).resolves.toEqual(Buffer.from('new-jpeg'));
+
+    // With Supabase active, the filesystem can never receive new images.
+    await expect(
+      storage.put(
+        {
+          provider: 'local',
+          key: `${AUTH_ID}/${SESSION_ID}/1b7c9a52-8d2f-4d57-9a8c-0d8c1f0a1b2c.jpg`,
+        },
+        Buffer.from('x'),
+        'image/jpeg',
+      ),
+    ).rejects.toMatchObject({
+      code: 'STORAGE_MISCONFIGURED',
+      provider: 'local',
+    });
   });
 
   it('issues a 60 s signed URL that downloads the object, expires, and can be re-issued', async () => {

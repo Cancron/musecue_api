@@ -26,13 +26,21 @@ export interface PrivateObjectStorageProvider {
   delete(key: string): Promise<void>;
 
   /**
-   * Returns a URL granting read access to one object for `expiresInSeconds`.
-   * The URL must embed only a short-lived, object-scoped token, never the
-   * provider credentials. Providers that cannot sign throw
-   * `SIGNED_URL_UNSUPPORTED`.
+   * Returns a URL granting read access to one object for `expiresInSeconds`
+   * (an integer from 1 to `MAX_SIGNED_URL_TTL_SECONDS`). The URL must embed
+   * only a short-lived, object-scoped token, never the provider credentials,
+   * and must not stay valid longer than requested. Providers that cannot sign
+   * throw `SIGNED_URL_UNSUPPORTED`.
    */
   createSignedUrl(key: string, expiresInSeconds: number): Promise<string>;
 }
+
+/**
+ * Hard upper bound for signed URL lifetimes, enforced by the facade and by
+ * every provider (requests above it are refused; longer-lived provider
+ * tokens are rejected).
+ */
+export const MAX_SIGNED_URL_TTL_SECONDS = 60;
 
 /** Multi-provider injection token: every registered provider instance. */
 export const PRIVATE_OBJECT_STORAGE_PROVIDERS = Symbol(

@@ -2,6 +2,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { WINSTON_MODULE_PROVIDER } from 'nest-winston';
 import type { Logger } from 'winston';
 import {
+  MAX_SIGNED_URL_TTL_SECONDS,
   PRIVATE_OBJECT_STORAGE_PROVIDERS,
   type PrivateObjectRef,
   type PrivateObjectStorageProvider,
@@ -23,8 +24,7 @@ import {
 export type { PrivateObjectRef } from './private-object-storage.provider';
 export type { SupportedImageMime } from './private-storage-key';
 
-/** Upper bound for any signed URL issued through this service. */
-export const MAX_SIGNED_URL_TTL_SECONDS = 60;
+export { MAX_SIGNED_URL_TTL_SECONDS } from './private-object-storage.provider';
 
 /**
  * Application-facing private image storage.

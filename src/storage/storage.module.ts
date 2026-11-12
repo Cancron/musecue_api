@@ -7,6 +7,7 @@ import {
   type PrivateObjectStorageProvider,
 } from './private-object-storage.provider';
 import {
+  LOCAL_STORAGE_PROVIDER_ID,
   PRIVATE_STORAGE_CONFIG,
   loadPrivateStorageConfig,
   type PrivateStorageConfig,
@@ -39,7 +40,10 @@ import { SupabaseStorageProvider } from './providers/supabase-storage.provider';
       provide: LocalFilesystemStorageProvider,
       inject: [PRIVATE_STORAGE_CONFIG],
       useFactory: (config: PrivateStorageConfig) =>
-        new LocalFilesystemStorageProvider(config.localRoot),
+        new LocalFilesystemStorageProvider(config.localRoot, {
+          // Legacy images stay readable/deletable; new ones go to the active provider.
+          writable: config.activeProvider === LOCAL_STORAGE_PROVIDER_ID,
+        }),
     },
     {
       provide: PRIVATE_OBJECT_STORAGE_PROVIDERS,

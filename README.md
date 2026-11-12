@@ -62,13 +62,15 @@ Face photos, step snapshots, and profile avatars are written to a **private** Su
    # SUPABASE_STORAGE_TIMEOUT_MS=15000
    ```
 
-3. Run `npx prisma migrate deploy` (migrations `20261112120000_add_private_storage_provider` and `20261112130000_add_private_storage_cleanup`) and restart the API and workers.
+3. Run `npx prisma migrate deploy` (migrations `20261112120000_add_private_storage_provider`, `20261112130000_add_private_storage_cleanup` and `20261112140000_enforce_avatar_storage_provider`) and restart the API and workers.
 
 For Docker deployments, `docker-compose.prod.yaml` passes these variables into the container at runtime. Compose reads them from the deploy host's environment or from the `.env` file next to the compose files on the server. `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` and `SUPABASE_STORAGE_BUCKET` are required; if one is missing, `docker-compose` stops before starting anything. `.dockerignore` excludes `.env` and `.env.*` (except `.env.example`), so secrets never enter the build context or image layers.
 
 Startup fails when the active provider is misconfigured: a missing variable, a non-https URL (http is accepted only for a local Supabase stack on loopback), or a publishable/anon key. Errors name the variable, never its value. Before uploading, the API checks that the bucket exists and is private. It re-checks every 5 minutes and refuses uploads to a public bucket. Never expose `SUPABASE_*` values to the mobile app or through an `EXPO_PUBLIC_`-style variable.
 
-Existing images keep working. The migration marks every stored image and avatar key as `local`, and reads and deletes always go to the provider recorded on the row. New uploads go to Supabase. Keep `PRIVATE_UPLOAD_DIR` (default `.data/private-images`, ignored by Git and never served statically) available until the old files are copied to the bucket or expire. `PRIVATE_STORAGE_PROVIDER=local` writes new uploads to that directory for offline development. Test runs (`NODE_ENV=test`) use `local` unless configured otherwise.
+Every workflow reads, signs and deletes an image through the provider and key recorded on its row; nothing derives a filesystem path. This covers face photos, step snapshots and checks, avatar uploads, replacements and removals, session deletion, and the AI worker. New uploads always go to the active provider (Supabase). The local filesystem provider stays registered only so images stored before the migration (marked `local`) can still be read and deleted. It is **read-only** unless `PRIVATE_STORAGE_PROVIDER=local`, so no new image can land on the filesystem. Keep `PRIVATE_UPLOAD_DIR` (default `.data/private-images`, ignored by Git and never served statically) available until those old files are copied to the bucket or expire. `PRIVATE_STORAGE_PROVIDER=local` writes new uploads to that directory for offline development. Test runs (`NODE_ENV=test`) use `local` unless configured otherwise.
+
+Avatars are either a private upload (`avatarUrl` holds the storage key and `avatarStorageProvider` holds its provider) or an external URL such as a Google profile photo (`avatarStorageProvider` is `NULL`). A database CHECK constraint enforces this, so a provider is never guessed. External avatar URLs are returned unchanged by `GET /v1/profile`, are never sent to storage, and are never deleted. Avatar uploads, replacements and removals lock the profile row. A first upload creates the row before locking it, so parallel uploads always leave exactly one stored avatar.
 
 Storage failures never expose provider details to clients:
 
@@ -119,7 +121,7 @@ WHERE status = 'FAILED';
 
 - The URL is generated from the provider and key stored on the image and is valid for 60 seconds. Each call issues a new URL, so clients request another one when it expires. URLs are never stored or logged, and the response is sent with `Cache-Control: private, no-store`.
 - The URL contains only an object-scoped token signed by Supabase, never the server key. It reveals the Supabase host, the bucket name and the object key (which contains the user's own id and session id).
-- The API rejects a provider response that is not a signed URL for exactly that bucket and key, or whose token expires later than requested (allowing 30 s of clock skew).
+- The maximum lifetime is strictly 60 seconds. The API asks for 60 s, and both the facade and the provider refuse longer requests. It accepts a provider response only if it is a signed URL for exactly that bucket and key, and its token is a JWT whose signed lifetime (`exp − iat`) is at most the requested 60 s. There is no clock-skew allowance. Tokens without readable `iat`/`exp` claims are rejected rather than trusted. Because the lifetime comes from the issuer's own claims, this does not depend on the API and Supabase clocks agreeing.
 - Responses: `401` without a valid token. `404` `Image not found` for a missing image *or another user's image* (they are indistinguishable). `404` `Image content is unavailable` for a missing object or a non-uploaded image. `409` for images still on the local filesystem (use `/content`). `503` or `500` for storage failures, as in the table above.
 - `GET /v1/images/:imageId/content` is unchanged.
 - Clients download directly from the Supabase host, so the mobile app must be allowed to reach it.
@@ -369,7 +371,7 @@ npm run build
 npm run lint
 npm test
 npx jest private-cloud   # private image storage unit tests
-TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json test/private-cloud   # cleanup ledger on PostgreSQL
+TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json test/private-cloud   # storage workflows + cleanup ledger on PostgreSQL (mocked Supabase)
 npm run test:e2e
 npx prisma generate
 npx prisma migrate dev

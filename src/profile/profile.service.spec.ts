@@ -33,6 +33,7 @@ describe('ProfileService avatar ownership and lifecycle', () => {
       username: 'owner',
       userProfile: {
         avatarUrl: 'owner-id/profile/avatar.jpg',
+        avatarStorageProvider: 'supabase',
         updatedAt,
       },
     } as never);

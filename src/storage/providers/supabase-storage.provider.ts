@@ -4,7 +4,10 @@ import {
   StorageUnknownError,
   isStorageError,
 } from '@supabase/storage-js';
-import type { PrivateObjectStorageProvider } from '../private-object-storage.provider';
+import {
+  MAX_SIGNED_URL_TTL_SECONDS,
+  type PrivateObjectStorageProvider,
+} from '../private-object-storage.provider';
 import {
   SUPABASE_STORAGE_PROVIDER_ID,
   type SupabaseStorageConfig,
@@ -19,8 +22,6 @@ type FetchLike = typeof fetch;
 
 /** Re-check bucket visibility periodically so a bucket made public is noticed. */
 const BUCKET_VISIBILITY_TTL_MS = 5 * 60_000;
-/** Tolerated clock difference when checking a signed token's expiry. */
-const SIGNED_URL_CLOCK_SKEW_SECONDS = 30;
 
 /**
  * Supabase Storage adapter for a private bucket.
@@ -98,6 +99,15 @@ export class SupabaseStorageProvider implements PrivateObjectStorageProvider {
     key: string,
     expiresInSeconds: number,
   ): Promise<string> {
+    if (
+      !Number.isInteger(expiresInSeconds) ||
+      expiresInSeconds < 1 ||
+      expiresInSeconds > MAX_SIGNED_URL_TTL_SECONDS
+    ) {
+      throw new RangeError(
+        `Signed URL lifetime must be 1-${MAX_SIGNED_URL_TTL_SECONDS} seconds`,
+      );
+    }
     const client = this.requireClient('sign');
     const { data, error } = await this.call('sign', () =>
       client.from(this.bucket).createSignedUrl(key, expiresInSeconds),
@@ -115,9 +125,11 @@ export class SupabaseStorageProvider implements PrivateObjectStorageProvider {
 
   /**
    * Accepts only a URL on the configured Storage origin, for exactly this
-   * bucket/key, carrying a token. When the token is a readable JWT its expiry
-   * must not exceed the requested lifetime, so a misbehaving or spoofed
-   * response can never hand out long-lived access.
+   * bucket/key, whose token is a JWT with `iat`/`exp` claims describing a
+   * lifetime of at most `expiresInSeconds` (itself at most 60 s). The
+   * lifetime comes from the issuer's own signed claims, so the check is
+   * strict without depending on clock agreement; tokens whose lifetime cannot
+   * be read are rejected rather than trusted.
    */
   private isExpectedSignedUrl(
     value: string,
@@ -142,13 +154,9 @@ export class SupabaseStorageProvider implements PrivateObjectStorageProvider {
     ) {
       return false;
     }
-    const exp = jwtExpiry(token);
+    const lifetime = tokenLifetimeSeconds(token);
     return (
-      exp === undefined ||
-      exp <=
-        Math.floor(this.now() / 1000) +
-          expiresInSeconds +
-          SIGNED_URL_CLOCK_SKEW_SECONDS
+      lifetime !== undefined && lifetime > 0 && lifetime <= expiresInSeconds
     );
   }
 
@@ -304,8 +312,11 @@ function classifyStatus(
   return 'STORAGE_REJECTED';
 }
 
-/** `exp` claim of a JWT-shaped token, or undefined when it is not readable. */
-function jwtExpiry(token: string): number | undefined {
+/**
+ * `exp - iat` of a JWT-shaped token (its issued lifetime in seconds), or
+ * undefined when the token or either claim is missing or malformed.
+ */
+function tokenLifetimeSeconds(token: string): number | undefined {
   const parts = token.split('.');
   if (parts.length !== 3) return undefined;
   try {
@@ -315,10 +326,14 @@ function jwtExpiry(token: string): number | undefined {
     if (
       typeof payload === 'object' &&
       payload !== null &&
+      'iat' in payload &&
       'exp' in payload &&
-      typeof payload.exp === 'number'
+      typeof payload.iat === 'number' &&
+      typeof payload.exp === 'number' &&
+      Number.isInteger(payload.iat) &&
+      Number.isInteger(payload.exp)
     ) {
-      return payload.exp;
+      return payload.exp - payload.iat;
     }
   } catch {
     return undefined;

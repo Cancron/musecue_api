@@ -9,7 +9,6 @@ import {
   PrivateImageStorageService,
   type PrivateObjectRef,
 } from '../storage/private-image-storage.service';
-import { LOCAL_STORAGE_PROVIDER_ID } from '../storage/private-storage.config';
 import { toImageStorageHttpError } from '../storage/private-storage-http';
 
 const AVATAR_MIME_TYPES: Readonly<Record<string, string>> = {
@@ -28,26 +27,34 @@ const AVATAR_SELECT = { avatarUrl: true, avatarStorageProvider: true } as const;
 /**
  * Returns the private storage location of an uploaded avatar, or null when
  * there is no avatar or it is an external URL (e.g. a Google profile photo).
+ * The database guarantees a provider is recorded exactly for private keys
+ * (`userProfile_avatar_storage_provider_check`), so nothing is guessed.
  */
 function privateAvatar(
   profile: StoredAvatar | null | undefined,
 ): PrivateObjectRef | null {
-  const key = profile?.avatarUrl;
-  if (!key) return null;
-  if (profile.avatarStorageProvider) {
-    return { provider: profile.avatarStorageProvider, key };
-  }
-  // Keys written before provider tracking came from the filesystem adapter.
-  return key.includes('://')
-    ? null
-    : { provider: LOCAL_STORAGE_PROVIDER_ID, key };
+  if (!profile?.avatarUrl || !profile.avatarStorageProvider) return null;
+  return { provider: profile.avatarStorageProvider, key: profile.avatarUrl };
 }
 
-/** Reads the current avatar while holding a row lock until the transaction ends. */
+/**
+ * Reads the current avatar while holding a row lock until the transaction
+ * ends. With `ensureRow`, an empty profile is created first: without a row
+ * there is nothing to lock, and concurrent first uploads would each see "no
+ * previous avatar" and leave all but one upload unreferenced.
+ */
 async function lockAvatar(
   tx: Prisma.TransactionClient,
   authId: string,
+  ensureRow = false,
 ): Promise<StoredAvatar | null> {
+  if (ensureRow) {
+    await tx.$executeRaw`
+      INSERT INTO "userProfile" ("id", "authId", "updatedAt")
+      VALUES (gen_random_uuid()::text, ${authId}, now())
+      ON CONFLICT ("authId") DO NOTHING
+    `;
+  }
   const rows = await tx.$queryRaw<StoredAvatar[]>`
     SELECT "avatarUrl", "avatarStorageProvider" FROM "userProfile"
     WHERE "authId" = ${authId} FOR UPDATE
@@ -118,7 +125,7 @@ export class ProfileService {
       replaced = await this.prisma.$transaction(async (tx) => {
         // Lock the row so concurrent uploads cannot both "replace" the same
         // previous avatar and leave one new avatar unreferenced.
-        const previous = privateAvatar(await lockAvatar(tx, authId));
+        const previous = privateAvatar(await lockAvatar(tx, authId, true));
         await tx.userProfile.upsert({
           where: { authId },
           create: { authId, ...avatar },

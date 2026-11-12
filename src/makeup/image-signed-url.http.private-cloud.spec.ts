@@ -97,11 +97,11 @@ const json = (body: unknown, status = 200) =>
     }),
   );
 
-const tokenFor = (exp: number, nonce: number) =>
+const tokenFor = (exp: number, nonce: number, iat = NOW_SECONDS) =>
   [
     Buffer.from('{"alg":"HS256","typ":"JWT"}').toString('base64url'),
     Buffer.from(
-      JSON.stringify({ url: `${SUPABASE.bucket}/${KEY}`, exp, n: nonce }),
+      JSON.stringify({ url: `${SUPABASE.bucket}/${KEY}`, iat, exp, n: nonce }),
     ).toString('base64url'),
     'mock-signature',
   ].join('.');
@@ -137,8 +137,9 @@ describe('GET /v1/images/:imageId/signed-url (HTTP, mocked Supabase)', () => {
         expiresIn: number;
       };
       signed += 1;
+      const iat = Math.floor(Date.now() / 1000);
       return json({
-        signedURL: `/object/sign/${SUPABASE.bucket}/${KEY}?token=${tokenFor(NOW_SECONDS + expiresIn, signed)}`,
+        signedURL: `/object/sign/${SUPABASE.bucket}/${KEY}?token=${tokenFor(iat + expiresIn, signed, iat)}`,
       });
     }
     if (url.endsWith(`/object/${SUPABASE.bucket}/${KEY}`)) {
@@ -310,7 +311,8 @@ describe('GET /v1/images/:imageId/signed-url (HTTP, mocked Supabase)', () => {
       ) as string;
       const claims = JSON.parse(
         Buffer.from(token.split('.')[1], 'base64url').toString(),
-      ) as { exp: number };
+      ) as { iat: number; exp: number };
+      expect(claims.exp - claims.iat).toBe(60);
       expect(claims.exp).toBe(NOW_SECONDS + 60);
     });
 
@@ -333,6 +335,36 @@ describe('GET /v1/images/:imageId/signed-url (HTTP, mocked Supabase)', () => {
       ]) {
         expect(write.calls).toHaveLength(0);
       }
+    });
+
+    it.each([61, 90, 3600])(
+      'refuses a provider URL valid for %i s (strict 60 s maximum)',
+      async (lifetime) => {
+        respond = () =>
+          json({
+            signedURL: `/object/sign/${SUPABASE.bucket}/${KEY}?token=${tokenFor(NOW_SECONDS + lifetime, 1)}`,
+          });
+
+        const response = await getSignedUrl('owned-image', OWNER).expect(500);
+
+        expect(bodyOf(response).message).toBe('Image storage is unavailable');
+        expect(JSON.stringify(bodyOf(response))).not.toContain('token');
+      },
+    );
+
+    it('refuses a token without iat, whose lifetime cannot be verified', async () => {
+      respond = () =>
+        json({
+          signedURL: `/object/sign/${SUPABASE.bucket}/${KEY}?token=${[
+            Buffer.from('{"alg":"HS256"}').toString('base64url'),
+            Buffer.from(JSON.stringify({ exp: NOW_SECONDS + 60 })).toString(
+              'base64url',
+            ),
+            'sig',
+          ].join('.')}`,
+        });
+
+      await getSignedUrl('owned-image', OWNER).expect(500);
     });
 
     it('refuses a provider URL that would stay valid longer than requested', async () => {

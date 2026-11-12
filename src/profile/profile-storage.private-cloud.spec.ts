@@ -86,10 +86,10 @@ describe('ProfileService private cloud storage lifecycle', () => {
     });
   });
 
-  it('reads avatars stored before provider tracking from local storage', async () => {
+  it('reads a stored avatar from the provider recorded with it', async () => {
     prisma.userProfile.findUnique.mockResolvedValue({
       avatarUrl: 'owner-id/profile/legacy.jpg',
-      avatarStorageProvider: null,
+      avatarStorageProvider: 'local',
     } as never);
     imageStorage.read.mockResolvedValue(Buffer.from('legacy'));
 
@@ -103,16 +103,37 @@ describe('ProfileService private cloud storage lifecycle', () => {
     });
   });
 
+  it('never guesses a provider (e.g. the local filesystem) for an avatar without one', async () => {
+    prisma.userProfile.findUnique.mockResolvedValue({
+      avatarUrl: 'owner-id/profile/orphan.jpg',
+      avatarStorageProvider: null,
+    } as never);
+
+    const error = await service
+      .getAvatarContent('owner-id')
+      .catch((caught: unknown) => caught);
+
+    expect((error as AppError).getStatus()).toBe(404);
+    expect(imageStorage.read.mock.calls).toHaveLength(0);
+  });
+
   describe('updateAvatar', () => {
     it('locks the profile row, stores the new avatar and records the old one in one transaction', async () => {
       lockedAvatar('owner-id/profile/legacy.jpg', 'local');
 
       await service.updateAvatar('owner-id', FILE);
 
+      const ensureSql = (
+        tx.$executeRaw.mock.calls[0]?.[0] as unknown as string[]
+      ).join('?');
       const lockSql = (
         tx.$queryRaw.mock.calls[0]?.[0] as unknown as string[]
       ).join('?');
+      expect(ensureSql).toContain('ON CONFLICT ("authId") DO NOTHING');
       expect(lockSql).toContain('FOR UPDATE');
+      expect(tx.$executeRaw.mock.invocationCallOrder[0]).toBeLessThan(
+        tx.$queryRaw.mock.invocationCallOrder[0],
+      );
       expect(tx.userProfile.upsert.mock.calls[0]?.[0].update).toEqual({
         avatarUrl: STORED.key,
         avatarStorageProvider: 'supabase',
@@ -192,11 +213,12 @@ describe('ProfileService private cloud storage lifecycle', () => {
       expect(lifecycle.processRefs.mock.calls).toEqual([[[STORED]]]);
     });
 
-    it('does nothing when there is no avatar', async () => {
+    it('does nothing when there is no avatar, and never creates a profile', async () => {
       lockedAvatar(null, null);
 
       await service.deleteAvatar('owner-id');
 
+      expect(tx.$executeRaw.mock.calls).toHaveLength(0);
       expect(tx.userProfile.update.mock.calls).toHaveLength(0);
       expect(lifecycle.scheduleDeletion.mock.calls).toHaveLength(0);
     });

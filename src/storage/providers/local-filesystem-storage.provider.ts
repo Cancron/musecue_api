@@ -9,15 +9,25 @@ import {
 
 /**
  * Private filesystem storage for local/offline development and for reading
- * and deleting images stored before the move to cloud storage. The root must
- * never be served as a public static directory.
+ * and deleting images stored before the move to cloud storage. Unless it is
+ * the active provider it is read-only (`writable: false`), so new images can
+ * never land on the filesystem. The root must never be served statically.
  */
 export class LocalFilesystemStorageProvider implements PrivateObjectStorageProvider {
   readonly id = LOCAL_STORAGE_PROVIDER_ID;
 
-  constructor(private readonly root: string) {}
+  constructor(
+    private readonly root: string,
+    private readonly options: { writable: boolean } = { writable: true },
+  ) {}
 
   async put(key: string, bytes: Buffer): Promise<void> {
+    if (!this.options.writable) {
+      throw new PrivateStorageError('STORAGE_MISCONFIGURED', {
+        provider: this.id,
+        operation: 'put',
+      });
+    }
     const absolutePath = this.resolveKey(key);
     try {
       await mkdir(dirname(absolutePath), { recursive: true });

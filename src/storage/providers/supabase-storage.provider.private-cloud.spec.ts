@@ -395,17 +395,13 @@ describe('SupabaseStorageProvider (private cloud storage)', () => {
       expect(url).not.toContain(SERVICE_KEY);
     });
 
-    it('accepts an opaque (non-JWT) token', async () => {
-      const { provider: supabase } = provider(() => signed('opaque-token'));
-
-      await expect(supabase.createSignedUrl(KEY, 60)).resolves.toBe(
-        `${SIGN_URL}?token=opaque-token`,
-      );
-    });
-
-    it('accepts a token expiring within the allowed clock skew', async () => {
+    it.each([
+      ['exactly 60 s', 60],
+      ['a shorter lifetime', 30],
+      ['one second', 1],
+    ])('accepts a token with a lifetime of %s', async (_label, lifetime) => {
       const { provider: supabase } = provider(() =>
-        signed(token({ exp: nowSeconds + 60 + 30 })),
+        signed(token({ iat: nowSeconds, exp: nowSeconds + lifetime })),
       );
 
       await expect(supabase.createSignedUrl(KEY, 60)).resolves.toContain(
@@ -413,21 +409,97 @@ describe('SupabaseStorageProvider (private cloud storage)', () => {
       );
     });
 
+    it('measures the lifetime from the signed claims, independent of the local clock', async () => {
+      // Supabase's clock 10 minutes ahead: still a 60 s token, so accepted.
+      const ahead = nowSeconds + 600;
+      const { provider: supabase } = provider(() =>
+        signed(token({ iat: ahead, exp: ahead + 60 })),
+      );
+
+      await expect(supabase.createSignedUrl(KEY, 60)).resolves.toContain(
+        'token=',
+      );
+    });
+
+    it('never accepts more than the requested lifetime, even below 60 s', async () => {
+      const { provider: supabase } = provider(() =>
+        signed(token({ iat: nowSeconds, exp: nowSeconds + 31 })),
+      );
+
+      await expectStorageError(
+        supabase.createSignedUrl(KEY, 30),
+        'INVALID_PROVIDER_RESPONSE',
+        false,
+      );
+    });
+
+    it.each([0, 61, 90, 3600, 1.5, -60])(
+      'refuses to request a lifetime of %p seconds without calling Supabase',
+      async (ttl) => {
+        const { provider: supabase, requests } = provider(() =>
+          signed(token({ iat: nowSeconds, exp: nowSeconds + 60 })),
+        );
+
+        await expect(supabase.createSignedUrl(KEY, ttl)).rejects.toThrow(
+          RangeError,
+        );
+        expect(requests).toHaveLength(0);
+      },
+    );
+
+    const VALID = token({ iat: nowSeconds, exp: nowSeconds + 60 });
+
     it.each([
       [
-        'a token valid far longer than requested',
-        () => signed(token({ exp: nowSeconds + 3600 })),
+        'a 61 s token (one second over the maximum)',
+        () => signed(token({ iat: nowSeconds, exp: nowSeconds + 61 })),
       ],
+      [
+        'a 90 s token (the former skew allowance)',
+        () => signed(token({ iat: nowSeconds, exp: nowSeconds + 90 })),
+      ],
+      [
+        'a token valid for an hour',
+        () => signed(token({ iat: nowSeconds, exp: nowSeconds + 3600 })),
+      ],
+      [
+        'a token without iat (lifetime cannot be verified)',
+        () => signed(token({ exp: nowSeconds + 60 })),
+      ],
+      [
+        'a token without exp (never expires)',
+        () => signed(token({ iat: nowSeconds })),
+      ],
+      [
+        'a token expiring before it was issued',
+        () => signed(token({ iat: nowSeconds, exp: nowSeconds })),
+      ],
+      [
+        'non-integer claims',
+        () => signed(token({ iat: nowSeconds, exp: nowSeconds + 59.5 })),
+      ],
+      [
+        'string claims',
+        () =>
+          signed(
+            token({ iat: String(nowSeconds), exp: String(nowSeconds + 60) }),
+          ),
+      ],
+      ['an opaque (non-JWT) token', () => signed('opaque-token')],
+      ['a JWT with an unreadable payload', () => signed('a.%%%.c')],
       [
         'a URL for another object',
         () =>
           json({
-            signedURL: `/object/sign/${CONFIG.bucket}/other/x.jpg?token=t`,
+            signedURL: `/object/sign/${CONFIG.bucket}/other/x.jpg?token=${VALID}`,
           }),
       ],
       [
         'a URL for another bucket',
-        () => json({ signedURL: `/object/sign/public-bucket/${KEY}?token=t` }),
+        () =>
+          json({
+            signedURL: `/object/sign/public-bucket/${KEY}?token=${VALID}`,
+          }),
       ],
       [
         'a URL without a token',
@@ -437,7 +509,9 @@ describe('SupabaseStorageProvider (private cloud storage)', () => {
       [
         'a public (unsigned) object URL',
         () =>
-          json({ signedURL: `/object/public/${CONFIG.bucket}/${KEY}?token=t` }),
+          json({
+            signedURL: `/object/public/${CONFIG.bucket}/${KEY}?token=${VALID}`,
+          }),
       ],
     ])('rejects %s', async (_label, responder) => {
       const { provider: supabase } = provider(responder);
