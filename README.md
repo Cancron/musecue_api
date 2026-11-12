@@ -2,7 +2,7 @@
 
 **AI makeup guidance, made for your face.**
 
-The MuseCue API is the NestJS authority for authentication, authorization, workflow state, persistence, and AI orchestration. Supabase is not used. AI providers may interpret or generate data, but only NestJS validates results and advances application state.
+The MuseCue API is the NestJS authority for authentication, authorization, workflow state, persistence, and AI orchestration. Supabase Auth and Database are not used; Supabase Storage serves only as the server-side private image store. AI providers may interpret or generate data, but only NestJS validates results and advances application state.
 
 The companion mobile application and detailed product specifications live in `../face_makeup_app`.
 
@@ -11,7 +11,7 @@ The companion mobile application and detailed product specifications live in `..
 - PostgreSQL/Prisma local accounts, SMTP verification through BullMQ, login auditing, account lockout, and Google OAuth foundations
 - short-lived JWT access tokens and rotating, revocable Redis-backed refresh tokens
 - owner-scoped makeup sessions and the documented workflow state machine
-- validated multipart image upload, private filesystem storage, image metadata, structured preferences, face analysis, ranked recommendations, saved looks, and selection
+- validated multipart image upload, private object storage (a private Supabase Storage bucket by default, behind a provider interface), image metadata, structured preferences, face analysis, ranked recommendations, saved looks, and selection
 - generated guides, authoritative step progression, retained visual attempts, contextual questions, completion history, profile statistics, and optional private profile avatars
 - BullMQ jobs for personalization, guide generation, visual checks, and guide questions
 - `AiRun` audit records containing operation, provider, model, prompt version, latency, progress, result/error, and status
@@ -22,7 +22,9 @@ Migration `20260827174107_add_makeup_workflow` adds the makeup aggregate and rem
 
 Intentionally deferred:
 
-- a production cloud object-storage adapter and short-lived signed reads; the current private filesystem adapter is intended for local/self-hosted deployments
+- short-lived signed reads; private images are streamed through the authenticated content routes instead
+- copying images stored on the filesystem before the Supabase migration into the bucket (they remain readable through the `local` provider while its directory is present)
+- additional S3-compatible storage providers (the provider interface is in place; see "Private image storage")
 - generated preview images (recommendation reasoning is live, while the existing curated preview-image contract remains in place)
 - production retention/deletion automation and AI cost accounting
 
@@ -45,7 +47,38 @@ The API defaults to `http://localhost:5000`; development Swagger is at `http://l
 
 Important environment variables are documented in `.env.example`. Never commit the real `.env` or log SMTP credentials, tokens, image contents, or future signed URLs.
 
-`PRIVATE_UPLOAD_DIR` controls the private image root and defaults to `.data/private-images`. The directory is ignored by Git and is never mounted as a public static directory.
+### Private image storage
+
+Face photos, step snapshots, and profile avatars are written to a **private** Supabase Storage bucket by default. The API validates the image and checks ownership first, then uploads the bytes with a server-side secret key. It records the object key and the provider that holds it (`ImageAsset.storageKey` + `storageProvider`, `userProfile.avatarUrl` + `avatarStorageProvider`). Clients never receive the key, bucket name, Supabase URL, or credentials; images are served only through the authenticated content routes.
+
+1. In the Supabase dashboard, create a bucket (for example `musecue-private-images`) with **Public bucket switched off**. We recommend a 10 MB file size limit and allowed MIME types `image/jpeg, image/png, image/webp`. No RLS policies are needed: only the server's secret key accesses the bucket.
+2. Set the server-side variables (see `.env.example`):
+
+   ```dotenv
+   PRIVATE_STORAGE_PROVIDER=supabase
+   SUPABASE_URL=https://your-project-ref.supabase.co
+   SUPABASE_SERVICE_ROLE_KEY=your-secret-or-service-role-key
+   SUPABASE_STORAGE_BUCKET=musecue-private-images
+   # SUPABASE_STORAGE_TIMEOUT_MS=15000
+   ```
+
+3. Run `npx prisma migrate deploy` (migration `20261112120000_add_private_storage_provider`) and restart the API and workers.
+
+Startup fails when the active provider is misconfigured: a missing variable, a non-https URL (http is accepted only for a local Supabase stack on loopback), or a publishable/anon key. Errors name the variable, never its value. Before uploading, the API checks that the bucket exists and is private. It re-checks every 5 minutes and refuses uploads to a public bucket. Never expose `SUPABASE_*` values to the mobile app or through an `EXPO_PUBLIC_`-style variable.
+
+Existing images keep working. The migration marks every stored image and avatar key as `local`, and reads and deletes always go to the provider recorded on the row. New uploads go to Supabase. Keep `PRIVATE_UPLOAD_DIR` (default `.data/private-images`, ignored by Git and never served statically) available until the old files are copied to the bucket or expire. `PRIVATE_STORAGE_PROVIDER=local` writes new uploads to that directory for offline development. Test runs (`NODE_ENV=test`) use `local` unless configured otherwise.
+
+Storage failures never expose provider details to clients:
+
+| Situation                                             | Upload / image read response                             | Worker (analysis, visual check)         |
+| ----------------------------------------------------- | -------------------------------------------------------- | --------------------------------------- |
+| Object missing                                        | read: `404` (`Image content is unavailable`)             | run fails immediately with a clear message |
+| Network error, timeout, rate limit, provider `5xx`     | `503` `Image storage is temporarily unavailable. Please try again.` | retried within the job's retry budget   |
+| Misconfiguration, public/missing bucket, rejected key | `500` `Image storage is unavailable`                     | run fails                               |
+
+Logs include the provider, operation, error code, and HTTP status, never URLs, credentials, or image bytes. If the database write fails after an upload, the new object is deleted. Replaced or deleted images are removed after the database commit. A failed removal does not fail the request; it logs `Private image cleanup failed; object may be orphaned` with the key so the object can be removed manually.
+
+To add a backend such as an S3-compatible service, implement `PrivateObjectStorageProvider` (`src/storage/private-object-storage.provider.ts`) and register it in `StorageModule`. Keys, validation, ownership checks, and the image workflow stay the same. The focused storage tests run with `npx jest private-cloud`.
 
 ### Live AI with OpenRouter
 
@@ -288,6 +321,7 @@ npm run start:dev
 npm run build
 npm run lint
 npm test
+npx jest private-cloud   # private image storage unit tests
 npm run test:e2e
 npx prisma generate
 npx prisma migrate dev

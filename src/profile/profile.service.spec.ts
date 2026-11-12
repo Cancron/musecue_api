@@ -46,8 +46,12 @@ describe('ProfileService avatar ownership and lifecycle', () => {
     });
     prisma.userProfile.findUnique.mockResolvedValue({
       avatarUrl: 'owner-id/profile/old.jpg',
+      avatarStorageProvider: 'supabase',
     } as never);
-    imageStorage.save.mockResolvedValue('owner-id/profile/new.jpg');
+    imageStorage.save.mockResolvedValue({
+      provider: 'supabase',
+      key: 'owner-id/profile/new.jpg',
+    });
     prisma.userProfile.upsert.mockResolvedValue({} as never);
     prisma.authUser.findUnique.mockResolvedValue({
       id: 'owner-id',
@@ -55,6 +59,7 @@ describe('ProfileService avatar ownership and lifecycle', () => {
       username: 'owner',
       userProfile: {
         avatarUrl: 'owner-id/profile/new.jpg',
+        avatarStorageProvider: 'supabase',
         updatedAt: new Date('2026-09-03T12:00:00.000Z'),
       },
     } as never);
@@ -68,12 +73,20 @@ describe('ProfileService avatar ownership and lifecycle', () => {
     ]);
     expect(prisma.userProfile.upsert.mock.calls[0]?.[0]).toEqual({
       where: { authId: 'owner-id' },
-      create: { authId: 'owner-id', avatarUrl: 'owner-id/profile/new.jpg' },
-      update: { avatarUrl: 'owner-id/profile/new.jpg' },
+      create: {
+        authId: 'owner-id',
+        avatarUrl: 'owner-id/profile/new.jpg',
+        avatarStorageProvider: 'supabase',
+      },
+      update: {
+        avatarUrl: 'owner-id/profile/new.jpg',
+        avatarStorageProvider: 'supabase',
+      },
     });
-    expect(imageStorage.delete.mock.calls).toContainEqual([
-      'owner-id/profile/old.jpg',
-    ]);
+    expect(imageStorage.deleteQuietly.mock.calls[0]?.[0]).toEqual({
+      provider: 'supabase',
+      key: 'owner-id/profile/old.jpg',
+    });
   });
 
   it('deletes a newly written file when the database update fails', async () => {
@@ -88,7 +101,10 @@ describe('ProfileService avatar ownership and lifecycle', () => {
       sizeBytes: 6,
     });
     prisma.userProfile.findUnique.mockResolvedValue(null);
-    imageStorage.save.mockResolvedValue('owner-id/profile/new.jpg');
+    imageStorage.save.mockResolvedValue({
+      provider: 'supabase',
+      key: 'owner-id/profile/new.jpg',
+    });
     prisma.userProfile.upsert.mockRejectedValue(
       new Error('Database unavailable'),
     );
@@ -96,14 +112,16 @@ describe('ProfileService avatar ownership and lifecycle', () => {
     await expect(service.updateAvatar('owner-id', file)).rejects.toThrow(
       'Database unavailable',
     );
-    expect(imageStorage.delete.mock.calls).toContainEqual([
-      'owner-id/profile/new.jpg',
-    ]);
+    expect(imageStorage.deleteQuietly.mock.calls[0]?.[0]).toEqual({
+      provider: 'supabase',
+      key: 'owner-id/profile/new.jpg',
+    });
   });
 
   it('removes an external provider avatar without treating its URL as a local path', async () => {
     prisma.userProfile.findUnique.mockResolvedValue({
       avatarUrl: 'https://images.example.com/avatar.jpg',
+      avatarStorageProvider: null,
     } as never);
     prisma.userProfile.update.mockResolvedValue({} as never);
     prisma.authUser.findUnique.mockResolvedValue({
@@ -117,17 +135,17 @@ describe('ProfileService avatar ownership and lifecycle', () => {
 
     expect(prisma.userProfile.update.mock.calls[0]?.[0]).toEqual({
       where: { authId: 'owner-id' },
-      data: { avatarUrl: null },
+      data: { avatarUrl: null, avatarStorageProvider: null },
     });
-    expect(imageStorage.delete.mock.calls).toContainEqual([
-      'https://images.example.com/avatar.jpg',
-    ]);
+    expect(imageStorage.delete.mock.calls).toHaveLength(0);
+    expect(imageStorage.deleteQuietly.mock.calls).toHaveLength(0);
   });
 
   it('reads only the current user profile avatar', async () => {
     const bytes = Buffer.from('private-avatar');
     prisma.userProfile.findUnique.mockResolvedValue({
       avatarUrl: 'owner-id/profile/avatar.webp',
+      avatarStorageProvider: 'supabase',
     } as never);
     imageStorage.read.mockResolvedValue(bytes);
 
@@ -137,7 +155,11 @@ describe('ProfileService avatar ownership and lifecycle', () => {
     });
     expect(prisma.userProfile.findUnique.mock.calls[0]?.[0]).toEqual({
       where: { authId: 'owner-id' },
-      select: { avatarUrl: true },
+      select: { avatarUrl: true, avatarStorageProvider: true },
+    });
+    expect(imageStorage.read.mock.calls[0]?.[0]).toEqual({
+      provider: 'supabase',
+      key: 'owner-id/profile/avatar.webp',
     });
   });
 });

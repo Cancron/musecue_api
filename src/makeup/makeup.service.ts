@@ -2,7 +2,12 @@ import { Inject, Injectable } from '@nestjs/common';
 import { Prisma, type AiRun } from '@prisma/client';
 import AppError from '../common/errors/app.error';
 import { PrismaService } from '../common/services/prisma.service';
-import { PrivateImageStorageService } from '../storage/private-image-storage.service';
+import {
+  PrivateImageStorageService,
+  type PrivateObjectRef,
+  type SupportedImageMime,
+} from '../storage/private-image-storage.service';
+import { toImageStorageHttpError } from '../storage/private-storage-http';
 import type {
   AskQuestionDto,
   CompleteStepDto,
@@ -47,6 +52,13 @@ const SESSION_INCLUDE = {
     },
   },
 } satisfies Prisma.MakeupSessionInclude;
+
+function storedObject(image: {
+  storageKey: string;
+  storageProvider: string;
+}): PrivateObjectRef {
+  return { provider: image.storageProvider, key: image.storageKey };
+}
 
 @Injectable()
 export class MakeupService {
@@ -106,7 +118,7 @@ export class MakeupService {
       select: {
         id: true,
         status: true,
-        images: { select: { storageKey: true } },
+        images: { select: { storageKey: true, storageProvider: true } },
       },
     });
     if (!session) throw AppError.notFound('Makeup session not found');
@@ -123,8 +135,13 @@ export class MakeupService {
       throw AppError.conflict('The session changed and could not be deleted');
     }
 
-    await Promise.allSettled(
-      session.images.map((image) => this.imageStorage.delete(image.storageKey)),
+    await Promise.all(
+      session.images.map((image) =>
+        this.imageStorage.deleteQuietly(
+          storedObject(image),
+          'completed session deleted',
+        ),
+      ),
     );
     return { id: sessionId };
   }
@@ -132,7 +149,12 @@ export class MakeupService {
   async getImageContent(authId: string, imageId: string) {
     const image = await this.prisma.imageAsset.findFirst({
       where: { id: imageId, session: { authId } },
-      select: { storageKey: true, mimeType: true, source: true },
+      select: {
+        storageKey: true,
+        storageProvider: true,
+        mimeType: true,
+        source: true,
+      },
     });
     if (!image) throw AppError.notFound('Image not found');
     if (image.source !== 'PRIVATE_UPLOAD') {
@@ -142,10 +164,10 @@ export class MakeupService {
     try {
       return {
         mimeType: image.mimeType,
-        bytes: await this.imageStorage.read(image.storageKey),
+        bytes: await this.imageStorage.read(storedObject(image)),
       };
-    } catch {
-      throw AppError.notFound('Image content is unavailable');
+    } catch (error) {
+      throw toImageStorageHttpError(error, 'Image content is unavailable');
     }
   }
 
@@ -163,8 +185,9 @@ export class MakeupService {
     if (!file) throw AppError.badRequest('An image file is required');
 
     const image = await this.imageValidation.validate(file);
-    let replacedImages: Array<{ storageKey: string }> = [];
-    const storageKey = await this.imageStorage.save(
+    let replacedImages: Array<{ storageKey: string; storageProvider: string }> =
+      [];
+    const stored = await this.storeImage(
       authId,
       sessionId,
       image.mimeType,
@@ -179,7 +202,7 @@ export class MakeupService {
         ]);
         replacedImages = await tx.imageAsset.findMany({
           where: { sessionId, purpose: 'INITIAL_ANALYSIS' },
-          select: { storageKey: true },
+          select: { storageKey: true, storageProvider: true },
         });
         await tx.imageAsset.deleteMany({
           where: { sessionId, purpose: 'INITIAL_ANALYSIS' },
@@ -189,7 +212,8 @@ export class MakeupService {
             sessionId,
             purpose: 'INITIAL_ANALYSIS',
             source: 'PRIVATE_UPLOAD',
-            storageKey,
+            storageKey: stored.key,
+            storageProvider: stored.provider,
             ...image,
           },
         });
@@ -199,13 +223,19 @@ export class MakeupService {
         });
       });
     } catch (error) {
-      await this.imageStorage.delete(storageKey);
+      await this.imageStorage.deleteQuietly(
+        stored,
+        'initial image upload rolled back',
+      );
       throw error;
     }
 
     await Promise.all(
       replacedImages.map((imageAsset) =>
-        this.imageStorage.delete(imageAsset.storageKey),
+        this.imageStorage.deleteQuietly(
+          storedObject(imageAsset),
+          'initial image replaced',
+        ),
       ),
     );
     return this.getSession(authId, sessionId);
@@ -355,7 +385,7 @@ export class MakeupService {
     if (!file) throw AppError.badRequest('A current makeup image is required');
 
     const image = await this.imageValidation.validate(file);
-    const storageKey = await this.imageStorage.save(
+    const stored = await this.storeImage(
       authId,
       step.guide.sessionId,
       image.mimeType,
@@ -369,7 +399,8 @@ export class MakeupService {
           sessionId: step.guide.sessionId,
           purpose: 'STEP_CHECK',
           source: 'PRIVATE_UPLOAD',
-          storageKey,
+          storageKey: stored.key,
+          storageProvider: stored.provider,
           ...image,
         },
       });
@@ -387,7 +418,10 @@ export class MakeupService {
       if (!runResult.created) {
         await Promise.allSettled([
           this.prisma.imageAsset.delete({ where: { id: imageAsset.id } }),
-          this.imageStorage.delete(storageKey),
+          this.imageStorage.deleteQuietly(
+            stored,
+            'duplicate visual check discarded',
+          ),
         ]);
       }
       return runResult.run;
@@ -397,7 +431,10 @@ export class MakeupService {
           where: { id: imageAssetId },
         });
       }
-      await this.imageStorage.delete(storageKey);
+      await this.imageStorage.deleteQuietly(
+        stored,
+        'visual check upload rolled back',
+      );
       throw error;
     }
   }
@@ -414,7 +451,7 @@ export class MakeupService {
     if (!file) throw AppError.badRequest('A current makeup image is required');
 
     const image = await this.imageValidation.validate(file);
-    const storageKey = await this.imageStorage.save(
+    const stored = await this.storeImage(
       authId,
       step.guide.sessionId,
       image.mimeType,
@@ -436,13 +473,17 @@ export class MakeupService {
             guideStepId: step.id,
             purpose: 'STEP_CHECK',
             source: 'PRIVATE_UPLOAD',
-            storageKey,
+            storageKey: stored.key,
+            storageProvider: stored.provider,
             ...image,
           },
         });
       });
     } catch (error) {
-      await this.imageStorage.delete(storageKey);
+      await this.imageStorage.deleteQuietly(
+        stored,
+        'step snapshot upload rolled back',
+      );
       throw error;
     }
 
@@ -564,6 +605,20 @@ export class MakeupService {
       }),
     ]);
     return { completedSessions, savedLooks, totalSteps };
+  }
+
+  /** Persists validated bytes to private storage; failures become safe HTTP errors. */
+  private async storeImage(
+    authId: string,
+    scopeId: string,
+    mimeType: SupportedImageMime,
+    bytes: Buffer,
+  ): Promise<PrivateObjectRef> {
+    try {
+      return await this.imageStorage.save(authId, scopeId, mimeType, bytes);
+    } catch (error) {
+      throw toImageStorageHttpError(error);
+    }
   }
 
   private async getOwnedStep(authId: string, stepId: string) {

@@ -184,6 +184,7 @@ describe('MakeupProcessor delivery semantics', () => {
     } as never);
     prisma.imageAsset.findFirstOrThrow.mockResolvedValue({
       storageKey: 'owned-image',
+      storageProvider: 'supabase',
       mimeType: 'image/jpeg',
     } as never);
     storage.read.mockResolvedValue(Buffer.from('test'));
@@ -283,6 +284,7 @@ describe('MakeupProcessor delivery semantics', () => {
     } as never);
     prisma.imageAsset.findFirstOrThrow.mockResolvedValue({
       storageKey: 'owner/session/image.jpg',
+      storageProvider: 'supabase',
       mimeType: 'image/jpeg',
     } as never);
     storage.read.mockResolvedValue(Buffer.from('photo'));

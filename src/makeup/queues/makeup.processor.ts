@@ -6,7 +6,14 @@ import { Job, Worker } from 'bullmq';
 import { WINSTON_MODULE_PROVIDER } from 'nest-winston';
 import { Logger } from 'winston';
 import { PrismaService } from '../../common/services/prisma.service';
-import { PrivateImageStorageService } from '../../storage/private-image-storage.service';
+import {
+  PrivateImageStorageService,
+  type PrivateObjectRef,
+} from '../../storage/private-image-storage.service';
+import {
+  isMissingPrivateObject,
+  isPrivateStorageError,
+} from '../../storage/private-storage.error';
 import {
   AI_GATEWAY,
   type AiCallMetadata,
@@ -339,15 +346,43 @@ export class MakeupProcessor extends WorkerHost {
   ): Promise<AiImageInput> {
     const image = await this.prisma.imageAsset.findFirstOrThrow({
       where: { id: imageId, session: { authId } },
-      select: { storageKey: true, mimeType: true },
+      select: { storageKey: true, storageProvider: true, mimeType: true },
     });
     if (!['image/jpeg', 'image/png', 'image/webp'].includes(image.mimeType)) {
       throw new Error('Stored image has an unsupported media type');
     }
     return {
-      bytes: await this.imageStorage.read(image.storageKey),
+      bytes: await this.readStoredImage({
+        provider: image.storageProvider,
+        key: image.storageKey,
+      }),
       mimeType: image.mimeType as AiImageInput['mimeType'],
     };
+  }
+
+  /**
+   * Storage failures keep the job's retry semantics: missing images fail the
+   * run immediately, transient outages use the normal retry budget. Messages
+   * are safe to persist on the run and show to the user.
+   */
+  private async readStoredImage(ref: PrivateObjectRef): Promise<Buffer> {
+    try {
+      return await this.imageStorage.read(ref);
+    } catch (error) {
+      if (!isPrivateStorageError(error)) throw error;
+      if (isMissingPrivateObject(error)) {
+        throw new AiProviderError(
+          'IMAGE_NOT_FOUND',
+          'The photo for this request is no longer available. Please upload it again.',
+          false,
+        );
+      }
+      throw new AiProviderError(
+        error.retryable ? 'IMAGE_STORAGE_UNAVAILABLE' : 'IMAGE_STORAGE_FAILED',
+        'Your photo could not be loaded right now. Please try again.',
+        error.retryable,
+      );
+    }
   }
 
   private toGuideStep(step: GuideStepResult): GuideStepResult {

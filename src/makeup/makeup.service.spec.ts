@@ -32,6 +32,7 @@ describe('MakeupService history media and deletion', () => {
     const bytes = Buffer.from('private-image');
     prisma.imageAsset.findFirst.mockResolvedValue({
       storageKey: 'owner/session/image.jpg',
+      storageProvider: 'supabase',
       mimeType: 'image/jpeg',
       source: 'PRIVATE_UPLOAD',
     } as never);
@@ -45,7 +46,16 @@ describe('MakeupService history media and deletion', () => {
     });
     expect(prisma.imageAsset.findFirst.mock.calls[0]?.[0]).toEqual({
       where: { id: 'image-id', session: { authId: 'owner-id' } },
-      select: { storageKey: true, mimeType: true, source: true },
+      select: {
+        storageKey: true,
+        storageProvider: true,
+        mimeType: true,
+        source: true,
+      },
+    });
+    expect(imageStorage.read.mock.calls[0]?.[0]).toEqual({
+      provider: 'supabase',
+      key: 'owner/session/image.jpg',
     });
   });
 
@@ -62,19 +72,22 @@ describe('MakeupService history media and deletion', () => {
     prisma.makeupSession.findFirst.mockResolvedValue({
       id: 'session-id',
       status: 'COMPLETED',
-      images: [{ storageKey: 'owner/session/image.jpg' }],
+      images: [
+        { storageKey: 'owner/session/image.jpg', storageProvider: 'supabase' },
+      ],
     } as never);
     prisma.makeupSession.deleteMany.mockResolvedValue({ count: 1 });
-    imageStorage.delete.mockResolvedValue();
+    imageStorage.deleteQuietly.mockResolvedValue(true);
 
     await expect(
       service.deleteSession('owner-id', 'session-id'),
     ).resolves.toEqual({
       id: 'session-id',
     });
-    expect(imageStorage.delete.mock.calls[0]?.[0]).toBe(
-      'owner/session/image.jpg',
-    );
+    expect(imageStorage.deleteQuietly.mock.calls[0]?.[0]).toEqual({
+      provider: 'supabase',
+      key: 'owner/session/image.jpg',
+    });
   });
 
   it('refuses to delete an active workflow from history', async () => {
@@ -151,8 +164,11 @@ describe('MakeupService history media and deletion', () => {
       height: 640,
       sizeBytes: 100,
     });
-    imageStorage.save.mockResolvedValue('owner/session/duplicate.jpg');
-    imageStorage.delete.mockResolvedValue();
+    imageStorage.save.mockResolvedValue({
+      provider: 'supabase',
+      key: 'owner/session/duplicate.jpg',
+    });
+    imageStorage.deleteQuietly.mockResolvedValue(true);
     prisma.imageAsset.create.mockResolvedValue({
       id: 'duplicate-image',
     } as never);
@@ -174,9 +190,10 @@ describe('MakeupService history media and deletion', () => {
     expect(prisma.imageAsset.delete.mock.calls).toContainEqual([
       { where: { id: 'duplicate-image' } },
     ]);
-    expect(imageStorage.delete.mock.calls).toContainEqual([
-      'owner/session/duplicate.jpg',
-    ]);
+    expect(imageStorage.deleteQuietly.mock.calls[0]?.[0]).toEqual({
+      provider: 'supabase',
+      key: 'owner/session/duplicate.jpg',
+    });
     expect(queue.enqueue.mock.calls).toHaveLength(0);
   });
 
@@ -192,7 +209,10 @@ describe('MakeupService history media and deletion', () => {
       height: 640,
       sizeBytes: 100,
     });
-    imageStorage.save.mockResolvedValue('owner/session/final-step.jpg');
+    imageStorage.save.mockResolvedValue({
+      provider: 'supabase',
+      key: 'owner/session/final-step.jpg',
+    });
     prisma.imageAsset.create.mockResolvedValue({
       id: 'snapshot-image',
     } as never);
@@ -213,6 +233,8 @@ describe('MakeupService history media and deletion', () => {
         sessionId: 'session-id',
         guideStepId: 'step-id',
         purpose: 'STEP_CHECK',
+        storageKey: 'owner/session/final-step.jpg',
+        storageProvider: 'supabase',
       },
     });
     expect(prisma.stepAttempt.findFirst.mock.calls).toHaveLength(0);
