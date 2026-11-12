@@ -19,7 +19,8 @@
     "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
     "test:e2e": "jest --config ./test/jest-e2e.json",
     "postinstall": "prisma generate",
-    "docker:dev": "docker compose -f docker-compose.yaml up -d"
+    "docker:dev": "docker compose -f docker-compose.yaml up -d",
+    "setup:services": "bash scripts/setup-services.sh"
   },
   "dependencies": {
     "@nest-lab/throttler-storage-redis": "^1.1.0",

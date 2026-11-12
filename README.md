@@ -33,8 +33,120 @@ Intentionally deferred:
 - Redis 7+
 - working SMTP credentials
 
+### Check PostgreSQL and Redis on Ubuntu
+
+Check whether the commands are installed:
+
 ```bash
-copy .env.example .env
+psql --version
+redis-server --version
+```
+
+Check the Ubuntu PostgreSQL clusters and whether the services are ready:
+
+```bash
+pg_lsclusters
+pg_isready -h 127.0.0.1 -p 5432
+redis-cli ping
+```
+
+PostgreSQL should report `accepting connections`, and Redis should return
+`PONG`. If the packages are installed but stopped, start them with:
+
+```bash
+sudo pg_ctlcluster 17 main start
+sudo systemctl start redis-server
+```
+
+On a system using `systemd`, service status is also available through:
+
+```bash
+systemctl status postgresql --no-pager
+systemctl status redis-server --no-pager
+```
+
+### Install native services on Ubuntu
+
+The repository setup script installs PostgreSQL 17 from the official
+PostgreSQL APT repository, installs Redis, starts both services, and verifies
+that they respond. It supports Ubuntu/Debian environments with `apt`; run it
+from the repository root:
+
+```bash
+npm run setup:services
+```
+
+You can also invoke it directly:
+
+```bash
+bash scripts/setup-services.sh
+```
+
+The script may ask for the current user's `sudo` password. It installs and
+starts the services, but intentionally does not create application roles or
+databases.
+
+### Create development and test databases
+
+Create a local application role and two separate databases. `createuser`
+prompts for the new role's password, which avoids putting it in shell history:
+
+```bash
+sudo -u postgres createuser --pwprompt musecue
+sudo -u postgres createdb --owner=musecue musecue
+sudo -u postgres createdb --owner=musecue musecue_test
+```
+
+If the `musecue` role or either database already exists, do not recreate it.
+Use the PostgreSQL administrator account to inspect them instead:
+
+```bash
+sudo -u postgres psql -c '\du musecue'
+sudo -u postgres psql -c '\l musecue'
+sudo -u postgres psql -c '\l musecue_test'
+```
+
+For native services, update `.env` to use port `5432` and the password chosen
+above. URL-encode the password if it contains reserved URL characters:
+
+```dotenv
+DATABASE_URL=postgresql://musecue:replace-with-local-password@127.0.0.1:5432/musecue
+TEST_DATABASE_URL=postgresql://musecue:replace-with-local-password@127.0.0.1:5432/musecue_test
+REDIS_HOST=127.0.0.1
+REDIS_PORT=6379
+REDIS_PASSWORD=
+```
+
+The native Redis installation created by the script has no password by
+default. Configure Redis authentication before exposing it outside a trusted
+local development environment.
+
+Apply migrations only to the development database:
+
+```bash
+npx prisma migrate deploy
+```
+
+The PostgreSQL-backed E2E tests create and drop temporary schemas inside
+`musecue_test`; they do not use or reset the development database. Export the
+test URL before running Jest because the E2E helper reads
+`TEST_DATABASE_URL` from the process environment:
+
+```bash
+export TEST_DATABASE_URL='postgresql://musecue:replace-with-local-password@127.0.0.1:5432/musecue_test'
+npm run test:e2e -- --runInBand
+```
+
+The `musecue` role owns `musecue_test`, so it has the `CREATE` permission the
+tests need for their temporary schemas.
+
+### Docker setup
+
+The example environment uses Docker PostgreSQL on host port `5433`, unlike
+the native Ubuntu service on port `5432`:
+
+```bash
+cp .env.example .env
 docker compose up -d postgres_db redis-stack
 npm install
 npx prisma migrate deploy
