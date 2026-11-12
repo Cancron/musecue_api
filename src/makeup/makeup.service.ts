@@ -3,6 +3,10 @@ import { Prisma, type AiRun } from '@prisma/client';
 import AppError from '../common/errors/app.error';
 import { PrismaService } from '../common/services/prisma.service';
 import {
+  PrivateImageLifecycleService,
+  type PrivateImageDeletionReason,
+} from '../storage/private-image-lifecycle.service';
+import {
   PrivateImageStorageService,
   type PrivateObjectRef,
   type SupportedImageMime,
@@ -53,6 +57,9 @@ const SESSION_INCLUDE = {
   },
 } satisfies Prisma.MakeupSessionInclude;
 
+/** Signed image URLs are valid for one minute; clients request a new one as needed. */
+export const SIGNED_IMAGE_URL_TTL_SECONDS = 60;
+
 function storedObject(image: {
   storageKey: string;
   storageProvider: string;
@@ -67,6 +74,7 @@ export class MakeupService {
     private readonly queue: MakeupQueueService,
     private readonly imageValidation: ImageValidationService,
     private readonly imageStorage: PrivateImageStorageService,
+    private readonly imageLifecycle: PrivateImageLifecycleService,
     @Inject(AI_GATEWAY) private readonly aiGateway: AiGateway,
   ) {}
 
@@ -115,11 +123,7 @@ export class MakeupService {
   async deleteSession(authId: string, sessionId: string) {
     const session = await this.prisma.makeupSession.findFirst({
       where: { id: sessionId, authId },
-      select: {
-        id: true,
-        status: true,
-        images: { select: { storageKey: true, storageProvider: true } },
-      },
+      select: { id: true, status: true },
     });
     if (!session) throw AppError.notFound('Makeup session not found');
     if (session.status !== 'COMPLETED') {
@@ -128,21 +132,26 @@ export class MakeupService {
       );
     }
 
-    const deletion = await this.prisma.makeupSession.deleteMany({
-      where: { id: sessionId, authId, status: 'COMPLETED' },
+    // The rows and their pending object deletions commit together, so no
+    // private image can lose its last record before it is actually deleted.
+    const removed = await this.prisma.$transaction(async (tx) => {
+      await lockSession(tx, authId, sessionId);
+      const images = await tx.imageAsset.findMany({
+        where: { sessionId },
+        select: { storageKey: true, storageProvider: true },
+      });
+      const deletion = await tx.makeupSession.deleteMany({
+        where: { id: sessionId, authId, status: 'COMPLETED' },
+      });
+      if (deletion.count !== 1) {
+        throw AppError.conflict('The session changed and could not be deleted');
+      }
+      const refs = images.map(storedObject);
+      await this.imageLifecycle.scheduleDeletion(tx, refs, 'SESSION_DELETED');
+      return refs;
     });
-    if (deletion.count !== 1) {
-      throw AppError.conflict('The session changed and could not be deleted');
-    }
 
-    await Promise.all(
-      session.images.map((image) =>
-        this.imageStorage.deleteQuietly(
-          storedObject(image),
-          'completed session deleted',
-        ),
-      ),
-    );
+    await this.imageLifecycle.processRefs(removed);
     return { id: sessionId };
   }
 
@@ -171,6 +180,35 @@ export class MakeupService {
     }
   }
 
+  /**
+   * Issues a fresh short-lived read URL for an owned private image. Nothing is
+   * stored or cached; clients request a new URL whenever one expires.
+   */
+  async getImageSignedUrl(authId: string, imageId: string) {
+    const image = await this.prisma.imageAsset.findFirst({
+      where: { id: imageId, session: { authId } },
+      select: { storageKey: true, storageProvider: true, source: true },
+    });
+    if (!image) throw AppError.notFound('Image not found');
+    if (image.source !== 'PRIVATE_UPLOAD') {
+      throw AppError.notFound('Image content is unavailable');
+    }
+
+    try {
+      const signed = await this.imageStorage.createSignedUrl(
+        storedObject(image),
+        SIGNED_IMAGE_URL_TTL_SECONDS,
+      );
+      return {
+        url: signed.url,
+        expiresAt: signed.expiresAt.toISOString(),
+        expiresInSeconds: SIGNED_IMAGE_URL_TTL_SECONDS,
+      };
+    } catch (error) {
+      throw toImageStorageHttpError(error, 'Image content is unavailable');
+    }
+  }
+
   async uploadInitialImage(
     authId: string,
     sessionId: string,
@@ -185,8 +223,6 @@ export class MakeupService {
     if (!file) throw AppError.badRequest('An image file is required');
 
     const image = await this.imageValidation.validate(file);
-    let replacedImages: Array<{ storageKey: string; storageProvider: string }> =
-      [];
     const stored = await this.storeImage(
       authId,
       sessionId,
@@ -194,13 +230,14 @@ export class MakeupService {
       file.buffer,
     );
 
+    let replaced: PrivateObjectRef[];
     try {
-      await this.prisma.$transaction(async (tx) => {
+      replaced = await this.prisma.$transaction(async (tx) => {
         requireSessionStatus(await lockSession(tx, authId, sessionId), [
           'CREATED',
           'IMAGE_UPLOADED',
         ]);
-        replacedImages = await tx.imageAsset.findMany({
+        const replacedImages = await tx.imageAsset.findMany({
           where: { sessionId, purpose: 'INITIAL_ANALYSIS' },
           select: { storageKey: true, storageProvider: true },
         });
@@ -217,27 +254,21 @@ export class MakeupService {
             ...image,
           },
         });
+        await this.imageLifecycle.confirmUpload(tx, stored);
+        const refs = replacedImages.map(storedObject);
+        await this.imageLifecycle.scheduleDeletion(tx, refs, 'IMAGE_REPLACED');
         await tx.makeupSession.update({
           where: { id: sessionId },
           data: { status: 'IMAGE_UPLOADED' },
         });
+        return refs;
       });
     } catch (error) {
-      await this.imageStorage.deleteQuietly(
-        stored,
-        'initial image upload rolled back',
-      );
+      await this.imageLifecycle.abandonUpload(stored);
       throw error;
     }
 
-    await Promise.all(
-      replacedImages.map((imageAsset) =>
-        this.imageStorage.deleteQuietly(
-          storedObject(imageAsset),
-          'initial image replaced',
-        ),
-      ),
-    );
+    await this.imageLifecycle.processRefs(replaced);
     return this.getSession(authId, sessionId);
   }
 
@@ -392,19 +423,28 @@ export class MakeupService {
       file.buffer,
     );
 
-    let imageAssetId: string | null = null;
+    let imageAsset: { id: string };
     try {
-      const imageAsset = await this.prisma.imageAsset.create({
-        data: {
-          sessionId: step.guide.sessionId,
-          purpose: 'STEP_CHECK',
-          source: 'PRIVATE_UPLOAD',
-          storageKey: stored.key,
-          storageProvider: stored.provider,
-          ...image,
-        },
+      imageAsset = await this.prisma.$transaction(async (tx) => {
+        const created = await tx.imageAsset.create({
+          data: {
+            sessionId: step.guide.sessionId,
+            purpose: 'STEP_CHECK',
+            source: 'PRIVATE_UPLOAD',
+            storageKey: stored.key,
+            storageProvider: stored.provider,
+            ...image,
+          },
+        });
+        await this.imageLifecycle.confirmUpload(tx, stored);
+        return created;
       });
-      imageAssetId = imageAsset.id;
+    } catch (error) {
+      await this.imageLifecycle.abandonUpload(stored);
+      throw error;
+    }
+
+    try {
       const runResult = await this.createRun(
         authId,
         step.guide.sessionId,
@@ -416,25 +456,11 @@ export class MakeupService {
         imageAsset.id,
       );
       if (!runResult.created) {
-        await Promise.allSettled([
-          this.prisma.imageAsset.delete({ where: { id: imageAsset.id } }),
-          this.imageStorage.deleteQuietly(
-            stored,
-            'duplicate visual check discarded',
-          ),
-        ]);
+        await this.discardImage(imageAsset.id, stored, 'IMAGE_DISCARDED');
       }
       return runResult.run;
     } catch (error) {
-      if (imageAssetId) {
-        await this.prisma.imageAsset.deleteMany({
-          where: { id: imageAssetId },
-        });
-      }
-      await this.imageStorage.deleteQuietly(
-        stored,
-        'visual check upload rolled back',
-      );
+      await this.discardImage(imageAsset.id, stored, 'IMAGE_DISCARDED');
       throw error;
     }
   }
@@ -478,12 +504,10 @@ export class MakeupService {
             ...image,
           },
         });
+        await this.imageLifecycle.confirmUpload(tx, stored);
       });
     } catch (error) {
-      await this.imageStorage.deleteQuietly(
-        stored,
-        'step snapshot upload rolled back',
-      );
+      await this.imageLifecycle.abandonUpload(stored);
       throw error;
     }
 
@@ -607,7 +631,11 @@ export class MakeupService {
     return { completedSessions, savedLooks, totalSteps };
   }
 
-  /** Persists validated bytes to private storage; failures become safe HTTP errors. */
+  /**
+   * Uploads validated bytes under a cleanup reservation; the caller confirms
+   * it in the transaction storing the reference. Failures become safe HTTP
+   * errors.
+   */
   private async storeImage(
     authId: string,
     scopeId: string,
@@ -615,10 +643,31 @@ export class MakeupService {
     bytes: Buffer,
   ): Promise<PrivateObjectRef> {
     try {
-      return await this.imageStorage.save(authId, scopeId, mimeType, bytes);
+      return await this.imageLifecycle.upload(authId, scopeId, mimeType, bytes);
     } catch (error) {
       throw toImageStorageHttpError(error);
     }
+  }
+
+  /**
+   * Removes an image row that must not be kept and records its object for
+   * deletion atomically. If this fails, the row keeps referencing the object,
+   * so nothing is orphaned.
+   */
+  private async discardImage(
+    imageId: string,
+    ref: PrivateObjectRef,
+    reason: PrivateImageDeletionReason,
+  ): Promise<void> {
+    try {
+      await this.prisma.$transaction(async (tx) => {
+        await tx.imageAsset.deleteMany({ where: { id: imageId } });
+        await this.imageLifecycle.scheduleDeletion(tx, [ref], reason);
+      });
+    } catch {
+      return;
+    }
+    await this.imageLifecycle.processRefs([ref]);
   }
 
   private async getOwnedStep(authId: string, stepId: string) {

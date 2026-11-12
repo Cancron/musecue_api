@@ -23,6 +23,9 @@ import {
 export type { PrivateObjectRef } from './private-object-storage.provider';
 export type { SupportedImageMime } from './private-storage-key';
 
+/** Upper bound for any signed URL issued through this service. */
+export const MAX_SIGNED_URL_TTL_SECONDS = 60;
+
 /**
  * Application-facing private image storage.
  *
@@ -66,18 +69,37 @@ export class PrivateImageStorageService {
     return this.activeProvider.id;
   }
 
-  /** Stores a new private image and returns where it was written. */
-  async save(
+  /**
+   * Allocates a new, unused location on the active provider without any I/O,
+   * so the location can be recorded (see `PrivateImageLifecycleService`)
+   * before bytes are written.
+   */
+  createRef(
     authId: string,
     scopeId: string,
     mimeType: SupportedImageMime,
+  ): PrivateObjectRef {
+    try {
+      return {
+        provider: this.activeProvider.id,
+        key: buildPrivateImageKey(authId, scopeId, mimeType),
+      };
+    } catch (cause) {
+      const error = this.toStorageError(cause, this.activeProvider.id, 'put');
+      this.log(error);
+      throw error;
+    }
+  }
+
+  /** Writes a new object; existing objects are never overwritten. */
+  put(
+    ref: PrivateObjectRef,
     bytes: Buffer,
-  ): Promise<PrivateObjectRef> {
-    const provider = this.activeProvider;
-    return this.run(provider.id, 'put', async () => {
-      const key = buildPrivateImageKey(authId, scopeId, mimeType);
-      await provider.put(key, bytes, mimeType);
-      return { provider: provider.id, key };
+    mimeType: SupportedImageMime,
+  ): Promise<void> {
+    return this.run(ref.provider, 'put', () => {
+      assertValidPrivateImageKey(ref.key);
+      return this.resolve(ref.provider).put(ref.key, bytes, mimeType);
     });
   }
 
@@ -97,25 +119,32 @@ export class PrivateImageStorageService {
   }
 
   /**
-   * Cleanup that must not mask the caller's outcome (rollback after a failed
-   * database write, or removing replaced/deleted images after a commit).
-   * Failures are logged with the key so orphaned objects can be removed.
+   * Issues a short-lived read URL from the provider that stores the object.
+   * `expiresAt` is computed before the request, so it is never later than the
+   * provider-side expiry. Nothing is cached or persisted; URLs are not logged.
    */
-  async deleteQuietly(ref: PrivateObjectRef, reason: string): Promise<boolean> {
-    try {
-      await this.delete(ref);
-      return true;
-    } catch (error) {
-      // The key (opaque ids only) is logged so operators can remove the orphan.
-      this.logger.warn('Private image cleanup failed; object may be orphaned', {
-        context: PrivateImageStorageService.name,
-        reason,
-        provider: ref.provider,
-        storageKey: ref.key,
-        code: error instanceof PrivateStorageError ? error.code : undefined,
-      });
-      return false;
+  async createSignedUrl(
+    ref: PrivateObjectRef,
+    expiresInSeconds: number,
+  ): Promise<{ url: string; expiresAt: Date }> {
+    if (
+      !Number.isInteger(expiresInSeconds) ||
+      expiresInSeconds < 1 ||
+      expiresInSeconds > MAX_SIGNED_URL_TTL_SECONDS
+    ) {
+      throw new RangeError(
+        `Signed URL lifetime must be 1-${MAX_SIGNED_URL_TTL_SECONDS} seconds`,
+      );
     }
+    const issuedAt = Date.now();
+    const url = await this.run(ref.provider, 'sign', () => {
+      assertValidPrivateImageKey(ref.key);
+      return this.resolve(ref.provider).createSignedUrl(
+        ref.key,
+        expiresInSeconds,
+      );
+    });
+    return { url, expiresAt: new Date(issuedAt + expiresInSeconds * 1000) };
   }
 
   private resolve(providerId: string): PrivateObjectStorageProvider {
@@ -132,20 +161,27 @@ export class PrivateImageStorageService {
     try {
       return await action();
     } catch (cause) {
-      const error =
-        cause instanceof PrivateStorageError
-          ? cause.withContext(providerId, operation)
-          : new PrivateStorageError('STORAGE_UNAVAILABLE', {
-              provider: providerId,
-              operation,
-              cause,
-            });
+      const error = this.toStorageError(cause, providerId, operation);
       this.log(error);
       throw error;
     }
   }
 
-  /** Logs codes and statuses only: never URLs, credentials or image bytes. */
+  private toStorageError(
+    cause: unknown,
+    providerId: string,
+    operation: PrivateStorageOperation,
+  ): PrivateStorageError {
+    return cause instanceof PrivateStorageError
+      ? cause.withContext(providerId, operation)
+      : new PrivateStorageError('STORAGE_UNAVAILABLE', {
+          provider: providerId,
+          operation,
+          cause,
+        });
+  }
+
+  /** Logs codes and statuses only: never URLs, keys, credentials or bytes. */
   private log(error: PrivateStorageError): void {
     const entry = {
       context: PrivateImageStorageService.name,

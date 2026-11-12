@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { PrivateImageLifecycleService } from './private-image-lifecycle.service';
 import { PrivateImageStorageService } from './private-image-storage.service';
 import {
   PRIVATE_OBJECT_STORAGE_PROVIDERS,
@@ -14,7 +15,9 @@ import { LocalFilesystemStorageProvider } from './providers/local-filesystem-sto
 import { SupabaseStorageProvider } from './providers/supabase-storage.provider';
 
 /**
- * Private image storage. To add a backend (e.g. an S3-compatible service),
+ * Private image storage. `PrivateImageLifecycleService` records every upload,
+ * replacement and deletion in the cleanup ledger; `PrivateImageStorageService`
+ * moves bytes and issues signed URLs. To add a backend (e.g. an S3-compatible service),
  * implement `PrivateObjectStorageProvider`, register it below and add it to
  * `PRIVATE_OBJECT_STORAGE_PROVIDERS`; callers and the image flow are unchanged.
  */
@@ -46,7 +49,8 @@ import { SupabaseStorageProvider } from './providers/supabase-storage.provider';
       ): PrivateObjectStorageProvider[] => providers,
     },
     PrivateImageStorageService,
+    PrivateImageLifecycleService,
   ],
-  exports: [PrivateImageStorageService],
+  exports: [PrivateImageStorageService, PrivateImageLifecycleService],
 })
 export class StorageModule {}

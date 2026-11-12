@@ -1,0 +1,43 @@
+// ================================
+// Private storage cleanup ledger
+// ================================
+
+/// Why an object is (or may become) unreferenced and must be deleted.
+enum PrivateStorageCleanupReason {
+  /// Reservation written before an upload. Removed in the same transaction that
+  /// stores the reference; if that never commits, it becomes UPLOAD_ABANDONED.
+  UPLOAD_PENDING
+  UPLOAD_ABANDONED
+  IMAGE_REPLACED
+  IMAGE_DISCARDED
+  SESSION_DELETED
+  AVATAR_REPLACED
+  AVATAR_REMOVED
+}
+
+enum PrivateStorageCleanupStatus {
+  /// Will be attempted (again) at `nextAttemptAt`.
+  PENDING
+  /// Retries exhausted or not retryable: kept for manual recovery, never dropped.
+  FAILED
+}
+
+/// Durable record of every private object that must be deleted. A row is only
+/// removed after the provider confirmed the deletion (or the object turned out
+/// to still be referenced), so a failed deletion is never treated as done.
+model PrivateStorageCleanup {
+  id            String                      @id @default(uuid())
+  provider      String                      @db.VarChar(32)
+  storageKey    String
+  reason        PrivateStorageCleanupReason
+  status        PrivateStorageCleanupStatus @default(PENDING)
+  attempts      Int                         @default(0)
+  lastErrorCode String?                     @db.VarChar(64)
+  nextAttemptAt DateTime                    @default(now())
+  lastAttemptAt DateTime?
+  createdAt     DateTime                    @default(now())
+  updatedAt     DateTime                    @updatedAt
+
+  @@unique([provider, storageKey])
+  @@index([status, nextAttemptAt])
+}

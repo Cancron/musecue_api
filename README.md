@@ -22,7 +22,7 @@ Migration `20260827174107_add_makeup_workflow` adds the makeup aggregate and rem
 
 Intentionally deferred:
 
-- short-lived signed reads; private images are streamed through the authenticated content routes instead
+- signed URLs for avatars and for images still on the local filesystem (they keep using the authenticated content routes)
 - copying images stored on the filesystem before the Supabase migration into the bucket (they remain readable through the `local` provider while its directory is present)
 - additional S3-compatible storage providers (the provider interface is in place; see "Private image storage")
 - generated preview images (recommendation reasoning is live, while the existing curated preview-image contract remains in place)
@@ -49,7 +49,7 @@ Important environment variables are documented in `.env.example`. Never commit t
 
 ### Private image storage
 
-Face photos, step snapshots, and profile avatars are written to a **private** Supabase Storage bucket by default. The API validates the image and checks ownership first, then uploads the bytes with a server-side secret key. It records the object key and the provider that holds it (`ImageAsset.storageKey` + `storageProvider`, `userProfile.avatarUrl` + `avatarStorageProvider`). Clients never receive the key, bucket name, Supabase URL, or credentials; images are served only through the authenticated content routes.
+Face photos, step snapshots, and profile avatars are written to a **private** Supabase Storage bucket by default. The API validates the image and checks ownership first, then uploads the bytes with a server-side secret key. It records the object key and the provider that holds it (`ImageAsset.storageKey` + `storageProvider`, `userProfile.avatarUrl` + `avatarStorageProvider`). Clients never receive the credentials. Images are served through the authenticated content routes, or through a 60-second signed URL (see "Signed image URLs").
 
 1. In the Supabase dashboard, create a bucket (for example `musecue-private-images`) with **Public bucket switched off**. We recommend a 10 MB file size limit and allowed MIME types `image/jpeg, image/png, image/webp`. No RLS policies are needed: only the server's secret key accesses the bucket.
 2. Set the server-side variables (see `.env.example`):
@@ -62,7 +62,9 @@ Face photos, step snapshots, and profile avatars are written to a **private** Su
    # SUPABASE_STORAGE_TIMEOUT_MS=15000
    ```
 
-3. Run `npx prisma migrate deploy` (migration `20261112120000_add_private_storage_provider`) and restart the API and workers.
+3. Run `npx prisma migrate deploy` (migrations `20261112120000_add_private_storage_provider` and `20261112130000_add_private_storage_cleanup`) and restart the API and workers.
+
+For Docker deployments, `docker-compose.prod.yaml` passes these variables into the container at runtime. Compose reads them from the deploy host's environment or from the `.env` file next to the compose files on the server. `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` and `SUPABASE_STORAGE_BUCKET` are required; if one is missing, `docker-compose` stops before starting anything. `.dockerignore` excludes `.env` and `.env.*` (except `.env.example`), so secrets never enter the build context or image layers.
 
 Startup fails when the active provider is misconfigured: a missing variable, a non-https URL (http is accepted only for a local Supabase stack on loopback), or a publishable/anon key. Errors name the variable, never its value. Before uploading, the API checks that the bucket exists and is private. It re-checks every 5 minutes and refuses uploads to a public bucket. Never expose `SUPABASE_*` values to the mobile app or through an `EXPO_PUBLIC_`-style variable.
 
@@ -76,7 +78,51 @@ Storage failures never expose provider details to clients:
 | Network error, timeout, rate limit, provider `5xx`     | `503` `Image storage is temporarily unavailable. Please try again.` | retried within the job's retry budget   |
 | Misconfiguration, public/missing bucket, rejected key | `500` `Image storage is unavailable`                     | run fails                               |
 
-Logs include the provider, operation, error code, and HTTP status, never URLs, credentials, or image bytes. If the database write fails after an upload, the new object is deleted. Replaced or deleted images are removed after the database commit. A failed removal does not fail the request; it logs `Private image cleanup failed; object may be orphaned` with the key so the object can be removed manually.
+Logs include the provider, operation, error code, and HTTP status, never URLs, credentials, or image bytes.
+
+#### Failed uploads, replacements, and deletions
+
+The `PrivateStorageCleanup` table records every object that is, or may become, unreferenced. It is written so that no case depends on a log line:
+
+| Case | What is recorded, and when | Outcome |
+| ---- | -------------------------- | ------- |
+| Upload | An `UPLOAD_PENDING` reservation, **before** any bytes are written. If it cannot be saved, nothing is uploaded (`503`). | The transaction that stores the image reference removes the reservation. |
+| Upload rejected by the provider (4xx, access denied) | Nothing was stored. | The reservation is removed. |
+| Upload timeout or provider `5xx` | The bytes may have been stored. | The reservation becomes `UPLOAD_ABANDONED` and is deleted. |
+| Database write fails after the upload | The rollback keeps the reservation. | It becomes `UPLOAD_ABANDONED` and is deleted. If the database itself is down, the cleaner deletes it once the 1-hour reservation expires. |
+| Process crash between upload and commit | The reservation stays. | After 1 hour the cleaner marks it abandoned and deletes it. A late commit is then refused with `409`. |
+| Replaced image or avatar, deleted session or avatar, discarded check image | A row (`IMAGE_REPLACED`, `AVATAR_REPLACED`, `SESSION_DELETED`, `AVATAR_REMOVED`, `IMAGE_DISCARDED`) in the **same transaction** that removes the reference. | Deleted right after the commit, then by the cleaner. |
+
+A row is removed only after the provider confirms the deletion. A failed deletion is never treated as done. The row stays `PENDING` with `attempts`, `lastErrorCode`, `lastAttemptAt` and `nextAttemptAt`, and is retried with exponential backoff (30 s doubling, capped at 6 h). After 14 attempts, or immediately for an invalid key, it becomes `FAILED`: it stays in the table for manual recovery, the cleaner no longer retries it, and an error is logged (`Private image deletion failed permanently; manual recovery required`). The user's request still succeeds: the database change is committed and the object deletion is pending.
+
+A background cleaner runs every minute on each API/worker instance (not when `NODE_ENV=test`). Instances claim rows atomically, so each deletion is attempted by one instance at a time. Before deleting, the cleaner checks that no `ImageAsset` or avatar still references the key; if one does, it keeps the object and drops the row.
+
+To inspect or recover:
+
+```sql
+SELECT id, provider, "storageKey", reason, status, attempts, "lastErrorCode", "nextAttemptAt"
+FROM "PrivateStorageCleanup" ORDER BY "createdAt";
+
+-- After fixing the cause (credentials, bucket, provider outage), requeue failed rows:
+UPDATE "PrivateStorageCleanup"
+SET status = 'PENDING', attempts = 0, "nextAttemptAt" = now()
+WHERE status = 'FAILED';
+```
+
+#### Signed image URLs
+
+`GET /v1/images/:imageId/signed-url` (bearer token) returns a direct download URL for an image the caller owns:
+
+```json
+{ "url": "https://<project>.supabase.co/storage/v1/object/sign/<bucket>/<key>?token=...", "expiresAt": "2026-11-12T12:01:00.000Z", "expiresInSeconds": 60 }
+```
+
+- The URL is generated from the provider and key stored on the image and is valid for 60 seconds. Each call issues a new URL, so clients request another one when it expires. URLs are never stored or logged, and the response is sent with `Cache-Control: private, no-store`.
+- The URL contains only an object-scoped token signed by Supabase, never the server key. It reveals the Supabase host, the bucket name and the object key (which contains the user's own id and session id).
+- The API rejects a provider response that is not a signed URL for exactly that bucket and key, or whose token expires later than requested (allowing 30 s of clock skew).
+- Responses: `401` without a valid token. `404` `Image not found` for a missing image *or another user's image* (they are indistinguishable). `404` `Image content is unavailable` for a missing object or a non-uploaded image. `409` for images still on the local filesystem (use `/content`). `503` or `500` for storage failures, as in the table above.
+- `GET /v1/images/:imageId/content` is unchanged.
+- Clients download directly from the Supabase host, so the mobile app must be allowed to reach it.
 
 To add a backend such as an S3-compatible service, implement `PrivateObjectStorageProvider` (`src/storage/private-object-storage.provider.ts`) and register it in `StorageModule`. Keys, validation, ownership checks, and the image workflow stay the same. The focused storage tests run with `npx jest private-cloud`.
 
@@ -168,6 +214,7 @@ Makeup routes require a bearer token:
 | `DELETE` | `/v1/sessions/:sessionId`                                          | Delete a completed session                         |
 | `POST`   | `/v1/sessions/:sessionId/images`                                   | Upload an initial face image                       |
 | `GET`    | `/v1/images/:imageId/content`                                      | Read an owned private image                        |
+| `GET`    | `/v1/images/:imageId/signed-url`                                   | 60-second signed download URL for an owned image   |
 | `PATCH`  | `/v1/sessions/:sessionId/preferences`                              | Save preferences                                   |
 | `POST`   | `/v1/sessions/:sessionId/analyze`                                  | Queue personalization analysis                     |
 | `POST`   | `/v1/sessions/:sessionId/recommendations/:recommendationId/select` | Select a look and queue its guide                  |
@@ -322,6 +369,7 @@ npm run build
 npm run lint
 npm test
 npx jest private-cloud   # private image storage unit tests
+TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json test/private-cloud   # cleanup ledger on PostgreSQL
 npm run test:e2e
 npx prisma generate
 npx prisma migrate dev

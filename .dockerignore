@@ -3,3 +3,9 @@ Dockerfile
 docker-compose.yaml
 .git
 .gitignore
+
+# Secrets are supplied at runtime (see docker-compose.prod.yaml), never baked into
+# the build context or image layers. The example file is documentation only.
+.env
+.env.*
+!.env.example

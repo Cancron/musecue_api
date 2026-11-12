@@ -1,8 +1,10 @@
 import { Injectable } from '@nestjs/common';
+import type { Prisma } from '@prisma/client';
 import { extname } from 'node:path';
 import AppError from '../common/errors/app.error';
 import { PrismaService } from '../common/services/prisma.service';
 import { ImageValidationService } from '../makeup/services/image-validation.service';
+import { PrivateImageLifecycleService } from '../storage/private-image-lifecycle.service';
 import {
   PrivateImageStorageService,
   type PrivateObjectRef,
@@ -41,12 +43,25 @@ function privateAvatar(
     : { provider: LOCAL_STORAGE_PROVIDER_ID, key };
 }
 
+/** Reads the current avatar while holding a row lock until the transaction ends. */
+async function lockAvatar(
+  tx: Prisma.TransactionClient,
+  authId: string,
+): Promise<StoredAvatar | null> {
+  const rows = await tx.$queryRaw<StoredAvatar[]>`
+    SELECT "avatarUrl", "avatarStorageProvider" FROM "userProfile"
+    WHERE "authId" = ${authId} FOR UPDATE
+  `;
+  return rows[0] ?? null;
+}
+
 @Injectable()
 export class ProfileService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly imageValidation: ImageValidationService,
     private readonly imageStorage: PrivateImageStorageService,
+    private readonly imageLifecycle: PrivateImageLifecycleService,
   ) {}
 
   async getProfile(authId: string) {
@@ -82,13 +97,9 @@ export class ProfileService {
   async updateAvatar(authId: string, file?: Express.Multer.File) {
     if (!file) throw AppError.badRequest('An avatar image is required');
     const image = await this.imageValidation.validate(file);
-    const previousProfile = await this.prisma.userProfile.findUnique({
-      where: { authId },
-      select: AVATAR_SELECT,
-    });
     let stored: PrivateObjectRef;
     try {
-      stored = await this.imageStorage.save(
+      stored = await this.imageLifecycle.upload(
         authId,
         'profile',
         image.mimeType,
@@ -102,42 +113,51 @@ export class ProfileService {
       avatarUrl: stored.key,
       avatarStorageProvider: stored.provider,
     };
+    let replaced: PrivateObjectRef | null;
     try {
-      await this.prisma.userProfile.upsert({
-        where: { authId },
-        create: { authId, ...avatar },
-        update: avatar,
+      replaced = await this.prisma.$transaction(async (tx) => {
+        // Lock the row so concurrent uploads cannot both "replace" the same
+        // previous avatar and leave one new avatar unreferenced.
+        const previous = privateAvatar(await lockAvatar(tx, authId));
+        await tx.userProfile.upsert({
+          where: { authId },
+          create: { authId, ...avatar },
+          update: avatar,
+        });
+        await this.imageLifecycle.confirmUpload(tx, stored);
+        if (!previous || previous.key === stored.key) return null;
+        await this.imageLifecycle.scheduleDeletion(
+          tx,
+          [previous],
+          'AVATAR_REPLACED',
+        );
+        return previous;
       });
     } catch (error) {
-      await this.imageStorage.deleteQuietly(
-        stored,
-        'avatar upload rolled back',
-      );
+      await this.imageLifecycle.abandonUpload(stored);
       throw error;
     }
 
-    const previousAvatar = privateAvatar(previousProfile);
-    if (previousAvatar && previousAvatar.key !== stored.key) {
-      await this.imageStorage.deleteQuietly(previousAvatar, 'avatar replaced');
-    }
+    if (replaced) await this.imageLifecycle.processRefs([replaced]);
     return this.getProfile(authId);
   }
 
   async deleteAvatar(authId: string) {
-    const profile = await this.prisma.userProfile.findUnique({
-      where: { authId },
-      select: AVATAR_SELECT,
+    const removed = await this.prisma.$transaction(async (tx) => {
+      const current = await lockAvatar(tx, authId);
+      if (!current?.avatarUrl) return null;
+      await tx.userProfile.update({
+        where: { authId },
+        data: { avatarUrl: null, avatarStorageProvider: null },
+      });
+      const ref = privateAvatar(current);
+      if (ref) {
+        await this.imageLifecycle.scheduleDeletion(tx, [ref], 'AVATAR_REMOVED');
+      }
+      return ref;
     });
-    if (!profile?.avatarUrl) return this.getProfile(authId);
 
-    await this.prisma.userProfile.update({
-      where: { authId },
-      data: { avatarUrl: null, avatarStorageProvider: null },
-    });
-    const removed = privateAvatar(profile);
-    if (removed) {
-      await this.imageStorage.deleteQuietly(removed, 'avatar removed');
-    }
+    if (removed) await this.imageLifecycle.processRefs([removed]);
     return this.getProfile(authId);
   }
 

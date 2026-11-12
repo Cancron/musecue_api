@@ -7,6 +7,7 @@ import { PrivateStorageError } from './private-storage.error';
 
 const AUTH_ID = '5f0c8a3e-2b4d-4c6e-8f10-123456789abc';
 const SESSION_ID = '9a8b7c6d-5e4f-4a3b-8c2d-0123456789ab';
+const KEY = `${AUTH_ID}/${SESSION_ID}/0b7c9a52-8d2f-4d57-9a8c-0d8c1f0a1b2c.jpg`;
 const KEY_PATTERN = new RegExp(
   `^${AUTH_ID}/${SESSION_ID}/[0-9a-f-]{36}\\.jpg$`,
 );
@@ -35,54 +36,64 @@ describe('PrivateImageStorageService (private cloud storage)', () => {
       logger,
     );
   });
+  afterEach(() => jest.restoreAllMocks());
 
-  describe('save', () => {
-    it('writes new images to the active provider and returns provider + key', async () => {
-      const bytes = Buffer.from('jpeg-bytes');
-
-      const ref = await storage.save(AUTH_ID, SESSION_ID, 'image/jpeg', bytes);
+  describe('createRef and put', () => {
+    it('allocates keys on the active provider without any I/O', () => {
+      const ref = storage.createRef(AUTH_ID, SESSION_ID, 'image/jpeg');
+      const again = storage.createRef(AUTH_ID, SESSION_ID, 'image/jpeg');
 
       expect(ref.provider).toBe('supabase');
       expect(ref.key).toMatch(KEY_PATTERN);
-      expect(supabase.put.mock.calls).toEqual([[ref.key, bytes, 'image/jpeg']]);
-      expect(local.put.mock.calls).toHaveLength(0);
+      expect(again.key).not.toBe(ref.key);
+      expect(supabase.put.mock.calls).toHaveLength(0);
       expect(storage.activeProviderId).toBe('supabase');
     });
 
-    it('uses the extension matching the validated MIME type and unique keys', async () => {
-      const png = await storage.save(
-        AUTH_ID,
-        'profile',
-        'image/png',
-        Buffer.from('p'),
+    it('uses the extension matching the validated MIME type', () => {
+      expect(storage.createRef(AUTH_ID, 'profile', 'image/png').key).toMatch(
+        /^[^/]+\/profile\/[0-9a-f-]{36}\.png$/,
       );
-      const webp = await storage.save(
-        AUTH_ID,
-        'profile',
-        'image/webp',
-        Buffer.from('w'),
+      expect(storage.createRef(AUTH_ID, 'profile', 'image/webp').key).toMatch(
+        /\.webp$/,
       );
-      const again = await storage.save(
-        AUTH_ID,
-        'profile',
-        'image/webp',
-        Buffer.from('w'),
-      );
-
-      expect(png.key).toMatch(/^[^/]+\/profile\/[0-9a-f-]{36}\.png$/);
-      expect(webp.key).toMatch(/\.webp$/);
-      expect(again.key).not.toBe(webp.key);
     });
 
     it.each(['..', '../other-user', 'a/b', '', 'session id', 'x'.repeat(129)])(
-      'rejects an unsafe scope segment %p before touching storage',
-      async (scope) => {
-        await expect(
-          storage.save(AUTH_ID, scope, 'image/jpeg', Buffer.from('x')),
-        ).rejects.toMatchObject({ code: 'INVALID_STORAGE_KEY' });
-        expect(supabase.put.mock.calls).toHaveLength(0);
+      'rejects an unsafe scope segment %p',
+      (scope) => {
+        let error: unknown;
+        try {
+          storage.createRef(AUTH_ID, scope, 'image/jpeg');
+        } catch (caught) {
+          error = caught;
+        }
+        expect(error).toBeInstanceOf(PrivateStorageError);
+        expect((error as PrivateStorageError).code).toBe('INVALID_STORAGE_KEY');
       },
     );
+
+    it('writes to the provider named in the reference', async () => {
+      const bytes = Buffer.from('jpeg-bytes');
+      const ref = storage.createRef(AUTH_ID, SESSION_ID, 'image/jpeg');
+
+      await storage.put(ref, bytes, 'image/jpeg');
+
+      expect(supabase.put.mock.calls).toEqual([[ref.key, bytes, 'image/jpeg']]);
+      expect(local.put.mock.calls).toHaveLength(0);
+    });
+
+    it('can switch the active provider through configuration alone', () => {
+      const localFirst = new PrivateImageStorageService(
+        [supabase, local],
+        config('local'),
+        logger,
+      );
+
+      expect(
+        localFirst.createRef(AUTH_ID, SESSION_ID, 'image/jpeg').provider,
+      ).toBe('local');
+    });
 
     it('annotates provider errors with context and logs them without keys or bytes', async () => {
       supabase.put.mockRejectedValue(
@@ -90,7 +101,11 @@ describe('PrivateImageStorageService (private cloud storage)', () => {
       );
 
       const error = await storage
-        .save(AUTH_ID, SESSION_ID, 'image/jpeg', Buffer.from('secret-bytes'))
+        .put(
+          { provider: 'supabase', key: KEY },
+          Buffer.from('secret-bytes'),
+          'image/jpeg',
+        )
         .catch((caught: unknown) => caught);
 
       expect(error).toMatchObject({
@@ -118,13 +133,11 @@ describe('PrivateImageStorageService (private cloud storage)', () => {
 
     it('wraps unexpected provider exceptions in a safe retryable error', async () => {
       supabase.put.mockRejectedValue(
-        new Error(
-          'socket hang up at https://project.supabase.co with key sb_secret_x',
-        ),
+        new Error('socket hang up at https://x.supabase.co key sb_secret_x'),
       );
 
       const error = (await storage
-        .save(AUTH_ID, SESSION_ID, 'image/jpeg', Buffer.from('x'))
+        .put({ provider: 'supabase', key: KEY }, Buffer.from('x'), 'image/jpeg')
         .catch((caught: unknown) => caught)) as PrivateStorageError;
 
       expect(error).toBeInstanceOf(PrivateStorageError);
@@ -134,51 +147,30 @@ describe('PrivateImageStorageService (private cloud storage)', () => {
       );
       expect(error.cause).toBeInstanceOf(Error);
     });
-
-    it('can switch the active provider through configuration alone', async () => {
-      const localFirst = new PrivateImageStorageService(
-        [supabase, local],
-        config('local'),
-        logger,
-      );
-
-      const ref = await localFirst.save(
-        AUTH_ID,
-        SESSION_ID,
-        'image/jpeg',
-        Buffer.from('x'),
-      );
-
-      expect(ref.provider).toBe('local');
-      expect(local.put.mock.calls).toHaveLength(1);
-      expect(supabase.put.mock.calls).toHaveLength(0);
-    });
   });
 
   describe('read and delete', () => {
-    const key = `${AUTH_ID}/${SESSION_ID}/0b7c9a52-8d2f-4d57-9a8c-0d8c1f0a1b2c.jpg`;
-
     it('routes each record to the provider that stored it', async () => {
       supabase.get.mockResolvedValue(Buffer.from('cloud'));
       local.get.mockResolvedValue(Buffer.from('legacy'));
 
       await expect(
-        storage.read({ provider: 'supabase', key }),
+        storage.read({ provider: 'supabase', key: KEY }),
       ).resolves.toEqual(Buffer.from('cloud'));
-      await expect(storage.read({ provider: 'local', key })).resolves.toEqual(
-        Buffer.from('legacy'),
-      );
-      await storage.delete({ provider: 'local', key });
+      await expect(
+        storage.read({ provider: 'local', key: KEY }),
+      ).resolves.toEqual(Buffer.from('legacy'));
+      await storage.delete({ provider: 'local', key: KEY });
 
-      expect(supabase.get.mock.calls).toEqual([[key]]);
-      expect(local.get.mock.calls).toEqual([[key]]);
-      expect(local.delete.mock.calls).toEqual([[key]]);
+      expect(supabase.get.mock.calls).toEqual([[KEY]]);
+      expect(local.get.mock.calls).toEqual([[KEY]]);
+      expect(local.delete.mock.calls).toEqual([[KEY]]);
       expect(supabase.delete.mock.calls).toHaveLength(0);
     });
 
     it('fails safely for records naming an unregistered provider', async () => {
       await expect(
-        storage.read({ provider: 'retired-s3', key }),
+        storage.read({ provider: 'retired-s3', key: KEY }),
       ).rejects.toMatchObject({
         code: 'UNKNOWN_STORAGE_PROVIDER',
         provider: 'retired-s3',
@@ -197,27 +189,20 @@ describe('PrivateImageStorageService (private cloud storage)', () => {
       `${AUTH_ID}/${SESSION_ID}/no-extension`,
       `${AUTH_ID}/${SESSION_ID}/script.svg`,
       'x.jpg',
-    ])(
-      'rejects the unsafe key %p without calling a provider',
-      async (badKey) => {
-        await expect(
-          storage.read({ provider: 'supabase', key: badKey }),
-        ).rejects.toMatchObject({ code: 'INVALID_STORAGE_KEY' });
-        await expect(
-          storage.delete({ provider: 'supabase', key: badKey }),
-        ).rejects.toMatchObject({ code: 'INVALID_STORAGE_KEY' });
-        expect(supabase.get.mock.calls).toHaveLength(0);
-        expect(supabase.delete.mock.calls).toHaveLength(0);
-      },
-    );
-
-    it('still reads keys produced by the previous filesystem adapter', async () => {
-      local.get.mockResolvedValue(Buffer.from('legacy'));
-      const legacyKey = `${AUTH_ID}/profile/0b7c9a52-8d2f-4d57-9a8c-0d8c1f0a1b2c.webp`;
-
-      await expect(
-        storage.read({ provider: 'local', key: legacyKey }),
-      ).resolves.toEqual(Buffer.from('legacy'));
+    ])('rejects the unsafe key %p without calling a provider', async (bad) => {
+      const ref = { provider: 'supabase', key: bad };
+      await expect(storage.read(ref)).rejects.toMatchObject({
+        code: 'INVALID_STORAGE_KEY',
+      });
+      await expect(storage.delete(ref)).rejects.toMatchObject({
+        code: 'INVALID_STORAGE_KEY',
+      });
+      await expect(storage.createSignedUrl(ref, 60)).rejects.toMatchObject({
+        code: 'INVALID_STORAGE_KEY',
+      });
+      expect(supabase.get.mock.calls).toHaveLength(0);
+      expect(supabase.delete.mock.calls).toHaveLength(0);
+      expect(supabase.createSignedUrl.mock.calls).toHaveLength(0);
     });
 
     it('logs a missing object as a warning rather than an error', async () => {
@@ -226,7 +211,7 @@ describe('PrivateImageStorageService (private cloud storage)', () => {
       );
 
       await expect(
-        storage.read({ provider: 'supabase', key }),
+        storage.read({ provider: 'supabase', key: KEY }),
       ).rejects.toMatchObject({ code: 'OBJECT_NOT_FOUND', operation: 'get' });
       expect(logger.warn.mock.calls).toContainEqual([
         'Private image object is missing',
@@ -234,30 +219,50 @@ describe('PrivateImageStorageService (private cloud storage)', () => {
       ]);
       expect(logger.error.mock.calls).toHaveLength(0);
     });
+  });
 
-    it('deleteQuietly never throws and logs the orphaned key for cleanup', async () => {
-      supabase.delete.mockRejectedValue(
-        new PrivateStorageError('STORAGE_TIMEOUT'),
+  describe('createSignedUrl', () => {
+    const SIGNED = `https://project.supabase.co/storage/v1/object/sign/bucket/${KEY}?token=abc`;
+
+    it('signs with the provider that stores the object and reports the expiry', async () => {
+      jest.spyOn(Date, 'now').mockReturnValue(1_000_000);
+      local.createSignedUrl.mockResolvedValue('unused');
+      supabase.createSignedUrl.mockResolvedValue(SIGNED);
+
+      await expect(
+        storage.createSignedUrl({ provider: 'supabase', key: KEY }, 60),
+      ).resolves.toEqual({
+        url: SIGNED,
+        expiresAt: new Date(1_000_000 + 60_000),
+      });
+      expect(supabase.createSignedUrl.mock.calls).toEqual([[KEY, 60]]);
+      expect(local.createSignedUrl.mock.calls).toHaveLength(0);
+    });
+
+    it.each([0, 61, 3600, 1.5])(
+      'refuses a lifetime of %p seconds',
+      async (ttl) => {
+        await expect(
+          storage.createSignedUrl({ provider: 'supabase', key: KEY }, ttl),
+        ).rejects.toThrow(RangeError);
+        expect(supabase.createSignedUrl.mock.calls).toHaveLength(0);
+      },
+    );
+
+    it('never logs the signed URL when signing fails', async () => {
+      supabase.createSignedUrl.mockRejectedValue(
+        new PrivateStorageError('INVALID_PROVIDER_RESPONSE'),
       );
 
       await expect(
-        storage.deleteQuietly({ provider: 'supabase', key }, 'avatar replaced'),
-      ).resolves.toBe(false);
-      expect(logger.warn.mock.calls).toContainEqual([
-        'Private image cleanup failed; object may be orphaned',
-        {
-          context: 'PrivateImageStorageService',
-          reason: 'avatar replaced',
-          provider: 'supabase',
-          storageKey: key,
-          code: 'STORAGE_TIMEOUT',
-        },
-      ]);
-
-      supabase.delete.mockResolvedValue();
-      await expect(
-        storage.deleteQuietly({ provider: 'supabase', key }, 'avatar replaced'),
-      ).resolves.toBe(true);
+        storage.createSignedUrl({ provider: 'supabase', key: KEY }, 60),
+      ).rejects.toMatchObject({
+        code: 'INVALID_PROVIDER_RESPONSE',
+        operation: 'sign',
+      });
+      const logged = JSON.stringify(logger.error.mock.calls);
+      expect(logged).not.toContain('token');
+      expect(logged).not.toContain(KEY);
     });
   });
 

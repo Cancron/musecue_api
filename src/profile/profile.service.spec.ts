@@ -1,6 +1,8 @@
+import type { Prisma } from '@prisma/client';
 import { mock, mockDeep } from 'jest-mock-extended';
 import { PrismaService } from '../common/services/prisma.service';
 import { ImageValidationService } from '../makeup/services/image-validation.service';
+import { PrivateImageLifecycleService } from '../storage/private-image-lifecycle.service';
 import { PrivateImageStorageService } from '../storage/private-image-storage.service';
 import { ProfileService } from './profile.service';
 
@@ -8,9 +10,20 @@ describe('ProfileService avatar ownership and lifecycle', () => {
   const prisma = mockDeep<PrismaService>();
   const imageValidation = mock<ImageValidationService>();
   const imageStorage = mock<PrivateImageStorageService>();
-  const service = new ProfileService(prisma, imageValidation, imageStorage);
+  const imageLifecycle = mock<PrivateImageLifecycleService>();
+  const service = new ProfileService(
+    prisma,
+    imageValidation,
+    imageStorage,
+    imageLifecycle,
+  );
 
-  beforeEach(() => jest.clearAllMocks());
+  beforeEach(() => {
+    jest.clearAllMocks();
+    prisma.$transaction.mockImplementation(((
+      callback: (tx: Prisma.TransactionClient) => Promise<unknown>,
+    ) => callback(prisma)) as PrismaService['$transaction']);
+  });
 
   it('returns an authenticated content route without exposing the storage key', async () => {
     const updatedAt = new Date('2026-09-03T12:00:00.000Z');
@@ -44,11 +57,13 @@ describe('ProfileService avatar ownership and lifecycle', () => {
       height: 640,
       sizeBytes: 6,
     });
-    prisma.userProfile.findUnique.mockResolvedValue({
-      avatarUrl: 'owner-id/profile/old.jpg',
-      avatarStorageProvider: 'supabase',
-    } as never);
-    imageStorage.save.mockResolvedValue({
+    prisma.$queryRaw.mockResolvedValue([
+      {
+        avatarUrl: 'owner-id/profile/old.jpg',
+        avatarStorageProvider: 'supabase',
+      },
+    ]);
+    imageLifecycle.upload.mockResolvedValue({
       provider: 'supabase',
       key: 'owner-id/profile/new.jpg',
     });
@@ -66,7 +81,7 @@ describe('ProfileService avatar ownership and lifecycle', () => {
 
     await service.updateAvatar('owner-id', file);
 
-    expect(imageStorage.save.mock.calls[0]?.slice(0, 3)).toEqual([
+    expect(imageLifecycle.upload.mock.calls[0]?.slice(0, 3)).toEqual([
       'owner-id',
       'profile',
       'image/jpeg',
@@ -83,10 +98,12 @@ describe('ProfileService avatar ownership and lifecycle', () => {
         avatarStorageProvider: 'supabase',
       },
     });
-    expect(imageStorage.deleteQuietly.mock.calls[0]?.[0]).toEqual({
-      provider: 'supabase',
-      key: 'owner-id/profile/old.jpg',
-    });
+    const previous = { provider: 'supabase', key: 'owner-id/profile/old.jpg' };
+    expect(imageLifecycle.scheduleDeletion.mock.calls[0]?.slice(1)).toEqual([
+      [previous],
+      'AVATAR_REPLACED',
+    ]);
+    expect(imageLifecycle.processRefs.mock.calls).toEqual([[[previous]]]);
   });
 
   it('deletes a newly written file when the database update fails', async () => {
@@ -100,8 +117,8 @@ describe('ProfileService avatar ownership and lifecycle', () => {
       height: 640,
       sizeBytes: 6,
     });
-    prisma.userProfile.findUnique.mockResolvedValue(null);
-    imageStorage.save.mockResolvedValue({
+    prisma.$queryRaw.mockResolvedValue([]);
+    imageLifecycle.upload.mockResolvedValue({
       provider: 'supabase',
       key: 'owner-id/profile/new.jpg',
     });
@@ -112,17 +129,18 @@ describe('ProfileService avatar ownership and lifecycle', () => {
     await expect(service.updateAvatar('owner-id', file)).rejects.toThrow(
       'Database unavailable',
     );
-    expect(imageStorage.deleteQuietly.mock.calls[0]?.[0]).toEqual({
-      provider: 'supabase',
-      key: 'owner-id/profile/new.jpg',
-    });
+    expect(imageLifecycle.abandonUpload.mock.calls).toEqual([
+      [{ provider: 'supabase', key: 'owner-id/profile/new.jpg' }],
+    ]);
   });
 
   it('removes an external provider avatar without treating its URL as a local path', async () => {
-    prisma.userProfile.findUnique.mockResolvedValue({
-      avatarUrl: 'https://images.example.com/avatar.jpg',
-      avatarStorageProvider: null,
-    } as never);
+    prisma.$queryRaw.mockResolvedValue([
+      {
+        avatarUrl: 'https://images.example.com/avatar.jpg',
+        avatarStorageProvider: null,
+      },
+    ]);
     prisma.userProfile.update.mockResolvedValue({} as never);
     prisma.authUser.findUnique.mockResolvedValue({
       id: 'owner-id',
@@ -138,7 +156,8 @@ describe('ProfileService avatar ownership and lifecycle', () => {
       data: { avatarUrl: null, avatarStorageProvider: null },
     });
     expect(imageStorage.delete.mock.calls).toHaveLength(0);
-    expect(imageStorage.deleteQuietly.mock.calls).toHaveLength(0);
+    expect(imageLifecycle.scheduleDeletion.mock.calls).toHaveLength(0);
+    expect(imageLifecycle.processRefs.mock.calls).toHaveLength(0);
   });
 
   it('reads only the current user profile avatar', async () => {

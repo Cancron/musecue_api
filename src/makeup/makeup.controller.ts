@@ -3,6 +3,7 @@ import {
   Controller,
   Delete,
   Get,
+  Header,
   Headers,
   Param,
   Patch,
@@ -86,6 +87,19 @@ export class MakeupController {
     response.setHeader('Cache-Control', 'private, no-store');
     response.setHeader('X-Content-Type-Options', 'nosniff');
     response.send(image.bytes);
+  }
+
+  /**
+   * Short-lived (60 s) direct download URL for an owned private image. A new
+   * URL is issued on every call; nothing is stored, and caching is disabled.
+   */
+  @Get('images/:imageId/signed-url')
+  @Header('Cache-Control', 'private, no-store')
+  getImageSignedUrl(
+    @Req() req: AuthenticatedRequest,
+    @Param('imageId') imageId: string,
+  ) {
+    return this.makeup.getImageSignedUrl(req.user.userId, imageId);
   }
 
   @Post('sessions/:sessionId/images')

@@ -350,6 +350,174 @@ describe('SupabaseStorageProvider (private cloud storage)', () => {
     });
   });
 
+  describe('createSignedUrl', () => {
+    const NOW_MS = Date.parse('2026-11-12T12:00:00.000Z');
+    const nowSeconds = Math.floor(NOW_MS / 1000);
+    const SIGN_URL = `${CONFIG.storageUrl}/object/sign/${CONFIG.bucket}/${KEY}`;
+    const token = (payload: object) =>
+      [
+        Buffer.from('{"alg":"HS256","typ":"JWT"}').toString('base64url'),
+        Buffer.from(JSON.stringify(payload)).toString('base64url'),
+        'signature',
+      ].join('.');
+    const signed = (value: string) =>
+      json({
+        signedURL: `/object/sign/${CONFIG.bucket}/${KEY}?token=${value}`,
+      });
+    const provider = (...responders: Responder[]) => {
+      const fake = fakeFetch(...responders);
+      return {
+        ...fake,
+        provider: new SupabaseStorageProvider(
+          CONFIG,
+          fake.fetchImpl,
+          () => NOW_MS,
+        ),
+      };
+    };
+
+    it('requests a 60 second URL with server-side credentials and returns it', async () => {
+      const jwt = token({
+        url: `${CONFIG.bucket}/${KEY}`,
+        iat: nowSeconds,
+        exp: nowSeconds + 60,
+      });
+      const { provider: supabase, requests } = provider(() => signed(jwt));
+
+      const url = await supabase.createSignedUrl(KEY, 60);
+
+      expect(url).toBe(`${SIGN_URL}?token=${jwt}`);
+      expect(requests[0]).toMatchObject({ method: 'POST', url: SIGN_URL });
+      expect(JSON.parse(requests[0].body as string)).toEqual({ expiresIn: 60 });
+      expect(requests[0].headers.get('authorization')).toBe(
+        `Bearer ${SERVICE_KEY}`,
+      );
+      expect(url).not.toContain(SERVICE_KEY);
+    });
+
+    it('accepts an opaque (non-JWT) token', async () => {
+      const { provider: supabase } = provider(() => signed('opaque-token'));
+
+      await expect(supabase.createSignedUrl(KEY, 60)).resolves.toBe(
+        `${SIGN_URL}?token=opaque-token`,
+      );
+    });
+
+    it('accepts a token expiring within the allowed clock skew', async () => {
+      const { provider: supabase } = provider(() =>
+        signed(token({ exp: nowSeconds + 60 + 30 })),
+      );
+
+      await expect(supabase.createSignedUrl(KEY, 60)).resolves.toContain(
+        'token=',
+      );
+    });
+
+    it.each([
+      [
+        'a token valid far longer than requested',
+        () => signed(token({ exp: nowSeconds + 3600 })),
+      ],
+      [
+        'a URL for another object',
+        () =>
+          json({
+            signedURL: `/object/sign/${CONFIG.bucket}/other/x.jpg?token=t`,
+          }),
+      ],
+      [
+        'a URL for another bucket',
+        () => json({ signedURL: `/object/sign/public-bucket/${KEY}?token=t` }),
+      ],
+      [
+        'a URL without a token',
+        () => json({ signedURL: `/object/sign/${CONFIG.bucket}/${KEY}` }),
+      ],
+      ['a missing signedURL', () => json({})],
+      [
+        'a public (unsigned) object URL',
+        () =>
+          json({ signedURL: `/object/public/${CONFIG.bucket}/${KEY}?token=t` }),
+      ],
+    ])('rejects %s', async (_label, responder) => {
+      const { provider: supabase } = provider(responder);
+
+      await expectStorageError(
+        supabase.createSignedUrl(KEY, 60),
+        'INVALID_PROVIDER_RESPONSE',
+        false,
+      );
+    });
+
+    it.each([
+      [
+        'a missing object',
+        () =>
+          json(
+            {
+              statusCode: '404',
+              error: 'not_found',
+              message: 'Object not found',
+            },
+            400,
+          ),
+        'OBJECT_NOT_FOUND',
+        false,
+      ],
+      [
+        'a missing bucket',
+        () =>
+          json(
+            {
+              statusCode: '404',
+              error: 'Bucket not found',
+              message: 'Bucket not found',
+            },
+            400,
+          ),
+        'STORAGE_MISCONFIGURED',
+        false,
+      ],
+      [
+        'rejected credentials',
+        () =>
+          json(
+            {
+              statusCode: '403',
+              error: 'Unauthorized',
+              message: 'invalid signature',
+            },
+            400,
+          ),
+        'STORAGE_ACCESS_DENIED',
+        false,
+      ],
+      [
+        'a provider outage',
+        () => json({ message: 'unavailable' }, 503),
+        'STORAGE_UNAVAILABLE',
+        true,
+      ],
+      [
+        'a network failure',
+        () => {
+          throw new TypeError('fetch failed');
+        },
+        'STORAGE_UNAVAILABLE',
+        true,
+      ],
+    ] as const)('maps %s to %s', async (_label, responder, code, retryable) => {
+      const { provider: supabase } = provider(responder);
+
+      const error = await expectStorageError(
+        supabase.createSignedUrl(KEY, 60),
+        code,
+        retryable,
+      );
+      expect(error.operation).toBe('sign');
+    });
+  });
+
   describe('failure classification', () => {
     it.each([
       [401, 'STORAGE_ACCESS_DENIED', false],
@@ -490,6 +658,11 @@ describe('SupabaseStorageProvider (private cloud storage)', () => {
       'STORAGE_MISCONFIGURED',
       false,
     );
-    expect(fetchImpl).not.toHaveBeenCalled();
+    await expectStorageError(
+      provider.createSignedUrl(KEY, 60),
+      'STORAGE_MISCONFIGURED',
+      false,
+    );
+    expect(fetchImpl.mock.calls).toHaveLength(0);
   });
 });

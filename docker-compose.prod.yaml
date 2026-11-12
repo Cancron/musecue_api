@@ -23,6 +23,15 @@ services:
       REDIS_USER: ${REDIS_USER}
       REDIS_PASSWORD: ${REDIS_PASSWORD}
 
+      # Private image storage. Values are interpolated at deploy time from the host
+      # environment or this compose project's .env on the server; they are never
+      # part of the image. Missing required values stop `docker-compose` early.
+      PRIVATE_STORAGE_PROVIDER: ${PRIVATE_STORAGE_PROVIDER:-supabase}
+      SUPABASE_URL: ${SUPABASE_URL:?SUPABASE_URL must be set for private image storage}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:?SUPABASE_SERVICE_ROLE_KEY must be set for private image storage}
+      SUPABASE_STORAGE_BUCKET: ${SUPABASE_STORAGE_BUCKET:?SUPABASE_STORAGE_BUCKET must be set for private image storage}
+      SUPABASE_STORAGE_TIMEOUT_MS: ${SUPABASE_STORAGE_TIMEOUT_MS:-15000}
+
       CHOKIDAR_USEPOLLING: "true"
       CHOKIDAR_INTERVAL: 1000
     depends_on:

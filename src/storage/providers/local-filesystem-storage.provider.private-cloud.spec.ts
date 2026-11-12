@@ -53,6 +53,16 @@ describe('LocalFilesystemStorageProvider (private cloud storage fallback)', () =
     });
   });
 
+  it('cannot issue signed URLs (callers fall back to the content endpoint)', async () => {
+    await provider.put(KEY, Buffer.from('x'));
+
+    await expect(provider.createSignedUrl()).rejects.toMatchObject({
+      code: 'SIGNED_URL_UNSUPPORTED',
+      provider: 'local',
+      operation: 'sign',
+    });
+  });
+
   it('refuses to resolve paths outside the private root', async () => {
     const outside = join(root, '..', 'outside.jpg');
     await writeFile(outside, 'secret');

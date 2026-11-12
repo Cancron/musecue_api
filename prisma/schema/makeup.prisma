@@ -39,6 +39,7 @@ model ImageAsset {
 
   @@index([sessionId, purpose, createdAt])
   @@index([guideStepId, createdAt])
+  @@index([storageKey])
 }
 
 model MakeupPreferences {

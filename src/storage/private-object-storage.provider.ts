@@ -24,6 +24,14 @@ export interface PrivateObjectStorageProvider {
   get(key: string): Promise<Buffer>;
 
   delete(key: string): Promise<void>;
+
+  /**
+   * Returns a URL granting read access to one object for `expiresInSeconds`.
+   * The URL must embed only a short-lived, object-scoped token, never the
+   * provider credentials. Providers that cannot sign throw
+   * `SIGNED_URL_UNSUPPORTED`.
+   */
+  createSignedUrl(key: string, expiresInSeconds: number): Promise<string>;
 }
 
 /** Multi-provider injection token: every registered provider instance. */

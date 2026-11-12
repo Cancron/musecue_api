@@ -1,14 +1,17 @@
 import { Global, Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Test } from '@nestjs/testing';
-import { mock } from 'jest-mock-extended';
+import { mock, mockDeep } from 'jest-mock-extended';
 import { WINSTON_MODULE_PROVIDER } from 'nest-winston';
+import { randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Logger } from 'winston';
+import { PrismaService } from '../common/services/prisma.service';
+import { PrivateImageLifecycleService } from './private-image-lifecycle.service';
 import { PrivateImageStorageService } from './private-image-storage.service';
 import { StorageModule } from './storage.module';
 
@@ -31,6 +34,14 @@ class FakeSupabaseStorage {
   readonly objects = new Map<string, { bytes: Buffer; contentType: string }>();
   readonly requests: SeenRequest[] = [];
   bucketIsPublic = false;
+  /** Simulated server clock, so expiry can be tested without waiting. */
+  clockOffsetMs = 0;
+  baseUrl = '';
+  private readonly tokens = new Map<string, { key: string; exp: number }>();
+
+  private nowSeconds(): number {
+    return Math.floor((Date.now() + this.clockOffsetMs) / 1000);
+  }
   private server?: Server;
 
   async start(): Promise<string> {
@@ -44,7 +55,8 @@ class FakeSupabaseStorage {
       this.server?.listen(0, '127.0.0.1', resolve),
     );
     const { port } = this.server.address() as AddressInfo;
-    return `http://127.0.0.1:${port}`;
+    this.baseUrl = `http://127.0.0.1:${port}`;
+    return this.baseUrl;
   }
 
   stop(): Promise<void> {
@@ -72,6 +84,39 @@ class FakeSupabaseStorage {
       body: JSON.stringify(value),
       contentType: 'application/json',
     });
+
+    // Signed downloads authenticate with the URL token only.
+    const signPrefix = `/storage/v1/object/sign/${BUCKET}/`;
+    if (req.method === 'GET' && path.startsWith(signPrefix)) {
+      const token = new URL(req.url ?? '/', 'http://x').searchParams.get(
+        'token',
+      );
+      const grant = token ? this.tokens.get(token) : undefined;
+      const key = path.slice(signPrefix.length);
+      if (!grant || grant.key !== key) {
+        return json(400, {
+          statusCode: '400',
+          error: 'InvalidSignature',
+          message: 'invalid signature',
+        });
+      }
+      if (this.nowSeconds() >= grant.exp) {
+        return json(400, {
+          statusCode: '400',
+          error: 'InvalidJWT',
+          message: 'jwt expired',
+        });
+      }
+      const object = this.objects.get(key);
+      return object
+        ? { status: 200, body: object.bytes, contentType: object.contentType }
+        : json(400, {
+            statusCode: '404',
+            error: 'not_found',
+            message: 'Object not found',
+          });
+    }
+
     if (
       req.headers.apikey !== SERVICE_KEY ||
       req.headers.authorization !== `Bearer ${SERVICE_KEY}`
@@ -90,6 +135,24 @@ class FakeSupabaseStorage {
         id: BUCKET,
         name: BUCKET,
         public: this.bucketIsPublic,
+      });
+    }
+    if (req.method === 'POST' && path.startsWith(signPrefix)) {
+      const key = path.slice(signPrefix.length);
+      if (!this.objects.has(key)) {
+        return json(400, {
+          statusCode: '404',
+          error: 'not_found',
+          message: 'Object not found',
+        });
+      }
+      const { expiresIn } = JSON.parse(body.toString()) as {
+        expiresIn: number;
+      };
+      const token = `t-${randomUUID()}`;
+      this.tokens.set(token, { key, exp: this.nowSeconds() + expiresIn });
+      return json(200, {
+        signedURL: `/object/sign/${BUCKET}/${key}?token=${token}`,
       });
     }
     if (req.method === 'DELETE' && path === objectPrefix) {
@@ -148,15 +211,27 @@ async function compileStorage(env: Record<string, string | undefined>) {
     providers: [
       { provide: ConfigService, useValue: { get: (key: string) => env[key] } },
       { provide: WINSTON_MODULE_PROVIDER, useValue: mock<Logger>() },
+      { provide: PrismaService, useValue: mockDeep<PrismaService>() },
     ],
-    exports: [ConfigService, WINSTON_MODULE_PROVIDER],
+    exports: [ConfigService, WINSTON_MODULE_PROVIDER, PrismaService],
   })
   class TestInfrastructureModule {}
 
   const moduleRef = await Test.createTestingModule({
     imports: [TestInfrastructureModule, StorageModule],
   }).compile();
+  expect(moduleRef.get(PrivateImageLifecycleService)).toBeDefined();
   return moduleRef.get(PrivateImageStorageService);
+}
+
+async function save(
+  storage: PrivateImageStorageService,
+  mimeType: 'image/jpeg' | 'image/webp',
+  bytes: Buffer,
+) {
+  const ref = storage.createRef(AUTH_ID, SESSION_ID, mimeType);
+  await storage.put(ref, bytes, mimeType);
+  return ref;
 }
 
 describe('StorageModule wiring (private cloud storage)', () => {
@@ -173,6 +248,7 @@ describe('StorageModule wiring (private cloud storage)', () => {
     fake.objects.clear();
     fake.requests.length = 0;
     fake.bucketIsPublic = false;
+    fake.clockOffsetMs = 0;
     localRoot = await mkdtemp(join(tmpdir(), 'musecue-module-'));
   });
   afterEach(() => rm(localRoot, { recursive: true, force: true }));
@@ -189,7 +265,7 @@ describe('StorageModule wiring (private cloud storage)', () => {
     const storage = await compileStorage(supabaseEnv());
     const bytes = Buffer.from([0x52, 0x49, 0x46, 0x46, 0, 255, 1, 2, 3]);
 
-    const ref = await storage.save(AUTH_ID, SESSION_ID, 'image/webp', bytes);
+    const ref = await save(storage, 'image/webp', bytes);
 
     expect(ref.provider).toBe('supabase');
     expect(fake.objects.get(ref.key)).toEqual({
@@ -214,20 +290,17 @@ describe('StorageModule wiring (private cloud storage)', () => {
   });
 
   it('keeps reading legacy filesystem images while new uploads go to Supabase', async () => {
-    const legacy = await (
+    const legacy = await save(
       await compileStorage({
         PRIVATE_STORAGE_PROVIDER: 'local',
         PRIVATE_UPLOAD_DIR: localRoot,
-      })
-    ).save(AUTH_ID, SESSION_ID, 'image/jpeg', Buffer.from('legacy-jpeg'));
+      }),
+      'image/jpeg',
+      Buffer.from('legacy-jpeg'),
+    );
 
     const storage = await compileStorage(supabaseEnv());
-    const fresh = await storage.save(
-      AUTH_ID,
-      SESSION_ID,
-      'image/jpeg',
-      Buffer.from('new-jpeg'),
-    );
+    const fresh = await save(storage, 'image/jpeg', Buffer.from('new-jpeg'));
 
     expect(legacy.provider).toBe('local');
     expect(fresh.provider).toBe('supabase');
@@ -237,12 +310,47 @@ describe('StorageModule wiring (private cloud storage)', () => {
     await expect(storage.read(fresh)).resolves.toEqual(Buffer.from('new-jpeg'));
   });
 
+  it('issues a 60 s signed URL that downloads the object, expires, and can be re-issued', async () => {
+    const storage = await compileStorage(supabaseEnv());
+    const bytes = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 7, 7, 7]);
+    const ref = await save(storage, 'image/jpeg', bytes);
+
+    const first = await storage.createSignedUrl(ref, 60);
+
+    expect(
+      first.url.startsWith(`${fake.baseUrl}/storage/v1/object/sign/`),
+    ).toBe(true);
+    expect(first.url).not.toContain(SERVICE_KEY);
+    const download = await fetch(first.url);
+    expect(download.status).toBe(200);
+    expect(Buffer.from(await download.arrayBuffer())).toEqual(bytes);
+
+    fake.clockOffsetMs = 61_000;
+    expect((await fetch(first.url)).status).toBe(400);
+
+    const second = await storage.createSignedUrl(ref, 60);
+    expect(second.url).not.toBe(first.url);
+    expect((await fetch(second.url)).status).toBe(200);
+  });
+
+  it('cannot sign images that live on the local filesystem', async () => {
+    const storage = await compileStorage(supabaseEnv());
+    const legacy = {
+      provider: 'local',
+      key: `${AUTH_ID}/${SESSION_ID}/0b7c9a52-8d2f-4d57-9a8c-0d8c1f0a1b2c.jpg`,
+    };
+
+    await expect(storage.createSignedUrl(legacy, 60)).rejects.toMatchObject({
+      code: 'SIGNED_URL_UNSUPPORTED',
+    });
+  });
+
   it('refuses uploads when the bucket is public', async () => {
     fake.bucketIsPublic = true;
     const storage = await compileStorage(supabaseEnv());
 
     await expect(
-      storage.save(AUTH_ID, SESSION_ID, 'image/jpeg', Buffer.from('x')),
+      save(storage, 'image/jpeg', Buffer.from('x')),
     ).rejects.toMatchObject({
       code: 'STORAGE_MISCONFIGURED',
       retryable: false,
@@ -257,7 +365,7 @@ describe('StorageModule wiring (private cloud storage)', () => {
     });
 
     await expect(
-      storage.save(AUTH_ID, SESSION_ID, 'image/jpeg', Buffer.from('x')),
+      save(storage, 'image/jpeg', Buffer.from('x')),
     ).rejects.toMatchObject({ code: 'STORAGE_ACCESS_DENIED' });
   });
 

@@ -46,6 +46,16 @@ export class LocalFilesystemStorageProvider implements PrivateObjectStorageProvi
     }
   }
 
+  /** The filesystem has no way to grant time-limited direct access. */
+  createSignedUrl(): Promise<string> {
+    return Promise.reject(
+      new PrivateStorageError('SIGNED_URL_UNSUPPORTED', {
+        provider: this.id,
+        operation: 'sign',
+      }),
+    );
+  }
+
   /** Defense in depth on top of key validation: stay inside the root. */
   private resolveKey(key: string): string {
     const absolutePath = resolve(this.root, key.replaceAll('/', sep));

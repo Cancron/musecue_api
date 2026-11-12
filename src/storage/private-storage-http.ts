@@ -7,6 +7,8 @@ import {
 export const IMAGE_STORAGE_RETRY_MESSAGE =
   'Image storage is temporarily unavailable. Please try again.';
 export const IMAGE_STORAGE_FAILURE_MESSAGE = 'Image storage is unavailable';
+export const SIGNED_URL_UNSUPPORTED_MESSAGE =
+  'A signed URL is not available for this image. Use the image content endpoint instead.';
 
 /**
  * Maps a storage failure to a client-safe HTTP error. Provider details were
@@ -22,6 +24,9 @@ export function toImageStorageHttpError(
   if (!isPrivateStorageError(error)) return error;
   if (notFoundMessage && isMissingPrivateObject(error)) {
     return AppError.notFound(notFoundMessage);
+  }
+  if (error.code === 'SIGNED_URL_UNSUPPORTED') {
+    return AppError.conflict(SIGNED_URL_UNSUPPORTED_MESSAGE);
   }
   return error.retryable
     ? AppError.serviceUnavailable(IMAGE_STORAGE_RETRY_MESSAGE)

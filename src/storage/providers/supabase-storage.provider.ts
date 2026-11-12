@@ -19,6 +19,8 @@ type FetchLike = typeof fetch;
 
 /** Re-check bucket visibility periodically so a bucket made public is noticed. */
 const BUCKET_VISIBILITY_TTL_MS = 5 * 60_000;
+/** Tolerated clock difference when checking a signed token's expiry. */
+const SIGNED_URL_CLOCK_SKEW_SECONDS = 30;
 
 /**
  * Supabase Storage adapter for a private bucket.
@@ -90,6 +92,64 @@ export class SupabaseStorageProvider implements PrivateObjectStorageProvider {
     const mapped = this.toStorageError(error, 'delete');
     // Deleting an object that is already gone is a success.
     if (mapped.code !== 'OBJECT_NOT_FOUND') throw mapped;
+  }
+
+  async createSignedUrl(
+    key: string,
+    expiresInSeconds: number,
+  ): Promise<string> {
+    const client = this.requireClient('sign');
+    const { data, error } = await this.call('sign', () =>
+      client.from(this.bucket).createSignedUrl(key, expiresInSeconds),
+    );
+    if (error) throw this.toStorageError(error, 'sign');
+    const url = data?.signedUrl;
+    if (!url || !this.isExpectedSignedUrl(url, key, expiresInSeconds)) {
+      throw new PrivateStorageError('INVALID_PROVIDER_RESPONSE', {
+        provider: this.id,
+        operation: 'sign',
+      });
+    }
+    return url;
+  }
+
+  /**
+   * Accepts only a URL on the configured Storage origin, for exactly this
+   * bucket/key, carrying a token. When the token is a readable JWT its expiry
+   * must not exceed the requested lifetime, so a misbehaving or spoofed
+   * response can never hand out long-lived access.
+   */
+  private isExpectedSignedUrl(
+    value: string,
+    key: string,
+    expiresInSeconds: number,
+  ): boolean {
+    let url: URL;
+    try {
+      url = new URL(value);
+    } catch {
+      return false;
+    }
+    const base = new URL(this.config?.storageUrl ?? '');
+    const expectedPath = `${base.pathname}/object/sign/${this.bucket}/${key}`;
+    const token = url.searchParams.get('token');
+    if (
+      url.origin !== base.origin ||
+      url.pathname !== expectedPath ||
+      url.username ||
+      url.password ||
+      !token
+    ) {
+      return false;
+    }
+    const exp = jwtExpiry(token);
+    return (
+      exp === undefined ||
+      exp <=
+        Math.floor(this.now() / 1000) +
+          expiresInSeconds +
+          SIGNED_URL_CLOCK_SKEW_SECONDS
+    );
   }
 
   /**
@@ -230,8 +290,8 @@ function classifyStatus(
   code: string | undefined,
 ): PrivateStorageErrorCode {
   if (status === 404) {
-    // Only a read can meaningfully miss an object; for writes a 404 means the
-    // bucket (or endpoint) is missing.
+    // Reads and signing can miss an object; for writes a 404 means the bucket
+    // (or endpoint) is missing.
     return operation === 'put' ? 'STORAGE_MISCONFIGURED' : 'OBJECT_NOT_FOUND';
   }
   if (status === 409) return 'OBJECT_ALREADY_EXISTS';
@@ -242,6 +302,28 @@ function classifyStatus(
       : 'STORAGE_UNAVAILABLE';
   }
   return 'STORAGE_REJECTED';
+}
+
+/** `exp` claim of a JWT-shaped token, or undefined when it is not readable. */
+function jwtExpiry(token: string): number | undefined {
+  const parts = token.split('.');
+  if (parts.length !== 3) return undefined;
+  try {
+    const payload: unknown = JSON.parse(
+      Buffer.from(parts[1], 'base64url').toString('utf8'),
+    );
+    if (
+      typeof payload === 'object' &&
+      payload !== null &&
+      'exp' in payload &&
+      typeof payload.exp === 'number'
+    ) {
+      return payload.exp;
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
 }
 
 /**

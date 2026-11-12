@@ -16,9 +16,13 @@ export type PrivateStorageErrorCode =
   /** The provider did not answer within the configured timeout. */
   | 'STORAGE_TIMEOUT'
   /** Network failure, rate limiting, or a provider-side 5xx. */
-  | 'STORAGE_UNAVAILABLE';
+  | 'STORAGE_UNAVAILABLE'
+  /** The provider cannot issue signed URLs (e.g. the local filesystem). */
+  | 'SIGNED_URL_UNSUPPORTED'
+  /** The provider answered with something unusable (e.g. a malformed URL). */
+  | 'INVALID_PROVIDER_RESPONSE';
 
-export type PrivateStorageOperation = 'put' | 'get' | 'delete';
+export type PrivateStorageOperation = 'put' | 'get' | 'delete' | 'sign';
 
 /** Fixed messages only: provider text, URLs, keys and credentials never reach `message`. */
 const SAFE_MESSAGES: Readonly<Record<PrivateStorageErrorCode, string>> = {
@@ -31,6 +35,9 @@ const SAFE_MESSAGES: Readonly<Record<PrivateStorageErrorCode, string>> = {
   STORAGE_REJECTED: 'Private image storage rejected the request',
   STORAGE_TIMEOUT: 'Private image storage timed out',
   STORAGE_UNAVAILABLE: 'Private image storage is temporarily unavailable',
+  SIGNED_URL_UNSUPPORTED: 'Signed URLs are not supported for this image',
+  INVALID_PROVIDER_RESPONSE:
+    'Private image storage returned an invalid response',
 };
 
 const RETRYABLE_CODES: ReadonlySet<PrivateStorageErrorCode> = new Set([
