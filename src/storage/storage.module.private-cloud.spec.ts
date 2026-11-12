@@ -167,6 +167,17 @@ class FakeSupabaseStorage {
         signedURL: `/object/sign/${BUCKET}/${key}?token=${token}`,
       });
     }
+    const infoPrefix = `/storage/v1/object/info/${BUCKET}/`;
+    if (req.method === 'GET' && path.startsWith(infoPrefix)) {
+      const key = path.slice(infoPrefix.length);
+      return this.objects.has(key)
+        ? json(200, { name: key })
+        : json(400, {
+            statusCode: '404',
+            error: 'not_found',
+            message: 'Object not found',
+          });
+    }
     if (req.method === 'DELETE' && path === objectPrefix) {
       const { prefixes } = JSON.parse(body.toString()) as {
         prefixes: string[];

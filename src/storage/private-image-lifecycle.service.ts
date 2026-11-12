@@ -42,6 +42,12 @@ export type CleanupOutcome =
 export const CLEANUP_POLICY = {
   /** Reservations older than this belong to uploads that never committed. */
   uploadGraceMs: 60 * 60_000,
+  /**
+   * After an ambiguous upload failure (timeout, network error, 5xx) the write
+   * may still be in flight at the provider. Deleting immediately could run
+   * before it lands and leave an untracked object, so deletion waits.
+   */
+  ambiguousUploadSettleMs: 10 * 60_000,
   /** A claimed row is invisible to other workers for this long. */
   leaseMs: 5 * 60_000,
   /** 30 s doubling, capped at 6 h: about 26 h of retries before FAILED. */
@@ -136,8 +142,11 @@ export class PrivateImageLifecycleService
         // nothing of ours was written, and an existing object must survive.
         await this.forgetReservation(ref);
       } else {
-        // Timeouts/5xx are ambiguous: the bytes may have been stored.
-        await this.abandonUpload(ref);
+        // Timeouts/5xx are ambiguous: the bytes may be stored now or land
+        // later, so the deletion is recorded and runs after a settle period.
+        await this.abandonUpload(ref, {
+          settleMs: CLEANUP_POLICY.ambiguousUploadSettleMs,
+        });
       }
       throw error;
     }
@@ -169,10 +178,15 @@ export class PrivateImageLifecycleService
 
   /**
    * Marks an upload whose reference was never committed for deletion and
-   * tries to delete it now. Never throws; if the database is unavailable the
-   * reservation remains and is cleaned once it expires.
+   * tries to delete it now, or after `settleMs` when the write may still be in
+   * flight. Never throws; if the database is unavailable the reservation
+   * remains and is cleaned once it expires.
    */
-  async abandonUpload(ref: PrivateObjectRef): Promise<CleanupOutcome> {
+  async abandonUpload(
+    ref: PrivateObjectRef,
+    options: { settleMs?: number } = {},
+  ): Promise<CleanupOutcome> {
+    const settleMs = options.settleMs ?? 0;
     try {
       await this.prisma.privateStorageCleanup.updateMany({
         where: {
@@ -181,7 +195,10 @@ export class PrivateImageLifecycleService
           reason: 'UPLOAD_PENDING',
           status: 'PENDING',
         },
-        data: { reason: 'UPLOAD_ABANDONED', nextAttemptAt: new Date() },
+        data: {
+          reason: 'UPLOAD_ABANDONED',
+          nextAttemptAt: new Date(Date.now() + settleMs),
+        },
       });
     } catch {
       this.logger.warn(
@@ -190,6 +207,7 @@ export class PrivateImageLifecycleService
       );
       return 'NOT_ATTEMPTED';
     }
+    if (settleMs > 0) return 'NOT_ATTEMPTED';
     const [outcome] = await this.processRefs([ref]);
     return outcome;
   }
@@ -249,7 +267,19 @@ export class PrivateImageLifecycleService
         take: CLEANUP_POLICY.batchSize,
       });
       const outcomes: CleanupOutcome[] = [];
-      for (const task of tasks) outcomes.push(await this.attempt(task));
+      for (const task of tasks) {
+        try {
+          outcomes.push(await this.attempt(task));
+        } catch {
+          // One row's database error must not stall the rest of the batch;
+          // the row keeps its lease and is retried on a later pass.
+          this.logger.warn('Private image cleanup deferred to the next pass', {
+            context: CONTEXT,
+            taskId: task.id,
+          });
+          outcomes.push('NOT_ATTEMPTED');
+        }
+      }
       return outcomes;
     } catch {
       this.logger.warn('Private image cleanup pass could not complete', {

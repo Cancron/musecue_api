@@ -92,13 +92,10 @@ describe('PrivateImageLifecycleService (private cloud cleanup ledger)', () => {
     });
 
     it.each(['STORAGE_TIMEOUT', 'STORAGE_UNAVAILABLE'] as const)(
-      'treats %s as possibly written: marks the upload abandoned and deletes it',
+      'treats %s as possibly written: records the deletion for after the settle period, not now',
       async (code) => {
         const failure = new PrivateStorageError(code);
         storage.put.mockRejectedValue(failure);
-        ledger.findUnique.mockResolvedValue(
-          task({ reason: 'UPLOAD_ABANDONED', nextAttemptAt: NOW }),
-        );
 
         await expect(
           lifecycle.upload('owner-id', 'session-id', 'image/jpeg', BYTES),
@@ -110,11 +107,31 @@ describe('PrivateImageLifecycleService (private cloud cleanup ledger)', () => {
             reason: 'UPLOAD_PENDING',
             status: 'PENDING',
           },
-          data: { reason: 'UPLOAD_ABANDONED', nextAttemptAt: NOW },
+          data: {
+            reason: 'UPLOAD_ABANDONED',
+            nextAttemptAt: new Date(
+              NOW.getTime() + CLEANUP_POLICY.ambiguousUploadSettleMs,
+            ),
+          },
         });
-        expect(storage.delete.mock.calls).toEqual([[REF]]);
+        // A late write could land after an immediate delete: wait instead.
+        expect(storage.delete.mock.calls).toHaveLength(0);
+        expect(ledger.findUnique.mock.calls).toHaveLength(0);
       },
     );
+
+    it('deletes right away when the upload succeeded but the database write failed', async () => {
+      ledger.findUnique.mockResolvedValue(
+        task({ reason: 'UPLOAD_ABANDONED', nextAttemptAt: NOW }),
+      );
+
+      await expect(lifecycle.abandonUpload(REF)).resolves.toBe('DELETED');
+      expect(ledger.updateMany.mock.calls[0]?.[0].data).toEqual({
+        reason: 'UPLOAD_ABANDONED',
+        nextAttemptAt: NOW,
+      });
+      expect(storage.delete.mock.calls).toEqual([[REF]]);
+    });
 
     it.each([
       'STORAGE_REJECTED',
@@ -379,6 +396,24 @@ describe('PrivateImageLifecycleService (private cloud cleanup ledger)', () => {
       expect(ledger.updateMany.mock.calls[0]?.[0].data).toMatchObject({
         reason: 'UPLOAD_ABANDONED',
       });
+    });
+
+    it('isolates a failing row so the rest of the batch is still processed', async () => {
+      ledger.findMany.mockResolvedValue([
+        task({ id: 'broken' }),
+        task({ id: 'healthy', storageKey: 'owner-id/s/ok.jpg' }),
+      ]);
+      prisma.imageAsset.count
+        .mockRejectedValueOnce(new Error('database hiccup'))
+        .mockResolvedValue(0);
+
+      await expect(lifecycle.processDue()).resolves.toEqual([
+        'NOT_ATTEMPTED',
+        'DELETED',
+      ]);
+      expect(storage.delete.mock.calls).toEqual([
+        [{ provider: 'supabase', key: 'owner-id/s/ok.jpg' }],
+      ]);
     });
 
     it('does not overlap passes on the same instance and survives ledger errors', async () => {

@@ -20,7 +20,9 @@ export type PrivateStorageErrorCode =
   /** The provider cannot issue signed URLs (e.g. the local filesystem). */
   | 'SIGNED_URL_UNSUPPORTED'
   /** The provider answered with something unusable (e.g. a malformed URL). */
-  | 'INVALID_PROVIDER_RESPONSE';
+  | 'INVALID_PROVIDER_RESPONSE'
+  /** The provider reported no removal and the object still exists. */
+  | 'DELETE_NOT_APPLIED';
 
 export type PrivateStorageOperation = 'put' | 'get' | 'delete' | 'sign';
 
@@ -38,6 +40,7 @@ const SAFE_MESSAGES: Readonly<Record<PrivateStorageErrorCode, string>> = {
   SIGNED_URL_UNSUPPORTED: 'Signed URLs are not supported for this image',
   INVALID_PROVIDER_RESPONSE:
     'Private image storage returned an invalid response',
+  DELETE_NOT_APPLIED: 'Private image storage did not delete the image',
 };
 
 const RETRYABLE_CODES: ReadonlySet<PrivateStorageErrorCode> = new Set([

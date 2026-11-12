@@ -1,4 +1,5 @@
 import { ConfigService } from '@nestjs/config';
+import { randomBytes } from 'node:crypto';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient } from '@prisma/client';
 import type { Job } from 'bullmq';
@@ -350,13 +351,29 @@ describeWithDatabase(
         expect(await ledger()).toEqual([]);
       });
 
+      it('fails cleanly on rejected credentials: nothing stored, nothing recorded', async () => {
+        const session = await newSession(owner);
+        supabase.failNext('upload', accessDenied);
+
+        expect(
+          await rejection(
+            makeup.uploadInitialImage(owner, session.id, await photo()),
+          ),
+        ).toMatchObject({ status: 500 });
+
+        expect(
+          await client.imageAsset.count({ where: { sessionId: session.id } }),
+        ).toBe(0);
+        expect(bucketKeys()).toEqual([]);
+        expect(await ledger()).toEqual([]);
+      });
+
       it.each([
-        ['a provider outage', unavailable, 503],
-        ['rejected credentials', accessDenied, 500],
-        ['a network failure', { kind: 'network' } as const, 503],
+        ['a provider outage', unavailable],
+        ['a network failure', { kind: 'network' } as const],
       ])(
-        'fails cleanly on %s: nothing stored, nothing recorded',
-        async (_label, failure, status) => {
+        'fails cleanly on %s: no reference, and the possible write is cleaned up later',
+        async (_label, failure) => {
           const session = await newSession(owner);
           supabase.failNext('upload', failure);
 
@@ -364,11 +381,18 @@ describeWithDatabase(
             await rejection(
               makeup.uploadInitialImage(owner, session.id, await photo()),
             ),
-          ).toMatchObject({ status });
+          ).toMatchObject({ status: 503 });
 
           expect(
             await client.imageAsset.count({ where: { sessionId: session.id } }),
           ).toBe(0);
+          const [pending] = await ledger();
+          expect(pending).toMatchObject({
+            reason: 'UPLOAD_ABANDONED',
+            status: 'PENDING',
+          });
+          await makeDue();
+          await expect(lifecycle.processDue()).resolves.toEqual(['DELETED']);
           expect(bucketKeys()).toEqual([]);
           expect(await ledger()).toEqual([]);
           expect(
@@ -391,12 +415,17 @@ describeWithDatabase(
           ),
         ).toMatchObject({ status: 503 });
 
-        expect(supabase.count('remove')).toBe(1);
-        expect(bucketKeys()).toEqual([]);
-        expect(await ledger()).toEqual([]);
         expect(
           await client.imageAsset.count({ where: { sessionId: session.id } }),
         ).toBe(0);
+        const [pending] = await ledger();
+        expect(pending).toMatchObject({ reason: 'UPLOAD_ABANDONED' });
+        expect(bucketKeys()).toEqual([pending.storageKey]);
+
+        await makeDue();
+        await expect(lifecycle.processDue()).resolves.toEqual(['DELETED']);
+        expect(bucketKeys()).toEqual([]);
+        expect(await ledger()).toEqual([]);
       });
 
       it('keeps a failed replacement deletion in the ledger and completes it later', async () => {
@@ -824,6 +853,10 @@ describeWithDatabase(
 
         expect(await avatarRow()).toEqual(current);
         expect(bucketKeys()).toEqual([current?.avatarUrl]);
+        await makeDue();
+        await lifecycle.processDue();
+        expect(await avatarRow()).toEqual(current);
+        expect(bucketKeys()).toEqual([current?.avatarUrl]);
         expect(await ledger()).toEqual([]);
       });
 
@@ -883,6 +916,476 @@ describeWithDatabase(
             },
           }),
         ).rejects.toThrow();
+      });
+    });
+
+    describe('failure atomicity and cross-user isolation', () => {
+      const injected: Array<{ name: string; table: string }> = [];
+
+      /** Makes PostgreSQL itself fail a write, via a trigger on the test schema. */
+      async function injectDbFailure(
+        table: string,
+        event: 'INSERT' | 'UPDATE' | 'DELETE',
+        when?: string,
+      ) {
+        const name = `inject_${randomBytes(4).toString('hex')}`;
+        await client.$executeRawUnsafe(
+          `CREATE FUNCTION ${name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected database failure'; END $$`,
+        );
+        await client.$executeRawUnsafe(
+          `CREATE TRIGGER ${name} BEFORE ${event} ON "${table}" FOR EACH ROW ${when ? `WHEN (${when}) ` : ''}EXECUTE FUNCTION ${name}()`,
+        );
+        injected.push({ name, table });
+      }
+
+      async function removeInjectedFailures() {
+        for (const { name, table } of injected.splice(0)) {
+          await client.$executeRawUnsafe(
+            `DROP TRIGGER IF EXISTS ${name} ON "${table}"`,
+          );
+          await client.$executeRawUnsafe(`DROP FUNCTION IF EXISTS ${name}()`);
+        }
+      }
+
+      afterEach(removeInjectedFailures);
+
+      async function uploadedSession(authId: string) {
+        const session = await newSession(authId);
+        await makeup.uploadInitialImage(
+          authId,
+          session.id,
+          await photo('jpeg', 5),
+        );
+        const image = await client.imageAsset.findFirstOrThrow({
+          where: { sessionId: session.id },
+        });
+        return { session, image };
+      }
+
+      const expectIntact = async (image: {
+        id: string;
+        storageKey: string;
+      }) => {
+        expect(
+          await client.imageAsset.findUnique({ where: { id: image.id } }),
+        ).not.toBeNull();
+        expect(supabase.objects.has(image.storageKey)).toBe(true);
+      };
+
+      describe('failed uploads', () => {
+        it('cleans up an upload that lands after the client gave up (no orphan, no reference)', async () => {
+          const session = await newSession(owner);
+          supabase.failNext('upload', {
+            kind: 'hang-then-store',
+            landAfterMs: 50,
+          });
+
+          expect(
+            await rejection(
+              makeup.uploadInitialImage(owner, session.id, await photo()),
+            ),
+          ).toMatchObject({ status: 503 });
+          await supabase.settle(); // the slow write has now landed
+
+          expect(
+            await client.imageAsset.count({ where: { sessionId: session.id } }),
+          ).toBe(0);
+          const [pending] = await ledger();
+          expect(pending).toMatchObject({
+            reason: 'UPLOAD_ABANDONED',
+            status: 'PENDING',
+          });
+          expect(bucketKeys()).toEqual([pending.storageKey]);
+
+          await makeDue();
+          await expect(lifecycle.processDue()).resolves.toEqual(['DELETED']);
+          expect(bucketKeys()).toEqual([]);
+          expect(await ledger()).toEqual([]);
+        });
+
+        it('does not delete an ambiguous upload right away, before a late write could land', async () => {
+          const session = await newSession(owner);
+          supabase.failNext('upload', unavailable);
+
+          await rejection(
+            makeup.uploadInitialImage(owner, session.id, await photo()),
+          );
+
+          const [pending] = await ledger();
+          expect(pending.reason).toBe('UPLOAD_ABANDONED');
+          expect(pending.nextAttemptAt.getTime()).toBeGreaterThan(
+            Date.now() + 5 * 60_000,
+          );
+          expect(supabase.count('remove')).toBe(0);
+          await expect(lifecycle.processDue()).resolves.toEqual([]);
+        });
+
+        it('rolls back a photo replacement whose image row cannot be written', async () => {
+          const { session, image } = await uploadedSession(owner);
+          await injectDbFailure('ImageAsset', 'INSERT');
+
+          expect(
+            await rejection(
+              makeup.uploadInitialImage(owner, session.id, await photo('png')),
+            ),
+          ).toMatchObject({
+            message: expect.stringContaining(
+              'injected database failure',
+            ) as string,
+          });
+
+          await expectIntact(image);
+          expect(bucketKeys()).toEqual([image.storageKey]);
+          expect(await ledger()).toEqual([]);
+          expect(
+            (
+              await client.makeupSession.findUniqueOrThrow({
+                where: { id: session.id },
+              })
+            ).status,
+          ).toBe('IMAGE_UPLOADED');
+        });
+
+        it('rolls back a photo replacement whose old-image deletion cannot be recorded', async () => {
+          const { session, image } = await uploadedSession(owner);
+          await injectDbFailure(
+            'PrivateStorageCleanup',
+            'INSERT',
+            `NEW.reason = 'IMAGE_REPLACED'`,
+          );
+
+          await expect(
+            makeup.uploadInitialImage(owner, session.id, await photo('png')),
+          ).rejects.toThrow('injected database failure');
+
+          await expectIntact(image);
+          expect(bucketKeys()).toEqual([image.storageKey]);
+          expect(
+            await client.imageAsset.count({ where: { sessionId: session.id } }),
+          ).toBe(1);
+          expect(await ledger()).toEqual([]);
+        });
+
+        it('keeps the reservation when the database is unavailable during rollback, then cleans up later', async () => {
+          const { session, image } = await uploadedSession(owner);
+          await injectDbFailure('ImageAsset', 'INSERT');
+          await injectDbFailure('PrivateStorageCleanup', 'UPDATE');
+
+          await expect(
+            makeup.uploadInitialImage(owner, session.id, await photo('png')),
+          ).rejects.toThrow('injected database failure');
+
+          const [reservation] = await ledger();
+          expect(reservation).toMatchObject({
+            reason: 'UPLOAD_PENDING',
+            status: 'PENDING',
+          });
+          expect(bucketKeys().sort()).toEqual(
+            [image.storageKey, reservation.storageKey].sort(),
+          );
+          await expect(lifecycle.processDue()).resolves.toEqual([]);
+
+          await removeInjectedFailures();
+          await makeDue();
+          await expect(lifecycle.processDue()).resolves.toEqual(['DELETED']);
+          expect(bucketKeys()).toEqual([image.storageKey]);
+          await expectIntact(image);
+        });
+
+        it('refuses a replacement when analysis starts during the upload, keeping the analysed photo', async () => {
+          const { session, image } = await uploadedSession(owner);
+          supabase.afterUploadStored = async () => {
+            await client.makeupSession.update({
+              where: { id: session.id },
+              data: { status: 'ANALYZING' },
+            });
+          };
+
+          expect(
+            await rejection(
+              makeup.uploadInitialImage(owner, session.id, await photo('png')),
+            ),
+          ).toMatchObject({ status: 409 });
+
+          await expectIntact(image);
+          expect(bucketKeys()).toEqual([image.storageKey]);
+          expect(await ledger()).toEqual([]);
+        });
+      });
+
+      describe('failed removals', () => {
+        it('never treats a removal that Supabase silently skipped as done', async () => {
+          const { session, image } = await uploadedSession(owner);
+          supabase.failNext('remove', { kind: 'silent-noop' });
+
+          await makeup.uploadInitialImage(
+            owner,
+            session.id,
+            await photo('png'),
+          );
+
+          expect(supabase.objects.has(image.storageKey)).toBe(true);
+          expect(await ledger()).toEqual([
+            expect.objectContaining({
+              storageKey: image.storageKey,
+              reason: 'IMAGE_REPLACED',
+              status: 'PENDING',
+              attempts: 1,
+              lastErrorCode: 'DELETE_NOT_APPLIED',
+            }),
+          ]);
+
+          await makeDue();
+          await expect(lifecycle.processDue()).resolves.toEqual(['DELETED']);
+          expect(supabase.objects.has(image.storageKey)).toBe(false);
+          expect(await ledger()).toEqual([]);
+        });
+
+        it('keeps a completed session intact when its image deletions cannot be recorded', async () => {
+          const { session, step } = await guideFixture(owner);
+          await makeup.saveStepSnapshot(owner, step.id, await photo());
+          await client.makeupSession.update({
+            where: { id: session.id },
+            data: { status: 'COMPLETED' },
+          });
+          await injectDbFailure(
+            'PrivateStorageCleanup',
+            'INSERT',
+            `NEW.reason = 'SESSION_DELETED'`,
+          );
+
+          await expect(makeup.deleteSession(owner, session.id)).rejects.toThrow(
+            'injected database failure',
+          );
+
+          expect(
+            await client.makeupSession.findUnique({
+              where: { id: session.id },
+            }),
+          ).not.toBeNull();
+          const [image] = await client.imageAsset.findMany({
+            where: { sessionId: session.id },
+          });
+          await expectIntact(image);
+          expect(supabase.count('remove')).toBe(0);
+        });
+
+        it('deletes a session exactly once when deletions race', async () => {
+          const { session, step } = await guideFixture(owner);
+          await makeup.saveStepSnapshot(owner, step.id, await photo('jpeg', 1));
+          await makeup.saveStepSnapshot(owner, step.id, await photo('jpeg', 2));
+          await client.makeupSession.update({
+            where: { id: session.id },
+            data: { status: 'COMPLETED' },
+          });
+          supabase.latencyMs = 10;
+
+          const results = await Promise.allSettled(
+            [1, 2, 3].map(() => makeup.deleteSession(owner, session.id)),
+          );
+
+          expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(
+            1,
+          );
+          for (const result of results) {
+            if (result.status === 'rejected') {
+              expect([404, 409]).toContain(
+                (result.reason as { status?: number }).status,
+              );
+            }
+          }
+          expect(bucketKeys()).toEqual([]);
+          expect(supabase.count('remove')).toBe(2);
+          expect(await ledger()).toEqual([]);
+        });
+      });
+
+      describe('avatar replacement and removal', () => {
+        let user: string;
+        const avatarRow = () =>
+          client.userProfile.findUniqueOrThrow({
+            where: { authId: user },
+            select: { avatarUrl: true, avatarStorageProvider: true },
+          });
+
+        beforeEach(async () => {
+          user = await createUser(client);
+          await profile.updateAvatar(user, await photo('jpeg', 9));
+        });
+
+        it('keeps the current avatar when the profile write fails, and removes the new upload', async () => {
+          const before = await avatarRow();
+          await injectDbFailure('userProfile', 'UPDATE');
+
+          await expect(
+            profile.updateAvatar(user, await photo('png')),
+          ).rejects.toThrow('injected database failure');
+
+          expect(await avatarRow()).toEqual(before);
+          expect(bucketKeys()).toEqual([before.avatarUrl]);
+          expect(await ledger()).toEqual([]);
+        });
+
+        it('keeps the current avatar when its deletion cannot be recorded', async () => {
+          const before = await avatarRow();
+          await injectDbFailure(
+            'PrivateStorageCleanup',
+            'INSERT',
+            `NEW.reason = 'AVATAR_REPLACED'`,
+          );
+
+          await expect(
+            profile.updateAvatar(user, await photo('png')),
+          ).rejects.toThrow('injected database failure');
+
+          expect(await avatarRow()).toEqual(before);
+          expect(bucketKeys()).toEqual([before.avatarUrl]);
+          expect(await ledger()).toEqual([]);
+        });
+
+        it('keeps the avatar when its removal cannot be recorded', async () => {
+          const before = await avatarRow();
+          await injectDbFailure(
+            'PrivateStorageCleanup',
+            'INSERT',
+            `NEW.reason = 'AVATAR_REMOVED'`,
+          );
+
+          await expect(profile.deleteAvatar(user)).rejects.toThrow(
+            'injected database failure',
+          );
+
+          expect(await avatarRow()).toEqual(before);
+          expect(bucketKeys()).toEqual([before.avatarUrl]);
+        });
+
+        it('ends consistent when replacements and removals race', async () => {
+          supabase.latencyMs = 10;
+
+          const results = await Promise.allSettled([
+            profile.updateAvatar(user, await photo('jpeg', 1)),
+            profile.deleteAvatar(user),
+            profile.updateAvatar(user, await photo('jpeg', 2)),
+            profile.deleteAvatar(user),
+            profile.updateAvatar(user, await photo('jpeg', 3)),
+          ]);
+
+          expect(results.every((r) => r.status === 'fulfilled')).toBe(true);
+          const row = await avatarRow();
+          expect(bucketKeys()).toEqual(row.avatarUrl ? [row.avatarUrl] : []);
+          expect(row.avatarStorageProvider).toBe(
+            row.avatarUrl ? 'supabase' : null,
+          );
+          expect(await ledger()).toEqual([]);
+        });
+      });
+
+      describe("other users' images", () => {
+        it("are never deleted by another user's replacements, removals or session deletions", async () => {
+          const victim = await createUser(client);
+          const attacker = await createUser(client);
+          const { image: victimPhoto } = await uploadedSession(victim);
+          const victimGuide = await guideFixture(victim);
+          await makeup.saveStepSnapshot(
+            victim,
+            victimGuide.step.id,
+            await photo(),
+          );
+          await client.makeupSession.update({
+            where: { id: victimGuide.session.id },
+            data: { status: 'COMPLETED' },
+          });
+          await profile.updateAvatar(victim, await photo('png'));
+          const victimKeys = bucketKeys();
+
+          const { session: attackerSession } = await uploadedSession(attacker);
+          await makeup.uploadInitialImage(
+            attacker,
+            attackerSession.id,
+            await photo('webp'),
+          );
+          await profile.updateAvatar(attacker, await photo('jpeg', 1));
+          await profile.updateAvatar(attacker, await photo('jpeg', 2));
+          await profile.deleteAvatar(attacker);
+          expect(
+            await rejection(
+              makeup.deleteSession(attacker, victimGuide.session.id),
+            ),
+          ).toMatchObject({ status: 404 });
+          expect(
+            await rejection(
+              makeup.uploadInitialImage(
+                attacker,
+                victimPhoto.sessionId,
+                await photo(),
+              ),
+            ),
+          ).toMatchObject({ status: 404 });
+          await makeDue();
+          await lifecycle.processDue();
+
+          for (const key of victimKeys)
+            expect(supabase.objects.has(key)).toBe(true);
+          await expectIntact(victimPhoto);
+          expect(
+            await client.makeupSession.findUnique({
+              where: { id: victimGuide.session.id },
+            }),
+          ).not.toBeNull();
+          expect(
+            (
+              await client.userProfile.findUniqueOrThrow({
+                where: { authId: victim },
+              })
+            ).avatarUrl,
+          ).toBe(victimKeys.find((key) => key.includes('/profile/')));
+        });
+
+        it("refuses a stray cleanup row that points at another user's referenced image", async () => {
+          const { image } = await uploadedSession(owner);
+          await client.privateStorageCleanup.create({
+            data: {
+              provider: 'supabase',
+              storageKey: image.storageKey,
+              reason: 'SESSION_DELETED',
+            },
+          });
+
+          await expect(lifecycle.processDue()).resolves.toEqual([
+            'SKIPPED_REFERENCED',
+          ]);
+          await expectIntact(image);
+          expect(supabase.count('remove')).toBe(0);
+        });
+
+        it.each([
+          ['a user folder', (u: string) => u],
+          ['a user folder with a slash', (u: string) => `${u}/`],
+          ['a session folder', (u: string, s: string) => `${u}/${s}`],
+          ['an empty key', () => ''],
+        ])(
+          'never sends %s to Supabase, so a prefix can never wipe other images',
+          async (_label, keyFor) => {
+            const { session, image } = await uploadedSession(owner);
+            await client.privateStorageCleanup.create({
+              data: {
+                provider: 'supabase',
+                storageKey: keyFor(owner, session.id),
+                reason: 'SESSION_DELETED',
+              },
+            });
+
+            await expect(lifecycle.processDue()).resolves.toEqual(['FAILED']);
+            expect(supabase.count('remove')).toBe(0);
+            await expectIntact(image);
+            expect(await ledger()).toEqual([
+              expect.objectContaining({
+                status: 'FAILED',
+                lastErrorCode: 'INVALID_STORAGE_KEY',
+              }),
+            ]);
+          },
+        );
       });
     });
 

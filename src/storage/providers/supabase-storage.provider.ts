@@ -83,15 +83,38 @@ export class SupabaseStorageProvider implements PrivateObjectStorageProvider {
     }
   }
 
+  /**
+   * Deletes exactly `key` (Storage matches the listed names exactly; callers
+   * only pass validated full object keys, never folders). Success is only
+   * reported when Storage lists the key as removed, or confirms it no longer
+   * exists: an empty "removed" list can also mean the delete was silently not
+   * applied (e.g. missing permissions), which must not count as done.
+   */
   async delete(key: string): Promise<void> {
     const client = this.requireClient('delete');
-    // Bulk removal by prefix succeeds with an empty list for missing objects.
-    const { error } = await this.call('delete', () =>
+    const { data, error } = await this.call('delete', () =>
       client.from(this.bucket).remove([key]),
     );
-    if (!error) return;
-    const mapped = this.toStorageError(error, 'delete');
-    // Deleting an object that is already gone is a success.
+    if (error) {
+      const mapped = this.toStorageError(error, 'delete');
+      // Deleting an object that is already gone is a success.
+      if (mapped.code === 'OBJECT_NOT_FOUND') return;
+      throw mapped;
+    }
+    if (Array.isArray(data) && data.some((object) => object.name === key)) {
+      return;
+    }
+
+    const { error: lookupError } = await this.call('delete', () =>
+      client.from(this.bucket).info(key),
+    );
+    if (!lookupError) {
+      throw new PrivateStorageError('DELETE_NOT_APPLIED', {
+        provider: this.id,
+        operation: 'delete',
+      });
+    }
+    const mapped = this.toStorageError(lookupError, 'delete');
     if (mapped.code !== 'OBJECT_NOT_FOUND') throw mapped;
   }
 

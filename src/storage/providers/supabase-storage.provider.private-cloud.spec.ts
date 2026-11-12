@@ -299,11 +299,21 @@ describe('SupabaseStorageProvider (private cloud storage)', () => {
   });
 
   describe('delete', () => {
-    it('removes the object by key and treats an already-missing object as success', async () => {
-      const { fetchImpl, requests } = fakeFetch(() => json([]));
+    const INFO_URL = `${CONFIG.storageUrl}/object/info/${CONFIG.bucket}/${KEY}`;
+    const missing = () =>
+      json(
+        { statusCode: '404', error: 'not_found', message: 'Object not found' },
+        400,
+      );
+
+    it('removes exactly the given key and trusts a removal that lists it', async () => {
+      const { fetchImpl, requests } = fakeFetch(() =>
+        json([{ name: KEY, bucket_id: CONFIG.bucket }]),
+      );
       const provider = new SupabaseStorageProvider(CONFIG, fetchImpl);
 
       await expect(provider.delete(KEY)).resolves.toBeUndefined();
+      expect(requests).toHaveLength(1);
       expect(requests[0]).toMatchObject({
         method: 'DELETE',
         url: `${CONFIG.storageUrl}/object/${CONFIG.bucket}`,
@@ -311,6 +321,57 @@ describe('SupabaseStorageProvider (private cloud storage)', () => {
       expect(JSON.parse(requests[0].body as string)).toEqual({
         prefixes: [KEY],
       });
+    });
+
+    it('confirms an empty removal by checking the object is really gone', async () => {
+      const { fetchImpl, requests } = fakeFetch(() => json([]), missing);
+      const provider = new SupabaseStorageProvider(CONFIG, fetchImpl);
+
+      await expect(provider.delete(KEY)).resolves.toBeUndefined();
+      expect(requests[1]).toMatchObject({ method: 'GET', url: INFO_URL });
+    });
+
+    it('does not trust a removal for another key', async () => {
+      const { fetchImpl } = fakeFetch(
+        () => json([{ name: `${KEY}.other` }]),
+        () => json({ name: KEY, size: 10 }),
+      );
+      const provider = new SupabaseStorageProvider(CONFIG, fetchImpl);
+
+      await expectStorageError(
+        provider.delete(KEY),
+        'DELETE_NOT_APPLIED',
+        false,
+      );
+    });
+
+    it('reports a silently skipped removal (object still exists) as a failure', async () => {
+      const { fetchImpl } = fakeFetch(
+        () => json([]),
+        () => json({ name: KEY, size: 10 }),
+      );
+      const provider = new SupabaseStorageProvider(CONFIG, fetchImpl);
+
+      const error = await expectStorageError(
+        provider.delete(KEY),
+        'DELETE_NOT_APPLIED',
+        false,
+      );
+      expect(error.operation).toBe('delete');
+    });
+
+    it('reports a failure when the removal cannot be confirmed', async () => {
+      const { fetchImpl } = fakeFetch(
+        () => json([]),
+        () => json({ message: 'unavailable' }, 503),
+      );
+      const provider = new SupabaseStorageProvider(CONFIG, fetchImpl);
+
+      await expectStorageError(
+        provider.delete(KEY),
+        'STORAGE_UNAVAILABLE',
+        true,
+      );
     });
 
     it('treats a 404 for the object as already deleted', async () => {

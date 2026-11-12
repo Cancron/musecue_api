@@ -10,6 +10,7 @@ export type FakeOperation =
   | 'bucket'
   | 'upload'
   | 'download'
+  | 'info'
   | 'remove'
   | 'sign';
 
@@ -18,7 +19,14 @@ export type FakeFailure =
   /** Connection-level failure (fetch rejects). */
   | { kind: 'network' }
   /** Stores the upload, then never answers: the client times out. */
-  | { kind: 'store-then-hang' };
+  | { kind: 'store-then-hang' }
+  /**
+   * Never answers; the write lands `landAfterMs` after the client gave up
+   * (a slow upload still being processed by Storage).
+   */
+  | { kind: 'hang-then-store'; landAfterMs: number }
+  /** Remove answers 200 with an empty list but deletes nothing. */
+  | { kind: 'silent-noop' };
 
 export interface FakeStoredObject {
   bytes: Buffer;
@@ -52,6 +60,12 @@ export class FakeSupabaseStorage {
   /** Runs after an upload is stored, before the response is sent. */
   afterUploadStored?: (key: string) => Promise<void>;
   private readonly failures = new Map<FakeOperation, FakeFailure[]>();
+  private readonly pendingWrites = new Set<Promise<void>>();
+
+  /** Resolves once every delayed ("late") write has landed. */
+  async settle(): Promise<void> {
+    await Promise.all([...this.pendingWrites]);
+  }
 
   readonly fetch = ((input: RequestInfo | URL, init?: RequestInit) =>
     this.handle(input, init)) as typeof fetch;
@@ -126,6 +140,20 @@ export class FakeSupabaseStorage {
         });
       case 'upload': {
         const objectKey = path.slice(bucketPrefix.length);
+        if (failure?.kind === 'hang-then-store') {
+          const bytes = Buffer.from(init?.body as Uint8Array);
+          const contentType = headers.get('content-type') ?? '';
+          return new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => {
+              const landing = sleep(failure.landAfterMs).then(() => {
+                this.objects.set(objectKey, { bytes, contentType });
+              });
+              this.pendingWrites.add(landing);
+              void landing.finally(() => this.pendingWrites.delete(landing));
+              reject(init.signal?.reason as Error);
+            });
+          });
+        }
         if (this.objects.has(objectKey)) {
           return json(400, {
             statusCode: '409',
@@ -163,10 +191,21 @@ export class FakeSupabaseStorage {
               message: 'Object not found',
             });
       }
+      case 'info': {
+        const object = this.objects.get(key ?? '');
+        return object
+          ? json(200, { name: key, size: object.bytes.length })
+          : json(400, {
+              statusCode: '404',
+              error: 'not_found',
+              message: 'Object not found',
+            });
+      }
       case 'remove': {
         const { prefixes } = JSON.parse(init?.body as string) as {
           prefixes: string[];
         };
+        if (failure?.kind === 'silent-noop') return json(200, []);
         const removed = prefixes.filter((prefix) =>
           this.objects.delete(prefix),
         );
@@ -220,6 +259,12 @@ export class FakeSupabaseStorage {
       return {
         op: 'sign',
         key: path.slice(`/object/sign/${bucket}/`.length),
+      };
+    }
+    if (method === 'GET' && path.startsWith(`/object/info/${bucket}/`)) {
+      return {
+        op: 'info',
+        key: path.slice(`/object/info/${bucket}/`.length),
       };
     }
     if (path.startsWith(`/object/${bucket}/`)) {
