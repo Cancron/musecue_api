@@ -41,15 +41,17 @@ interface AuthenticatedRequest extends Request {
 /**
  * Private image responses must never be stored by shared caches (proxies,
  * CDNs) or by the client: `no-store` covers HTTP/1.1 caches, `Pragma` and
- * `Expires` cover HTTP/1.0 intermediaries, `Vary` keeps a misbehaving cache
- * from serving one user's response to another, and `nosniff` stops browsers
- * from reinterpreting the bytes.
+ * `Expires` cover HTTP/1.0 intermediaries, adding `Authorization` to `Vary`
+ * (next to the CORS middleware's `Origin`) keeps a misbehaving cache from
+ * serving one user's response to another, and `nosniff` stops browsers from
+ * reinterpreting the bytes.
  */
 function setPrivateNoStoreHeaders(response: Response): void {
   response.setHeader('Cache-Control', 'private, no-store, max-age=0');
   response.setHeader('Pragma', 'no-cache');
   response.setHeader('Expires', '0');
-  response.setHeader('Vary', 'Authorization');
+  // Append, never replace: the CORS middleware has already set `Vary: Origin`.
+  response.vary('Authorization');
   response.setHeader('X-Content-Type-Options', 'nosniff');
 }
 

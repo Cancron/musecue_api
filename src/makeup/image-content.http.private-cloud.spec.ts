@@ -10,6 +10,7 @@ import { FakeS3CompatibleStorage } from '../../test/support/fake-s3-compatible-s
 import { UserRole } from '../auth/interfaces/auth.interface';
 import { AuthUtilsService } from '../auth/services/auth-utils.service';
 import config from '../common/config/app.config';
+import { createCorsOptions } from '../common/config/cors.config';
 import { AllExceptionsFilter } from '../common/filters/all-exception.filter';
 import { AuthGuard } from '../common/guards/auth.guard';
 import { TransformInterceptor } from '../common/interceptors/transform.interceptor';
@@ -34,6 +35,18 @@ const SUPABASE: SupabaseStorageConfig = {
   timeoutMs: 200,
 };
 const OWNER = 'owner-user';
+const CORS_ORIGINS = 'https://app.musecue.example,http://localhost:8081';
+/** `Vary` values as a set, however the header list is formatted. */
+const varyOf = (headers: Record<string, unknown>) =>
+  (Array.isArray(headers.vary)
+    ? (headers.vary as string[]).join(',')
+    : typeof headers.vary === 'string'
+      ? headers.vary
+      : ''
+  )
+    .split(',')
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean);
 const key = (name: string) => `${OWNER}/session-1/${name}`;
 
 interface StoredImage {
@@ -175,6 +188,8 @@ describe('GET /v1/images/:imageId/content (HTTP, mocked providers)', () => {
       ],
     }).compile();
     app = moduleRef.createNestApplication();
+    // Same CORS setup as main.ts, so header interplay is tested for real.
+    app.enableCors(createCorsOptions(CORS_ORIGINS));
     app.useGlobalFilters(new AllExceptionsFilter(logger));
     app.useGlobalInterceptors(new TransformInterceptor(logger));
     await app.init();
@@ -270,7 +285,6 @@ describe('GET /v1/images/:imageId/content (HTTP, mocked providers)', () => {
         'cache-control': 'private, no-store, max-age=0',
         pragma: 'no-cache',
         expires: '0',
-        vary: expect.stringContaining('Authorization') as string,
         'x-content-type-options': 'nosniff',
         'content-disposition': 'inline',
       });
@@ -295,6 +309,47 @@ describe('GET /v1/images/:imageId/content (HTTP, mocked providers)', () => {
         expect(response.headers.pragma).toBe('no-cache');
       },
     );
+
+    describe('Vary', () => {
+      it('keeps the CORS Origin value and adds Authorization (request with Origin)', async () => {
+        const response = await getContent('jpeg-image', OWNER)
+          .set('Origin', 'https://app.musecue.example')
+          .expect(200);
+
+        expect(response.headers['access-control-allow-origin']).toBe(
+          'https://app.musecue.example',
+        );
+        expect(varyOf(response.headers)).toEqual(['origin', 'authorization']);
+      });
+
+      it('keeps both values for native app requests without an Origin header', async () => {
+        const response = await getContent('jpeg-image', OWNER).expect(200);
+
+        expect(varyOf(response.headers)).toEqual(['origin', 'authorization']);
+      });
+
+      it.each([
+        ['a missing image (404)', 'no-such-image', OWNER, 404],
+        ['an unauthenticated request (401)', 'jpeg-image', undefined, 401],
+      ])('keeps both values on %s', async (_label, imageId, user, status) => {
+        const response = await getContent(imageId, user)
+          .set('Origin', 'https://app.musecue.example')
+          .expect(status);
+
+        expect(varyOf(response.headers)).toContain('origin');
+        if (status !== 401) {
+          expect(varyOf(response.headers)).toEqual(['origin', 'authorization']);
+        }
+      });
+
+      it('lists Authorization once even if it was already present', async () => {
+        const response = await getContent('png-image', OWNER).expect(200);
+
+        expect(
+          varyOf(response.headers).filter((value) => value === 'authorization'),
+        ).toHaveLength(1);
+      });
+    });
 
     it('answers HEAD with the same headers and no body', async () => {
       const response = await request(app.getHttpServer())

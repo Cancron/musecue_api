@@ -2339,6 +2339,229 @@ describeWithDatabase(
         },
       );
 
+      describe('complete image flow: retrieval, corrupt data and download failures', () => {
+        /** A real image cut off mid-data: headers intact, pixels incomplete. */
+        async function truncated(format: 'jpeg' | 'png', keep: number) {
+          const full = await sharp({
+            create: {
+              width: 800,
+              height: 600,
+              channels: 3,
+              background: '#000000',
+              noise: { type: 'gaussian', mean: 128, sigma: 40 },
+            },
+          })
+            .toFormat(format)
+            .toBuffer();
+          return full.subarray(0, Math.floor(full.length * keep));
+        }
+
+        async function checkWith(bytes: Buffer) {
+          const { step } = await guideFixture(owner);
+          const run = await makeup.checkStep(
+            owner,
+            step.id,
+            `flow-${randomBytes(4).toString('hex')}`,
+            { buffer: bytes, size: bytes.length } as Express.Multer.File,
+          );
+          const payload = queue.enqueue.mock.calls.at(-1)?.[1] as MakeupAiJob;
+          const image = await client.imageAsset.findUniqueOrThrow({
+            where: { id: payload.imageId as string },
+          });
+          return { run, payload, image };
+        }
+
+        const received = () =>
+          spies[1].mock.calls.map(
+            (call) => (call as [StructuredGenerationRequest])[0].image?.bytes,
+          );
+
+        async function expectFailedSafely(
+          runId: string,
+          storageKey: string,
+          message: string,
+        ) {
+          const stored = await client.aiRun.findUniqueOrThrow({
+            where: { id: runId },
+          });
+          expect(stored).toMatchObject({ status: 'FAILED', error: message });
+          for (const detail of storageDetails(storageKey)) {
+            expect(JSON.stringify(stored)).not.toContain(detail);
+          }
+        }
+
+        it.each(['png', 'webp'] as const)(
+          'retrieves the exact stored %s bytes and sends OpenRouter a normalized JPEG',
+          async (format) => {
+            const original = await sharp({
+              create: {
+                width: 900,
+                height: 700,
+                channels: 4,
+                background: { r: 90, g: 60, b: 50, alpha: 0.5 },
+              },
+            })
+              .toFormat(format)
+              .toBuffer();
+            const { run, payload, image } = await checkWith(original);
+
+            await liveProcessor.process(job('VISION_CHECK', payload).job);
+
+            expect(supabase.objects.get(image.storageKey)?.bytes).toEqual(
+              original,
+            );
+            expect(received()).toEqual([original]);
+            expect(openRouterCalls).toHaveLength(1);
+            const body = openRouterCalls[0].init?.body as string;
+            const sent = /data:image\/jpeg;base64,([A-Za-z0-9+/=]+)/.exec(body);
+            expect(
+              await sharp(Buffer.from(sent?.[1] ?? '', 'base64')).metadata(),
+            ).toMatchObject({
+              format: 'jpeg',
+              width: 900,
+              height: 700,
+              hasAlpha: false,
+            });
+            expect(
+              await client.aiRun.findUniqueOrThrow({ where: { id: run.id } }),
+            ).toMatchObject({ status: 'COMPLETED' });
+          },
+        );
+
+        it.each([
+          ['a JPEG truncated at 30%', 'jpeg', 0.3],
+          ['a JPEG truncated at 5%', 'jpeg', 0.05],
+          ['a PNG truncated at 50%', 'png', 0.5],
+        ] as const)(
+          'rejects %s that passed upload validation, before any OpenRouter call',
+          async (_label, format, keep) => {
+            const bytes = await truncated(format, keep);
+            // Upload validation reads headers only, so the photo is accepted...
+            const { run, payload, image } = await checkWith(bytes);
+            expect(image).toMatchObject({
+              mimeType: `image/${format}`,
+              width: 800,
+              height: 600,
+            });
+            const { job: vision, discard } = job('VISION_CHECK', payload);
+
+            // ...and the worker rejects it once it tries to decode the pixels.
+            await expect(liveProcessor.process(vision)).rejects.toMatchObject({
+              code: 'AI_IMAGE_INVALID',
+              retryable: false,
+            });
+            expect(received()).toEqual([bytes]); // the stored bytes were retrieved
+            expect(openRouterCalls).toHaveLength(0);
+            expect(discard).toHaveBeenCalledTimes(1);
+            await expectFailedSafely(
+              run.id,
+              image.storageKey,
+              'The photo could not be processed. Please upload it again.',
+            );
+          },
+        );
+
+        it('rejects a corrupted object that keeps a valid image signature', async () => {
+          const { run, payload, image } = await checkWith(
+            (await photo('jpeg', 44)).buffer,
+          );
+          const corrupted = Buffer.concat([
+            Buffer.from([0xff, 0xd8, 0xff, 0xe0]),
+            randomBytes(4_096),
+          ]);
+          supabase.objects.set(image.storageKey, {
+            bytes: corrupted,
+            contentType: 'image/jpeg',
+          });
+
+          await expect(
+            liveProcessor.process(job('VISION_CHECK', payload).job),
+          ).rejects.toMatchObject({
+            code: 'AI_IMAGE_INVALID',
+            retryable: false,
+          });
+          expect(received()).toEqual([corrupted]);
+          expect(openRouterCalls).toHaveLength(0);
+          await expectFailedSafely(
+            run.id,
+            image.storageKey,
+            'The photo could not be processed. Please upload it again.',
+          );
+        });
+
+        it('fails face-photo analysis for a truncated photo without calling OpenRouter', async () => {
+          const session = await newSession(owner);
+          const bytes = await truncated('jpeg', 0.3);
+          await makeup.uploadInitialImage(owner, session.id, {
+            buffer: bytes,
+            size: bytes.length,
+          } as Express.Multer.File);
+          await makeup.savePreferences(owner, session.id, {
+            vibe: 'natural',
+            timeMinutes: 10,
+          });
+          const run = await makeup.startAnalysis(
+            owner,
+            session.id,
+            `analysis-${randomBytes(4).toString('hex')}`,
+          );
+          const image = await client.imageAsset.findFirstOrThrow({
+            where: { sessionId: session.id },
+          });
+
+          await expect(
+            liveProcessor.process(
+              job('PERSONALIZATION', {
+                runId: run.id,
+                authId: owner,
+                sessionId: session.id,
+              }).job,
+            ),
+          ).rejects.toMatchObject({ code: 'AI_IMAGE_INVALID' });
+
+          expect(openRouterCalls).toHaveLength(0);
+          await expectFailedSafely(
+            run.id,
+            image.storageKey,
+            'The photo could not be processed. Please upload it again.',
+          );
+          expect(
+            (
+              await client.makeupSession.findUniqueOrThrow({
+                where: { id: session.id },
+              })
+            ).status,
+          ).toBe('ANALYSIS_FAILED');
+        });
+
+        it('never processes a download that breaks mid-transfer, and succeeds on retry', async () => {
+          const original = (await photo('jpeg', 66)).buffer;
+          const { run, payload } = await checkWith(original);
+          supabase.failNext('download', { kind: 'broken-body' });
+          const { job: first, discard } = job('VISION_CHECK', payload);
+
+          await expect(liveProcessor.process(first)).rejects.toMatchObject({
+            code: 'IMAGE_STORAGE_UNAVAILABLE',
+            retryable: true,
+          });
+          // The partial bytes never reached preprocessing or OpenRouter.
+          expect(received()).toEqual([]);
+          expect(openRouterCalls).toHaveLength(0);
+          expect(discard).not.toHaveBeenCalled();
+          expect(
+            await client.aiRun.findUniqueOrThrow({ where: { id: run.id } }),
+          ).toMatchObject({ status: 'QUEUED', error: null });
+
+          // BullMQ's retry: the next attempt downloads the full photo.
+          await liveProcessor.process(job('VISION_CHECK', payload).job);
+          expect(received()).toEqual([original]);
+          expect(openRouterCalls).toHaveLength(1);
+          expect(
+            await client.aiRun.findUniqueOrThrow({ where: { id: run.id } }),
+          ).toMatchObject({ status: 'COMPLETED' });
+        });
+      });
+
       it('fails the run immediately when the image record no longer exists', async () => {
         const { run, payload, image } = await submittedCheck('record-gone');
         await client.imageAsset.delete({ where: { id: image.id } });

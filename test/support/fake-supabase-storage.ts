@@ -29,7 +29,9 @@ export type FakeFailure =
   /** Remove answers 200 with an empty list but deletes nothing. */
   | { kind: 'silent-noop' }
   /** Never answers: the client times out (any operation). */
-  | { kind: 'hang' };
+  | { kind: 'hang' }
+  /** Download starts (200, first half of the bytes), then the connection breaks. */
+  | { kind: 'broken-body' };
 
 export interface FakeStoredObject {
   bytes: Buffer;
@@ -198,6 +200,16 @@ export class FakeSupabaseStorage {
       }
       case 'download': {
         const object = this.objects.get(path.slice(bucketPrefix.length));
+        if (object && failure?.kind === 'broken-body') {
+          const half = object.bytes.subarray(0, object.bytes.length >> 1);
+          const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new Uint8Array(half));
+              controller.error(new TypeError('terminated: other side closed'));
+            },
+          });
+          return new Response(body, { status: 200 });
+        }
         return object
           ? new Response(new Uint8Array(object.bytes), {
               status: 200,

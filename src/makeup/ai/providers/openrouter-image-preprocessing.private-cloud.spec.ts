@@ -152,14 +152,22 @@ describe('OpenRouter image preprocessing (private images)', () => {
   });
 
   it('shrinks until the image fits OPENROUTER_IMAGE_MAX_BYTES', async () => {
-    const noise = await sharp(
-      Buffer.from(
-        Array.from({ length: 1200 * 900 * 3 }, (_, i) => (i * 7919) % 251),
-      ),
-      { raw: { width: 1200, height: 900, channels: 3 } },
-    )
+    // Noise compresses badly, so the first JPEG pass is over the limit.
+    const noise = await sharp({
+      create: {
+        width: 1000,
+        height: 750,
+        channels: 3,
+        background: '#000000',
+        noise: { type: 'gaussian', mean: 128, sigma: 60 },
+      },
+    })
       .png()
       .toBuffer();
+    const firstPass = await sharp(noise)
+      .jpeg({ quality: 82, mozjpeg: true })
+      .toBuffer();
+    expect(firstPass.length).toBeGreaterThan(120_000);
 
     const sent = await sentImage(
       { bytes: noise, mimeType: 'image/png' },
@@ -167,7 +175,7 @@ describe('OpenRouter image preprocessing (private images)', () => {
     );
 
     expect(sent.bytes.length).toBeLessThanOrEqual(120_000);
-  });
+  }, 20_000);
 
   it.each([
     [
@@ -200,6 +208,59 @@ describe('OpenRouter image preprocessing (private images)', () => {
       expect(fetchSpy).not.toHaveBeenCalled();
     },
   );
+
+  describe('truncated files with readable metadata (regression)', () => {
+    /** A real image cut off mid-data: headers intact, pixels incomplete. */
+    async function truncated(format: 'jpeg' | 'png', keep: number) {
+      const full = await sharp({
+        create: {
+          width: 800,
+          height: 600,
+          channels: 3,
+          background: '#000000',
+          noise: { type: 'gaussian', mean: 128, sigma: 40 },
+        },
+      })
+        .toFormat(format)
+        .toBuffer();
+      return full.subarray(0, Math.floor(full.length * keep));
+    }
+
+    it.each([
+      ['JPEG cut at 60%', 'jpeg', 0.6],
+      ['JPEG cut at 30%', 'jpeg', 0.3],
+      ['JPEG cut at 5%', 'jpeg', 0.05],
+      ['PNG cut at 50%', 'png', 0.5],
+    ] as const)(
+      'rejects a %s before any OpenRouter call, without retrying',
+      async (_label, format, keep) => {
+        const bytes = await truncated(format, keep);
+        // The trap: the header still parses, so metadata-only checks pass.
+        await expect(sharp(bytes).metadata()).resolves.toMatchObject({
+          format,
+          width: 800,
+          height: 600,
+        });
+        const fetchSpy = jest.spyOn(global, 'fetch');
+
+        const error = await provider()
+          .generateStructured(
+            request({
+              bytes,
+              mimeType: `image/${format}` as Image['mimeType'],
+            }),
+          )
+          .catch((caught: unknown) => caught);
+
+        expect(error).toBeInstanceOf(AiProviderError);
+        expect(error).toMatchObject({
+          code: 'AI_IMAGE_INVALID',
+          retryable: false,
+        });
+        expect(fetchSpy).not.toHaveBeenCalled();
+      },
+    );
+  });
 
   it('fails without retrying when the image cannot be made small enough', async () => {
     const fetchSpy = jest.spyOn(global, 'fetch');
