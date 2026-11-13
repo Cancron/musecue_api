@@ -12,6 +12,7 @@ import {
   type SupportedImageMime,
 } from '../storage/private-image-storage.service';
 import { toImageStorageHttpError } from '../storage/private-storage-http';
+import { issueSignedImageUrl } from '../storage/signed-image-url';
 import type {
   AskQuestionDto,
   CompleteStepDto,
@@ -56,9 +57,6 @@ const SESSION_INCLUDE = {
     },
   },
 } satisfies Prisma.MakeupSessionInclude;
-
-/** Signed image URLs are valid for one minute; clients request a new one as needed. */
-export const SIGNED_IMAGE_URL_TTL_SECONDS = 60;
 
 function storedObject(image: {
   storageKey: string;
@@ -194,19 +192,11 @@ export class MakeupService {
       throw AppError.notFound('Image content is unavailable');
     }
 
-    try {
-      const signed = await this.imageStorage.createSignedUrl(
-        storedObject(image),
-        SIGNED_IMAGE_URL_TTL_SECONDS,
-      );
-      return {
-        url: signed.url,
-        expiresAt: signed.expiresAt.toISOString(),
-        expiresInSeconds: SIGNED_IMAGE_URL_TTL_SECONDS,
-      };
-    } catch (error) {
-      throw toImageStorageHttpError(error, 'Image content is unavailable');
-    }
+    return issueSignedImageUrl(
+      this.imageStorage,
+      storedObject(image),
+      'Image content is unavailable',
+    );
   }
 
   async uploadInitialImage(

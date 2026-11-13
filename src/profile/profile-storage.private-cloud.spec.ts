@@ -6,7 +6,7 @@ import { ImageValidationService } from '../makeup/services/image-validation.serv
 import { PrivateImageLifecycleService } from '../storage/private-image-lifecycle.service';
 import { PrivateImageStorageService } from '../storage/private-image-storage.service';
 import { PrivateStorageError } from '../storage/private-storage.error';
-import { ProfileService } from './profile.service';
+import { EXTERNAL_AVATAR_MESSAGE, ProfileService } from './profile.service';
 
 const FILE = { buffer: Buffer.from('avatar'), size: 6 } as Express.Multer.File;
 const STORED = { provider: 'supabase', key: 'owner-id/profile/new.webp' };
@@ -115,6 +115,118 @@ describe('ProfileService private cloud storage lifecycle', () => {
 
     expect((error as AppError).getStatus()).toBe(404);
     expect(imageStorage.read.mock.calls).toHaveLength(0);
+  });
+
+  describe('getAvatarSignedUrl', () => {
+    const SIGNED = `https://project.supabase.co/storage/v1/object/sign/bucket/${STORED.key}?token=t`;
+    const stored = (avatarUrl: string | null, provider: string | null) =>
+      prisma.userProfile.findUnique.mockResolvedValue(
+        avatarUrl === null && provider === null
+          ? null
+          : ({ avatarUrl, avatarStorageProvider: provider } as never),
+      );
+
+    it("signs the caller's own avatar for 60 s using the stored provider and key", async () => {
+      stored(STORED.key, 'supabase');
+      imageStorage.createSignedUrl.mockResolvedValue({
+        url: SIGNED,
+        expiresAt: new Date('2026-11-12T12:01:00.000Z'),
+      });
+
+      await expect(service.getAvatarSignedUrl('owner-id')).resolves.toEqual({
+        url: SIGNED,
+        expiresAt: '2026-11-12T12:01:00.000Z',
+        expiresInSeconds: 60,
+      });
+      expect(prisma.userProfile.findUnique.mock.calls[0]?.[0]).toEqual({
+        where: { authId: 'owner-id' },
+        select: { avatarUrl: true, avatarStorageProvider: true },
+      });
+      expect(imageStorage.createSignedUrl.mock.calls).toEqual([[STORED, 60]]);
+    });
+
+    it.each([
+      ['no profile', null],
+      [
+        'a profile without an avatar',
+        { avatarUrl: null, avatarStorageProvider: null },
+      ],
+    ])('answers 404 for %s without touching storage', async (_label, row) => {
+      prisma.userProfile.findUnique.mockResolvedValue(row as never);
+
+      const error = await service
+        .getAvatarSignedUrl('owner-id')
+        .catch((caught: unknown) => caught);
+
+      expect((error as AppError).getStatus()).toBe(404);
+      expect(imageStorage.createSignedUrl.mock.calls).toHaveLength(0);
+    });
+
+    it('never signs or replaces an external (Google) avatar', async () => {
+      stored('https://lh3.googleusercontent.com/a/photo', null);
+
+      const error = await service
+        .getAvatarSignedUrl('owner-id')
+        .catch((caught: unknown) => caught);
+
+      expect((error as AppError).getStatus()).toBe(409);
+      expect((error as AppError).getResponse()).toMatchObject({
+        message: EXTERNAL_AVATAR_MESSAGE,
+      });
+      expect(imageStorage.createSignedUrl.mock.calls).toHaveLength(0);
+      expect(imageStorage.read.mock.calls).toHaveLength(0);
+    });
+
+    it("refuses to sign or stream a key outside the caller's own avatar folder", async () => {
+      stored('other-user/profile/avatar.jpg', 'supabase');
+
+      // Lazily invoked, so one failing call cannot leave another unhandled.
+      for (const call of [
+        () => service.getAvatarSignedUrl('owner-id'),
+        () => service.getAvatarContent('owner-id'),
+      ]) {
+        const error = await call().catch((caught: unknown) => caught);
+        expect((error as AppError).getStatus()).toBe(404);
+      }
+      expect(imageStorage.createSignedUrl.mock.calls).toHaveLength(0);
+      expect(imageStorage.read.mock.calls).toHaveLength(0);
+    });
+
+    it.each([
+      ['OBJECT_NOT_FOUND', 404, 'Avatar image is unavailable'],
+      [
+        'STORAGE_TIMEOUT',
+        503,
+        'Image storage is temporarily unavailable. Please try again.',
+      ],
+      [
+        'STORAGE_UNAVAILABLE',
+        503,
+        'Image storage is temporarily unavailable. Please try again.',
+      ],
+      ['STORAGE_ACCESS_DENIED', 500, 'Image storage is unavailable'],
+      ['INVALID_PROVIDER_RESPONSE', 500, 'Image storage is unavailable'],
+      [
+        'SIGNED_URL_UNSUPPORTED',
+        409,
+        'A signed URL is not available for this image. Use the image content endpoint instead.',
+      ],
+    ] as const)(
+      'maps %s to %i with a safe message',
+      async (code, status, message) => {
+        stored(STORED.key, 'supabase');
+        imageStorage.createSignedUrl.mockRejectedValue(
+          new PrivateStorageError(code),
+        );
+
+        const error = (await service
+          .getAvatarSignedUrl('owner-id')
+          .catch((caught: unknown) => caught)) as AppError;
+
+        expect(error.getStatus()).toBe(status);
+        expect(error.getResponse()).toMatchObject({ message });
+      },
+    );
   });
 
   describe('updateAvatar', () => {

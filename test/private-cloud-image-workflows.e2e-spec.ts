@@ -99,6 +99,35 @@ describeWithDatabase(
       client.makeupSession.create({ data: { authId, status } });
     const bucketKeys = () => [...supabase.objects.keys()].sort();
 
+    const injected: Array<{ name: string; table: string }> = [];
+
+    /** Makes PostgreSQL itself fail a write, via a trigger on the test schema. */
+    async function injectDbFailure(
+      table: string,
+      event: 'INSERT' | 'UPDATE' | 'DELETE',
+      when?: string,
+    ) {
+      const name = `inject_${randomBytes(4).toString('hex')}`;
+      await client.$executeRawUnsafe(
+        `CREATE FUNCTION ${name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected database failure'; END $$`,
+      );
+      await client.$executeRawUnsafe(
+        `CREATE TRIGGER ${name} BEFORE ${event} ON "${table}" FOR EACH ROW ${when ? `WHEN (${when}) ` : ''}EXECUTE FUNCTION ${name}()`,
+      );
+      injected.push({ name, table });
+    }
+
+    async function removeInjectedFailures() {
+      for (const { name, table } of injected.splice(0)) {
+        await client.$executeRawUnsafe(
+          `DROP TRIGGER IF EXISTS ${name} ON "${table}"`,
+        );
+        await client.$executeRawUnsafe(`DROP FUNCTION IF EXISTS ${name}()`);
+      }
+    }
+
+    afterEach(removeInjectedFailures);
+
     /** Session with a selected look and a guide whose first step is CURRENT. */
     async function guideFixture(authId: string) {
       const session = await client.makeupSession.create({
@@ -920,35 +949,6 @@ describeWithDatabase(
     });
 
     describe('failure atomicity and cross-user isolation', () => {
-      const injected: Array<{ name: string; table: string }> = [];
-
-      /** Makes PostgreSQL itself fail a write, via a trigger on the test schema. */
-      async function injectDbFailure(
-        table: string,
-        event: 'INSERT' | 'UPDATE' | 'DELETE',
-        when?: string,
-      ) {
-        const name = `inject_${randomBytes(4).toString('hex')}`;
-        await client.$executeRawUnsafe(
-          `CREATE FUNCTION ${name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected database failure'; END $$`,
-        );
-        await client.$executeRawUnsafe(
-          `CREATE TRIGGER ${name} BEFORE ${event} ON "${table}" FOR EACH ROW ${when ? `WHEN (${when}) ` : ''}EXECUTE FUNCTION ${name}()`,
-        );
-        injected.push({ name, table });
-      }
-
-      async function removeInjectedFailures() {
-        for (const { name, table } of injected.splice(0)) {
-          await client.$executeRawUnsafe(
-            `DROP TRIGGER IF EXISTS ${name} ON "${table}"`,
-          );
-          await client.$executeRawUnsafe(`DROP FUNCTION IF EXISTS ${name}()`);
-        }
-      }
-
-      afterEach(removeInjectedFailures);
-
       async function uploadedSession(authId: string) {
         const session = await newSession(authId);
         await makeup.uploadInitialImage(
@@ -1386,6 +1386,266 @@ describeWithDatabase(
             ]);
           },
         );
+      });
+    });
+
+    describe('avatar signed URLs (end to end)', () => {
+      let user: string;
+      const avatarRow = () =>
+        client.userProfile.findUnique({
+          where: { authId: user },
+          select: { avatarUrl: true, avatarStorageProvider: true },
+        });
+      const download = (url: string) => supabase.fetch(url);
+      const userAvatarObjects = () =>
+        bucketKeys().filter((key) => key.startsWith(`${user}/profile/`));
+
+      /**
+       * The invariant: a profile either has no private avatar, or points to an
+       * object that exists and whose fresh signed URL downloads exactly it.
+       */
+      async function expectValidAvatarPointer() {
+        const row = await avatarRow();
+        if (row?.avatarStorageProvider) {
+          const key = row.avatarUrl as string;
+          expect(supabase.objects.has(key)).toBe(true);
+          const signed = await profile.getAvatarSignedUrl(user);
+          const response = await download(signed.url);
+          expect(response.status).toBe(200);
+          expect(Buffer.from(await response.arrayBuffer())).toEqual(
+            supabase.objects.get(key)?.bytes,
+          );
+        }
+        return row;
+      }
+
+      /** After cleanup, only the referenced avatar (if any) remains. */
+      async function expectNoStrayAvatarObjects() {
+        await makeDue();
+        await lifecycle.processDue();
+        const row = await expectValidAvatarPointer();
+        expect(userAvatarObjects()).toEqual(
+          row?.avatarStorageProvider ? [row.avatarUrl] : [],
+        );
+      }
+
+      beforeEach(async () => {
+        user = await createUser(client);
+      });
+
+      it('downloads exactly the uploaded avatar, expires after 60 s, and can be re-issued', async () => {
+        const file = await photo('png', 42);
+        await profile.updateAvatar(user, file);
+
+        const first = await profile.getAvatarSignedUrl(user);
+        expect(first.expiresInSeconds).toBe(60);
+        const ok = await download(first.url);
+        expect(ok.status).toBe(200);
+        expect(Buffer.from(await ok.arrayBuffer())).toEqual(file.buffer);
+
+        supabase.clockOffsetMs = 61_000;
+        expect((await download(first.url)).status).not.toBe(200);
+
+        const second = await profile.getAvatarSignedUrl(user);
+        expect(second.url).not.toBe(first.url);
+        expect((await download(second.url)).status).toBe(200);
+      });
+
+      it("keeps every user to their own avatar: URLs are scoped to the caller's object", async () => {
+        const other = await createUser(client);
+        await profile.updateAvatar(user, await photo('png', 1));
+        await profile.updateAvatar(other, await photo('png', 2));
+        const mine = await profile.getAvatarSignedUrl(user);
+        const theirs = await profile.getAvatarSignedUrl(other);
+        const myKey = (await avatarRow())?.avatarUrl as string;
+
+        expect(new URL(mine.url).pathname).toContain(`/${myKey}`);
+        expect(new URL(theirs.url).pathname).not.toContain(user);
+        // My token cannot be replayed against the other user's object.
+        const replay = new URL(mine.url);
+        replay.pathname = new URL(theirs.url).pathname;
+        expect((await download(replay.toString())).status).not.toBe(200);
+      });
+
+      it('keeps external avatars working, unsigned, and never touches storage for them', async () => {
+        const google = 'https://lh3.googleusercontent.com/a/photo';
+        await client.userProfile.create({
+          data: { authId: user, avatarUrl: google },
+        });
+
+        expect(await rejection(profile.getAvatarSignedUrl(user))).toMatchObject(
+          {
+            status: 409,
+          },
+        );
+        await expect(profile.getProfile(user)).resolves.toMatchObject({
+          avatarUrl: google,
+        });
+        expect(supabase.requests).toHaveLength(0);
+
+        await profile.updateAvatar(user, await photo());
+        await expectNoStrayAvatarObjects();
+        expect(supabase.count('remove')).toBe(0);
+      });
+
+      it('after a change, points to the new object and the old URL stops working', async () => {
+        await profile.updateAvatar(user, await photo('jpeg', 1));
+        const oldUrl = (await profile.getAvatarSignedUrl(user)).url;
+
+        const next = await photo('webp', 2);
+        await profile.updateAvatar(user, next);
+
+        const row = await expectValidAvatarPointer();
+        expect(supabase.objects.get(row?.avatarUrl as string)?.bytes).toEqual(
+          next.buffer,
+        );
+        expect((await download(oldUrl)).status).not.toBe(200);
+        await expectNoStrayAvatarObjects();
+      });
+
+      it('after deletion, no URL can be issued and the old one stops working', async () => {
+        await profile.updateAvatar(user, await photo());
+        const oldUrl = (await profile.getAvatarSignedUrl(user)).url;
+
+        await profile.deleteAvatar(user);
+
+        expect(await rejection(profile.getAvatarSignedUrl(user))).toMatchObject(
+          {
+            status: 404,
+          },
+        );
+        expect((await download(oldUrl)).status).not.toBe(200);
+        await expectNoStrayAvatarObjects();
+      });
+
+      it('after a deletion whose object removal fails, the profile is cleared and the object stays tracked', async () => {
+        await profile.updateAvatar(user, await photo());
+        const key = (await avatarRow())?.avatarUrl as string;
+        supabase.failNext('remove', unavailable);
+
+        await profile.deleteAvatar(user);
+
+        expect(await avatarRow()).toEqual({
+          avatarUrl: null,
+          avatarStorageProvider: null,
+        });
+        expect(await rejection(profile.getAvatarSignedUrl(user))).toMatchObject(
+          {
+            status: 404,
+          },
+        );
+        expect(await ledger()).toEqual([
+          expect.objectContaining({
+            storageKey: key,
+            reason: 'AVATAR_REMOVED',
+            status: 'PENDING',
+          }),
+        ]);
+        await expectNoStrayAvatarObjects();
+      });
+
+      it.each([
+        [
+          'the upload fails (outage)',
+          () => Promise.resolve(supabase.failNext('upload', unavailable)),
+        ],
+        [
+          'the upload times out after storing',
+          () =>
+            Promise.resolve(
+              supabase.failNext('upload', { kind: 'store-then-hang' }),
+            ),
+        ],
+        [
+          'the profile write fails',
+          () => injectDbFailure('userProfile', 'UPDATE'),
+        ],
+        [
+          "the old avatar's deletion cannot be recorded",
+          () =>
+            injectDbFailure(
+              'PrivateStorageCleanup',
+              'INSERT',
+              `NEW.reason = 'AVATAR_REPLACED'`,
+            ),
+        ],
+      ])(
+        'keeps the profile on the existing, downloadable avatar when %s',
+        async (_label, inject) => {
+          const original = await photo('jpeg', 3);
+          await profile.updateAvatar(user, original);
+          const before = await avatarRow();
+          const oldUrl = (await profile.getAvatarSignedUrl(user)).url;
+          await inject();
+
+          await expect(
+            profile.updateAvatar(user, await photo('png', 4)),
+          ).rejects.toBeDefined();
+          await removeInjectedFailures();
+
+          expect(await avatarRow()).toEqual(before);
+          const stillOk = await download(oldUrl);
+          expect(stillOk.status).toBe(200);
+          expect(Buffer.from(await stillOk.arrayBuffer())).toEqual(
+            original.buffer,
+          );
+          await expectNoStrayAvatarObjects();
+        },
+      );
+
+      it('leaves the profile untouched when signing fails', async () => {
+        await profile.updateAvatar(user, await photo());
+        const before = await avatarRow();
+        supabase.failNext('sign', unavailable);
+
+        expect(await rejection(profile.getAvatarSignedUrl(user))).toMatchObject(
+          {
+            status: 503,
+          },
+        );
+        expect(await avatarRow()).toEqual(before);
+        await expectValidAvatarPointer();
+      });
+
+      it('reports a missing object as 404 without rewriting the profile', async () => {
+        await profile.updateAvatar(user, await photo());
+        const before = await avatarRow();
+        supabase.objects.clear();
+
+        expect(await rejection(profile.getAvatarSignedUrl(user))).toMatchObject(
+          {
+            status: 404,
+          },
+        );
+        expect(await avatarRow()).toEqual(before);
+      });
+
+      it('always leaves a signable avatar or none when changes, deletions and URL requests race', async () => {
+        await profile.updateAvatar(user, await photo('jpeg', 100));
+        supabase.latencyMs = 10;
+        const files = await Promise.all([1, 2, 3].map((n) => photo('jpeg', n)));
+
+        const results = await Promise.allSettled([
+          profile.updateAvatar(user, files[0]),
+          profile.getAvatarSignedUrl(user),
+          profile.deleteAvatar(user),
+          profile.getAvatarSignedUrl(user),
+          profile.updateAvatar(user, files[1]),
+          profile.deleteAvatar(user),
+          profile.getAvatarSignedUrl(user),
+          profile.updateAvatar(user, files[2]),
+          profile.getAvatarSignedUrl(user),
+        ]);
+
+        for (const result of results) {
+          if (result.status === 'rejected') {
+            // A URL request racing a deletion may find no avatar; nothing else fails.
+            expect((result.reason as { status?: number }).status).toBe(404);
+          }
+        }
+        supabase.latencyMs = 0;
+        await expectNoStrayAvatarObjects();
+        expect(await ledger()).toEqual([]);
       });
     });
 

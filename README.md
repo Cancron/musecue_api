@@ -126,6 +126,14 @@ WHERE status = 'FAILED';
 - `GET /v1/images/:imageId/content` is unchanged.
 - Clients download directly from the Supabase host, so the mobile app must be allowed to reach it.
 
+`GET /v1/profile/avatar/signed-url` (bearer token) returns the same `{ url, expiresAt, expiresInSeconds: 60 }` for the caller's **own** uploaded avatar:
+
+- It goes through the same code path as makeup images (`issueSignedImageUrl`), so the safeguards are identical: the provider and key stored on the profile, the strict 60-second limit checked against the provider's token, nothing stored or logged, `Cache-Control: private, no-store`, and the same safe error mapping.
+- The user comes only from the access token; there is no route or query parameter to select another user. A stored avatar key must also be inside the caller's `<userId>/profile/` folder. Otherwise the API answers `404` and contacts no storage provider, so even a corrupted profile row cannot expose another user's file. The same check now protects `GET /v1/profile/avatar/content`.
+- Responses: `401` without a valid token. `404` `Avatar image is unavailable` when there is no avatar or its object is missing. `409` for external avatars, and for avatars still on the local filesystem (use `/v1/profile/avatar/content`). `503` or `500` for storage failures.
+- External avatars (for example a Google profile photo) are never signed or replaced. `GET /v1/profile` keeps returning their URL unchanged, and this endpoint answers `409` `This avatar is an external image and has no signed URL. Use avatarUrl from the profile instead.`
+- Changing or removing an avatar never leaves the profile pointing at a missing file. The new file is confirmed in the same transaction that updates the profile, the old file is only recorded for deletion in that transaction, and the old file is deleted only after the commit. Signed URLs issued for an old avatar stop working once it is deleted.
+
 To add a backend such as an S3-compatible service, implement `PrivateObjectStorageProvider` (`src/storage/private-object-storage.provider.ts`) and register it in `StorageModule`. Keys, validation, ownership checks, and the image workflow stay the same. The focused storage tests run with `npx jest private-cloud`.
 
 ### Live AI with OpenRouter
@@ -231,6 +239,7 @@ Makeup routes require a bearer token:
 | `GET`    | `/v1/profile`                                                      | Return the current user's profile                  |
 | `POST`   | `/v1/profile/avatar`                                               | Upload or replace a private avatar                 |
 | `GET`    | `/v1/profile/avatar/content`                                       | Read the current user's avatar                     |
+| `GET`    | `/v1/profile/avatar/signed-url`                                    | 60-second signed download URL for the own avatar   |
 | `DELETE` | `/v1/profile/avatar`                                               | Remove the current user's avatar                   |
 
 Queueing mutations accept an `Idempotency-Key`. Every owned record is scoped with the JWT user ID; clients cannot supply another user's owner ID.

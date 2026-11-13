@@ -12,7 +12,8 @@ export type FakeOperation =
   | 'download'
   | 'info'
   | 'remove'
-  | 'sign';
+  | 'sign'
+  | 'signed-download';
 
 export type FakeFailure =
   | { kind: 'http'; status: number; statusCode: string; error: string }
@@ -57,6 +58,8 @@ export class FakeSupabaseStorage {
   readonly requests: Array<{ op: FakeOperation; key?: string }> = [];
   /** Artificial latency so concurrent requests overlap. */
   latencyMs = 0;
+  /** Simulated Storage clock offset, to test signed URL expiry. */
+  clockOffsetMs = 0;
   /** Runs after an upload is stored, before the response is sent. */
   afterUploadStored?: (key: string) => Promise<void>;
   private readonly failures = new Map<FakeOperation, FakeFailure[]>();
@@ -81,6 +84,7 @@ export class FakeSupabaseStorage {
     this.requests.length = 0;
     this.failures.clear();
     this.latencyMs = 0;
+    this.clockOffsetMs = 0;
     this.afterUploadStored = undefined;
   }
 
@@ -108,6 +112,11 @@ export class FakeSupabaseStorage {
     this.requests.push({ op, key });
 
     if (this.latencyMs) await sleep(this.latencyMs);
+
+    // Signed downloads authenticate with the URL token only (no API key).
+    if (op === 'signed-download') {
+      return this.signedDownload(key ?? '', url.searchParams.get('token'));
+    }
 
     if (
       headers.get('apikey') !== FAKE_SUPABASE.serviceKey ||
@@ -226,7 +235,7 @@ export class FakeSupabaseStorage {
         const { expiresIn } = JSON.parse(init?.body as string) as {
           expiresIn: number;
         };
-        const iat = Math.floor(Date.now() / 1000);
+        const iat = this.nowSeconds();
         const token = [
           Buffer.from('{"alg":"HS256","typ":"JWT"}').toString('base64url'),
           Buffer.from(
@@ -245,6 +254,37 @@ export class FakeSupabaseStorage {
     }
   }
 
+  private nowSeconds(): number {
+    return Math.floor((Date.now() + this.clockOffsetMs) / 1000);
+  }
+
+  private signedDownload(key: string, token: string | null): Response {
+    const reject = (error: string) =>
+      json(400, { statusCode: '400', error, message: error });
+    const payload = token?.split('.')[1];
+    if (!payload) return reject('InvalidSignature');
+    const claims = JSON.parse(
+      Buffer.from(payload, 'base64url').toString('utf8'),
+    ) as { url?: string; exp?: number };
+    if (claims.url !== `${FAKE_SUPABASE.bucket}/${key}`) {
+      return reject('InvalidSignature');
+    }
+    if (!claims.exp || this.nowSeconds() >= claims.exp) {
+      return reject('InvalidJWT');
+    }
+    const object = this.objects.get(key);
+    return object
+      ? new Response(new Uint8Array(object.bytes), {
+          status: 200,
+          headers: { 'content-type': object.contentType },
+        })
+      : json(400, {
+          statusCode: '404',
+          error: 'not_found',
+          message: 'Object not found',
+        });
+  }
+
   private route(
     method: string,
     path: string,
@@ -254,6 +294,12 @@ export class FakeSupabaseStorage {
       return { op: 'bucket' };
     if (method === 'DELETE' && path === `/object/${bucket}`) {
       return { op: 'remove' };
+    }
+    if (method === 'GET' && path.startsWith(`/object/sign/${bucket}/`)) {
+      return {
+        op: 'signed-download',
+        key: path.slice(`/object/sign/${bucket}/`.length),
+      };
     }
     if (method === 'POST' && path.startsWith(`/object/sign/${bucket}/`)) {
       return {

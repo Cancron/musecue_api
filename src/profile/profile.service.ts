@@ -10,6 +10,10 @@ import {
   type PrivateObjectRef,
 } from '../storage/private-image-storage.service';
 import { toImageStorageHttpError } from '../storage/private-storage-http';
+import {
+  issueSignedImageUrl,
+  type SignedImageUrlResponse,
+} from '../storage/signed-image-url';
 
 const AVATAR_MIME_TYPES: Readonly<Record<string, string>> = {
   '.jpg': 'image/jpeg',
@@ -23,6 +27,19 @@ interface StoredAvatar {
 }
 
 const AVATAR_SELECT = { avatarUrl: true, avatarStorageProvider: true } as const;
+
+const AVATAR_UNAVAILABLE = 'Avatar image is unavailable';
+export const EXTERNAL_AVATAR_MESSAGE =
+  'This avatar is an external image and has no signed URL. Use avatarUrl from the profile instead.';
+
+/**
+ * Uploaded avatars always live under `<authId>/profile/`. Checking this
+ * before any read or signing means even a corrupted profile row can never
+ * expose another user's object.
+ */
+function isOwnAvatarKey(authId: string, key: string): boolean {
+  return key.startsWith(`${authId}/profile/`);
+}
 
 /**
  * Returns the private storage location of an uploaded avatar, or null when
@@ -168,14 +185,33 @@ export class ProfileService {
     return this.getProfile(authId);
   }
 
+  /**
+   * Issues a fresh 60 s read URL for the caller's own uploaded avatar, from the
+   * provider and key stored on the profile. External avatars (e.g. Google)
+   * are never signed or replaced; they keep being served as `avatarUrl`.
+   */
+  async getAvatarSignedUrl(authId: string): Promise<SignedImageUrlResponse> {
+    const profile = await this.prisma.userProfile.findUnique({
+      where: { authId },
+      select: AVATAR_SELECT,
+    });
+    if (!profile?.avatarUrl) throw AppError.notFound(AVATAR_UNAVAILABLE);
+    const avatar = privateAvatar(profile);
+    if (!avatar) throw AppError.conflict(EXTERNAL_AVATAR_MESSAGE);
+    if (!isOwnAvatarKey(authId, avatar.key)) {
+      throw AppError.notFound(AVATAR_UNAVAILABLE);
+    }
+    return issueSignedImageUrl(this.imageStorage, avatar, AVATAR_UNAVAILABLE);
+  }
+
   async getAvatarContent(authId: string) {
     const profile = await this.prisma.userProfile.findUnique({
       where: { authId },
       select: AVATAR_SELECT,
     });
     const avatar = privateAvatar(profile);
-    if (!avatar) {
-      throw AppError.notFound('Avatar image is unavailable');
+    if (!avatar || !isOwnAvatarKey(authId, avatar.key)) {
+      throw AppError.notFound(AVATAR_UNAVAILABLE);
     }
 
     try {
@@ -186,7 +222,7 @@ export class ProfileService {
           'application/octet-stream',
       };
     } catch (error) {
-      throw toImageStorageHttpError(error, 'Avatar image is unavailable');
+      throw toImageStorageHttpError(error, AVATAR_UNAVAILABLE);
     }
   }
 }
