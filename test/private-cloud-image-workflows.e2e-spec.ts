@@ -8,6 +8,9 @@ import sharp from 'sharp';
 import type { Logger } from 'winston';
 import type { PrismaService } from '../src/common/services/prisma.service';
 import { MockAiGateway } from '../src/makeup/ai/mock-ai.gateway';
+import { LiveAiGateway } from '../src/makeup/ai/live-ai.gateway';
+import { OpenRouterProvider } from '../src/makeup/ai/providers/openrouter.provider';
+import type { StructuredGenerationRequest } from '../src/makeup/ai/providers/structured-ai.provider';
 import { MakeupService } from '../src/makeup/makeup.service';
 import { MakeupProcessor } from '../src/makeup/queues/makeup.processor';
 import type {
@@ -2116,6 +2119,237 @@ describeWithDatabase(
             await client.aiRun.findUniqueOrThrow({ where: { id: run.id } }),
           ).toMatchObject({ status: 'QUEUED' });
         });
+      });
+    });
+
+    describe('AI worker image pipeline (Supabase → preprocessing → OpenRouter)', () => {
+      const EVALUATION = {
+        result: 'PASS',
+        feedback: 'Blended evenly.',
+        spokenFeedback: 'That looks nicely blended.',
+        confidence: 0.9,
+      };
+      const OPENROUTER_KEY = 'sk-or-v1-fake-openrouter-key';
+      let openRouter: OpenRouterProvider;
+      let liveProcessor: MakeupProcessor;
+      let spies: jest.SpyInstance[];
+      let openRouterCalls: Array<{ url: string; init?: RequestInit }>;
+
+      beforeEach(() => {
+        openRouter = new OpenRouterProvider(
+          new ConfigService({
+            OPENROUTER_API_KEY: OPENROUTER_KEY,
+            OPENROUTER_MODEL: 'vision/model',
+          }),
+        );
+        liveProcessor = new MakeupProcessor(
+          prisma,
+          new LiveAiGateway(openRouter),
+          storage,
+          mock<Logger>(),
+          new ConfigService(),
+        );
+        openRouterCalls = [];
+        spies = [
+          jest
+            .spyOn(global, 'fetch')
+            .mockImplementation(
+              (input: RequestInfo | URL, init?: RequestInit) => {
+                openRouterCalls.push({
+                  url:
+                    typeof input === 'string'
+                      ? input
+                      : input instanceof URL
+                        ? input.href
+                        : input.url,
+                  init,
+                });
+                return Promise.resolve(
+                  new Response(
+                    JSON.stringify({
+                      id: 'generation-id',
+                      model: 'vision/model',
+                      choices: [
+                        { message: { content: JSON.stringify(EVALUATION) } },
+                      ],
+                    }),
+                    {
+                      status: 200,
+                      headers: { 'Content-Type': 'application/json' },
+                    },
+                  ),
+                );
+              },
+            ),
+          jest.spyOn(openRouter, 'generateStructured'),
+        ];
+      });
+      afterEach(() => spies.forEach((spy) => spy.mockRestore()));
+
+      /** A large, EXIF-tagged phone photo submitted as a step check. */
+      async function submittedCheck(idempotencyKey: string) {
+        const { step } = await guideFixture(owner);
+        const original = await sharp({
+          create: {
+            width: 2400,
+            height: 1800,
+            channels: 3,
+            background: '#b08070',
+          },
+        })
+          .withExif({
+            IFD0: { Make: 'PhoneMaker', Model: 'Phone 15 Pro' },
+            IFD3: { GPSLatitudeRef: 'N', GPSLatitude: '51/1 30/1 0/1' },
+          })
+          .jpeg()
+          .toBuffer();
+        const run = await makeup.checkStep(owner, step.id, idempotencyKey, {
+          buffer: original,
+          size: original.length,
+        } as Express.Multer.File);
+        const payload = queue.enqueue.mock.calls[0][1];
+        const image = await client.imageAsset.findUniqueOrThrow({
+          where: { id: payload.imageId as string },
+        });
+        return { run, payload, image, original };
+      }
+
+      const storageDetails = (storageKey: string) => [
+        FAKE_SUPABASE.url,
+        new URL(FAKE_SUPABASE.url).host,
+        FAKE_SUPABASE.serviceKey,
+        FAKE_SUPABASE.bucket,
+        storageKey,
+        'supabase',
+      ];
+
+      it('processes the original photo from Supabase and sends OpenRouter only a normalized copy', async () => {
+        const { run, payload, image, original } =
+          await submittedCheck('pipeline-1');
+
+        await liveProcessor.process(job('VISION_CHECK', payload).job);
+
+        // The worker read the original bytes from the stored provider + key,
+        // exactly what the content endpoint serves for the same image.
+        expect(supabase.requests).toContainEqual({
+          op: 'download',
+          key: image.storageKey,
+        });
+        const received = (
+          spies[1].mock.calls[0] as [StructuredGenerationRequest]
+        )[0];
+        expect(received.image?.bytes).toEqual(original);
+        await expect(makeup.getImageContent(owner, image.id)).resolves.toEqual({
+          bytes: original,
+          mimeType: 'image/jpeg',
+        });
+
+        // OpenRouter received one request with a resized, metadata-free JPEG.
+        expect(openRouterCalls).toHaveLength(1);
+        expect(openRouterCalls[0].url).toBe(
+          'https://openrouter.ai/api/v1/chat/completions',
+        );
+        const body = openRouterCalls[0].init?.body as string;
+        const dataUrl = /data:image\/jpeg;base64,([A-Za-z0-9+/=]+)/.exec(body);
+        const sent = await sharp(
+          Buffer.from(dataUrl?.[1] ?? '', 'base64'),
+        ).metadata();
+        expect(sent).toMatchObject({
+          format: 'jpeg',
+          width: 1600,
+          height: 1200,
+        });
+        expect(sent.exif).toBeUndefined();
+
+        // Nothing about private storage left the server.
+        const outgoing = `${body} ${JSON.stringify(openRouterCalls[0].init?.headers)}`;
+        for (const detail of storageDetails(image.storageKey)) {
+          expect(outgoing).not.toContain(detail);
+        }
+        expect(outgoing).not.toContain('PhoneMaker');
+        expect(
+          new Headers(openRouterCalls[0].init?.headers).get('authorization'),
+        ).toBe(`Bearer ${OPENROUTER_KEY}`);
+
+        expect(
+          await client.aiRun.findUniqueOrThrow({ where: { id: run.id } }),
+        ).toMatchObject({ status: 'COMPLETED' });
+        expect(
+          await client.stepAttempt.count({ where: { imageId: image.id } }),
+        ).toBe(1);
+      });
+
+      it.each([
+        [
+          'the stored object is missing',
+          (key: string) => supabase.objects.delete(key),
+          'FAILED',
+          'The photo for this request is no longer available. Please upload it again.',
+        ],
+        [
+          'the provider times out',
+          () => supabase.failNext('download', { kind: 'hang' }),
+          'QUEUED',
+          null,
+        ],
+        [
+          'the provider is unavailable',
+          () => supabase.failNext('download', unavailable),
+          'QUEUED',
+          null,
+        ],
+        [
+          'the provider rejects the server credentials',
+          () => supabase.failNext('download', accessDenied),
+          'FAILED',
+          'Your photo could not be loaded right now. Please try again.',
+        ],
+        [
+          'the object was replaced by something that is not the photo',
+          (key: string) =>
+            supabase.objects.set(key, {
+              bytes: Buffer.from('<html>gateway error</html>'),
+              contentType: 'text/html',
+            }),
+          'FAILED',
+          'Your photo could not be loaded right now. Please try again.',
+        ],
+      ] as const)(
+        'handles it gracefully when %s: no OpenRouter call, no provider details',
+        async (_label, inject, status, message) => {
+          const { run, payload, image } = await submittedCheck(
+            `failure-${randomBytes(4).toString('hex')}`,
+          );
+          inject(image.storageKey);
+          const { job: vision, discard } = job('VISION_CHECK', payload);
+
+          await expect(liveProcessor.process(vision)).rejects.toBeDefined();
+
+          expect(openRouterCalls).toHaveLength(0);
+          const stored = await client.aiRun.findUniqueOrThrow({
+            where: { id: run.id },
+          });
+          expect(stored.status).toBe(status);
+          if (message) expect(stored.error).toBe(message);
+          expect(discard).toHaveBeenCalledTimes(status === 'FAILED' ? 1 : 0);
+          const visible = JSON.stringify(stored);
+          for (const detail of storageDetails(image.storageKey)) {
+            expect(visible).not.toContain(detail);
+          }
+        },
+      );
+
+      it('fails the run immediately when the image record no longer exists', async () => {
+        const { run, payload, image } = await submittedCheck('record-gone');
+        await client.imageAsset.delete({ where: { id: image.id } });
+
+        await expect(
+          liveProcessor.process(job('VISION_CHECK', payload).job),
+        ).rejects.toMatchObject({ code: 'IMAGE_NOT_FOUND', retryable: false });
+        expect(openRouterCalls).toHaveLength(0);
+        expect(
+          await client.aiRun.findUniqueOrThrow({ where: { id: run.id } }),
+        ).toMatchObject({ status: 'FAILED' });
       });
     });
 

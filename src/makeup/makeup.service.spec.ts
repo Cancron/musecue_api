@@ -43,7 +43,7 @@ describe('MakeupService history media and deletion', () => {
       mimeType: 'image/jpeg',
       source: 'PRIVATE_UPLOAD',
     } as never);
-    imageStorage.read.mockResolvedValue(bytes);
+    imageStorage.readImage.mockResolvedValue(bytes);
 
     await expect(
       service.getImageContent('owner-id', 'image-id'),
@@ -60,10 +60,10 @@ describe('MakeupService history media and deletion', () => {
         source: true,
       },
     });
-    expect(imageStorage.read.mock.calls[0]?.[0]).toEqual({
-      provider: 'supabase',
-      key: 'owner/session/image.jpg',
-    });
+    expect(imageStorage.readImage.mock.calls[0]).toEqual([
+      { provider: 'supabase', key: 'owner/session/image.jpg' },
+      'image/jpeg',
+    ]);
   });
 
   it('does not read storage when the image is not owned by the user', async () => {
@@ -72,7 +72,7 @@ describe('MakeupService history media and deletion', () => {
     await expect(
       service.getImageContent('other-user', 'image-id'),
     ).rejects.toThrow('Image not found');
-    expect(imageStorage.read.mock.calls).toHaveLength(0);
+    expect(imageStorage.readImage.mock.calls).toHaveLength(0);
   });
 
   it('deletes a completed aggregate and its private files', async () => {

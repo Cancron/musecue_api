@@ -6,10 +6,11 @@ import { Job, Worker } from 'bullmq';
 import { WINSTON_MODULE_PROVIDER } from 'nest-winston';
 import { Logger } from 'winston';
 import { PrismaService } from '../../common/services/prisma.service';
+import { PrivateImageStorageService } from '../../storage/private-image-storage.service';
 import {
-  PrivateImageStorageService,
-  type PrivateObjectRef,
-} from '../../storage/private-image-storage.service';
+  PrivateImageUnavailableError,
+  loadOwnedPrivateImage,
+} from '../private-image-content';
 import {
   isMissingPrivateObject,
   isPrivateStorageError,
@@ -340,43 +341,37 @@ export class MakeupProcessor extends WorkerHost {
     });
   }
 
+  /**
+   * Loads the original private image through the same owner-scoped path as
+   * `GET /v1/images/:id/content` (storage provider + stored key, verified
+   * type). Failures keep the job's retry semantics: missing or unusable
+   * images fail the run immediately, transient storage outages use the
+   * normal retry budget. Messages are safe to persist on the run and show to
+   * the user; they never name the storage provider, bucket or key.
+   */
   private async loadImage(
     authId: string,
     imageId: string,
   ): Promise<AiImageInput> {
-    const image = await this.prisma.imageAsset.findFirstOrThrow({
-      where: { id: imageId, session: { authId } },
-      select: { storageKey: true, storageProvider: true, mimeType: true },
-    });
-    if (!['image/jpeg', 'image/png', 'image/webp'].includes(image.mimeType)) {
-      throw new Error('Stored image has an unsupported media type');
-    }
-    return {
-      bytes: await this.readStoredImage({
-        provider: image.storageProvider,
-        key: image.storageKey,
-      }),
-      mimeType: image.mimeType as AiImageInput['mimeType'],
-    };
-  }
-
-  /**
-   * Storage failures keep the job's retry semantics: missing images fail the
-   * run immediately, transient outages use the normal retry budget. Messages
-   * are safe to persist on the run and show to the user.
-   */
-  private async readStoredImage(ref: PrivateObjectRef): Promise<Buffer> {
     try {
-      return await this.imageStorage.read(ref);
+      return await loadOwnedPrivateImage(
+        this.prisma,
+        this.imageStorage,
+        authId,
+        imageId,
+      );
     } catch (error) {
-      if (!isPrivateStorageError(error)) throw error;
-      if (isMissingPrivateObject(error)) {
+      if (
+        error instanceof PrivateImageUnavailableError ||
+        isMissingPrivateObject(error)
+      ) {
         throw new AiProviderError(
           'IMAGE_NOT_FOUND',
           'The photo for this request is no longer available. Please upload it again.',
           false,
         );
       }
+      if (!isPrivateStorageError(error)) throw error;
       throw new AiProviderError(
         error.retryable ? 'IMAGE_STORAGE_UNAVAILABLE' : 'IMAGE_STORAGE_FAILED',
         'Your photo could not be loaded right now. Please try again.',

@@ -162,7 +162,23 @@ OPENROUTER_MODEL=openrouter/free
 
 Restart the API and BullMQ worker after changing environment variables. Use `AI_MODE=mock` for deterministic offline development. The optional analysis, guide, vision, and question model variables allow each operation to be routed independently without changing services or mobile API contracts.
 
-Initial analysis and makeup checks read owned images from private storage and send them to OpenRouter as in-request data URLs. They are never exposed through permanent public URLs. Structured responses are validated again by Zod before any transaction changes workflow state. Provider timeouts, rate limits, and server failures use the existing BullMQ job retry budget; invalid credentials and other non-retryable requests fail immediately.
+Initial analysis and makeup checks load owned images through the same code path as `GET /v1/images/:id/content` (`loadOwnedPrivateImage`). It looks the image up scoped to its owner, then reads the original bytes through the storage provider and key stored on the image, just as the filesystem adapter used to be read, and checks them against the stored type. The worker calls that code path directly rather than the HTTP endpoint, because it holds no user access token.
+
+Before anything is sent to OpenRouter, **every** image is normalized, whatever its size:
+- decoded with the same 8192 × 8192 limit as uploads
+- turned upright from its EXIF orientation
+- resized to fit `OPENROUTER_IMAGE_MAX_EDGE`
+- flattened onto white and re-encoded as JPEG, which removes all metadata (EXIF location, device, XMP)
+- reduced a few times if still over `OPENROUTER_IMAGE_MAX_BYTES`
+
+Only those bytes are embedded as a `data:` URL; no storage URL, key, bucket or credential is ever part of the request. An undecodable image fails with `AI_IMAGE_INVALID` and an image that cannot be made small enough with `AI_IMAGE_TOO_LARGE`. Both are non-retryable and OpenRouter is not contacted. Previously an undecodable image was reported as a retryable "Unable to reach OpenRouter".
+
+When the worker cannot load an image, the run stores only a generic message and never names the provider, bucket or key:
+- **Missing image or record:** fails immediately with "The photo for this request is no longer available. Please upload it again."
+- **Storage timeout or outage:** retried within the job's retry budget.
+- **Rejected credentials, unknown provider, or an object that is not the recorded image:** fails with "Your photo could not be loaded right now. Please try again."
+
+Images are never exposed through permanent public URLs. Structured responses are validated again by Zod before any transaction changes workflow state. Provider timeouts, rate limits, and server failures use the existing BullMQ job retry budget; invalid credentials and other non-retryable requests fail immediately.
 
 `openrouter/free` is useful for development, but model choice and availability can vary. For face-photo privacy, review the chosen model/provider policy and optionally set `OPENROUTER_DATA_COLLECTION=deny`; that restriction may leave fewer or no free providers. Production should pin evaluated vision/text models rather than rely on the free router.
 
@@ -262,7 +278,21 @@ The image endpoint accepts `multipart/form-data` fields `image` and `purpose=INI
 
 The avatar upload accepts a single `image` field. The mobile client crops and compresses it before upload; the API independently validates JPEG, PNG, or WebP content up to 5 MB and stores it under the authenticated user's private profile scope.
 
-Private image reads require the same bearer token and verify ownership through the image's session. Completed-session deletion cascades through its guide, steps, attempts, questions, recommendations, and image metadata, then removes its private files. Active workflows cannot be deleted through the history endpoint.
+Private image reads require the same bearer token and verify ownership through the image's session.
+
+`GET /v1/images/:imageId/content` returns the original bytes exactly as stored. `Content-Type` is the type validated and recorded at upload, and it is checked against the bytes' own format signature. A provider answer that is not that image (a corrupted object, an error page, a different file) is never served; it becomes `500 Image storage is unavailable`. `Content-Length` is set.
+
+Every response from this route, including errors, carries `Cache-Control: private, no-store, max-age=0`, `Pragma: no-cache`, `Expires: 0`, `Vary: Authorization` and `X-Content-Type-Options: nosniff`, so no proxy, CDN or client cache keeps private images. No ETag or cookie is sent, and no header reveals the storage provider.
+
+The mobile app authenticates exactly as for every other route: `Authorization: Bearer <access token>` (React Native / Expo image components accept request headers). Tokens in the URL are never accepted. An expired token answers a JSON `401` (`Token has expired`), so the app can refresh through `POST /auth/refresh-token` and retry. Image components that cannot send headers should use the 60-second signed URL from `GET /v1/images/:imageId/signed-url` instead.
+
+Responses:
+- `404 Image not found` for a missing image *or another user's image* (they are indistinguishable).
+- `404 Image content is unavailable` for a missing object or a non-uploaded image.
+- `503` for storage timeouts or outages.
+- `500` for misconfiguration or an integrity failure.
+
+None of these name the provider. Completed-session deletion cascades through its guide, steps, attempts, questions, recommendations, and image metadata, then removes its private files. Active workflows cannot be deleted through the history endpoint.
 
 Successful responses use one envelope:
 

@@ -13,6 +13,11 @@ import {
 } from '../storage/private-image-storage.service';
 import { toImageStorageHttpError } from '../storage/private-storage-http';
 import { issueSignedImageUrl } from '../storage/signed-image-url';
+import {
+  PrivateImageUnavailableError,
+  loadOwnedPrivateImage,
+  type PrivateImageContent,
+} from './private-image-content';
 import type {
   AskQuestionDto,
   CompleteStepDto,
@@ -153,27 +158,29 @@ export class MakeupService {
     return { id: sessionId };
   }
 
-  async getImageContent(authId: string, imageId: string) {
-    const image = await this.prisma.imageAsset.findFirst({
-      where: { id: imageId, session: { authId } },
-      select: {
-        storageKey: true,
-        storageProvider: true,
-        mimeType: true,
-        source: true,
-      },
-    });
-    if (!image) throw AppError.notFound('Image not found');
-    if (image.source !== 'PRIVATE_UPLOAD') {
-      throw AppError.notFound('Image content is unavailable');
-    }
-
+  /**
+   * The original bytes and stored content type of an owned private image,
+   * loaded exactly as the AI worker loads it (`loadOwnedPrivateImage`).
+   */
+  async getImageContent(
+    authId: string,
+    imageId: string,
+  ): Promise<PrivateImageContent> {
     try {
-      return {
-        mimeType: image.mimeType,
-        bytes: await this.imageStorage.read(storedObject(image)),
-      };
+      return await loadOwnedPrivateImage(
+        this.prisma,
+        this.imageStorage,
+        authId,
+        imageId,
+      );
     } catch (error) {
+      if (error instanceof PrivateImageUnavailableError) {
+        throw AppError.notFound(
+          error.reason === 'NOT_FOUND'
+            ? 'Image not found'
+            : 'Image content is unavailable',
+        );
+      }
       throw toImageStorageHttpError(error, 'Image content is unavailable');
     }
   }

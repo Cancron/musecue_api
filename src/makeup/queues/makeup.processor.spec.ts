@@ -182,12 +182,13 @@ describe('MakeupProcessor delivery semantics', () => {
         session: { preferences: null },
       },
     } as never);
-    prisma.imageAsset.findFirstOrThrow.mockResolvedValue({
+    prisma.imageAsset.findFirst.mockResolvedValue({
       storageKey: 'owned-image',
       storageProvider: 'supabase',
       mimeType: 'image/jpeg',
+      source: 'PRIVATE_UPLOAD',
     } as never);
-    storage.read.mockResolvedValue(Buffer.from('test'));
+    storage.readImage.mockResolvedValue(Buffer.from('test'));
     prisma.$transaction.mockImplementation(
       (callback: (tx: Prisma.TransactionClient) => Promise<unknown>) =>
         callback(prisma),
@@ -282,12 +283,13 @@ describe('MakeupProcessor delivery semantics', () => {
       },
       images: [{ id: 'image-id' }],
     } as never);
-    prisma.imageAsset.findFirstOrThrow.mockResolvedValue({
+    prisma.imageAsset.findFirst.mockResolvedValue({
       storageKey: 'owner/session/image.jpg',
       storageProvider: 'supabase',
       mimeType: 'image/jpeg',
+      source: 'PRIVATE_UPLOAD',
     } as never);
-    storage.read.mockResolvedValue(Buffer.from('photo'));
+    storage.readImage.mockResolvedValue(Buffer.from('photo'));
     ai.describe.mockReturnValue({
       provider: 'openrouter',
       model: 'free-model',

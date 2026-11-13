@@ -47,6 +47,11 @@ const SUPABASE: SupabaseStorageConfig = {
   timeoutMs: 200,
 };
 const OWNER = 'owner-user';
+/** JPEG signature + payload: what the stored object really contains. */
+const PRIVATE_JPEG = Buffer.concat([
+  Buffer.from([0xff, 0xd8, 0xff, 0xe0]),
+  Buffer.from('private-jpeg-bytes'),
+]);
 const KEY = `${OWNER}/session-1/0b7c9a52-8d2f-4d57-9a8c-0d8c1f0a1b2c.jpg`;
 const SIGN_ENDPOINT = `${SUPABASE.storageUrl}/object/sign/${SUPABASE.bucket}/${KEY}`;
 
@@ -143,9 +148,7 @@ describe('GET /v1/images/:imageId/signed-url (HTTP, mocked Supabase)', () => {
       });
     }
     if (url.endsWith(`/object/${SUPABASE.bucket}/${KEY}`)) {
-      return Promise.resolve(
-        new Response(Buffer.from('private-jpeg-bytes'), { status: 200 }),
-      );
+      return Promise.resolve(new Response(PRIVATE_JPEG, { status: 200 }));
     }
     return json({ statusCode: '400', error: 'unexpected' }, 400);
   };
@@ -584,9 +587,11 @@ describe('GET /v1/images/:imageId/signed-url (HTTP, mocked Supabase)', () => {
         })
         .expect(200);
 
-      expect(response.body).toEqual(Buffer.from('private-jpeg-bytes'));
+      expect(response.body).toEqual(PRIVATE_JPEG);
       expect(response.headers['content-type']).toBe('image/jpeg');
-      expect(response.headers['cache-control']).toBe('private, no-store');
+      expect(response.headers['cache-control']).toBe(
+        'private, no-store, max-age=0',
+      );
       expect(response.headers['x-content-type-options']).toBe('nosniff');
       expect(signRequests()).toHaveLength(0);
     });

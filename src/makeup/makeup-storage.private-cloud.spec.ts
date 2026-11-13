@@ -402,15 +402,18 @@ describe('MakeupService private cloud storage lifecycle', () => {
         500,
         'Image storage is unavailable',
       ],
-    ] as const)('maps %s to %i', async (_label, code, status, message) => {
-      imageStorage.read.mockRejectedValue(new PrivateStorageError(code));
+    ] as const)(
+      'maps %s to the expected status',
+      async (_label, code, status, message) => {
+        imageStorage.readImage.mockRejectedValue(new PrivateStorageError(code));
 
-      const error = await rejection(
-        service.getImageContent('owner', 'image-id'),
-      );
+        const error = await rejection(
+          service.getImageContent('owner', 'image-id'),
+        );
 
-      expect(httpError(error)).toEqual({ status, message });
-    });
+        expect(httpError(error)).toEqual({ status, message });
+      },
+    );
   });
 });
 
@@ -444,12 +447,13 @@ describe('MakeupProcessor private cloud storage reads', () => {
         session: { preferences: null },
       },
     } as never);
-    prisma.imageAsset.findFirstOrThrow.mockResolvedValue({
+    prisma.imageAsset.findFirst.mockResolvedValue({
+      source: 'PRIVATE_UPLOAD',
       storageKey: 'owner/session/photo.jpg',
       storageProvider: 'supabase',
       mimeType: 'image/jpeg',
     } as never);
-    storage.read.mockRejectedValue(readError);
+    storage.readImage.mockRejectedValue(readError);
     const processor = new MakeupProcessor(
       prisma,
       ai,
@@ -484,14 +488,19 @@ describe('MakeupProcessor private cloud storage reads', () => {
 
     await processor.process(job).catch(() => undefined);
 
-    expect(prisma.imageAsset.findFirstOrThrow.mock.calls[0]?.[0]).toEqual({
+    expect(prisma.imageAsset.findFirst.mock.calls[0]?.[0]).toEqual({
       where: { id: 'photo', session: { authId: 'owner' } },
-      select: { storageKey: true, storageProvider: true, mimeType: true },
+      select: {
+        storageKey: true,
+        storageProvider: true,
+        mimeType: true,
+        source: true,
+      },
     });
-    expect(storage.read.mock.calls[0]?.[0]).toEqual({
-      provider: 'supabase',
-      key: 'owner/session/photo.jpg',
-    });
+    expect(storage.readImage.mock.calls[0]).toEqual([
+      { provider: 'supabase', key: 'owner/session/photo.jpg' },
+      'image/jpeg',
+    ]);
   });
 
   it('fails the run immediately with a safe message when the image is gone', async () => {
@@ -530,4 +539,68 @@ describe('MakeupProcessor private cloud storage reads', () => {
       ),
     ).toBe(true);
   });
+
+  it.each([
+    ['the image record is gone (or belongs to someone else)', null],
+    [
+      'the image is not a private upload',
+      {
+        source: 'MOCK_CAPTURE',
+        storageKey: 'mock',
+        storageProvider: 'supabase',
+        mimeType: 'image/jpeg',
+      },
+    ],
+    [
+      'the stored type is not a supported image',
+      {
+        source: 'PRIVATE_UPLOAD',
+        storageKey: 'owner/session/photo.gif',
+        storageProvider: 'supabase',
+        mimeType: 'image/gif',
+      },
+    ],
+  ])(
+    'fails the run immediately, without reading storage, when %s',
+    async (_label, record) => {
+      const { prisma, ai, storage, processor, job, discard } = setup(
+        new PrivateStorageError('STORAGE_UNAVAILABLE'),
+      );
+      prisma.imageAsset.findFirst.mockResolvedValue(record as never);
+
+      await expect(processor.process(job)).rejects.toMatchObject({
+        code: 'IMAGE_NOT_FOUND',
+        retryable: false,
+      });
+      expect(storage.readImage.mock.calls).toHaveLength(0);
+      expect(discard.mock.calls).toHaveLength(1);
+      expect(ai.evaluateStep.mock.calls).toHaveLength(0);
+    },
+  );
+
+  it.each([
+    ['a corrupted or mismatched object', 'INVALID_PROVIDER_RESPONSE'],
+    ['an unregistered provider', 'UNKNOWN_STORAGE_PROVIDER'],
+    ['rejected storage credentials', 'STORAGE_ACCESS_DENIED'],
+  ] as const)(
+    'fails the run without retrying on %s, with a message that names no provider',
+    async (_label, code) => {
+      const { prisma, ai, processor, job, discard } = setup(
+        new PrivateStorageError(code, { provider: 'supabase' }),
+      );
+
+      await expect(processor.process(job)).rejects.toMatchObject({
+        code: 'IMAGE_STORAGE_FAILED',
+        retryable: false,
+      });
+      expect(discard.mock.calls).toHaveLength(1);
+      expect(ai.evaluateStep.mock.calls).toHaveLength(0);
+      const failed = prisma.aiRun.updateMany.mock.calls.find(
+        ([args]) => args.data.status === 'FAILED',
+      );
+      expect(failed?.[0].data.error).toBe(
+        'Your photo could not be loaded right now. Please try again.',
+      );
+    },
+  );
 });

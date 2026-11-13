@@ -27,7 +27,9 @@ export type FakeFailure =
    */
   | { kind: 'hang-then-store'; landAfterMs: number }
   /** Remove answers 200 with an empty list but deletes nothing. */
-  | { kind: 'silent-noop' };
+  | { kind: 'silent-noop' }
+  /** Never answers: the client times out (any operation). */
+  | { kind: 'hang' };
 
 export interface FakeStoredObject {
   bytes: Buffer;
@@ -131,6 +133,13 @@ export class FakeSupabaseStorage {
 
     const failure = this.failures.get(op)?.shift();
     if (failure?.kind === 'network') throw new TypeError('fetch failed');
+    if (failure?.kind === 'hang') {
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () =>
+          reject(init.signal?.reason as Error),
+        );
+      });
+    }
     if (failure?.kind === 'http') {
       return json(failure.status, {
         statusCode: failure.statusCode,

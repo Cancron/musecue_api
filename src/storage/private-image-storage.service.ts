@@ -16,6 +16,7 @@ import {
   PrivateStorageError,
   type PrivateStorageOperation,
 } from './private-storage.error';
+import { detectImageMime } from './image-signature';
 import {
   assertValidPrivateImageKey,
   buildPrivateImageKey,
@@ -123,6 +124,25 @@ export class PrivateImageStorageService {
     return this.run(ref.provider, 'get', () => {
       assertValidPrivateImageKey(ref.key);
       return this.resolve(ref.provider).get(ref.key);
+    });
+  }
+
+  /**
+   * Reads an image and verifies the bytes really are the format recorded
+   * when it was stored, so a corrupted object, a provider error page or a
+   * different file is never served or processed as that image.
+   */
+  readImage(
+    ref: PrivateObjectRef,
+    expectedMimeType: SupportedImageMime,
+  ): Promise<Buffer> {
+    return this.run(ref.provider, 'get', async () => {
+      assertValidPrivateImageKey(ref.key);
+      const bytes = await this.resolve(ref.provider).get(ref.key);
+      if (detectImageMime(bytes) !== expectedMimeType) {
+        throw new PrivateStorageError('INVALID_PROVIDER_RESPONSE');
+      }
+      return bytes;
     });
   }
 

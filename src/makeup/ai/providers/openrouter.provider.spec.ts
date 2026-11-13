@@ -1,4 +1,5 @@
 import { ConfigService } from '@nestjs/config';
+import sharp from 'sharp';
 import { OpenRouterProvider } from './openrouter.provider';
 import type { StructuredGenerationRequest } from './structured-ai.provider';
 
@@ -15,6 +16,11 @@ describe('OpenRouterProvider', () => {
   afterEach(() => jest.restoreAllMocks());
 
   it('sends private image bytes as a structured multimodal request', async () => {
+    const photo = await sharp({
+      create: { width: 400, height: 300, channels: 3, background: '#c08080' },
+    })
+      .png()
+      .toBuffer();
     const fetchSpy = jest.spyOn(global, 'fetch').mockResolvedValue(
       new Response(
         JSON.stringify({
@@ -42,7 +48,7 @@ describe('OpenRouterProvider', () => {
         systemInstruction: 'system',
         taskInstruction: 'task',
         userContext: { step: 1 },
-        image: { bytes: Buffer.from('photo'), mimeType: 'image/jpeg' },
+        image: { bytes: photo, mimeType: 'image/png' },
       }),
     ).resolves.toMatchObject({
       value: { answer: 'Use less.' },
@@ -68,9 +74,15 @@ describe('OpenRouterProvider', () => {
     expect(body.model).toBe('openrouter/free');
     expect(body.response_format.json_schema.strict).toBe(true);
     expect(body.provider.require_parameters).toBe(true);
-    expect(JSON.stringify(body.messages[1].content)).toContain(
-      'data:image/jpeg;base64,cGhvdG8=',
+    // The image is always normalized to JPEG and embedded as a data URL.
+    const dataUrl = JSON.stringify(body.messages[1].content).match(
+      /data:image\/jpeg;base64,([A-Za-z0-9+/=]+)/,
     );
+    expect(dataUrl).not.toBeNull();
+    const sent = await sharp(
+      Buffer.from(dataUrl?.[1] ?? '', 'base64'),
+    ).metadata();
+    expect(sent).toMatchObject({ format: 'jpeg', width: 400, height: 300 });
   });
 
   it('fails without making a request when its secret is missing', async () => {
