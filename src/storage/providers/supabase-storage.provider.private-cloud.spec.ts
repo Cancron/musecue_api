@@ -445,9 +445,14 @@ describe('SupabaseStorageProvider (private cloud storage)', () => {
       });
       const { provider: supabase, requests } = provider(() => signed(jwt));
 
-      const url = await supabase.createSignedUrl(KEY, 60);
+      const grant = await supabase.createSignedUrl(KEY, 60);
+      const url = grant.url;
 
-      expect(url).toBe(`${SIGN_URL}?token=${jwt}`);
+      expect(grant).toEqual({
+        url: `${SIGN_URL}?token=${jwt}`,
+        issuedAt: new Date(nowSeconds * 1000),
+        expiresAt: new Date((nowSeconds + 60) * 1000),
+      });
       expect(requests[0]).toMatchObject({ method: 'POST', url: SIGN_URL });
       expect(JSON.parse(requests[0].body as string)).toEqual({ expiresIn: 60 });
       expect(requests[0].headers.get('authorization')).toBe(
@@ -465,22 +470,30 @@ describe('SupabaseStorageProvider (private cloud storage)', () => {
         signed(token({ iat: nowSeconds, exp: nowSeconds + lifetime })),
       );
 
-      await expect(supabase.createSignedUrl(KEY, 60)).resolves.toContain(
-        'token=',
-      );
+      await expect(supabase.createSignedUrl(KEY, 60)).resolves.toMatchObject({
+        url: expect.stringContaining('token=') as string,
+        expiresAt: new Date((nowSeconds + lifetime) * 1000),
+      });
     });
 
-    it('measures the lifetime from the signed claims, independent of the local clock', async () => {
-      // Supabase's clock 10 minutes ahead: still a 60 s token, so accepted.
-      const ahead = nowSeconds + 600;
-      const { provider: supabase } = provider(() =>
-        signed(token({ iat: ahead, exp: ahead + 60 })),
-      );
+    it.each([
+      ['10 minutes ahead', 600],
+      ['10 minutes behind', -600],
+      ['3 s later (slow signing)', 3],
+    ])(
+      "reports Supabase's own validity window when its clock is %s",
+      async (_label, offsetSeconds) => {
+        const iat = nowSeconds + offsetSeconds;
+        const { provider: supabase } = provider(() =>
+          signed(token({ iat, exp: iat + 60 })),
+        );
 
-      await expect(supabase.createSignedUrl(KEY, 60)).resolves.toContain(
-        'token=',
-      );
-    });
+        await expect(supabase.createSignedUrl(KEY, 60)).resolves.toMatchObject({
+          issuedAt: new Date(iat * 1000),
+          expiresAt: new Date((iat + 60) * 1000),
+        });
+      },
+    );
 
     it('never accepts more than the requested lifetime, even below 60 s', async () => {
       const { provider: supabase } = provider(() =>

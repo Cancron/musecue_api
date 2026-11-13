@@ -1,6 +1,9 @@
 import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
-import type { PrivateObjectStorageProvider } from '../private-object-storage.provider';
+import type {
+  PrivateObjectStorageProvider,
+  SignedObjectUrl,
+} from '../private-object-storage.provider';
 import { LOCAL_STORAGE_PROVIDER_ID } from '../private-storage.config';
 import {
   PrivateStorageError,
@@ -20,6 +23,10 @@ export class LocalFilesystemStorageProvider implements PrivateObjectStorageProvi
     private readonly root: string,
     private readonly options: { writable: boolean } = { writable: true },
   ) {}
+
+  isConfigured(): boolean {
+    return true;
+  }
 
   async put(key: string, bytes: Buffer): Promise<void> {
     if (!this.options.writable) {
@@ -57,7 +64,7 @@ export class LocalFilesystemStorageProvider implements PrivateObjectStorageProvi
   }
 
   /** The filesystem has no way to grant time-limited direct access. */
-  createSignedUrl(): Promise<string> {
+  createSignedUrl(): Promise<SignedObjectUrl> {
     return Promise.reject(
       new PrivateStorageError('SIGNED_URL_UNSUPPORTED', {
         provider: this.id,

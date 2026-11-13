@@ -110,11 +110,26 @@ describe('loadPrivateStorageConfig (private cloud storage)', () => {
     ).toContain('SUPABASE_SERVICE_ROLE_KEY');
   });
 
-  it('rejects unknown providers', () => {
-    expect(loadError({ PRIVATE_STORAGE_PROVIDER: 's3' }).message).toBe(
-      'PRIVATE_STORAGE_PROVIDER must be either "supabase" or "local"',
-    );
+  it('accepts any well-formed provider id (registration is checked at startup by the registry)', () => {
+    expect(
+      loadPrivateStorageConfig(env({ PRIVATE_STORAGE_PROVIDER: 'fake-s3' }))
+        .activeProvider,
+    ).toBe('fake-s3');
+    // Supabase settings are only required when Supabase is the active provider.
+    expect(
+      loadPrivateStorageConfig(env({ PRIVATE_STORAGE_PROVIDER: 'r2-eu' }))
+        .supabase,
+    ).toBeUndefined();
   });
+
+  it.each(['s3_bucket', 'my provider', '../local', '-s3', 'x'.repeat(33)])(
+    'rejects the malformed provider id %p',
+    (id) => {
+      expect(loadError({ PRIVATE_STORAGE_PROVIDER: id }).message).toContain(
+        'PRIVATE_STORAGE_PROVIDER must be a provider id',
+      );
+    },
+  );
 
   it.each([
     ['not a URL', 'project-ref.supabase.co', 'must be a valid URL'],

@@ -20,6 +20,8 @@ import { PrivateImageLifecycleService } from '../src/storage/private-image-lifec
 import { PrivateImageStorageService } from '../src/storage/private-image-storage.service';
 import { LocalFilesystemStorageProvider } from '../src/storage/providers/local-filesystem-storage.provider';
 import { SupabaseStorageProvider } from '../src/storage/providers/supabase-storage.provider';
+import type { PrivateObjectStorageProvider } from '../src/storage/private-object-storage.provider';
+import { FakeS3CompatibleStorage } from './support/fake-s3-compatible-storage';
 import {
   FAKE_SUPABASE,
   FakeSupabaseStorage,
@@ -1646,6 +1648,474 @@ describeWithDatabase(
         supabase.latencyMs = 0;
         await expectNoStrayAvatarObjects();
         expect(await ledger()).toEqual([]);
+      });
+    });
+
+    describe('signed URL expiry follows the storage provider', () => {
+      const claimsOf = (url: string) =>
+        JSON.parse(
+          Buffer.from(
+            (new URL(url).searchParams.get('token') as string).split('.')[1],
+            'base64url',
+          ).toString(),
+        ) as { iat: number; exp: number };
+
+      it('uses the provider expiry when signing takes real time (image and avatar)', async () => {
+        const session = await newSession(owner);
+        await makeup.uploadInitialImage(owner, session.id, await photo());
+        const image = await client.imageAsset.findFirstOrThrow({
+          where: { sessionId: session.id },
+        });
+        const user = await createUser(client);
+        await profile.updateAvatar(user, await photo('png'));
+        supabase.latencyMs = 1_100;
+
+        for (const sign of [
+          () => makeup.getImageSignedUrl(owner, image.id),
+          () => profile.getAvatarSignedUrl(user),
+        ]) {
+          const requestedAt = Date.now();
+          const signed = await sign();
+          const claims = claimsOf(signed.url);
+
+          expect(Date.parse(signed.expiresAt)).toBe(claims.exp * 1000);
+          expect(signed.expiresInSeconds).toBe(claims.exp - claims.iat);
+          expect(signed.expiresInSeconds).toBe(60);
+          // Supabase signed after the delay, so its expiry is later than the
+          // old local estimate (request time + 60 s) would have claimed.
+          expect(Date.parse(signed.expiresAt)).toBeGreaterThan(
+            requestedAt + 60_000,
+          );
+        }
+      });
+
+      it("reports the provider's clock when it differs from the API's, and the URL works for that window", async () => {
+        const user = await createUser(client);
+        await profile.updateAvatar(user, await photo('png'));
+        supabase.clockOffsetMs = -5 * 60_000; // Storage runs 5 minutes behind
+
+        const before = Date.now();
+        const signed = await profile.getAvatarSignedUrl(user);
+        const claims = claimsOf(signed.url);
+
+        expect(Date.parse(signed.expiresAt)).toBe(claims.exp * 1000);
+        expect(signed.expiresInSeconds).toBe(60);
+        expect(Date.parse(signed.expiresAt)).toBeLessThan(before);
+        expect((await supabase.fetch(signed.url)).status).toBe(200);
+        supabase.clockOffsetMs += 61_000;
+        expect((await supabase.fetch(signed.url)).status).not.toBe(200);
+      });
+    });
+
+    describe('switching the default storage provider', () => {
+      const s3 = new FakeS3CompatibleStorage();
+      const logger = mock<Logger>();
+      const supabaseProvider = () =>
+        new SupabaseStorageProvider(
+          {
+            storageUrl: FAKE_SUPABASE.url,
+            serviceKey: FAKE_SUPABASE.serviceKey,
+            bucket: FAKE_SUPABASE.bucket,
+            timeoutMs: 300,
+          },
+          supabase.fetch,
+        );
+
+      /** The services as a deployment with this registry and default would build them. */
+      function stack(
+        activeProvider: string,
+        providers: PrivateObjectStorageProvider[],
+      ) {
+        const storageService = new PrivateImageStorageService(
+          providers,
+          { activeProvider, localRoot: '/nonexistent' },
+          logger,
+        );
+        const lifecycleService = new PrivateImageLifecycleService(
+          prisma,
+          storageService,
+          new ConfigService({ NODE_ENV: 'test' }),
+          logger,
+        );
+        const validation = new ImageValidationService();
+        return {
+          storage: storageService,
+          lifecycle: lifecycleService,
+          makeup: new MakeupService(
+            prisma,
+            queue,
+            validation,
+            storageService,
+            lifecycleService,
+            ai,
+          ),
+          profile: new ProfileService(
+            prisma,
+            validation,
+            storageService,
+            lifecycleService,
+          ),
+          processor: new MakeupProcessor(
+            prisma,
+            ai,
+            storageService,
+            logger,
+            new ConfigService(),
+          ),
+        };
+      }
+      const supabaseDefault = () => stack('supabase', [supabaseProvider(), s3]);
+      const s3Default = () => stack('fake-s3', [supabaseProvider(), s3]);
+      const withoutS3 = () => stack('supabase', [supabaseProvider()]);
+
+      beforeEach(() => s3.reset());
+
+      async function sessionWithPhoto(
+        app: ReturnType<typeof stack>,
+        authId = owner,
+      ) {
+        const session = await newSession(authId);
+        const file = await photo('jpeg', 30);
+        await app.makeup.uploadInitialImage(authId, session.id, file);
+        const image = await client.imageAsset.findFirstOrThrow({
+          where: { sessionId: session.id },
+        });
+        return { session, image, file };
+      }
+
+      it('stores every new upload with the configured provider and records it', async () => {
+        const app = s3Default();
+        const { session: photoSession } = await sessionWithPhoto(app);
+        const { session: guideSession, step } = await guideFixture(owner);
+        await app.makeup.saveStepSnapshot(owner, step.id, await photo('png'));
+        await app.makeup.checkStep(
+          owner,
+          step.id,
+          's3-check',
+          await photo('webp'),
+        );
+        const user = await createUser(client);
+        await app.profile.updateAvatar(user, await photo('png', 7));
+
+        // Photo, snapshot and check image: every row records the new default.
+        const rows = await client.imageAsset.findMany({
+          where: { sessionId: { in: [photoSession.id, guideSession.id] } },
+        });
+        expect(rows.map((row) => row.storageProvider)).toEqual([
+          'fake-s3',
+          'fake-s3',
+          'fake-s3',
+        ]);
+        expect(
+          (
+            await client.userProfile.findUniqueOrThrow({
+              where: { authId: user },
+            })
+          ).avatarStorageProvider,
+        ).toBe('fake-s3');
+        expect(s3.objects.size).toBe(4);
+        expect(supabase.count('upload')).toBe(0);
+
+        // The AI worker reads the check image from the provider that stored it.
+        const payload = queue.enqueue.mock.calls[0][1];
+        const evaluate = jest.spyOn(ai, 'evaluateStep');
+        await app.processor.process(job('VISION_CHECK', payload).job);
+        expect(s3.calls).toContainEqual({
+          op: 'get',
+          key: expect.any(String) as string,
+        });
+        expect(evaluate.mock.calls[0]?.[0].image.bytes).toEqual(
+          s3.objects.get(
+            (
+              await client.imageAsset.findUniqueOrThrow({
+                where: { id: payload.imageId },
+              })
+            ).storageKey,
+          )?.bytes,
+        );
+      });
+
+      it('keeps serving, signing and processing images stored before the switch from their own provider', async () => {
+        const before = supabaseDefault();
+        const { session, image, file } = await sessionWithPhoto(before);
+        const user = await createUser(client);
+        await before.profile.updateAvatar(user, await photo('png', 9));
+        await before.makeup.savePreferences(owner, session.id, {
+          vibe: 'natural',
+          timeMinutes: 10,
+        });
+
+        const after = s3Default();
+        await expect(
+          after.makeup.getImageContent(owner, image.id),
+        ).resolves.toEqual({
+          mimeType: 'image/jpeg',
+          bytes: file.buffer,
+        });
+        const signed = await after.makeup.getImageSignedUrl(owner, image.id);
+        expect(signed.url.startsWith(FAKE_SUPABASE.url)).toBe(true);
+        expect((await supabase.fetch(signed.url)).status).toBe(200);
+        const avatarUrl = await after.profile.getAvatarSignedUrl(user);
+        expect((await supabase.fetch(avatarUrl.url)).status).toBe(200);
+
+        const run = await after.makeup.startAnalysis(
+          owner,
+          session.id,
+          'after-switch',
+        );
+        const personalize = jest.spyOn(ai, 'personalize');
+        await after.processor.process(
+          job('PERSONALIZATION', {
+            runId: run.id,
+            authId: owner,
+            sessionId: session.id,
+          }).job,
+        );
+        expect(personalize.mock.calls[0]?.[0].image.bytes).toEqual(file.buffer);
+        expect(s3.calls).toEqual([]);
+      });
+
+      it('removes old-provider images from their own provider when they are replaced or deleted', async () => {
+        const before = supabaseDefault();
+        const { session, image: oldPhoto } = await sessionWithPhoto(before);
+        const user = await createUser(client);
+        await before.profile.updateAvatar(user, await photo('png', 1));
+        const oldAvatar = (
+          await client.userProfile.findUniqueOrThrow({
+            where: { authId: user },
+          })
+        ).avatarUrl as string;
+
+        const after = s3Default();
+        await after.makeup.uploadInitialImage(
+          owner,
+          session.id,
+          await photo('png', 2),
+        );
+        await after.profile.updateAvatar(user, await photo('png', 3));
+
+        expect(supabase.objects.has(oldPhoto.storageKey)).toBe(false);
+        expect(supabase.objects.has(oldAvatar)).toBe(false);
+        expect(s3.objects.size).toBe(2);
+        const [newPhoto] = await client.imageAsset.findMany({
+          where: { sessionId: session.id },
+        });
+        expect(newPhoto.storageProvider).toBe('fake-s3');
+
+        // A session holding images from both providers is deleted from both.
+        const { session: mixed, step } = await guideFixture(owner);
+        await before.makeup.saveStepSnapshot(
+          owner,
+          step.id,
+          await photo('jpeg', 4),
+        );
+        await after.makeup.saveStepSnapshot(
+          owner,
+          step.id,
+          await photo('jpeg', 5),
+        );
+        await client.makeupSession.update({
+          where: { id: mixed.id },
+          data: { status: 'COMPLETED' },
+        });
+        const mixedKeys = (
+          await client.imageAsset.findMany({ where: { sessionId: mixed.id } })
+        ).map((i) => `${i.storageProvider}:${i.storageKey}`);
+        expect(mixedKeys.filter((k) => k.startsWith('supabase:'))).toHaveLength(
+          1,
+        );
+        expect(mixedKeys.filter((k) => k.startsWith('fake-s3:'))).toHaveLength(
+          1,
+        );
+
+        await after.makeup.deleteSession(owner, mixed.id);
+        for (const entry of mixedKeys) {
+          const [provider, key] = entry.split(/:(.*)/s);
+          expect(
+            provider === 'supabase'
+              ? supabase.objects.has(key)
+              : s3.objects.has(key),
+          ).toBe(false);
+        }
+        expect(await ledger()).toEqual([]);
+      });
+
+      it('keeps images from the newer provider working after switching back', async () => {
+        const { image, file } = await sessionWithPhoto(s3Default());
+
+        const back = supabaseDefault();
+        await expect(
+          back.makeup.getImageContent(owner, image.id),
+        ).resolves.toMatchObject({
+          bytes: file.buffer,
+        });
+        const signed = await back.makeup.getImageSignedUrl(owner, image.id);
+        expect(s3.download(signed.url)).toEqual({
+          status: 200,
+          bytes: file.buffer,
+        });
+        expect(signed.expiresInSeconds).toBe(60);
+      });
+
+      describe('when a provider that still holds images is missing', () => {
+        it('fails safely, never treats its deletions as done, and recovers once it is registered again', async () => {
+          const { session, image } = await sessionWithPhoto(s3Default());
+          const user = await createUser(client);
+          await s3Default().profile.updateAvatar(user, await photo('png'));
+          const missing = withoutS3();
+
+          expect(await missing.lifecycle.auditReferencedProviders()).toEqual([
+            'fake-s3',
+          ]);
+          expect(
+            await rejection(missing.makeup.getImageContent(owner, image.id)),
+          ).toMatchObject({
+            status: 500,
+            message: 'Image storage is unavailable',
+          });
+          expect(
+            await rejection(missing.makeup.getImageSignedUrl(owner, image.id)),
+          ).toMatchObject({
+            status: 500,
+          });
+          expect(
+            await rejection(missing.profile.getAvatarSignedUrl(user)),
+          ).toMatchObject({
+            status: 500,
+          });
+
+          // New uploads still work (they use the default), and replacing the
+          // stranded image records its deletion instead of dropping it.
+          await missing.makeup.uploadInitialImage(
+            owner,
+            session.id,
+            await photo('png'),
+          );
+          expect(s3.objects.has(image.storageKey)).toBe(true);
+          expect(await ledger()).toEqual([
+            expect.objectContaining({
+              provider: 'fake-s3',
+              storageKey: image.storageKey,
+              status: 'PENDING',
+              lastErrorCode: 'UNKNOWN_STORAGE_PROVIDER',
+            }),
+          ]);
+
+          const restored = s3Default();
+          await makeDue();
+          await expect(restored.lifecycle.processDue()).resolves.toEqual([
+            'DELETED',
+          ]);
+          expect(s3.objects.has(image.storageKey)).toBe(false);
+          expect(await restored.lifecycle.auditReferencedProviders()).toEqual(
+            [],
+          );
+        });
+
+        it('fails the AI run with a safe message instead of reading another provider', async () => {
+          const app = s3Default();
+          const { step } = await guideFixture(owner);
+          await app.makeup.checkStep(
+            owner,
+            step.id,
+            'missing-provider',
+            await photo(),
+          );
+          const payload = queue.enqueue.mock.calls[0][1];
+          const { job: vision, discard } = job('VISION_CHECK', payload);
+          const downloadsBefore = supabase.count('download');
+
+          expect(
+            await rejection(withoutS3().processor.process(vision)),
+          ).toMatchObject({
+            code: 'IMAGE_STORAGE_FAILED',
+          });
+          expect(discard).toHaveBeenCalledTimes(1);
+          expect(supabase.count('download')).toBe(downloadsBefore);
+        });
+      });
+
+      describe('failures of the configured provider', () => {
+        it('leaves no reference when an upload to it fails, and cleans up later', async () => {
+          const app = s3Default();
+          const session = await newSession(owner);
+          s3.failNext('put', 'STORAGE_UNAVAILABLE');
+
+          expect(
+            await rejection(
+              app.makeup.uploadInitialImage(owner, session.id, await photo()),
+            ),
+          ).toMatchObject({ status: 503 });
+
+          expect(
+            await client.imageAsset.count({ where: { sessionId: session.id } }),
+          ).toBe(0);
+          expect(await ledger()).toEqual([
+            expect.objectContaining({
+              provider: 'fake-s3',
+              reason: 'UPLOAD_ABANDONED',
+            }),
+          ]);
+          await makeDue();
+          await expect(app.lifecycle.processDue()).resolves.toEqual([
+            'DELETED',
+          ]);
+        });
+
+        it('keeps a failed deletion in the ledger and retries it', async () => {
+          const app = s3Default();
+          const { session, image } = await sessionWithPhoto(app);
+          s3.failNext('delete', 'STORAGE_TIMEOUT');
+
+          await app.makeup.uploadInitialImage(
+            owner,
+            session.id,
+            await photo('png'),
+          );
+
+          expect(s3.objects.has(image.storageKey)).toBe(true);
+          expect(await ledger()).toEqual([
+            expect.objectContaining({
+              lastErrorCode: 'STORAGE_TIMEOUT',
+              status: 'PENDING',
+            }),
+          ]);
+          await makeDue();
+          await expect(app.lifecycle.processDue()).resolves.toEqual([
+            'DELETED',
+          ]);
+          expect(s3.objects.has(image.storageKey)).toBe(false);
+        });
+
+        it('maps signing and worker read failures like any other provider', async () => {
+          const app = s3Default();
+          const { step } = await guideFixture(owner);
+          const run = await app.makeup.checkStep(
+            owner,
+            step.id,
+            's3-failure',
+            await photo(),
+          );
+          const payload = queue.enqueue.mock.calls[0][1];
+          const imageId = payload.imageId as string;
+
+          s3.failNext('sign', 'STORAGE_UNAVAILABLE');
+          expect(
+            await rejection(app.makeup.getImageSignedUrl(owner, imageId)),
+          ).toMatchObject({
+            status: 503,
+          });
+
+          s3.failNext('get', 'STORAGE_TIMEOUT');
+          const { job: vision, discard } = job('VISION_CHECK', payload);
+          expect(await rejection(app.processor.process(vision))).toMatchObject({
+            code: 'IMAGE_STORAGE_UNAVAILABLE',
+          });
+          expect(discard).not.toHaveBeenCalled();
+          expect(
+            await client.aiRun.findUniqueOrThrow({ where: { id: run.id } }),
+          ).toMatchObject({ status: 'QUEUED' });
+        });
       });
     });
 

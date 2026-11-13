@@ -1,6 +1,7 @@
 import {
   Inject,
   Injectable,
+  OnApplicationBootstrap,
   OnModuleDestroy,
   OnModuleInit,
 } from '@nestjs/common';
@@ -72,7 +73,7 @@ const CONTEXT = 'PrivateImageLifecycle';
  */
 @Injectable()
 export class PrivateImageLifecycleService
-  implements OnModuleInit, OnModuleDestroy
+  implements OnModuleInit, OnApplicationBootstrap, OnModuleDestroy
 {
   private timer?: ReturnType<typeof setInterval>;
   private sweeping = false;
@@ -95,6 +96,46 @@ export class PrivateImageLifecycleService
 
   onModuleDestroy(): void {
     clearInterval(this.timer);
+  }
+
+  onApplicationBootstrap(): void {
+    if (this.config.get<string>('NODE_ENV') === 'test') return;
+    void this.auditReferencedProviders();
+  }
+
+  /**
+   * Changing the default provider must not strand existing images: every
+   * provider still referenced by an image, avatar or pending deletion has to
+   * stay registered and configured. Logs an error for each one that is not
+   * (never blocks startup) and returns their ids.
+   */
+  async auditReferencedProviders(): Promise<string[]> {
+    try {
+      const rows = await this.prisma.$queryRaw<Array<{ provider: string }>>`
+        SELECT DISTINCT "storageProvider" AS provider FROM "ImageAsset"
+        UNION
+        SELECT DISTINCT "avatarStorageProvider" FROM "userProfile"
+        WHERE "avatarStorageProvider" IS NOT NULL
+        UNION
+        SELECT DISTINCT provider FROM "PrivateStorageCleanup"
+      `;
+      const unavailable = rows
+        .map((row) => row.provider)
+        .filter((provider) => !this.storage.isAvailable(provider))
+        .sort();
+      for (const provider of unavailable) {
+        this.logger.error(
+          'Stored images reference a storage provider that is not registered or not configured; they cannot be served or deleted',
+          { context: CONTEXT, provider },
+        );
+      }
+      return unavailable;
+    } catch {
+      this.logger.warn('Storage provider audit could not run', {
+        context: CONTEXT,
+      });
+      return [];
+    }
   }
 
   /**

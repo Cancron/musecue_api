@@ -1,4 +1,5 @@
 import { join, resolve } from 'node:path';
+import { PROVIDER_ID_PATTERN } from './private-object-storage.provider';
 
 /** Provider identifiers persisted in `ImageAsset.storageProvider` / `userProfile.avatarStorageProvider`. */
 export const SUPABASE_STORAGE_PROVIDER_ID = 'supabase';
@@ -22,7 +23,11 @@ export interface SupabaseStorageConfig {
 }
 
 export interface PrivateStorageConfig {
-  /** Provider used for new uploads. Reads/deletes follow each record's provider. */
+  /**
+   * Id of the provider used for new uploads; it must be registered in
+   * `StorageModule` (checked at startup). Reads, deletions and signed URLs
+   * always follow each record's own provider.
+   */
   activeProvider: string;
   localRoot: string;
   /** Undefined when Supabase variables are not set (allowed only if it is not active). */
@@ -65,12 +70,10 @@ function resolveActiveProvider(config: ConfigReader): string {
     (read(config, 'NODE_ENV') === 'test'
       ? LOCAL_STORAGE_PROVIDER_ID
       : SUPABASE_STORAGE_PROVIDER_ID);
-  if (
-    provider !== SUPABASE_STORAGE_PROVIDER_ID &&
-    provider !== LOCAL_STORAGE_PROVIDER_ID
-  ) {
+  // Whether the id is registered is checked by PrivateImageStorageService.
+  if (!PROVIDER_ID_PATTERN.test(provider)) {
     throw new Error(
-      'PRIVATE_STORAGE_PROVIDER must be either "supabase" or "local"',
+      'PRIVATE_STORAGE_PROVIDER must be a provider id (lowercase letters, digits and "-", at most 32 characters)',
     );
   }
   return provider;

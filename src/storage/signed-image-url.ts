@@ -5,8 +5,8 @@ import type {
 import { toImageStorageHttpError } from './private-storage-http';
 
 /**
- * Lifetime of every signed image URL handed to clients. The storage layer
- * enforces it as a strict maximum (see `MAX_SIGNED_URL_TTL_SECONDS`).
+ * Lifetime requested for every signed image URL handed to clients. The
+ * storage layer enforces it as a strict maximum (`MAX_SIGNED_URL_TTL_SECONDS`).
  */
 export const SIGNED_IMAGE_URL_TTL_SECONDS = 60;
 
@@ -20,7 +20,9 @@ export interface SignedImageUrlResponse {
  * The single path used to issue client-facing signed URLs (makeup images and
  * profile avatars), so both get identical protections: the provider and key
  * stored with the record, a strict 60 s lifetime verified against the
- * provider's token, nothing persisted or logged, and client-safe errors.
+ * provider's grant, nothing persisted or logged, and client-safe errors.
+ * `expiresAt` and `expiresInSeconds` both come from the provider's grant
+ * (`expiresInSeconds = expiresAt - issuedAt`), never from the local clock.
  * Callers must have checked ownership before calling.
  */
 export async function issueSignedImageUrl(
@@ -36,7 +38,7 @@ export async function issueSignedImageUrl(
     return {
       url: signed.url,
       expiresAt: signed.expiresAt.toISOString(),
-      expiresInSeconds: SIGNED_IMAGE_URL_TTL_SECONDS,
+      expiresInSeconds: signed.expiresInSeconds,
     };
   } catch (error) {
     throw toImageStorageHttpError(error, notFoundMessage);

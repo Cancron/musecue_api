@@ -3,6 +3,7 @@ import { WINSTON_MODULE_PROVIDER } from 'nest-winston';
 import type { Logger } from 'winston';
 import {
   MAX_SIGNED_URL_TTL_SECONDS,
+  PROVIDER_ID_PATTERN,
   PRIVATE_OBJECT_STORAGE_PROVIDERS,
   type PrivateObjectRef,
   type PrivateObjectStorageProvider,
@@ -47,6 +48,11 @@ export class PrivateImageStorageService {
   ) {
     const registry = new Map<string, PrivateObjectStorageProvider>();
     for (const provider of providers) {
+      if (!PROVIDER_ID_PATTERN.test(provider.id)) {
+        throw new Error(
+          `Invalid private storage provider id "${provider.id}" (lowercase letters, digits and "-", at most 32 characters)`,
+        );
+      }
       if (registry.has(provider.id)) {
         throw new Error(
           `Duplicate private storage provider id "${provider.id}"`,
@@ -67,6 +73,16 @@ export class PrivateImageStorageService {
   /** Provider id used for new uploads. */
   get activeProviderId(): string {
     return this.activeProvider.id;
+  }
+
+  /** Ids of every registered provider (active or kept for existing images). */
+  get registeredProviderIds(): string[] {
+    return [...this.providers.keys()];
+  }
+
+  /** True when images stored under `providerId` can be served and deleted. */
+  isAvailable(providerId: string): boolean {
+    return this.providers.get(providerId)?.isConfigured() ?? false;
   }
 
   /**
@@ -120,13 +136,16 @@ export class PrivateImageStorageService {
 
   /**
    * Issues a short-lived read URL from the provider that stores the object.
-   * `expiresAt` is computed before the request, so it is never later than the
-   * provider-side expiry. Nothing is cached or persisted; URLs are not logged.
+   * `expiresAt` is the provider's own expiry and `expiresInSeconds` the
+   * provider's issued lifetime (`expiresAt - issuedAt`), so the two always
+   * agree and nothing is derived from the local clock. Any provider's grant
+   * longer than requested (at most 60 s) is rejected. Nothing is cached or
+   * persisted; URLs are not logged.
    */
   async createSignedUrl(
     ref: PrivateObjectRef,
     expiresInSeconds: number,
-  ): Promise<{ url: string; expiresAt: Date }> {
+  ): Promise<{ url: string; expiresAt: Date; expiresInSeconds: number }> {
     if (
       !Number.isInteger(expiresInSeconds) ||
       expiresInSeconds < 1 ||
@@ -136,15 +155,28 @@ export class PrivateImageStorageService {
         `Signed URL lifetime must be 1-${MAX_SIGNED_URL_TTL_SECONDS} seconds`,
       );
     }
-    const issuedAt = Date.now();
-    const url = await this.run(ref.provider, 'sign', () => {
+    return this.run(ref.provider, 'sign', async () => {
       assertValidPrivateImageKey(ref.key);
-      return this.resolve(ref.provider).createSignedUrl(
+      const signed = await this.resolve(ref.provider).createSignedUrl(
         ref.key,
         expiresInSeconds,
       );
+      const lifetimeMs = signed.expiresAt.getTime() - signed.issuedAt.getTime();
+      const lifetimeSeconds = lifetimeMs / 1000;
+      if (
+        !signed.url ||
+        !Number.isInteger(lifetimeSeconds) ||
+        lifetimeSeconds < 1 ||
+        lifetimeSeconds > expiresInSeconds
+      ) {
+        throw new PrivateStorageError('INVALID_PROVIDER_RESPONSE');
+      }
+      return {
+        url: signed.url,
+        expiresAt: signed.expiresAt,
+        expiresInSeconds: lifetimeSeconds,
+      };
     });
-    return { url, expiresAt: new Date(issuedAt + expiresInSeconds * 1000) };
   }
 
   private resolve(providerId: string): PrivateObjectStorageProvider {

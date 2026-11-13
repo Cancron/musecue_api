@@ -224,20 +224,66 @@ describe('PrivateImageStorageService (private cloud storage)', () => {
   describe('createSignedUrl', () => {
     const SIGNED = `https://project.supabase.co/storage/v1/object/sign/bucket/${KEY}?token=abc`;
 
-    it('signs with the provider that stores the object and reports the expiry', async () => {
-      jest.spyOn(Date, 'now').mockReturnValue(1_000_000);
-      local.createSignedUrl.mockResolvedValue('unused');
-      supabase.createSignedUrl.mockResolvedValue(SIGNED);
+    const grant = (issuedAtMs: number, lifetimeMs: number) => ({
+      url: SIGNED,
+      issuedAt: new Date(issuedAtMs),
+      expiresAt: new Date(issuedAtMs + lifetimeMs),
+    });
+
+    it("reports the provider's own expiry, never a locally computed one", async () => {
+      const now = jest.spyOn(Date, 'now');
+      // Provider clock 10 minutes ahead of ours, and it signed 3 s later.
+      const providerIssuedAt = Date.parse('2026-11-12T12:10:03.000Z');
+      supabase.createSignedUrl.mockResolvedValue(
+        grant(providerIssuedAt, 60_000),
+      );
+      now.mockClear();
 
       await expect(
         storage.createSignedUrl({ provider: 'supabase', key: KEY }, 60),
       ).resolves.toEqual({
         url: SIGNED,
-        expiresAt: new Date(1_000_000 + 60_000),
+        expiresAt: new Date('2026-11-12T12:11:03.000Z'),
+        expiresInSeconds: 60,
       });
+      expect(now).not.toHaveBeenCalled();
       expect(supabase.createSignedUrl.mock.calls).toEqual([[KEY, 60]]);
       expect(local.createSignedUrl.mock.calls).toHaveLength(0);
     });
+
+    it('reports a shorter provider lifetime as it is, keeping both fields consistent', async () => {
+      supabase.createSignedUrl.mockResolvedValue(grant(5_000_000, 30_000));
+
+      const signed = await storage.createSignedUrl(
+        { provider: 'supabase', key: KEY },
+        60,
+      );
+
+      expect(signed.expiresInSeconds).toBe(30);
+      expect(signed.expiresAt).toEqual(new Date(5_030_000));
+    });
+
+    it.each([
+      ['longer than requested', grant(0, 61_000)],
+      ['far longer than requested', grant(0, 3_600_000)],
+      ['not a whole number of seconds', grant(0, 59_500)],
+      ['zero', grant(0, 0)],
+      ['negative (expires before it was issued)', grant(10_000, -1_000)],
+      ['missing a URL', { ...grant(0, 60_000), url: '' }],
+    ])(
+      'rejects any provider grant whose lifetime is %s',
+      async (_label, signed) => {
+        supabase.createSignedUrl.mockResolvedValue(signed);
+
+        await expect(
+          storage.createSignedUrl({ provider: 'supabase', key: KEY }, 60),
+        ).rejects.toMatchObject({
+          code: 'INVALID_PROVIDER_RESPONSE',
+          provider: 'supabase',
+          operation: 'sign',
+        });
+      },
+    );
 
     it.each([0, 61, 3600, 1.5])(
       'refuses a lifetime of %p seconds',

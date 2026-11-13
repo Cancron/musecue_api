@@ -121,6 +121,7 @@ WHERE status = 'FAILED';
 
 - The URL is generated from the provider and key stored on the image and is valid for 60 seconds. Each call issues a new URL, so clients request another one when it expires. URLs are never stored or logged, and the response is sent with `Cache-Control: private, no-store`.
 - The URL contains only an object-scoped token signed by Supabase, never the server key. It reveals the Supabase host, the bucket name and the object key (which contains the user's own id and session id).
+- `expiresAt` is the expiry reported by the storage provider (for Supabase, the signed token's `exp`), never the API's request time + 60 s. `expiresInSeconds` is the provider's issued lifetime (`exp − iat`), so `expiresAt = issuedAt + expiresInSeconds` always holds. Both come from the provider's clock: a slow signing call or a clock difference between the API and the provider is reflected exactly. Clients that don't trust their own clock should count down `expiresInSeconds` from when they received the response.
 - The maximum lifetime is strictly 60 seconds. The API asks for 60 s, and both the facade and the provider refuse longer requests. It accepts a provider response only if it is a signed URL for exactly that bucket and key, and its token is a JWT whose signed lifetime (`exp − iat`) is at most the requested 60 s. There is no clock-skew allowance. Tokens without readable `iat`/`exp` claims are rejected rather than trusted. Because the lifetime comes from the issuer's own claims, this does not depend on the API and Supabase clocks agreeing.
 - Responses: `401` without a valid token. `404` `Image not found` for a missing image *or another user's image* (they are indistinguishable). `404` `Image content is unavailable` for a missing object or a non-uploaded image. `409` for images still on the local filesystem (use `/content`). `503` or `500` for storage failures, as in the table above.
 - `GET /v1/images/:imageId/content` is unchanged.
@@ -134,7 +135,20 @@ WHERE status = 'FAILED';
 - External avatars (for example a Google profile photo) are never signed or replaced. `GET /v1/profile` keeps returning their URL unchanged, and this endpoint answers `409` `This avatar is an external image and has no signed URL. Use avatarUrl from the profile instead.`
 - Changing or removing an avatar never leaves the profile pointing at a missing file. The new file is confirmed in the same transaction that updates the profile, the old file is only recorded for deletion in that transaction, and the old file is deleted only after the commit. Signed URLs issued for an old avatar stop working once it is deleted.
 
-To add a backend such as an S3-compatible service, implement `PrivateObjectStorageProvider` (`src/storage/private-object-storage.provider.ts`) and register it in `StorageModule`. Keys, validation, ownership checks, and the image workflow stay the same. The focused storage tests run with `npx jest private-cloud`.
+#### Storage providers
+
+New uploads go to the provider named by `PRIVATE_STORAGE_PROVIDER` (default `supabase`). Every image and avatar row stores the provider that holds it. Downloads, deletions, signed URLs and AI-worker reads always use that stored provider, never the current default. Changing the default therefore only affects new uploads:
+- Images stored earlier keep working, as long as their provider stays registered and configured.
+- Replacing or deleting an old image removes it from its own provider.
+- Switching back later works the same way.
+
+To add a backend such as an S3-compatible service:
+
+1. Implement `PrivateObjectStorageProvider` (`src/storage/private-object-storage.provider.ts`): `put` (write-once), `get`, `delete` (exact key, idempotent, only report success once the object is really gone), `createSignedUrl`, and `isConfigured`. `createSignedUrl` must return the provider's own validity window (`issuedAt`/`expiresAt`, for example from `X-Amz-Date` + `X-Amz-Expires`) and refuse lifetimes above 60 s. Errors must be `PrivateStorageError`s with safe messages.
+2. Give it a stable id matching `^[a-z][a-z0-9-]{0,31}$` (stored in `VARCHAR(32)` columns), register it in `StorageModule`, and validate its settings at startup.
+3. Add it to the provider contract suite (`src/storage/provider-contract.private-cloud.spec.ts`). Supabase, a fake S3-compatible store and the local filesystem all pass the same cases there. Keys, ownership checks, validation and the image workflows need no changes.
+
+Never rename or unregister a provider, or remove its credentials, while rows still reference it. At startup the API logs an error (`Stored images reference a storage provider that is not registered or not configured`) for every such provider found in images, avatars or pending deletions. While a provider is missing, its images answer `500 Image storage is unavailable`, AI runs that need them fail with a safe message, and their deletions stay `PENDING` in the cleanup ledger until the provider is registered again. They are never counted as done. The focused storage tests run with `npx jest private-cloud`.
 
 ### Live AI with OpenRouter
 

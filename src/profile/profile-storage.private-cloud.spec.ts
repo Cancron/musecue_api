@@ -131,6 +131,7 @@ describe('ProfileService private cloud storage lifecycle', () => {
       imageStorage.createSignedUrl.mockResolvedValue({
         url: SIGNED,
         expiresAt: new Date('2026-11-12T12:01:00.000Z'),
+        expiresInSeconds: 60,
       });
 
       await expect(service.getAvatarSignedUrl('owner-id')).resolves.toEqual({

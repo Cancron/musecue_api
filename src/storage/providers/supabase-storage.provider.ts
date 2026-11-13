@@ -7,6 +7,7 @@ import {
 import {
   MAX_SIGNED_URL_TTL_SECONDS,
   type PrivateObjectStorageProvider,
+  type SignedObjectUrl,
 } from '../private-object-storage.provider';
 import {
   SUPABASE_STORAGE_PROVIDER_ID,
@@ -49,6 +50,10 @@ export class SupabaseStorageProvider implements PrivateObjectStorageProvider {
       { apikey: key, Authorization: `Bearer ${key}` },
       withTimeout(fetchImpl, config.timeoutMs),
     );
+  }
+
+  isConfigured(): boolean {
+    return this.client !== undefined;
   }
 
   async put(key: string, bytes: Buffer, contentType: string): Promise<void> {
@@ -121,7 +126,7 @@ export class SupabaseStorageProvider implements PrivateObjectStorageProvider {
   async createSignedUrl(
     key: string,
     expiresInSeconds: number,
-  ): Promise<string> {
+  ): Promise<SignedObjectUrl> {
     if (
       !Number.isInteger(expiresInSeconds) ||
       expiresInSeconds < 1 ||
@@ -137,13 +142,16 @@ export class SupabaseStorageProvider implements PrivateObjectStorageProvider {
     );
     if (error) throw this.toStorageError(error, 'sign');
     const url = data?.signedUrl;
-    if (!url || !this.isExpectedSignedUrl(url, key, expiresInSeconds)) {
+    const validity = url
+      ? this.signedUrlValidity(url, key, expiresInSeconds)
+      : undefined;
+    if (!url || !validity) {
       throw new PrivateStorageError('INVALID_PROVIDER_RESPONSE', {
         provider: this.id,
         operation: 'sign',
       });
     }
-    return url;
+    return { url, ...validity };
   }
 
   /**
@@ -152,18 +160,19 @@ export class SupabaseStorageProvider implements PrivateObjectStorageProvider {
    * lifetime of at most `expiresInSeconds` (itself at most 60 s). The
    * lifetime comes from the issuer's own signed claims, so the check is
    * strict without depending on clock agreement; tokens whose lifetime cannot
-   * be read are rejected rather than trusted.
+   * be read are rejected rather than trusted. Returns the validity window
+   * exactly as Supabase will enforce it (the token's `iat`/`exp`).
    */
-  private isExpectedSignedUrl(
+  private signedUrlValidity(
     value: string,
     key: string,
     expiresInSeconds: number,
-  ): boolean {
+  ): { issuedAt: Date; expiresAt: Date } | undefined {
     let url: URL;
     try {
       url = new URL(value);
     } catch {
-      return false;
+      return undefined;
     }
     const base = new URL(this.config?.storageUrl ?? '');
     const expectedPath = `${base.pathname}/object/sign/${this.bucket}/${key}`;
@@ -175,12 +184,16 @@ export class SupabaseStorageProvider implements PrivateObjectStorageProvider {
       url.password ||
       !token
     ) {
-      return false;
+      return undefined;
     }
-    const lifetime = tokenLifetimeSeconds(token);
-    return (
-      lifetime !== undefined && lifetime > 0 && lifetime <= expiresInSeconds
-    );
+    const claims = tokenValidity(token);
+    if (!claims) return undefined;
+    const lifetime = claims.exp - claims.iat;
+    if (lifetime <= 0 || lifetime > expiresInSeconds) return undefined;
+    return {
+      issuedAt: new Date(claims.iat * 1000),
+      expiresAt: new Date(claims.exp * 1000),
+    };
   }
 
   /**
@@ -336,10 +349,12 @@ function classifyStatus(
 }
 
 /**
- * `exp - iat` of a JWT-shaped token (its issued lifetime in seconds), or
- * undefined when the token or either claim is missing or malformed.
+ * `iat`/`exp` (seconds) of a JWT-shaped token, or undefined when the token or
+ * either claim is missing or malformed.
  */
-function tokenLifetimeSeconds(token: string): number | undefined {
+function tokenValidity(
+  token: string,
+): { iat: number; exp: number } | undefined {
   const parts = token.split('.');
   if (parts.length !== 3) return undefined;
   try {
@@ -356,7 +371,7 @@ function tokenLifetimeSeconds(token: string): number | undefined {
       Number.isInteger(payload.iat) &&
       Number.isInteger(payload.exp)
     ) {
-      return payload.exp - payload.iat;
+      return { iat: payload.iat, exp: payload.exp };
     }
   } catch {
     return undefined;

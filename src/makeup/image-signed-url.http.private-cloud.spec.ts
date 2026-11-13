@@ -316,6 +316,47 @@ describe('GET /v1/images/:imageId/signed-url (HTTP, mocked Supabase)', () => {
       expect(claims.exp).toBe(NOW_SECONDS + 60);
     });
 
+    it.each([
+      ['signs 3 s after the request (slow provider)', 3],
+      ['runs 10 minutes ahead of the API', 600],
+      ['runs 10 minutes behind the API', -600],
+    ])(
+      "reports Supabase's own expiry when Supabase %s",
+      async (_label, offsetSeconds) => {
+        respond = (url, init) => {
+          const { expiresIn } = JSON.parse(init?.body as string) as {
+            expiresIn: number;
+          };
+          const iat = NOW_SECONDS + offsetSeconds;
+          return json({
+            signedURL: `/object/sign/${SUPABASE.bucket}/${KEY}?token=${tokenFor(iat + expiresIn, 1, iat)}`,
+          });
+        };
+
+        const response = await getSignedUrl('owned-image', OWNER).expect(200);
+
+        const { data } = bodyOf(response);
+        const claims = JSON.parse(
+          Buffer.from(
+            (new URL(data.url).searchParams.get('token') as string).split(
+              '.',
+            )[1],
+            'base64url',
+          ).toString(),
+        ) as { iat: number; exp: number };
+        expect(data.expiresAt).toBe(new Date(claims.exp * 1000).toISOString());
+        expect(data.expiresInSeconds).toBe(claims.exp - claims.iat);
+        expect(data.expiresInSeconds).toBe(60);
+        expect(Date.parse(data.expiresAt) - claims.iat * 1000).toBe(
+          data.expiresInSeconds * 1000,
+        );
+        // Not the local-clock estimate (request time + 60 s).
+        expect(data.expiresAt).not.toBe(
+          new Date(NOW.getTime() + 60_000).toISOString(),
+        );
+      },
+    );
+
     it('issues a fresh URL on every request and persists nothing', async () => {
       const first = await getSignedUrl('owned-image', OWNER).expect(200);
       freezeTime(new Date(NOW.getTime() + 61_000));

@@ -12,6 +12,7 @@ import { PrivateImageStorageService } from '../src/storage/private-image-storage
 import type {
   PrivateObjectRef,
   PrivateObjectStorageProvider,
+  SignedObjectUrl,
 } from '../src/storage/private-object-storage.provider';
 import { PrivateStorageError } from '../src/storage/private-storage.error';
 import {
@@ -33,6 +34,10 @@ class MemoryProvider implements PrivateObjectStorageProvider {
   readonly deleteCalls: string[] = [];
   failDeletes = false;
   deleteDelayMs = 0;
+
+  isConfigured(): boolean {
+    return true;
+  }
 
   put(key: string, bytes: Buffer): Promise<void> {
     if (this.objects.has(key)) {
@@ -58,7 +63,7 @@ class MemoryProvider implements PrivateObjectStorageProvider {
     this.objects.delete(key);
   }
 
-  createSignedUrl(): Promise<string> {
+  createSignedUrl(): Promise<SignedObjectUrl> {
     return Promise.reject(new PrivateStorageError('SIGNED_URL_UNSUPPORTED'));
   }
 }

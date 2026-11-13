@@ -407,6 +407,15 @@ describe('StorageModule wiring (private cloud storage)', () => {
     ).rejects.toMatchObject({ code: 'STORAGE_ACCESS_DENIED' });
   });
 
+  it('fails application startup when the configured provider is not registered', async () => {
+    await expect(
+      compileStorage({
+        PRIVATE_STORAGE_PROVIDER: 's3',
+        PRIVATE_UPLOAD_DIR: localRoot,
+      }),
+    ).rejects.toThrow('Private storage provider "s3" is not registered');
+  });
+
   it('fails application startup when Supabase is active but not configured', async () => {
     await expect(
       compileStorage({ PRIVATE_STORAGE_PROVIDER: 'supabase' }),
