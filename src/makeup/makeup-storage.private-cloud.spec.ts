@@ -71,6 +71,9 @@ describe('MakeupService private cloud storage lifecycle', () => {
     imageValidation.validate.mockResolvedValue(VALIDATED);
     lifecycle.upload.mockResolvedValue(STORED);
     lifecycle.processRefs.mockResolvedValue([]);
+    lifecycle.scheduleDeletion.mockImplementation((_tx, refs) =>
+      Promise.resolve(refs),
+    );
     lifecycle.abandonUpload.mockResolvedValue('DELETED');
     prisma.makeupSession.findFirst.mockResolvedValue({
       id: 'session-id',
@@ -118,7 +121,7 @@ describe('MakeupService private cloud storage lifecycle', () => {
       const replaced = { provider: 'local', key: legacy.storageKey };
       expect(lifecycle.confirmUpload.mock.calls).toEqual([[tx, STORED]]);
       expect(lifecycle.scheduleDeletion.mock.calls).toEqual([
-        [tx, [replaced], 'IMAGE_REPLACED'],
+        [tx, [replaced], 'IMAGE_REPLACED', 'owner'],
       ]);
       expect(lifecycle.processRefs.mock.calls).toEqual([[[replaced]]]);
       expect(lifecycle.abandonUpload.mock.calls).toHaveLength(0);
@@ -298,7 +301,7 @@ describe('MakeupService private cloud storage lifecycle', () => {
         [{ where: { id: 'image-id' } }],
       ]);
       expect(lifecycle.scheduleDeletion.mock.calls).toEqual([
-        [tx, [STORED], 'IMAGE_DISCARDED'],
+        [tx, [STORED], 'IMAGE_DISCARDED', 'owner'],
       ]);
       expect(lifecycle.processRefs.mock.calls).toEqual([[[STORED]]]);
     });
@@ -351,7 +354,7 @@ describe('MakeupService private cloud storage lifecycle', () => {
         where: { id: 'session-id', authId: 'owner', status: 'COMPLETED' },
       });
       expect(lifecycle.scheduleDeletion.mock.calls).toEqual([
-        [tx, refs, 'SESSION_DELETED'],
+        [tx, refs, 'SESSION_DELETED', 'owner'],
       ]);
       expect(lifecycle.processRefs.mock.calls).toEqual([[refs]]);
     });
@@ -577,6 +580,36 @@ describe('MakeupProcessor private cloud storage reads', () => {
       expect(ai.evaluateStep.mock.calls).toHaveLength(0);
     },
   );
+
+  it('keeps a database failure while loading the image retryable, without persisting its text', async () => {
+    const { prisma, ai, storage, processor, job, discard } = setup(
+      new PrivateStorageError('STORAGE_UNAVAILABLE'),
+    );
+    prisma.imageAsset.findFirst.mockRejectedValue(
+      Object.assign(
+        new Error("Can't reach database server at `db.internal:5432`"),
+        { code: 'P1001' },
+      ),
+    );
+    const finalAttempt = { ...job, attemptsMade: 2 } as typeof job;
+
+    await expect(processor.process(finalAttempt)).rejects.toMatchObject({
+      code: 'IMAGE_LOAD_FAILED',
+      retryable: true,
+    });
+    expect(storage.readImage.mock.calls).toHaveLength(0);
+    expect(ai.evaluateStep.mock.calls).toHaveLength(0);
+    expect(discard.mock.calls).toHaveLength(0);
+    const failed = prisma.aiRun.updateMany.mock.calls.find(
+      ([args]) => args.data.status === 'FAILED',
+    );
+    expect(failed?.[0].data.error).toBe(
+      'Your photo could not be loaded right now. Please try again.',
+    );
+    expect(JSON.stringify(prisma.aiRun.updateMany.mock.calls)).not.toContain(
+      'db.internal',
+    );
+  });
 
   it.each([
     ['a corrupted or mismatched object', 'INVALID_PROVIDER_RESPONSE'],

@@ -29,6 +29,9 @@ describe('MakeupService history media and deletion', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    imageLifecycle.scheduleDeletion.mockImplementation((_tx, refs) =>
+      Promise.resolve(refs),
+    );
     prisma.$queryRaw.mockResolvedValue([{ status: 'IN_PROGRESS' }]);
     prisma.guideStep.findUnique.mockResolvedValue({
       status: 'CURRENT',
@@ -96,6 +99,7 @@ describe('MakeupService history media and deletion', () => {
     expect(imageLifecycle.scheduleDeletion.mock.calls[0]?.slice(1)).toEqual([
       [ref],
       'SESSION_DELETED',
+      'owner-id',
     ]);
     expect(imageLifecycle.processRefs.mock.calls).toEqual([[[ref]]]);
   });
@@ -207,6 +211,7 @@ describe('MakeupService history media and deletion', () => {
     expect(imageLifecycle.scheduleDeletion.mock.calls[0]?.slice(1)).toEqual([
       [ref],
       'IMAGE_DISCARDED',
+      'owner-id',
     ]);
     expect(imageLifecycle.processRefs.mock.calls).toEqual([[[ref]]]);
     expect(queue.enqueue.mock.calls).toHaveLength(0);

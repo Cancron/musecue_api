@@ -196,34 +196,68 @@ describe('PrivateImageLifecycleService (private cloud cleanup ledger)', () => {
   });
 
   describe('scheduleDeletion', () => {
-    it('records due deletions in the given transaction, ignoring duplicates', async () => {
+    const sqlOf = (call: unknown[]) => (call[0] as string[]).join('?');
+
+    it('records each owned deletion in the given transaction, re-arming existing rows', async () => {
       const other = { provider: 'local', key: 'owner-id/profile/old.png' };
 
-      await lifecycle.scheduleDeletion(tx, [REF, other], 'SESSION_DELETED');
+      await expect(
+        lifecycle.scheduleDeletion(
+          tx,
+          [REF, other],
+          'SESSION_DELETED',
+          'owner-id',
+        ),
+      ).resolves.toEqual([REF, other]);
 
-      expect(ledger.createMany.mock.calls).toHaveLength(0);
-      expect(tx.privateStorageCleanup.createMany.mock.calls[0]?.[0]).toEqual({
-        data: [
-          {
-            provider: 'supabase',
-            storageKey: REF.key,
-            reason: 'SESSION_DELETED',
-            nextAttemptAt: NOW,
-          },
-          {
-            provider: 'local',
-            storageKey: other.key,
-            reason: 'SESSION_DELETED',
-            nextAttemptAt: NOW,
-          },
-        ],
-        skipDuplicates: true,
-      });
+      expect(prisma.$executeRaw.mock.calls).toHaveLength(0);
+      const calls = tx.$executeRaw.mock.calls;
+      expect(calls).toHaveLength(2);
+      const sql = sqlOf(calls[0]);
+      expect(sql).toContain('INSERT INTO "PrivateStorageCleanup"');
+      expect(sql).toContain('ON CONFLICT ("provider", "storageKey") DO UPDATE');
+      expect(sql).toContain('"status" = \'PENDING\'');
+      expect(sql).toContain('"lastAttemptAt" = NULL');
+      expect(calls.map((call) => (call as unknown[]).slice(1, 4))).toEqual([
+        ['supabase', REF.key, 'SESSION_DELETED'],
+        ['local', other.key, 'SESSION_DELETED'],
+      ]);
+    });
+
+    it("refuses objects outside the owner's folder and logs it", async () => {
+      const foreign = { provider: 'supabase', key: 'victim-id/session/x.jpg' };
+      const lookalike = {
+        provider: 'supabase',
+        key: 'owner-id-2/session/x.jpg',
+      };
+
+      await expect(
+        lifecycle.scheduleDeletion(
+          tx,
+          [foreign, REF, lookalike],
+          'SESSION_DELETED',
+          'owner-id',
+        ),
+      ).resolves.toEqual([REF]);
+
+      expect(tx.$executeRaw.mock.calls).toHaveLength(1);
+      expect(tx.$executeRaw.mock.calls[0].slice(1, 3)).toEqual([
+        'supabase',
+        REF.key,
+      ]);
+      expect(
+        (logger.error.mock.calls[0] as unknown[] | undefined)?.[1],
+      ).toMatchObject({ refused: 2 });
+      expect(JSON.stringify(logger.error.mock.calls)).not.toContain(
+        'victim-id',
+      );
     });
 
     it('does nothing for an empty list', async () => {
-      await lifecycle.scheduleDeletion(tx, [], 'IMAGE_REPLACED');
-      expect(tx.privateStorageCleanup.createMany.mock.calls).toHaveLength(0);
+      await expect(
+        lifecycle.scheduleDeletion(tx, [], 'IMAGE_REPLACED', 'owner-id'),
+      ).resolves.toEqual([]);
+      expect(tx.$executeRaw.mock.calls).toHaveLength(0);
     });
   });
 
@@ -244,8 +278,9 @@ describe('PrivateImageLifecycleService (private cloud cleanup ledger)', () => {
         },
       });
       expect(storage.delete.mock.calls).toEqual([[REF]]);
+      // Fenced on this attempt's claim: a re-armed row is never removed.
       expect(ledger.deleteMany.mock.calls).toEqual([
-        [{ where: { id: 'task-1' } }],
+        [{ where: { id: 'task-1', status: 'PENDING', lastAttemptAt: NOW } }],
       ]);
       expect(storage.delete.mock.invocationCallOrder[0]).toBeLessThan(
         ledger.deleteMany.mock.invocationCallOrder[0],
@@ -263,7 +298,7 @@ describe('PrivateImageLifecycleService (private cloud cleanup ledger)', () => {
       ]);
       expect(ledger.deleteMany.mock.calls).toHaveLength(0);
       expect(ledger.updateMany.mock.calls[1]?.[0]).toEqual({
-        where: { id: 'task-1' },
+        where: { id: 'task-1', status: 'PENDING', lastAttemptAt: NOW },
         data: {
           attempts: 3,
           lastErrorCode: 'STORAGE_TIMEOUT',
@@ -378,6 +413,114 @@ describe('PrivateImageLifecycleService (private cloud cleanup ledger)', () => {
         'NOT_ATTEMPTED',
         'NOT_ATTEMPTED',
       ]);
+    });
+  });
+
+  describe('provider outages (circuit breaker)', () => {
+    const key = (n: number) => `owner-id/s/${n}.jpg`;
+    const rows = (provider: string, n: number) =>
+      Array.from({ length: n }, (_, i) =>
+        task({ id: `${provider}-${i}`, provider, storageKey: key(i) }),
+      );
+
+    it.each(['STORAGE_TIMEOUT', 'STORAGE_UNAVAILABLE'] as const)(
+      'after a %s, leaves the rest of that provider for the cleaner instead of waiting on each',
+      async (code) => {
+        const queued = rows('supabase', 4);
+        ledger.findUnique.mockImplementation(((args: {
+          where: { provider_storageKey: { storageKey: string } };
+        }) =>
+          Promise.resolve(
+            queued.find(
+              (row) =>
+                row.storageKey === args.where.provider_storageKey.storageKey,
+            ) ?? null,
+          )) as never);
+        storage.delete.mockRejectedValue(new PrivateStorageError(code));
+
+        await expect(
+          lifecycle.processRefs(
+            queued.map((row) => ({
+              provider: 'supabase',
+              key: row.storageKey,
+            })),
+          ),
+        ).resolves.toEqual([
+          'RETRY_SCHEDULED',
+          'NOT_ATTEMPTED',
+          'NOT_ATTEMPTED',
+          'NOT_ATTEMPTED',
+        ]);
+        expect(storage.delete.mock.calls).toHaveLength(1);
+        // Skipped rows are untouched: still PENDING and due for the cleaner.
+        expect(ledger.findUnique.mock.calls).toHaveLength(1);
+      },
+    );
+
+    it('keeps processing other providers in the same cleaner pass', async () => {
+      ledger.findMany.mockResolvedValue([
+        ...rows('supabase', 2),
+        ...rows('fake-s3', 2),
+      ]);
+      storage.delete.mockImplementation((ref) =>
+        ref.provider === 'supabase'
+          ? Promise.reject(new PrivateStorageError('STORAGE_TIMEOUT'))
+          : Promise.resolve(),
+      );
+
+      await expect(lifecycle.processDue()).resolves.toEqual([
+        'RETRY_SCHEDULED',
+        'NOT_ATTEMPTED',
+        'DELETED',
+        'DELETED',
+      ]);
+      expect(storage.delete.mock.calls.map(([ref]) => ref.provider)).toEqual([
+        'supabase',
+        'fake-s3',
+        'fake-s3',
+      ]);
+    });
+
+    it('does not trip on permanent, object-specific failures', async () => {
+      ledger.findMany.mockResolvedValue(rows('supabase', 3));
+      storage.delete
+        .mockRejectedValueOnce(new PrivateStorageError('DELETE_NOT_APPLIED'))
+        .mockResolvedValue();
+
+      await expect(lifecycle.processDue()).resolves.toEqual([
+        'RETRY_SCHEDULED',
+        'DELETED',
+        'DELETED',
+      ]);
+    });
+  });
+
+  describe('requeueFailedDeletions (recovery)', () => {
+    it('requeues only FAILED rows, keeping provider, key, reason and last error', async () => {
+      ledger.updateMany.mockResolvedValue({ count: 2 });
+
+      await expect(
+        lifecycle.requeueFailedDeletions({ provider: 'supabase' }),
+      ).resolves.toBe(2);
+
+      expect(ledger.updateMany.mock.calls[0]?.[0]).toEqual({
+        where: { status: 'FAILED', provider: 'supabase' },
+        data: {
+          status: 'PENDING',
+          attempts: 0,
+          nextAttemptAt: NOW,
+          lastAttemptAt: null,
+        },
+      });
+    });
+
+    it('can target specific rows', async () => {
+      await lifecycle.requeueFailedDeletions({ ids: ['a', 'b'] });
+
+      expect(ledger.updateMany.mock.calls[0]?.[0].where).toEqual({
+        status: 'FAILED',
+        id: { in: ['a', 'b'] },
+      });
     });
   });
 

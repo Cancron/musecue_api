@@ -2340,9 +2340,9 @@ describeWithDatabase(
       );
 
       describe('complete image flow: retrieval, corrupt data and download failures', () => {
-        /** A real image cut off mid-data: headers intact, pixels incomplete. */
-        async function truncated(format: 'jpeg' | 'png', keep: number) {
-          const full = await sharp({
+        /** A valid 800x600 image (noisy, so it compresses like a photo). */
+        function fullImage(format: 'jpeg' | 'png') {
+          return sharp({
             create: {
               width: 800,
               height: 600,
@@ -2353,8 +2353,63 @@ describeWithDatabase(
           })
             .toFormat(format)
             .toBuffer();
-          return full.subarray(0, Math.floor(full.length * keep));
         }
+
+        /** The same image cut off mid-data: headers intact, pixels incomplete. */
+        async function truncated(format: 'jpeg' | 'png', keep: number) {
+          const full = await fullImage(format);
+          return {
+            full,
+            cut: full.subarray(0, Math.floor(full.length * keep)),
+          };
+        }
+
+        /** Replaces a stored object's bytes, as corruption in storage would. */
+        function corruptStoredObject(key: string, bytes: Buffer) {
+          const stored = supabase.objects.get(key);
+          supabase.objects.set(key, {
+            bytes,
+            contentType: stored?.contentType ?? 'image/jpeg',
+          });
+        }
+
+        it('upload validation rejects truncated images on every upload path: nothing stored or recorded', async () => {
+          const { cut: jpeg } = await truncated('jpeg', 0.3);
+          const { cut: png } = await truncated('png', 0.5);
+          const session = await newSession(owner);
+          const { step } = await guideFixture(owner);
+          const user = await createUser(client);
+          const asFile = (buffer: Buffer) =>
+            ({ buffer, size: buffer.length }) as Express.Multer.File;
+          const objectsBefore = bucketKeys();
+          const rowsBefore = await client.imageAsset.count();
+
+          for (const bytes of [jpeg, png]) {
+            for (const upload of [
+              () => makeup.uploadInitialImage(owner, session.id, asFile(bytes)),
+              () => makeup.saveStepSnapshot(owner, step.id, asFile(bytes)),
+              () =>
+                makeup.checkStep(
+                  owner,
+                  step.id,
+                  `truncated-${randomBytes(4).toString('hex')}`,
+                  asFile(bytes),
+                ),
+              () => profile.updateAvatar(user, asFile(bytes)),
+            ]) {
+              expect(await rejection(upload())).toMatchObject({
+                status: 400,
+                message: 'The uploaded file is not a readable image',
+              });
+            }
+          }
+
+          expect(supabase.count('upload')).toBe(0);
+          expect(bucketKeys()).toEqual(objectsBefore);
+          expect(await client.imageAsset.count()).toBe(rowsBefore);
+          expect(await ledger()).toEqual([]);
+          expect(queue.enqueue.mock.calls).toHaveLength(0);
+        });
 
         async function checkWith(bytes: Buffer) {
           const { step } = await guideFixture(owner);
@@ -2433,19 +2488,21 @@ describeWithDatabase(
           ['a JPEG truncated at 5%', 'jpeg', 0.05],
           ['a PNG truncated at 50%', 'png', 0.5],
         ] as const)(
-          'rejects %s that passed upload validation, before any OpenRouter call',
+          'rejects %s found in storage (corrupted after upload), before any OpenRouter call',
           async (_label, format, keep) => {
-            const bytes = await truncated(format, keep);
-            // Upload validation reads headers only, so the photo is accepted...
-            const { run, payload, image } = await checkWith(bytes);
+            const { full, cut: bytes } = await truncated(format, keep);
+            // A valid upload, whose stored object is later cut off (storage
+            // corruption, or an object stored before upload decoding existed)...
+            const { run, payload, image } = await checkWith(full);
             expect(image).toMatchObject({
               mimeType: `image/${format}`,
               width: 800,
               height: 600,
             });
+            corruptStoredObject(image.storageKey, bytes);
             const { job: vision, discard } = job('VISION_CHECK', payload);
 
-            // ...and the worker rejects it once it tries to decode the pixels.
+            // ...is rejected by the worker once it tries to decode the pixels.
             await expect(liveProcessor.process(vision)).rejects.toMatchObject({
               code: 'AI_IMAGE_INVALID',
               retryable: false,
@@ -2489,13 +2546,21 @@ describeWithDatabase(
           );
         });
 
-        it('fails face-photo analysis for a truncated photo without calling OpenRouter', async () => {
+        it('fails face-photo analysis for a photo truncated in storage without calling OpenRouter', async () => {
           const session = await newSession(owner);
-          const bytes = await truncated('jpeg', 0.3);
+          const { full, cut } = await truncated('jpeg', 0.3);
           await makeup.uploadInitialImage(owner, session.id, {
-            buffer: bytes,
-            size: bytes.length,
+            buffer: full,
+            size: full.length,
           } as Express.Multer.File);
+          corruptStoredObject(
+            (
+              await client.imageAsset.findFirstOrThrow({
+                where: { sessionId: session.id },
+              })
+            ).storageKey,
+            cut,
+          );
           await makeup.savePreferences(owner, session.id, {
             vibe: 'natural',
             timeMinutes: 10,

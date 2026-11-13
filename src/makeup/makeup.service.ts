@@ -2,10 +2,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { Prisma, type AiRun } from '@prisma/client';
 import AppError from '../common/errors/app.error';
 import { PrismaService } from '../common/services/prisma.service';
-import {
-  PrivateImageLifecycleService,
-  type PrivateImageDeletionReason,
-} from '../storage/private-image-lifecycle.service';
+import { PrivateImageLifecycleService } from '../storage/private-image-lifecycle.service';
 import {
   PrivateImageStorageService,
   type PrivateObjectRef,
@@ -149,9 +146,12 @@ export class MakeupService {
       if (deletion.count !== 1) {
         throw AppError.conflict('The session changed and could not be deleted');
       }
-      const refs = images.map(storedObject);
-      await this.imageLifecycle.scheduleDeletion(tx, refs, 'SESSION_DELETED');
-      return refs;
+      return this.imageLifecycle.scheduleDeletion(
+        tx,
+        images.map(storedObject),
+        'SESSION_DELETED',
+        authId,
+      );
     });
 
     await this.imageLifecycle.processRefs(removed);
@@ -252,8 +252,12 @@ export class MakeupService {
           },
         });
         await this.imageLifecycle.confirmUpload(tx, stored);
-        const refs = replacedImages.map(storedObject);
-        await this.imageLifecycle.scheduleDeletion(tx, refs, 'IMAGE_REPLACED');
+        const refs = await this.imageLifecycle.scheduleDeletion(
+          tx,
+          replacedImages.map(storedObject),
+          'IMAGE_REPLACED',
+          authId,
+        );
         await tx.makeupSession.update({
           where: { id: sessionId },
           data: { status: 'IMAGE_UPLOADED' },
@@ -453,11 +457,11 @@ export class MakeupService {
         imageAsset.id,
       );
       if (!runResult.created) {
-        await this.discardImage(imageAsset.id, stored, 'IMAGE_DISCARDED');
+        await this.discardImage(authId, imageAsset.id, stored);
       }
       return runResult.run;
     } catch (error) {
-      await this.discardImage(imageAsset.id, stored, 'IMAGE_DISCARDED');
+      await this.discardImage(authId, imageAsset.id, stored);
       throw error;
     }
   }
@@ -652,19 +656,25 @@ export class MakeupService {
    * so nothing is orphaned.
    */
   private async discardImage(
+    authId: string,
     imageId: string,
     ref: PrivateObjectRef,
-    reason: PrivateImageDeletionReason,
   ): Promise<void> {
+    let scheduled: PrivateObjectRef[];
     try {
-      await this.prisma.$transaction(async (tx) => {
+      scheduled = await this.prisma.$transaction(async (tx) => {
         await tx.imageAsset.deleteMany({ where: { id: imageId } });
-        await this.imageLifecycle.scheduleDeletion(tx, [ref], reason);
+        return this.imageLifecycle.scheduleDeletion(
+          tx,
+          [ref],
+          'IMAGE_DISCARDED',
+          authId,
+        );
       });
     } catch {
       return;
     }
-    await this.imageLifecycle.processRefs([ref]);
+    await this.imageLifecycle.processRefs(scheduled);
   }
 
   private async getOwnedStep(authId: string, stepId: string) {

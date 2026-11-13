@@ -57,6 +57,22 @@ export class ImageValidationService {
       );
     }
 
+    // Headers can parse while the pixel data is truncated or corrupt. Decode
+    // every pixel (at thumbnail scale: still reads all compressed data, but
+    // stays fast and small) so such files are rejected here, not stored.
+    try {
+      await sharp(file.buffer, {
+        failOn: 'error',
+        limitInputPixels: MAX_IMAGE_DIMENSION * MAX_IMAGE_DIMENSION,
+        sequentialRead: true,
+      })
+        .resize(64, 64, { fit: 'inside' })
+        .raw()
+        .toBuffer();
+    } catch {
+      throw AppError.badRequest('The uploaded file is not a readable image');
+    }
+
     return { mimeType, width, height, sizeBytes: file.size };
   }
 }

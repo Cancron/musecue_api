@@ -99,6 +99,22 @@ A row is removed only after the provider confirms the deletion. A failed deletio
 
 A background cleaner runs every minute on each API/worker instance (not when `NODE_ENV=test`). Instances claim rows atomically, so each deletion is attempted by one instance at a time, and a database error on one row does not stop the rest of the batch. Only full, validated object keys (`<user>/<scope>/<uuid>.<ext>`) are ever sent to the provider for deletion. A folder-like or empty key is refused before any request and marked `FAILED` (`INVALID_STORAGE_KEY`), so no row can remove other images by prefix. Before deleting, the cleaner checks that no `ImageAsset` or avatar still references the key; if one does, it keeps the object and drops the row.
 
+How failures during deletion are handled:
+
+- **Provider crash or timeout.** After the first transient failure for a provider, the remaining deletions for that provider are left queued (`PENDING`, due) instead of each waiting for a timeout. A session with many images therefore costs one timeout, not one per image, and the cleaner keeps serving other providers in the same pass.
+- **Database failure.**
+  - The reference change and its deletion records commit together, or neither does.
+  - If the object was deleted but its row could not be removed, the row is retried after its lease; the delete is idempotent.
+  - If a failed deletion could not be recorded, it is retried after the lease and recorded then.
+- **Process crash.** At each point (after the commit, after claiming a row, after the provider deleted the object) the row stays in the table, and any instance completes it after the 5-minute lease.
+- **Repeats and concurrency.**
+  - Every cleaner write is fenced on its own claim (`lastAttemptAt`). A stale or slow cleaner can never remove a row that a newer request has re-recorded.
+  - Recording a deletion for an object that already has a row re-arms that row (pending, due now, attempts reset) instead of silently skipping it.
+  - Each object is deleted once, however often requests or recovery run.
+- **Other users' files.** Deletions are recorded only for keys inside the requesting user's own folder (`<userId>/...`). A corrupted reference into another user's folder is refused and logged, never queued.
+
+Every row keeps the `provider` and `storageKey` needed for recovery until the provider confirms the deletion.
+
 To inspect or recover:
 
 ```sql
@@ -107,9 +123,11 @@ FROM "PrivateStorageCleanup" ORDER BY "createdAt";
 
 -- After fixing the cause (credentials, bucket, provider outage), requeue failed rows:
 UPDATE "PrivateStorageCleanup"
-SET status = 'PENDING', attempts = 0, "nextAttemptAt" = now()
+SET status = 'PENDING', attempts = 0, "nextAttemptAt" = now(), "lastAttemptAt" = NULL
 WHERE status = 'FAILED';
 ```
+
+The same recovery is available in code as `PrivateImageLifecycleService.requeueFailedDeletions({ provider?, ids? })`. It only touches `FAILED` rows, keeps provider, key, reason and last error, and is safe to run repeatedly or while the cleaner runs. No HTTP endpoint is exposed for it.
 
 #### Signed image URLs
 

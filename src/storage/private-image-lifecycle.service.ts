@@ -253,29 +253,98 @@ export class PrivateImageLifecycleService
     return outcome;
   }
 
-  /** Records objects whose references are removed in this transaction. */
+  /**
+   * Records objects whose references are removed in this transaction, and
+   * returns the ones recorded (pass those to `processRefs`).
+   *
+   * - Only keys inside the owner's own folder (`<ownerId>/...`) are ever
+   *   recorded; anything else (a corrupted reference into another user's
+   *   folder) is refused and logged, so no request can queue another user's
+   *   file for deletion.
+   * - An existing row for the same object is re-armed (PENDING, due now,
+   *   attempts reset) instead of being silently skipped, so a new deletion is
+   *   never lost behind an older or FAILED record, and a cleaner still holding
+   *   a stale claim on that row can no longer remove it (see `attempt`).
+   */
   async scheduleDeletion(
     tx: Prisma.TransactionClient,
     refs: PrivateObjectRef[],
     reason: PrivateImageDeletionReason,
-  ): Promise<void> {
-    if (refs.length === 0) return;
+    ownerId: string,
+  ): Promise<PrivateObjectRef[]> {
+    const owned = refs.filter((ref) => ref.key.startsWith(`${ownerId}/`));
+    if (owned.length !== refs.length) {
+      this.logger.error(
+        "Refused to schedule deletion of objects outside the owner's storage folder",
+        { context: CONTEXT, reason, refused: refs.length - owned.length },
+      );
+    }
     const now = new Date();
-    await tx.privateStorageCleanup.createMany({
-      data: refs.map((ref) => ({
-        provider: ref.provider,
-        storageKey: ref.key,
-        reason,
-        nextAttemptAt: now,
-      })),
-      skipDuplicates: true,
-    });
+    for (const ref of owned) {
+      await tx.$executeRaw`
+        INSERT INTO "PrivateStorageCleanup"
+          ("id", "provider", "storageKey", "reason", "status", "attempts",
+           "nextAttemptAt", "createdAt", "updatedAt")
+        VALUES
+          (gen_random_uuid()::text, ${ref.provider}, ${ref.key},
+           ${reason}::"PrivateStorageCleanupReason", 'PENDING', 0,
+           ${now}, ${now}, ${now})
+        ON CONFLICT ("provider", "storageKey") DO UPDATE SET
+          "reason" = EXCLUDED."reason",
+          "status" = 'PENDING',
+          "attempts" = 0,
+          "nextAttemptAt" = EXCLUDED."nextAttemptAt",
+          "lastAttemptAt" = NULL,
+          "updatedAt" = EXCLUDED."updatedAt"
+      `;
+    }
+    return owned;
   }
 
-  /** Attempts recorded deletions right away. Never throws. */
+  /**
+   * Recovery for deletions that gave up (status FAILED): puts them back in
+   * the queue with a fresh retry budget, keeping provider, key, reason and
+   * last error. Idempotent: rows that are not FAILED are never touched, so
+   * running it twice, or while the cleaner runs, cannot double-process
+   * anything. Returns the number of rows requeued.
+   */
+  async requeueFailedDeletions(
+    filter: { provider?: string; ids?: string[] } = {},
+  ): Promise<number> {
+    const { count } = await this.prisma.privateStorageCleanup.updateMany({
+      where: {
+        status: 'FAILED',
+        ...(filter.provider ? { provider: filter.provider } : {}),
+        ...(filter.ids ? { id: { in: filter.ids } } : {}),
+      },
+      data: {
+        status: 'PENDING',
+        attempts: 0,
+        nextAttemptAt: new Date(),
+        lastAttemptAt: null,
+      },
+    });
+    this.logger.info('Requeued failed private image deletions', {
+      context: CONTEXT,
+      provider: filter.provider,
+      count,
+    });
+    return count;
+  }
+
+  /**
+   * Attempts recorded deletions right away. Never throws. After a transient
+   * failure (provider down or timing out), the remaining deletions for that
+   * provider are left to the cleaner instead of each waiting for a timeout.
+   */
   async processRefs(refs: PrivateObjectRef[]): Promise<CleanupOutcome[]> {
     const outcomes: CleanupOutcome[] = [];
+    const unavailable = new Set<string>();
     for (const ref of refs) {
+      if (unavailable.has(ref.provider)) {
+        outcomes.push('NOT_ATTEMPTED');
+        continue;
+      }
       try {
         const task = await this.prisma.privateStorageCleanup.findUnique({
           where: {
@@ -285,7 +354,9 @@ export class PrivateImageLifecycleService
             },
           },
         });
-        outcomes.push(task ? await this.attempt(task) : 'NOT_ATTEMPTED');
+        outcomes.push(
+          task ? await this.attempt(task, unavailable) : 'NOT_ATTEMPTED',
+        );
       } catch {
         this.logger.warn('Private image cleanup deferred to the next pass', {
           context: CONTEXT,
@@ -308,9 +379,15 @@ export class PrivateImageLifecycleService
         take: CLEANUP_POLICY.batchSize,
       });
       const outcomes: CleanupOutcome[] = [];
+      const unavailable = new Set<string>();
       for (const task of tasks) {
+        if (unavailable.has(task.provider)) {
+          // Provider failed transiently in this pass: leave its rows due.
+          outcomes.push('NOT_ATTEMPTED');
+          continue;
+        }
         try {
-          outcomes.push(await this.attempt(task));
+          outcomes.push(await this.attempt(task, unavailable));
         } catch {
           // One row's database error must not stall the rest of the batch;
           // the row keeps its lease and is retried on a later pass.
@@ -332,7 +409,16 @@ export class PrivateImageLifecycleService
     }
   }
 
-  private async attempt(task: PrivateStorageCleanup): Promise<CleanupOutcome> {
+  /**
+   * Claims one row, then deletes its object. Every later write is fenced on
+   * the claim (`lastAttemptAt` = this attempt's timestamp): if the row was
+   * re-armed by a new deletion or reclaimed after the lease expired, this
+   * attempt's bookkeeping is discarded and the row stays for the next pass.
+   */
+  private async attempt(
+    task: PrivateStorageCleanup,
+    unavailable: Set<string>,
+  ): Promise<CleanupOutcome> {
     const now = new Date();
     if (task.status !== 'PENDING' || task.nextAttemptAt > now) {
       return 'NOT_ATTEMPTED';
@@ -355,11 +441,14 @@ export class PrivateImageLifecycleService
     });
     if (claim.count !== 1) return 'NOT_ATTEMPTED';
 
+    const claimed = {
+      id: task.id,
+      status: 'PENDING' as const,
+      lastAttemptAt: now,
+    };
     const ref = { provider: task.provider, key: task.storageKey };
     if (await this.isReferenced(ref)) {
-      await this.prisma.privateStorageCleanup.deleteMany({
-        where: { id: task.id },
-      });
+      await this.prisma.privateStorageCleanup.deleteMany({ where: claimed });
       this.logger.warn('Skipped deleting a private image that is referenced', {
         context: CONTEXT,
         taskId: task.id,
@@ -372,11 +461,12 @@ export class PrivateImageLifecycleService
     try {
       await this.storage.delete(ref);
     } catch (error) {
+      if (error instanceof PrivateStorageError && error.retryable) {
+        unavailable.add(task.provider);
+      }
       return this.recordFailure({ ...task, reason }, error, now);
     }
-    await this.prisma.privateStorageCleanup.deleteMany({
-      where: { id: task.id },
-    });
+    await this.prisma.privateStorageCleanup.deleteMany({ where: claimed });
     return 'DELETED';
   }
 
@@ -394,7 +484,7 @@ export class PrivateImageLifecycleService
       ? now
       : new Date(now.getTime() + backoffMs(attempts));
     await this.prisma.privateStorageCleanup.updateMany({
-      where: { id: task.id },
+      where: { id: task.id, status: 'PENDING', lastAttemptAt: now },
       data: {
         attempts,
         lastErrorCode: code,

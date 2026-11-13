@@ -137,7 +137,7 @@ export class ProfileService {
       avatarUrl: stored.key,
       avatarStorageProvider: stored.provider,
     };
-    let replaced: PrivateObjectRef | null;
+    let replaced: PrivateObjectRef[];
     try {
       replaced = await this.prisma.$transaction(async (tx) => {
         // Lock the row so concurrent uploads cannot both "replace" the same
@@ -149,39 +149,43 @@ export class ProfileService {
           update: avatar,
         });
         await this.imageLifecycle.confirmUpload(tx, stored);
-        if (!previous || previous.key === stored.key) return null;
-        await this.imageLifecycle.scheduleDeletion(
+        if (!previous || previous.key === stored.key) return [];
+        return this.imageLifecycle.scheduleDeletion(
           tx,
           [previous],
           'AVATAR_REPLACED',
+          authId,
         );
-        return previous;
       });
     } catch (error) {
       await this.imageLifecycle.abandonUpload(stored);
       throw error;
     }
 
-    if (replaced) await this.imageLifecycle.processRefs([replaced]);
+    if (replaced.length) await this.imageLifecycle.processRefs(replaced);
     return this.getProfile(authId);
   }
 
   async deleteAvatar(authId: string) {
     const removed = await this.prisma.$transaction(async (tx) => {
       const current = await lockAvatar(tx, authId);
-      if (!current?.avatarUrl) return null;
+      if (!current?.avatarUrl) return [];
       await tx.userProfile.update({
         where: { authId },
         data: { avatarUrl: null, avatarStorageProvider: null },
       });
       const ref = privateAvatar(current);
-      if (ref) {
-        await this.imageLifecycle.scheduleDeletion(tx, [ref], 'AVATAR_REMOVED');
-      }
-      return ref;
+      return ref
+        ? this.imageLifecycle.scheduleDeletion(
+            tx,
+            [ref],
+            'AVATAR_REMOVED',
+            authId,
+          )
+        : [];
     });
 
-    if (removed) await this.imageLifecycle.processRefs([removed]);
+    if (removed.length) await this.imageLifecycle.processRefs(removed);
     return this.getProfile(authId);
   }
 

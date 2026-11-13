@@ -20,6 +20,9 @@ describe('ProfileService avatar ownership and lifecycle', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    imageLifecycle.scheduleDeletion.mockImplementation((_tx, refs) =>
+      Promise.resolve(refs),
+    );
     prisma.$transaction.mockImplementation(((
       callback: (tx: Prisma.TransactionClient) => Promise<unknown>,
     ) => callback(prisma)) as PrismaService['$transaction']);
@@ -103,6 +106,7 @@ describe('ProfileService avatar ownership and lifecycle', () => {
     expect(imageLifecycle.scheduleDeletion.mock.calls[0]?.slice(1)).toEqual([
       [previous],
       'AVATAR_REPLACED',
+      'owner-id',
     ]);
     expect(imageLifecycle.processRefs.mock.calls).toEqual([[[previous]]]);
   });

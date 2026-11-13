@@ -31,6 +31,17 @@ import type { MakeupAiJob } from './makeup.queue';
 import { canPublishRun, failRun } from './run-lifecycle';
 import { lockSession } from '../workflow-lock';
 
+/** A Prisma/driver error code (e.g. P1001) for logs; never the message. */
+function errorCodeOf(error: unknown): string | undefined {
+  if (typeof error !== 'object' || error === null || !('code' in error)) {
+    return undefined;
+  }
+  const { code } = error;
+  return typeof code === 'string' || typeof code === 'number'
+    ? String(code)
+    : undefined;
+}
+
 @Processor('makeup-ai', {
   concurrency: 8,
   limiter: { max: 1_000_000, duration: 1_000 },
@@ -371,7 +382,21 @@ export class MakeupProcessor extends WorkerHost {
           false,
         );
       }
-      if (!isPrivateStorageError(error)) throw error;
+      if (!isPrivateStorageError(error)) {
+        // E.g. the database is unreachable. Retry within the job budget, and
+        // never persist the raw error text (it can name internal hosts) on a
+        // run that the client can read.
+        this.logger.warn('Private image could not be loaded; will retry', {
+          context: 'MakeupProcessor',
+          errorType: error instanceof Error ? error.name : typeof error,
+          errorCode: errorCodeOf(error),
+        });
+        throw new AiProviderError(
+          'IMAGE_LOAD_FAILED',
+          'Your photo could not be loaded right now. Please try again.',
+          true,
+        );
+      }
       throw new AiProviderError(
         error.retryable ? 'IMAGE_STORAGE_UNAVAILABLE' : 'IMAGE_STORAGE_FAILED',
         'Your photo could not be loaded right now. Please try again.',

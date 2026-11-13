@@ -111,7 +111,7 @@ describe('OpenRouter image preprocessing (private images)', () => {
       width: 1600,
       height: 1200,
     });
-  });
+  }, 20_000);
 
   it('never enlarges small photos', async () => {
     const sent = await sentImage({

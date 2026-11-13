@@ -57,6 +57,9 @@ describe('ProfileService private cloud storage lifecycle', () => {
     });
     lifecycle.upload.mockResolvedValue(STORED);
     lifecycle.processRefs.mockResolvedValue([]);
+    lifecycle.scheduleDeletion.mockImplementation((_tx, refs) =>
+      Promise.resolve(refs),
+    );
     prisma.$transaction.mockImplementation(((
       callback: (client: Prisma.TransactionClient) => Promise<unknown>,
     ) => callback(tx)) as PrismaService['$transaction']);
@@ -257,7 +260,7 @@ describe('ProfileService private cloud storage lifecycle', () => {
       };
       expect(lifecycle.confirmUpload.mock.calls).toEqual([[tx, STORED]]);
       expect(lifecycle.scheduleDeletion.mock.calls).toEqual([
-        [tx, [previous], 'AVATAR_REPLACED'],
+        [tx, [previous], 'AVATAR_REPLACED', 'owner-id'],
       ]);
       expect(lifecycle.processRefs.mock.calls).toEqual([[[previous]]]);
     });
@@ -321,7 +324,7 @@ describe('ProfileService private cloud storage lifecycle', () => {
         data: { avatarUrl: null, avatarStorageProvider: null },
       });
       expect(lifecycle.scheduleDeletion.mock.calls).toEqual([
-        [tx, [STORED], 'AVATAR_REMOVED'],
+        [tx, [STORED], 'AVATAR_REMOVED', 'owner-id'],
       ]);
       expect(lifecycle.processRefs.mock.calls).toEqual([[[STORED]]]);
     });

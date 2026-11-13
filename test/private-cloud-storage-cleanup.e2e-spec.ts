@@ -111,7 +111,11 @@ describeWithDatabase('Private storage cleanup ledger (PostgreSQL)', () => {
     await applyMigrations(schema, migrationNames());
     client = new PrismaClient({
       adapter: new PrismaPg(
-        { connectionString: TEST_DATABASE_URL as string },
+        {
+          connectionString: TEST_DATABASE_URL as string,
+          // Raw SQL (deletion scheduling) resolves through search_path.
+          options: `-c search_path=${schema}`,
+        },
         { schema },
       ),
     });
@@ -240,7 +244,7 @@ describeWithDatabase('Private storage cleanup ledger (PostgreSQL)', () => {
       await tx.imageAsset.delete({ where: { id: oldImage.id } });
       await tx.imageAsset.create({ data: imageData(newRef) });
       await lifecycle.confirmUpload(tx, newRef);
-      await lifecycle.scheduleDeletion(tx, [oldRef], 'IMAGE_REPLACED');
+      await lifecycle.scheduleDeletion(tx, [oldRef], 'IMAGE_REPLACED', authId);
     });
     await expect(lifecycle.processRefs([oldRef])).resolves.toEqual(['DELETED']);
 
@@ -260,7 +264,7 @@ describeWithDatabase('Private storage cleanup ledger (PostgreSQL)', () => {
     await expect(
       client.$transaction(async (tx) => {
         await tx.imageAsset.delete({ where: { id: image.id } });
-        await lifecycle.scheduleDeletion(tx, [ref], 'SESSION_DELETED');
+        await lifecycle.scheduleDeletion(tx, [ref], 'SESSION_DELETED', authId);
         throw new Error('session delete failed');
       }),
     ).rejects.toThrow('session delete failed');
@@ -312,7 +316,7 @@ describeWithDatabase('Private storage cleanup ledger (PostgreSQL)', () => {
       await lifecycle.confirmUpload(tx, ref);
     });
     await client.$transaction((tx) =>
-      lifecycle.scheduleDeletion(tx, [ref, ref], 'IMAGE_DISCARDED'),
+      lifecycle.scheduleDeletion(tx, [ref, ref], 'IMAGE_DISCARDED', authId),
     );
     expect(await ledger()).toHaveLength(1);
 
