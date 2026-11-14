@@ -103,6 +103,7 @@ model PaymentTransaction {
   subscription    UserSubscription   @relation(fields: [subscriptionId], references: [id], onDelete: Restrict)
   event           SubscriptionEvent?
   checkoutSession CheckoutSession?
+  refunds         PaymentRefund[]
 
   @@unique([provider, providerPaymentId])
   @@index([subscriptionId, createdAt])
@@ -186,4 +187,30 @@ model CheckoutSession {
   @@unique([provider, providerSessionId])
   @@index([subscriptionId, createdAt])
   @@index([status, expiresAt])
+}
+
+// One refund of a collected payment at the provider (Stripe `re_...`), full
+// or partial, as confirmed by the provider. Only SUCCEEDED refunds count
+// towards PaymentTransaction.refundedAmountCents. Refund facts never change,
+// the status only moves forward, succeeded refunds never exceed the payment
+// and rows are never deleted (database trigger).
+model PaymentRefund {
+  id                String       @id @default(uuid())
+  paymentId         String
+  provider          String       @db.VarChar(50)
+  providerRefundId  String       @db.VarChar(255)
+  providerChargeId  String       @db.VarChar(255)
+  status            RefundStatus
+  amountCents       Int
+  currency          String       @default("USD") @db.Char(3)
+  reason            String?      @db.VarChar(100)
+  // When the refund was created at the provider.
+  providerCreatedAt DateTime
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  payment PaymentTransaction @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+
+  @@unique([provider, providerRefundId])
+  @@index([paymentId])
 }

@@ -17,6 +17,7 @@ import { resolveSubscriptionAccess } from '../subscription-access.policy';
 import { SubscriptionPlanService } from '../subscription-plan.service';
 import { StripeCancellationService } from './stripe-cancellation.service';
 import { StripeCheckoutService } from './stripe-checkout.service';
+import { StripeRefundService } from './stripe-refund.service';
 import {
   StripeWebhookService,
   type WebhookOutcome,
@@ -70,6 +71,7 @@ describe('StripeWebhookService', () => {
       activityLog,
       logger,
       new StripeCancellationService(prisma, gateway, activityLog, logger),
+      new StripeRefundService(prisma, gateway, activityLog, logger),
     );
   });
 

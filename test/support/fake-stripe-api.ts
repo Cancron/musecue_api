@@ -82,6 +82,8 @@ export class FakeStripeApi {
   readonly subscriptions = new Map<string, Json>();
   readonly invoices = new Map<string, Json>();
   readonly paymentIntents = new Map<string, Json>();
+  readonly charges = new Map<string, Json>();
+  readonly refunds = new Map<string, Json>();
   private readonly idempotency = new Map<string, StoredResponse>();
   private readonly failures = new Map<string, FailureKind[]>();
   private counter = 0;
@@ -301,6 +303,79 @@ export class FakeStripeApi {
     Object.assign(session, { payment_status: 'paid' });
   }
 
+  /** The charge that collected an invoice. */
+  chargeOf(invoiceId: string): string {
+    const charge = str(this.requireInvoice(invoiceId)._charge);
+    if (!charge) throw new Error(`Invoice ${invoiceId} has no charge`);
+    return charge;
+  }
+
+  /**
+   * A refund made in Stripe (e.g. from the dashboard) of the charge that
+   * collected an invoice: full by default, or `amount` cents. A `pending`
+   * refund only counts once it succeeds.
+   */
+  refundInvoice(
+    invoiceId: string,
+    options: {
+      amount?: number;
+      status?: 'succeeded' | 'pending' | 'failed';
+      reason?: string;
+    } = {},
+  ): Json {
+    const charge = this.charges.get(this.chargeOf(invoiceId)) as Json;
+    const refundId = this.id('re');
+    const refund: Json = {
+      id: refundId,
+      object: 'refund',
+      amount: options.amount ?? Number(charge.amount),
+      charge: charge.id,
+      payment_intent: charge.payment_intent,
+      currency: charge.currency,
+      created: Math.floor(Date.now() / 1000),
+      reason: options.reason ?? 'requested_by_customer',
+      status: 'pending',
+    };
+    this.refunds.set(refundId, refund);
+    this.setRefundStatus(refundId, options.status ?? 'succeeded');
+    return refund;
+  }
+
+  /** A refund changes status in Stripe (e.g. a pending refund succeeds). */
+  setRefundStatus(refundId: string, status: string) {
+    const refund = this.refunds.get(refundId);
+    if (!refund) throw new Error(`Unknown refund ${refundId}`);
+    const charge = this.charges.get(str(refund.charge)) as Json;
+    if (status === 'succeeded' && refund.status !== 'succeeded') {
+      charge.amount_refunded =
+        Number(charge.amount_refunded) + Number(refund.amount);
+      charge.refunded = charge.amount_refunded === charge.amount;
+    }
+    refund.status = status;
+  }
+
+  /** A signed event for a charge, carrying the charge as it is now. */
+  signedChargeEvent(
+    type: string,
+    chargeId: string,
+    overrides: Json = {},
+  ): { payload: string; signature: string; eventId: string } {
+    const charge = this.charges.get(chargeId);
+    if (!charge) throw new Error(`Unknown charge ${chargeId}`);
+    return this.sign(type, { ...charge, ...overrides });
+  }
+
+  /** A signed event for a refund, carrying the refund as it is now. */
+  signedRefundEvent(
+    type: string,
+    refundId: string,
+    overrides: Json = {},
+  ): { payload: string; signature: string; eventId: string } {
+    const refund = this.refunds.get(refundId);
+    if (!refund) throw new Error(`Unknown refund ${refundId}`);
+    return this.sign(type, { ...refund, ...overrides });
+  }
+
   /**
    * POST /v1/subscriptions/:id with `cancel_at_period_end`. Like Stripe:
    * canceled subscriptions cannot be updated; scheduling a cancellation sets
@@ -459,9 +534,25 @@ export class FakeStripeApi {
       amount_paid: amount ?? line.amount,
       status_transitions: { paid_at: Math.floor(Date.now() / 1000) },
     });
+    const chargeId = this.id('ch');
+    this.charges.set(chargeId, {
+      id: chargeId,
+      object: 'charge',
+      amount: amount ?? line.amount,
+      amount_captured: amount ?? line.amount,
+      amount_refunded: 0,
+      refunded: false,
+      currency: invoice.currency,
+      customer: invoice.customer,
+      payment_intent: invoice._paymentIntent,
+      status: 'succeeded',
+      created: Math.floor(Date.now() / 1000),
+    });
+    invoice._charge = chargeId;
     Object.assign(this.paymentIntentOf(invoice), {
       status: 'succeeded',
       last_payment_error: null,
+      latest_charge: chargeId,
     });
     Object.assign(this.subscriptions.get(this.subscriptionOf(invoice)) ?? {}, {
       status: 'active',
@@ -551,7 +642,7 @@ export class FakeStripeApi {
     const idempotencyKey = headers.get('idempotency-key');
     this.requests.push({ method, path: url.pathname, params, idempotencyKey });
 
-    const operation = `${method} ${url.pathname.replace(/\/(cs_test|cus|in|sub|pi)_[^/]+/, '/:id')}`;
+    const operation = `${method} ${url.pathname.replace(/\/(cs_test|cus|in|sub|pi|ch|re)_[^/]+/, '/:id')}`;
     const failure = this.failures.get(operation)?.shift();
     if (failure === 'connection') throw new TypeError('fetch failed');
     if (failure === 'server') {
@@ -620,8 +711,31 @@ export class FakeStripeApi {
     if (method === 'POST' && path === '/v1/checkout/sessions') {
       return this.createSession(params);
     }
+    if (method === 'GET' && path === '/v1/refunds') {
+      const data = [...this.refunds.values()]
+        .filter((refund) => refund.charge === params.charge)
+        .reverse();
+      return {
+        status: 200,
+        body: { object: 'list', data, has_more: false, url: path },
+      };
+    }
+    const charge = /^\/v1\/charges\/([^/]+)$/.exec(path);
+    if (charge && method === 'GET') {
+      const found = this.charges.get(charge[1]);
+      return found
+        ? { status: 200, body: { ...found } }
+        : invalid(404, 'resource_missing', 'No such charge');
+    }
     if (method === 'GET' && path === '/v1/invoice_payments') {
-      const invoice = this.invoices.get(str(params.invoice));
+      const byIntent = str(
+        (params.payment as Json | undefined)?.payment_intent,
+      );
+      const invoice = byIntent
+        ? [...this.invoices.values()].find(
+            (candidate) => candidate._paymentIntent === byIntent,
+          )
+        : this.invoices.get(str(params.invoice));
       const data = invoice
         ? [
             {

@@ -327,7 +327,12 @@ describeWithDatabase(
           });
           api.failNext('POST /v1/subscriptions/:id', failure);
 
-          await cancel(authId).expect(503);
+          // Without Stripe's positive response nothing is saved.
+          const unconfirmed = await cancel(authId).expect(503);
+          expect(unconfirmed.body).toMatchObject({
+            message:
+              'Cancellation could not be confirmed; please retry or check subscription status',
+          });
 
           await expect(
             client.userSubscription.findUniqueOrThrow({ where: { authId } }),
@@ -352,7 +357,12 @@ describeWithDatabase(
         const { authId, subscriptionId } = await subscriber(10);
         api.failNext('POST /v1/subscriptions/:id', 'lost');
 
-        await cancel(authId).expect(503);
+        // Without Stripe's positive response nothing is saved.
+        const unconfirmed = await cancel(authId).expect(503);
+        expect(unconfirmed.body).toMatchObject({
+          message:
+            'Cancellation could not be confirmed; please retry or check subscription status',
+        });
         await expect(recordOf(authId)).resolves.toMatchObject({
           proCanceledAt: null,
         });

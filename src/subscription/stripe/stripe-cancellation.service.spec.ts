@@ -16,6 +16,7 @@ import { resolveSubscriptionAccess } from '../subscription-access.policy';
 import { SubscriptionPlanService } from '../subscription-plan.service';
 import { StripeCancellationService } from './stripe-cancellation.service';
 import { StripeCheckoutService } from './stripe-checkout.service';
+import { StripeRefundService } from './stripe-refund.service';
 import { StripeWebhookService } from './stripe-webhook.service';
 import type { StripeSettings } from './stripe.config';
 import { StripeGateway } from './stripe.gateway';
@@ -62,6 +63,7 @@ describe('StripeCancellationService', () => {
       activityLog,
       logger,
       service,
+      new StripeRefundService(prisma, gateway, activityLog, logger),
     );
   };
 
@@ -289,7 +291,7 @@ describe('StripeCancellationService', () => {
       ['Stripe fails with a server error', 'server'],
       ['Stripe rejects the request', 'invalid'],
     ] as const)(
-      'keeps the subscription active and renewing when %s',
+      'saves nothing and reports an unconfirmed cancellation when %s',
       async (_label, failure) => {
         const { authId, subscriptionId } = await subscriber();
         const before = { ...recordOf(authId) };
@@ -299,7 +301,8 @@ describe('StripeCancellationService', () => {
           service.cancelAtPeriodEnd(authId, meta),
         ).rejects.toMatchObject({
           status: 503,
-          message: expect.stringContaining('could not be canceled') as string,
+          message:
+            'Cancellation could not be confirmed; please retry or check subscription status',
         });
 
         expect(recordOf(authId)).toEqual(before);

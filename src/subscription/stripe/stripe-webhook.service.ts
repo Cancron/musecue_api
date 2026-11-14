@@ -18,6 +18,7 @@ import { CustomLoggerService } from '../../common/services/custom-logger.service
 import { PrismaService } from '../../common/services/prisma.service';
 import { isProActive } from '../subscription-access.policy';
 import { StripeCancellationService } from './stripe-cancellation.service';
+import { StripeRefundService } from './stripe-refund.service';
 import { PENDING_CHECKOUT_STATUSES } from './stripe-checkout.service';
 import {
   type InvoiceVerification,
@@ -56,6 +57,12 @@ export type WebhookOutcome =
   | 'SUBSCRIPTION_ENDED'
   /** A period-end cancellation confirmed by Stripe was recorded. */
   | 'CANCELED'
+  /** A refund newly succeeded: payment updated and its access revoked. */
+  | 'REFUNDED'
+  /** Refunds were recorded or updated, but none newly succeeded. */
+  | 'REFUND_RECORDED'
+  /** A refund of a charge that paid no MuseCue invoice. */
+  | 'UNKNOWN_PAYMENT'
   | 'REJECTED'
   | 'CLOSED';
 
@@ -106,6 +113,9 @@ export const failedAttemptId = (invoiceId: string, eventId: string) =>
  *   failed renewal marks the subscription past due until Stripe collects the
  *   invoice (recovery: `invoice.paid`, recorded once like any payment) or
  *   ends the subscription (`customer.subscription.deleted`).
+ * - `charge.refunded`, `charge.refund.updated`, `refund.created`,
+ *   `refund.updated`, `refund.failed`: refunds made in Stripe, recorded and
+ *   applied by StripeRefundService (access paid by a refunded payment ends).
  * - `customer.subscription.updated`: records a period-end cancellation that
  *   Stripe confirms (e.g. when the response to the user's own cancellation
  *   request was lost). It never reverses a recorded cancellation, so stale or
@@ -126,6 +136,7 @@ export class StripeWebhookService {
     private readonly activityLog: ActivityLogService,
     private readonly logger: CustomLoggerService,
     private readonly cancellation: StripeCancellationService,
+    private readonly refunds: StripeRefundService,
   ) {}
 
   verifyEvent(
@@ -175,6 +186,19 @@ export class StripeWebhookService {
         return this.endSubscription(event.data.object, metadata, now);
       case 'customer.subscription.updated':
         return this.syncCancellation(event.data.object, metadata, now);
+      // Refunds: every event only names the charge; StripeRefundService
+      // reads the charge and all of its refunds from Stripe.
+      case 'charge.refunded':
+        return this.refunds.syncCharge(event.data.object.id, metadata, now);
+      case 'charge.refund.updated':
+      case 'refund.created':
+      case 'refund.updated':
+      case 'refund.failed': {
+        const chargeId = idOf(event.data.object.charge);
+        return chargeId
+          ? this.refunds.syncCharge(chargeId, metadata, now)
+          : 'IGNORED';
+      }
       default:
         return 'IGNORED';
     }

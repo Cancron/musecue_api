@@ -321,6 +321,52 @@ describe('StripeGateway', () => {
     });
   });
 
+  describe('refund lookups', () => {
+    it('reads a charge, all of its refunds and the invoice it paid', async () => {
+      const session = await gateway.createCheckoutSession(
+        await checkoutRequest(),
+      );
+      const invoiceId = api.completeSession(session.id).invoice as string;
+      const chargeId = api.chargeOf(invoiceId);
+      const partial = api.refundInvoice(invoiceId, { amount: 400 });
+      const rest = api.refundInvoice(invoiceId, {
+        amount: 1500,
+        status: 'pending',
+      });
+
+      const charge = await gateway.retrieveCharge(chargeId);
+      const refunds = await gateway.listChargeRefunds(chargeId);
+      const invoice = await gateway.findInvoiceForPaymentIntent(
+        charge.payment_intent as string,
+      );
+
+      expect(charge).toMatchObject({ id: chargeId, amount: 1900 });
+      expect(refunds.map((r) => [r.id, r.amount, r.status]).sort()).toEqual(
+        [
+          [partial.id, 400, 'succeeded'],
+          [rest.id, 1500, 'pending'],
+        ].sort(),
+      );
+      expect(invoice).toBe(invoiceId);
+      expect(api.requests.at(-1)).toMatchObject({
+        method: 'GET',
+        path: '/v1/invoice_payments',
+        params: {
+          payment: {
+            type: 'payment_intent',
+            payment_intent: charge.payment_intent,
+          },
+        },
+      });
+    });
+
+    it('returns null for a PaymentIntent that paid no invoice', async () => {
+      await expect(
+        gateway.findInvoiceForPaymentIntent('pi_unrelated'),
+      ).resolves.toBeNull();
+    });
+  });
+
   describe('webhook signatures', () => {
     const signed = () => {
       const payload = JSON.stringify({

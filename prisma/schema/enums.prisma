@@ -172,6 +172,17 @@ enum SubscriptionEventType {
   CANCELED
   EXPIRED
   PAYMENT_FAILED
+  PAYMENT_REFUNDED
+}
+
+// Status of a provider refund. Only SUCCEEDED refunds count towards the
+// payment's refunded amount; the status only moves forward.
+enum RefundStatus {
+  PENDING
+  REQUIRES_ACTION
+  SUCCEEDED
+  FAILED
+  CANCELED
 }
 
 // One hosted checkout attempt with the payment provider. CREATING, OPEN and

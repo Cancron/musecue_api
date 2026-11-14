@@ -28,9 +28,11 @@ export const CANCELLATION_ERRORS = {
     ),
   notConfigured: () =>
     AppError.serviceUnavailable('Payments are not configured'),
+  // Stripe may have canceled even when its response was lost, so the
+  // outcome is unknown: never claim the subscription is still renewing.
   failed: () =>
     AppError.serviceUnavailable(
-      'The subscription could not be canceled; it is still active and will renew. Please try again',
+      'Cancellation could not be confirmed; please retry or check subscription status',
     ),
   changed: () =>
     AppError.conflict('The subscription changed; refresh before trying again'),
@@ -52,9 +54,12 @@ export type CancellationOutcome =
  * - Only an active paid term backed by a Stripe subscription can be canceled,
  *   and only at the end of the period: Pro access continues until
  *   proExpiresAt, auto-renewal is turned off, and proExpiresAt never changes.
- * - Stripe is asked first, outside any database transaction. Nothing is
- *   recorded unless Stripe confirms `cancel_at_period_end`; a failed or
- *   unconfirmed request leaves the subscription active and renewing.
+ * - Stripe is asked first, outside any database transaction. The
+ *   cancellation is saved only after Stripe responds positively
+ *   (`cancel_at_period_end`). Without that response the outcome is unknown
+ *   (Stripe may have canceled and the response been lost), so nothing is
+ *   saved and the caller is told to retry or check the status. A retry, or
+ *   Stripe's `customer.subscription.updated` webhook, records it then.
  * - Recording is idempotent and serialized by the UserSubscription row lock:
  *   proCanceledAt is set only while it is empty, with exactly one CANCELED
  *   event. Repeated requests and Stripe webhooks

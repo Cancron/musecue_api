@@ -225,6 +225,17 @@ export function createInMemoryBillingPrisma() {
       }),
       [(row) => `payment:${key(row.provider)}:${key(row.providerPaymentId)}`],
     ),
+    paymentRefund: new Table<Row>(
+      (data) => ({
+        id: randomUUID(),
+        currency: 'USD',
+        reason: null,
+        createdAt: now(),
+        updatedAt: now(),
+        ...data,
+      }),
+      [(row) => `refund:${key(row.provider)}:${key(row.providerRefundId)}`],
+    ),
     subscriptionEvent: new Table<Row>(
       (data) => ({ id: randomUUID(), createdAt: now(), ...data }),
       [(row) => (row.paymentId ? `payment:${key(row.paymentId)}` : null)],

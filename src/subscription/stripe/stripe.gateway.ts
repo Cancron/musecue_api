@@ -218,6 +218,30 @@ export class StripeGateway {
     return this.client !== null;
   }
 
+  /** A charge read from Stripe (not from the webhook payload). */
+  retrieveCharge(chargeId: string): Promise<Stripe.Charge> {
+    return this.requireClient().charges.retrieve(chargeId);
+  }
+
+  /** Every refund of a charge, in any status, read from Stripe. */
+  listChargeRefunds(chargeId: string): Promise<Stripe.Refund[]> {
+    return this.requireClient()
+      .refunds.list({ charge: chargeId, limit: 100 })
+      .autoPagingToArray({ limit: 10_000 });
+  }
+
+  /** The invoice a PaymentIntent paid, or null if it paid no invoice. */
+  async findInvoiceForPaymentIntent(
+    paymentIntentId: string,
+  ): Promise<string | null> {
+    const payments = await this.requireClient().invoicePayments.list({
+      payment: { type: 'payment_intent', payment_intent: paymentIntentId },
+      limit: 1,
+    });
+    const invoice = payments.data[0]?.invoice;
+    return typeof invoice === 'string' ? invoice : (invoice?.id ?? null);
+  }
+
   /** Stripe only expires `open` sessions; others reject the request. */
   async expireCheckoutSession(
     sessionId: string,
