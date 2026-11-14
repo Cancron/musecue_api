@@ -214,6 +214,14 @@ export class PrivacyExportStorageService {
     return scopes;
   }
 
+  /** Removes every export archive of one owner (`<authId>/`). */
+  async deleteOwnerDirectory(authId: string): Promise<void> {
+    if (!SAFE_SEGMENT.test(authId)) {
+      throw new Error('Invalid private export scope');
+    }
+    await rm(resolve(this.root, authId), { recursive: true, force: true });
+  }
+
   /** Removes an owner's export directory if it is empty. */
   async removeEmptyOwnerDirectory(authId: string): Promise<void> {
     if (!SAFE_SEGMENT.test(authId)) return;

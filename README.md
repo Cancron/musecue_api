@@ -18,7 +18,7 @@ The companion mobile application and detailed product specifications live in `..
 - a provider-neutral AI gateway with OpenRouter live mode, multimodal private-image input, strict structured output, runtime validation, bounded retries, and deterministic mock mode
 - a single Pro subscription plan: admin-configured monthly/yearly pricing and free trial, one-time trial activation, date-based Pro access through `ProAccessGuard`, and payment/lifecycle records protected by database rules (see "Subscriptions" under API); checkout, webhooks and billing endpoints are not implemented yet
 - personal data export: an authenticated user can request an asynchronous ZIP archive of their own account, profile, makeup history, subscription records and private photos, poll its status, and download it through a signed link valid for at most 15 minutes; archives expire 24 hours after export and are deleted by a scheduled retention sweep (see "Personal data export" under API)
-- account deletion requests: the owner confirms their identity (password, or an emailed code for accounts without one), the account is blocked at once (`PENDING_DELETION`, all sessions revoked) and the request is recorded for resumable processing (see "Account deletion" under API); erasing the account's data is the next step
+- account deletion: the owner confirms their identity (password and an emailed code, or the code alone for accounts without a password), the account is blocked and every token invalidated at once (`PENDING_DELETION`), and a background sweep hard-deletes the account and all its data and files, keeping payment records detached (see "Account deletion" under API)
 
 Migration `20260827174107_add_makeup_workflow` adds the makeup aggregate and removes the dormant job-tracker and subscription starter domains.
 
@@ -332,7 +332,7 @@ Billing records for the future payment integration (migration `20260918120000_ad
 - `PaymentTransaction` records one charge attempt for one billing period. It stores the amount in cents, currency, status (`PENDING`, `SUCCEEDED`, `FAILED`, `PARTIALLY_REFUNDED`, `REFUNDED`), `provider` + `providerPaymentId`, the period, timestamps, and failure and refund details.
   - `(provider, providerPaymentId)` is unique, and only one verified payment may cover a given period.
   - Payments are never deleted. Amount, currency, provider IDs and period never change, and status only moves forward.
-  - A user with payments cannot be hard-deleted.
+  - When a user is hard-deleted, their subscription is deleted and their payments are kept, detached: `subscriptionId` becomes `NULL` (`ON DELETE SET NULL`, migration `20260929120000_account_erasure`). This is the only change the database allows to `subscriptionId`, and only once the subscription no longer exists. A payment is never moved, re-attached or deleted.
 - `SubscriptionEvent` is an append-only lifecycle log: `TRIAL_STARTED`, `CREATED`, `RENEWED`, `CANCELED`, `EXPIRED`. `CREATED` and `RENEWED` reference the `SUCCEEDED` payment for the period, and each payment backs at most one event.
 - `UserSubscription` gains `paymentProvider` and `providerSubscriptionId` (unique together) to link the provider's recurring subscription.
 - A paid term (`proStartedAt`/`proExpiresAt`) can only be created or extended by a `SUCCEEDED` payment of the same subscription and interval that covers the newly granted range and ends exactly at `proExpiresAt`. A new term may not start before its paid period, and a renewal's period must start no later than the current expiry, so it cannot bridge an unpaid gap. Early renewals and monthly-to-yearly changes may overlap. Pending, failed and refunded payments never grant or renew Pro access. Cancelling keeps access until `proExpiresAt`.
@@ -373,10 +373,10 @@ handler(@Req() req: ProAccessRequest) { /* req.proAccess: status, accessSource, 
 
 The guard delegates to `SubscriptionAccessService`, the single Pro access decision. An active free trial and an active paid term unlock the same features, each within its own `[startedAt, expiresAt)` window. Without access, the guard returns `403` with `An active Pro subscription or free trial is required` and the handler does not run. Requests that did not pass `AuthGuard` are rejected with `401`, and lookup errors never grant access. No makeup endpoint uses the guard yet.
 
-Database tests (`test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`, `test/privacy-export.e2e-spec.ts`, `test/account-deletion.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
+Database tests (`test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`, `test/privacy-export.e2e-spec.ts`, `test/account-deletion.e2e-spec.ts`, `test/account-erasure.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
 
 ```bash
-TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json test/subscription-plan test/user-subscription test/subscription-trial test/subscription-status test/pro-access test/trial-lifecycle test/billing test/subscription-security test/privacy-export test/account-deletion
+TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json test/subscription-plan test/user-subscription test/subscription-trial test/subscription-status test/pro-access test/trial-lifecycle test/billing test/subscription-security test/privacy-export test/account-deletion test/account-erasure
 ```
 
 Personal data export unit tests (no database or Redis needed):
@@ -486,19 +486,36 @@ Routes require a bearer token. The account is always the token's user. A request
 | `POST` | `/v1/privacy/account-deletion/confirmation-code` | Email a one-time confirmation code (accounts without a password, e.g. Google sign-in) |
 | `POST` | `/v1/privacy/account-deletion` | Confirm identity and request permanent deletion (`202`) |
 
-**Identity verification** follows the login conventions:
+**Identity verification** follows the login conventions. Every deletion is confirmed with a one-time code sent to the account's email address (`POST .../confirmation-code`, no body):
 
-- Accounts with a password send `{ "password": "..." }`. The check uses constant-time bcrypt, and wrong passwords count toward the same lockout as failed logins (5 failures lock the account for 30 minutes and revoke its tokens).
-- Accounts without a password (Google sign-in) first request a code, which is emailed to the account's address, then send `{ "code": "A1B2C3" }`. Codes are 6 characters, stored only as a hash bound to the account, valid 10 minutes, single-use and limited to 5 guesses. At most 3 codes can be requested per 15 minutes.
-- Sending the wrong kind of proof returns `400`; a wrong password or code returns `403` (`Identity verification failed`). Confirmations are limited to 5 per 15 minutes (`429`).
+- Accounts with a password send **both** `{ "password": "...", "code": "A1B2C3" }`. The password check uses constant-time bcrypt, and wrong passwords count toward the same lockout as failed logins (5 failures lock the account for 30 minutes and revoke its tokens). A wrong password does not use up the code.
+- Accounts without a password (Google sign-in) send `{ "code": "A1B2C3" }` only; a password is rejected.
+- Codes are 6 characters, stored only as a hash bound to the account, valid 10 minutes, single-use and limited to 5 guesses. At most 3 codes can be requested per 15 minutes.
+- Missing proof or the wrong kind of proof returns `400`; a wrong password or code returns `403` (`Identity verification failed`). Confirmations are limited to 5 per 15 minutes (`429`).
 
-**Acceptance and blocking.** In one transaction, the account moves from `ACTIVE` to `PENDING_DELETION` (a guarded update), its `tokenVersion` is incremented, and an `AccountDeletionRequest` is recorded. Then every refresh token is revoked and the cached token version is overwritten, so the current and all other sessions stop working at once. Login, token refresh and Google sign-in refuse any account that is not `ACTIVE`. The response is `202` with `{ id, status, requestedAt, accountBlockedAt, sessionsRevoked }`.
+**Acceptance and token invalidation.** In one transaction, the account moves from `ACTIVE` to `PENDING_DELETION` (a guarded update), its `tokenVersion` is incremented, and an `AccountDeletionRequest` is recorded.
 
-**Multiple requests.** Only one open (not `COMPLETED`) request per account can exist; a partial unique index enforces this. Concurrent requests are serialized by the row lock and all receive the same request. A repeated request after acceptance is refused with `401`, because the session has been revoked.
+- **Before the transaction commits,** the new token version is written to the token cache. If that write fails, the transaction rolls back and the request returns `503`, so a deletion is never approved while old tokens could still work.
+- `AuthGuard` fills an empty cache entry only with `SET NX`, so a request that read the account just before the approval cannot put the old version back.
+- After the commit, every refresh session is removed. Login, token refresh and Google sign-in refuse any account that is not `ACTIVE`.
+- The response is `202` with `{ id, status, requestedAt, accountBlockedAt, sessionsRevoked }`.
 
-**Processing status.** The request stores `status` (`PENDING` → `PROCESSING` → `COMPLETED`), `accountBlockedAt`, `sessionsRevokedAt`, `processingStartedAt`, `completedAt`, `attempts` and `lastError`. If revoking sessions fails, for example while Redis is down, the account stays blocked in the database, `sessionsRevokedAt` stays null, and `AccountDeletionRecoveryService` resumes the revocation at startup and every 30 seconds. The request has no foreign key to the account and holds no personal data, so it outlives the account it deletes.
+**Multiple requests.** Only one open (not `COMPLETED`) request per account can exist; a partial unique index enforces this. Concurrent requests are serialized by the row lock and all receive the same request. A repeated request after approval is refused with `401`.
 
-Not implemented yet: erasing the account's data and files and completing the request.
+#### Erasure (hard deletion)
+
+`AccountDeletionRecoveryService` runs at startup and every 30 seconds. It finishes any pending session revocation and hands every open request whose processing lease (`lockedUntil`, 5 minutes) is free or expired to `AccountErasureService`. Each step is recorded on the request, so a crash or failure resumes from the last completed step:
+
+1. **Data (one transaction).**
+   - Records the account's storage references as `AccountDeletionFile` rows: each private image inside the owner's own scope (session photos, avatar), plus the owner's whole image and export directories, which also catches files no row references any more.
+   - Deletes activity-log entries about the account (its `authUser` and `UserSubscription` records).
+   - Anonymizes entries the account made about shared records (for example an administrator changing the plan): the actor, IP, user agent and device are cleared, and the change itself is kept.
+   - Hard-deletes the `authUser` row, guarded by `status = PENDING_DELETION`. Foreign keys cascade to every row the account owns: profile, security, sign-in and email history, makeup sessions with images, preferences, analyses, recommendations, guides, steps, attempts and questions, AI runs, subscription and events, and data exports.
+   - Payments survive, detached. Either everything commits, references included, or nothing does (`dataErasedAt`).
+2. **Files.** Deletes each referenced file and directory and marks it `deletedAt`. A storage failure is retried from the saved references (`filesDeletedAt`).
+3. **Completion.** Once sessions are revoked, the data erased and the files deleted, the request becomes `COMPLETED`. Cached authentication data of the account (sessions, the token version, keys containing its email) and any outstanding code are removed.
+
+The database allows `COMPLETED` only after all three steps, and the request (no foreign key, no personal data) remains as the record that the deletion happened. The request, the deletion files table, the plan and payments are never reachable by a user's cascade. A foreign-key audit test enforces this: nothing `RESTRICT`s a user's deletion, and only `ActivityLogEvent.actionedBy` and `PaymentTransaction.subscriptionId` are set to `NULL`.
 
 ## Domain
 
@@ -506,7 +523,7 @@ Not implemented yet: erasing the account's data and files and completing the req
 authUser
 |-- UserSubscription (0..1)
 |-- DataExport
-|-- (AccountDeletionRequest: references authId without a foreign key)
+|-- (AccountDeletionRequest -> AccountDeletionFile: references authId without a foreign key)
 `-- MakeupSession
     |-- ImageAsset
     |-- MakeupPreferences

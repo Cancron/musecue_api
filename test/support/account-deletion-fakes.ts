@@ -180,6 +180,11 @@ export class AccountStore {
   beforeTransaction: () => Promise<void> = () => Promise.resolve();
   /** Makes the next request insert fail (to test rollback). */
   failNextRequestInsert = false;
+  /**
+   * Runs after a user lookup has read its (possibly soon stale) row and
+   * before it returns it, to reproduce races with concurrent writes.
+   */
+  onUserLookup: ((id: string) => Promise<void>) | null = null;
 
   constructor() {
     this.wire();
@@ -191,6 +196,7 @@ export class AccountStore {
     this.loginHistory = [];
     this.failNextRequestInsert = false;
     this.beforeTransaction = () => Promise.resolve();
+    this.onUserLookup = null;
   }
 
   addUser(user: Partial<StoredUser> & { id?: string }): StoredUser {
@@ -228,14 +234,28 @@ export class AccountStore {
     );
   }
 
-  private matchesRequest(request: AccountDeletionRequest, where: Where) {
+  private matchesRequest(
+    request: AccountDeletionRequest,
+    where: Where,
+  ): boolean {
     return Object.entries(where).every(([field, expected]) => {
+      if (field === 'OR') {
+        return (expected as Where[]).some((branch) =>
+          this.matchesRequest(request, branch),
+        );
+      }
       const value = request[field as keyof AccountDeletionRequest];
       if (expected && typeof expected === 'object' && 'in' in expected) {
         return (expected.in as unknown[]).includes(value);
       }
       if (expected && typeof expected === 'object' && 'gt' in expected) {
         return String(value) > String(expected.gt);
+      }
+      if (expected && typeof expected === 'object' && 'lt' in expected) {
+        return (
+          value instanceof Date &&
+          value.getTime() < (expected.lt as Date).getTime()
+        );
       }
       return value === expected;
     });
@@ -267,7 +287,7 @@ export class AccountStore {
       }
     }) as never);
 
-    prisma.authUser.findUnique.mockImplementation(((args: {
+    prisma.authUser.findUnique.mockImplementation((async (args: {
       where: { id?: string; email?: string };
     }) => {
       const user = args.where.id
@@ -275,14 +295,16 @@ export class AccountStore {
         : [...this.users.values()].find(
             (item) => item.email === args.where.email,
           );
-      if (!user) return Promise.resolve(null);
-      return Promise.resolve({
+      if (!user) return null;
+      const row = {
         ...user,
         authSecurity: user.security && {
           id: `sec-${user.id}`,
           ...user.security,
         },
-      });
+      };
+      if (this.onUserLookup) await this.onUserLookup(user.id);
+      return row;
     }) as never);
     prisma.authUser.findUniqueOrThrow.mockImplementation(((args: {
       where: { id: string };
@@ -361,6 +383,9 @@ export class AccountStore {
         status: 'PENDING',
         sessionsRevokedAt: null,
         processingStartedAt: null,
+        dataErasedAt: null,
+        filesDeletedAt: null,
+        lockedUntil: null,
         completedAt: null,
         attempts: 0,
         lastError: null,

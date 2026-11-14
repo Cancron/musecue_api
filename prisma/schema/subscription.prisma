@@ -72,9 +72,14 @@ model UserSubscription {
 // (PENDING -> SUCCEEDED | FAILED; SUCCEEDED -> PARTIALLY_REFUNDED | REFUNDED).
 // Only a SUCCEEDED payment can create or extend a paid term on
 // UserSubscription (enforced by a database trigger).
+//
+// When an account is deleted, its subscription is deleted and its payments
+// are kept, detached: subscriptionId becomes NULL (ON DELETE SET NULL). That
+// is the only change the database allows to subscriptionId, and only once the
+// subscription no longer exists; a payment is never re-attached.
 model PaymentTransaction {
   id                  String          @id @default(uuid())
-  subscriptionId      String
+  subscriptionId      String?
   provider            String          @db.VarChar(50)
   providerPaymentId   String          @db.VarChar(255)
   status              PaymentStatus   @default(PENDING)
@@ -92,7 +97,7 @@ model PaymentTransaction {
   createdAt           DateTime        @default(now())
   updatedAt           DateTime        @updatedAt
 
-  subscription UserSubscription   @relation(fields: [subscriptionId], references: [id], onDelete: Restrict)
+  subscription UserSubscription?  @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
   event        SubscriptionEvent?
 
   @@unique([provider, providerPaymentId])

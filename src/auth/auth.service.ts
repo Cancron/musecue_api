@@ -973,10 +973,57 @@ export class AuthService {
    */
   async revokeAllSessions(userId: string, tokenVersion: number): Promise<void> {
     await this.revokeAllUserTokens(userId);
+    await this.publishTokenVersion(userId, tokenVersion);
+  }
+
+  /**
+   * Overwrites the cached token version, so every access token carrying an
+   * older version is rejected by AuthGuard at once. Throws when Redis cannot
+   * confirm the write, so callers can fail closed.
+   */
+  async publishTokenVersion(
+    userId: string,
+    tokenVersion: number,
+  ): Promise<void> {
     const cacheKey = `${config.redis_cache_key_prefix}:token_version:${userId}`;
     const cached = await this.redisService.set(cacheKey, tokenVersion, 3600);
     if (!cached) {
       throw new Error('The cached token version could not be updated');
+    }
+  }
+
+  /**
+   * Drops the cached token version so the next request reloads it from the
+   * database (used to undo publishTokenVersion when its transaction failed).
+   */
+  async forgetCachedTokenVersion(userId: string): Promise<void> {
+    await this.redisService.del(
+      `${config.redis_cache_key_prefix}:token_version:${userId}`,
+    );
+  }
+
+  /**
+   * Removes short-lived authentication data kept in Redis for a deleted
+   * account: sessions, the cached token version (set to 0, which matches no
+   * token) and keys that contain the email address. Best effort: every key
+   * also expires on its own.
+   */
+  async forgetDeletedAccount(userId: string, email: string | null) {
+    await this.revokeAllUserTokens(userId).catch(() => undefined);
+    await this.redisService.set(
+      `${config.redis_cache_key_prefix}:token_version:${userId}`,
+      0,
+      3600,
+    );
+    if (email) {
+      const rateLimit = `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.RATE_LIMIT}login:email:${email}`;
+      await Promise.all([
+        this.redisService.del(
+          `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.VERIFICATION_TOKEN}:${email}`,
+        ),
+        this.redisService.del(rateLimit),
+        this.redisService.del(`${rateLimit}:locked`),
+      ]);
     }
   }
 

@@ -34,8 +34,8 @@ export class AccountDeletionController {
   constructor(private readonly deletions: AccountDeletionService) {}
 
   /**
-   * Emails a one-time code to confirm the deletion of an account without a
-   * password (for example Google sign-in). Takes no body.
+   * Emails the one-time code that confirms a deletion (required for every
+   * account). Takes no body.
    */
   @Post('confirmation-code')
   @HttpCode(HttpStatus.ACCEPTED)
@@ -48,9 +48,10 @@ export class AccountDeletionController {
   }
 
   /**
-   * Confirms identity (password, or the emailed code) and accepts the
-   * deletion: the account is blocked at once and every session revoked.
-   * Repeating the request returns the same deletion.
+   * Confirms identity (password and emailed code; the code alone for
+   * accounts without a password) and accepts the deletion: the account is
+   * blocked and every token invalidated at once. Repeating the request
+   * returns the same deletion.
    */
   @Post()
   @HttpCode(HttpStatus.ACCEPTED)

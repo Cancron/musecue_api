@@ -29,15 +29,27 @@ export interface RequestMeta {
 
 const OPEN_STATUSES = ['PENDING', 'PROCESSING'] as const;
 
+/** The token cache could not be updated, so the deletion is not approved. */
+class TokenInvalidationUnavailableError extends Error {
+  constructor() {
+    super('Access tokens could not be invalidated');
+    this.name = 'TokenInvalidationUnavailableError';
+  }
+}
+
 /**
  * Accepts a signed-in user's request to permanently delete their own
  * account.
  *
- * The owner proves their identity again (password, or an emailed code for
- * accounts without a password). Accepting the request blocks the account in
- * the same transaction that records it (status PENDING_DELETION and a new
- * token version, so no existing or new token works), then revokes every
- * session. Repeated or concurrent requests return the same open request: at
+ * The owner proves their identity again: accounts with a password send the
+ * current password and a code emailed to the account's address; accounts
+ * without a password (Google sign-in) send the emailed code. Accepting the
+ * request blocks the account in the same transaction that records it
+ * (status PENDING_DELETION and a new token version) and, before that
+ * transaction commits, publishes the new token version to the token cache,
+ * so no existing access token works once the deletion is approved (the
+ * transaction rolls back if that is not possible). Refresh sessions are then
+ * removed. Repeated or concurrent requests return the same open request: at
  * most one deletion per account can exist (database-enforced).
  */
 @Injectable()
@@ -50,7 +62,7 @@ export class AccountDeletionService {
     @Inject(WINSTON_MODULE_PROVIDER) private readonly logger: Logger,
   ) {}
 
-  /** Emails a confirmation code; only for accounts without a password. */
+  /** Emails the one-time code that every deletion must be confirmed with. */
   async requestConfirmationCode(authId: string): Promise<ConfirmationCodeView> {
     const user = await this.prisma.authUser.findUnique({
       where: { id: authId },
@@ -64,11 +76,6 @@ export class AccountDeletionService {
     });
     if (!user || user.status !== 'ACTIVE') {
       throw AppError.unauthorized('User account is not active');
-    }
-    if (user.provider === 'local') {
-      throw AppError.badRequest(
-        'This account has a password; confirm the deletion with it',
-      );
     }
     const { expiresAt } = await this.codes.issue(user);
     return {
@@ -105,6 +112,7 @@ export class AccountDeletionService {
     const verificationMethod = await this.verifyIdentity(user, dto, meta, now);
 
     let accepted: { request: AccountDeletionRequest; tokenVersion: number };
+    let tokenCachePublished = false;
     try {
       const outcome = await this.prisma.$transaction(async (tx) => {
         // Guarded transition: only an ACTIVE account can start a deletion.
@@ -120,6 +128,14 @@ export class AccountDeletionService {
           where: { id: authId },
           select: { tokenVersion: true },
         });
+        // Invalidate every access token before the deletion is committed. If
+        // the token cache cannot be updated, nothing is committed.
+        tokenCachePublished = true;
+        try {
+          await this.auth.publishTokenVersion(authId, tokenVersion);
+        } catch {
+          throw new TokenInvalidationUnavailableError();
+        }
         // The row lock taken by the update above serializes this with any
         // concurrent request for the same account. An open request can only
         // exist here if the account was reactivated meanwhile; it is reused
@@ -149,6 +165,15 @@ export class AccountDeletionService {
       if (!outcome) return this.existingRequest(authId);
       accepted = outcome;
     } catch (error) {
+      if (tokenCachePublished) {
+        // The block was rolled back: let the cache reload the real version.
+        await this.auth.forgetCachedTokenVersion(authId).catch(() => undefined);
+      }
+      if (error instanceof TokenInvalidationUnavailableError) {
+        throw AppError.serviceUnavailable(
+          'Account deletion is temporarily unavailable. Please try again later.',
+        );
+      }
       // A concurrent request already opened the deletion.
       if (this.isUniqueConstraintError(error)) {
         return this.existingRequest(authId);
@@ -221,19 +246,20 @@ export class AccountDeletionService {
     now: Date,
   ): Promise<AccountDeletionVerification> {
     if (user.provider !== 'local') {
+      // No password exists: the emailed code alone proves ownership.
       if (!dto.code || dto.password !== undefined) {
         throw AppError.badRequest(
           'Confirm the deletion with the code sent to your email address',
         );
       }
-      if (!(await this.codes.verify(user.id, dto.code))) {
-        throw AppError.forbidden(IDENTITY_VERIFICATION_FAILED);
-      }
+      await this.verifyCode(user.id, dto.code);
       return 'EMAIL_CODE';
     }
 
-    if (!dto.password || dto.code !== undefined) {
-      throw AppError.badRequest('Confirm the deletion with your password');
+    if (!dto.password || !dto.code) {
+      throw AppError.badRequest(
+        'Confirm the deletion with your password and the code sent to your email address',
+      );
     }
     const security = user.authSecurity;
     if (security?.lockExpiresAt && now < security.lockExpiresAt) {
@@ -253,7 +279,14 @@ export class AccountDeletionService {
       }
       throw AppError.forbidden(IDENTITY_VERIFICATION_FAILED);
     }
-    return 'PASSWORD';
+    await this.verifyCode(user.id, dto.code);
+    return 'PASSWORD_AND_EMAIL_CODE';
+  }
+
+  private async verifyCode(userId: string, code: string): Promise<void> {
+    if (!(await this.codes.verify(userId, code))) {
+      throw AppError.forbidden(IDENTITY_VERIFICATION_FAILED);
+    }
   }
 
   /** The open request of an account that is already pending deletion. */

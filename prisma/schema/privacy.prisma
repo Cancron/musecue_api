@@ -53,18 +53,23 @@ model DataExport {
 // ================================
 
 // The owner's request to permanently delete their account, and the state of
-// its processing so an interrupted deletion can be resumed.
+// its processing so an interrupted deletion is always resumed.
 //
-// Accepting a request blocks the account in the same transaction
-// (authUser.status = PENDING_DELETION, tokenVersion + 1), then revokes every
-// session (`sessionsRevokedAt`). Erasing the account's data completes the
-// request (`completedAt`).
+// Steps (each recorded when done):
+//   accountBlockedAt  - accepted: account PENDING_DELETION, tokens invalidated
+//   sessionsRevokedAt - every refresh session removed
+//   dataErasedAt      - one transaction recorded the account's storage
+//                       references (AccountDeletionFile) and hard-deleted the
+//                       account and all its data
+//   filesDeletedAt    - every referenced file was deleted from storage
+//   completedAt       - status COMPLETED
+// `lockedUntil` is a short processing lease so only one worker processes a
+// request at a time; an expired lease is picked up again.
 //
 // Deliberately no foreign key to authUser: the request must outlive the
-// account it deletes (as the record that the deletion happened and to resume
-// it), so it stores only the pseudonymous account ID and no personal data.
-// At most one request per account is open (not COMPLETED) at a time
-// (partial unique index in the migration).
+// account it deletes, so it stores only the pseudonymous account ID and no
+// personal data. At most one request per account is open (not COMPLETED) at a
+// time (partial unique index in the migration).
 model AccountDeletionRequest {
   id                  String                      @id @default(uuid())
   authId              String
@@ -74,11 +79,35 @@ model AccountDeletionRequest {
   accountBlockedAt    DateTime
   sessionsRevokedAt   DateTime?
   processingStartedAt DateTime?
+  dataErasedAt        DateTime?
+  filesDeletedAt      DateTime?
   completedAt         DateTime?
+  lockedUntil         DateTime?
   attempts            Int                         @default(0)
   lastError           String?                     @db.VarChar(500)
   updatedAt           DateTime                    @updatedAt
 
+  files AccountDeletionFile[]
+
   @@index([authId])
   @@index([status, sessionsRevokedAt])
+  @@index([status, lockedUntil])
+}
+
+// A file of a deleted account that must be removed from private storage. The
+// references are written in the same transaction that erases the account's
+// rows, so they can never be lost; `deletedAt` is set once the file (or
+// directory) is gone.
+model AccountDeletionFile {
+  id         String                  @id @default(uuid())
+  requestId  String
+  kind       AccountDeletionFileKind
+  storageKey String                  @db.VarChar(512)
+  deletedAt  DateTime?
+  createdAt  DateTime                @default(now())
+
+  request AccountDeletionRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  @@unique([requestId, kind, storageKey])
+  @@index([requestId, deletedAt])
 }

@@ -104,6 +104,11 @@ export class AccountDeletionCodeService {
     return matches;
   }
 
+  /** Removes any outstanding code of an account (after it was erased). */
+  async forget(userId: string): Promise<void> {
+    await this.invalidate(userId);
+  }
+
   private async invalidate(userId: string): Promise<void> {
     await this.redis.del(this.codeKey(userId));
     await this.redis.del(this.attemptsKey(userId));

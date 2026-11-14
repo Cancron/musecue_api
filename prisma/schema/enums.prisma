@@ -203,6 +203,19 @@ enum AccountDeletionStatus {
 }
 
 enum AccountDeletionVerification {
+  // Legacy: password only (requests accepted before codes were required).
   PASSWORD
+  // The account password and an emailed code.
+  PASSWORD_AND_EMAIL_CODE
+  // An emailed code (accounts without a password, e.g. Google sign-in).
   EMAIL_CODE
+}
+
+enum AccountDeletionFileKind {
+  // One private image (session photo or avatar): an image storage key.
+  PRIVATE_IMAGE
+  // The owner's whole image directory (`<authId>`), for unreferenced files.
+  IMAGE_OWNER_DIRECTORY
+  // The owner's whole export directory (`<authId>`) with every archive.
+  EXPORT_OWNER_DIRECTORY
 }

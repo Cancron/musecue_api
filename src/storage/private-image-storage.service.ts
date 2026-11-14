@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, unlink, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import {
   isMissingFileError,
@@ -14,6 +14,8 @@ const EXTENSIONS_BY_MIME = {
 } as const;
 
 type SupportedImageMime = keyof typeof EXTENSIONS_BY_MIME;
+
+const SAFE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
 @Injectable()
 export class PrivateImageStorageService {
@@ -50,6 +52,17 @@ export class PrivateImageStorageService {
     } catch (error) {
       if (!isMissingFileError(error)) throw error;
     }
+  }
+
+  /**
+   * Removes every private image of one owner (`<authId>/`), including files
+   * no database row references any more. Used when an account is erased.
+   */
+  async deleteOwnerDirectory(authId: string): Promise<void> {
+    if (!SAFE_SEGMENT.test(authId)) {
+      throw new Error('Invalid private image storage owner');
+    }
+    await rm(resolve(this.root, authId), { recursive: true, force: true });
   }
 
   read(storageKey: string): Promise<Buffer> {

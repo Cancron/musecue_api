@@ -40,6 +40,7 @@ import { AccountDeletionRecoveryService } from './account-deletion-recovery.serv
 import { AccountDeletionController } from './account-deletion.controller';
 import type { AccountDeletionView } from './account-deletion.interface';
 import { AccountDeletionService } from './account-deletion.service';
+import { AccountErasureService } from './account-erasure.service';
 
 const PASSWORD = 'correct horse battery staple';
 const PASSWORD_HASH = bcrypt.hashSync(PASSWORD, 4);
@@ -49,6 +50,7 @@ const PREFIX = config.redis_cache_key_prefix;
 const store = new AccountStore();
 const redis = new FakeRedis();
 const emailQueue = mock<EmailQueueService>();
+const erasure = mock<AccountErasureService>();
 
 /** Any other protected endpoint of the application. */
 @UseGuards(AuthGuard)
@@ -137,6 +139,24 @@ describe('Account deletion requests (HTTP)', () => {
   const emailedCode = () =>
     emailQueue.sendAccountDeletionCode.mock.calls.at(-1)?.[2] as string;
 
+  /**
+   * The full confirmation a user performs: request the emailed code, then
+   * send it (with the password, for accounts that have one).
+   */
+  async function confirmDeletion(
+    expectedStatus: number,
+    user: StoredUser,
+    token = tokenFor(user),
+    proof: { password?: string; code?: string } = {},
+  ) {
+    await requestCode(token).expect(202);
+    const body =
+      user.provider === 'local'
+        ? { password: PASSWORD, code: emailedCode(), ...proof }
+        : { code: emailedCode(), ...proof };
+    return requestDeletion(token, body).expect(expectedStatus);
+  }
+
   beforeAll(async () => {
     originalSecret = config.jwt_access_secret;
     config.jwt_access_secret = 'account-deletion-spec-secret';
@@ -147,6 +167,8 @@ describe('Account deletion requests (HTTP)', () => {
         AccountDeletionService,
         AccountDeletionCodeService,
         AccountDeletionRecoveryService,
+        // Erasure has its own unit and database tests.
+        { provide: AccountErasureService, useValue: erasure },
         AuthService,
         AuthUtilsService,
         AuthGuard,
@@ -182,6 +204,7 @@ describe('Account deletion requests (HTTP)', () => {
     freezeTime(T0);
     jest.clearAllMocks();
     emailQueue.sendAccountDeletionCode.mockResolvedValue();
+    erasure.process.mockResolvedValue('PENDING');
     redis.failing.clear();
     redis.clear();
     store.reset();
@@ -189,15 +212,15 @@ describe('Account deletion requests (HTTP)', () => {
 
   afterEach(() => jest.useRealTimers());
 
-  describe('valid requests', () => {
-    it('accepts the owner’s password-confirmed request, blocks the account at once and records the request', async () => {
+  const requestsOf = (user: StoredUser) =>
+    store.requests.filter((item) => item.authId === user.id);
+
+  describe('identity verification', () => {
+    it('accepts a password account confirmed with BOTH its password and the emailed code', async () => {
       const user = localUser();
       const token = tokenFor(user);
-      await protectedCall(token).expect(200);
 
-      const response = await requestDeletion(token, {
-        password: PASSWORD,
-      }).expect(202);
+      const response = await confirmDeletion(202, user, token);
 
       expect(viewOf(response)).toEqual({
         id: expect.any(String) as unknown,
@@ -207,57 +230,32 @@ describe('Account deletion requests (HTTP)', () => {
         sessionsRevoked: true,
         message: expect.stringContaining('permanent deletion') as unknown,
       });
+      expect(requestsOf(user)).toEqual([
+        expect.objectContaining({
+          verificationMethod: 'PASSWORD_AND_EMAIL_CODE',
+          accountBlockedAt: T0,
+          sessionsRevokedAt: T0,
+        }),
+      ]);
       expect(store.users.get(user.id)).toMatchObject({
         status: 'PENDING_DELETION',
         tokenVersion: 2,
       });
-      expect(store.requests).toEqual([
-        expect.objectContaining({
-          id: viewOf(response).id,
-          authId: user.id,
-          status: 'PENDING',
-          verificationMethod: 'PASSWORD',
-          accountBlockedAt: T0,
-          sessionsRevokedAt: T0,
-          attempts: 0,
-          lastError: null,
-        }),
-      ]);
-
-      // Blocked immediately: the same token no longer works anywhere, and
-      // every refresh token (all devices) is gone.
-      await protectedCall(token).expect(401);
-      expect(refreshTokensOf(user)).toEqual([]);
-      expect(redis.raw(`${PREFIX}:token_version:${user.id}`)).toBe(2);
+      // The code was sent to the account's own address.
+      expect(emailQueue.sendAccountDeletionCode.mock.calls[0][0]).toBe(
+        user.email,
+      );
     });
 
-    it('accepts an email-code-confirmed request from an account without a password (Google sign-in)', async () => {
+    it('accepts a passwordless (Google) account confirmed with the emailed code alone', async () => {
       const user = googleUser();
-      const token = tokenFor(user);
 
-      const code = await requestCode(token).expect(202);
-      expect(JSON.stringify(code.body)).not.toContain(emailedCode());
-      expect(emailQueue.sendAccountDeletionCode.mock.calls[0]).toEqual([
-        user.email,
-        user.username,
-        expect.stringMatching(/^[0-9A-F]{6}$/),
-        10,
+      await confirmDeletion(202, user);
+
+      expect(requestsOf(user)).toEqual([
+        expect.objectContaining({ verificationMethod: 'EMAIL_CODE' }),
       ]);
-
-      const response = await requestDeletion(token, {
-        code: emailedCode(),
-      }).expect(202);
-
-      expect(viewOf(response)).toMatchObject({
-        status: 'PENDING',
-        sessionsRevoked: true,
-      });
-      expect(store.requests[store.requests.length - 1]).toMatchObject({
-        authId: user.id,
-        verificationMethod: 'EMAIL_CODE',
-      });
       expect(store.users.get(user.id)?.status).toBe('PENDING_DELETION');
-      await protectedCall(token).expect(401);
     });
 
     it('accepts the code case-insensitively', async () => {
@@ -270,72 +268,97 @@ describe('Account deletion requests (HTTP)', () => {
       }).expect(202);
     });
 
-    it('only ever deletes the token owner’s account, never another one', async () => {
-      const owner = localUser();
-      const bystander = localUser();
+    it('never returns the code to the client', async () => {
+      const user = localUser();
 
-      await requestDeletion(tokenFor(owner), { password: PASSWORD }).expect(
-        202,
-      );
+      const response = await requestCode(tokenFor(user)).expect(202);
 
-      expect(store.users.get(bystander.id)).toMatchObject({
-        status: 'ACTIVE',
-        tokenVersion: 1,
-      });
-      expect(refreshTokensOf(bystander)).toHaveLength(2);
-      await protectedCall(tokenFor(bystander)).expect(200);
-      expect(
-        store.requests.filter((item) => item.authId === bystander.id),
-      ).toEqual([]);
+      expect(JSON.stringify(response.body)).not.toContain(emailedCode());
     });
-  });
 
-  describe('wrong identity verification', () => {
-    it('rejects a wrong password without blocking or recording anything, and counts it toward the lockout', async () => {
+    it.each([
+      ['the password alone', () => ({ password: PASSWORD })],
+      ['the code alone', () => ({ code: emailedCode() })],
+      ['no proof', () => ({})],
+    ])(
+      'rejects %s for a password account (both are required)',
+      async (_label, proof) => {
+        const user = localUser();
+        const token = tokenFor(user);
+        await requestCode(token).expect(202);
+
+        await requestDeletion(token, proof()).expect(400);
+
+        expect(store.users.get(user.id)?.status).toBe('ACTIVE');
+        expect(requestsOf(user)).toEqual([]);
+      },
+    );
+
+    it('rejects a password for an account without one', async () => {
+      const user = googleUser();
+
+      await confirmDeletion(400, user, tokenFor(user), {
+        password: 'anything',
+      });
+
+      expect(store.users.get(user.id)?.status).toBe('ACTIVE');
+    });
+
+    it('rejects the right password with a wrong code (and keeps the password counter untouched)', async () => {
       const user = localUser();
       const token = tokenFor(user);
+      await requestCode(token).expect(202);
+      const wrong = emailedCode() === 'AAAAAA' ? 'BBBBBB' : 'AAAAAA';
 
       const response = await requestDeletion(token, {
-        password: 'wrong',
+        password: PASSWORD,
+        code: wrong,
       }).expect(403);
 
       expect(messageOf(response)).toBe('Identity verification failed');
-      expect(store.users.get(user.id)).toMatchObject({
-        status: 'ACTIVE',
-        tokenVersion: 1,
-      });
+      expect(store.users.get(user.id)?.security?.failedAttempts).toBe(0);
+      expect(store.users.get(user.id)?.status).toBe('ACTIVE');
+      await protectedCall(token).expect(200);
+    });
+
+    it('rejects a wrong password with the right code, counts it toward the lockout, and leaves the code usable', async () => {
+      const user = localUser();
+      const token = tokenFor(user);
+      await requestCode(token).expect(202);
+      const code = emailedCode();
+
+      await requestDeletion(token, { password: 'wrong', code }).expect(403);
+
       expect(store.users.get(user.id)?.security?.failedAttempts).toBe(1);
       expect(store.loginHistory.at(-1)).toMatchObject({
         authId: user.id,
         success: false,
       });
-      expect(store.requests.filter((item) => item.authId === user.id)).toEqual(
-        [],
-      );
-      await protectedCall(token).expect(200);
+      expect(store.users.get(user.id)?.status).toBe('ACTIVE');
+      // The code was not consumed by the failed password check.
+      await requestDeletion(token, { password: PASSWORD, code }).expect(202);
     });
 
     it('locks the account and signs the session out after repeated wrong passwords', async () => {
       const user = localUser();
       const token = tokenFor(user);
+      await requestCode(token).expect(202);
 
       for (let attempt = 0; attempt < 5; attempt += 1) {
-        await requestDeletion(token, { password: 'wrong' }).expect(403);
+        await requestDeletion(token, {
+          password: 'wrong',
+          code: emailedCode(),
+        }).expect(403);
       }
 
-      // Five failures lock the account (same rule as login), which also
-      // revokes the (possibly stolen) session.
       expect(store.users.get(user.id)?.security?.lockExpiresAt).toBeInstanceOf(
         Date,
       );
       await protectedCall(token).expect(401);
-      expect(store.users.get(user.id)?.status).toBe('ACTIVE');
-      expect(store.requests.filter((item) => item.authId === user.id)).toEqual(
-        [],
-      );
+      expect(requestsOf(user)).toEqual([]);
     });
 
-    it('refuses even the right password while the account is locked', async () => {
+    it('refuses even the right proof while the account is locked', async () => {
       const user = localUser({
         security: {
           failedAttempts: 5,
@@ -344,41 +367,13 @@ describe('Account deletion requests (HTTP)', () => {
         },
       });
 
-      const response = await requestDeletion(tokenFor(user), {
-        password: PASSWORD,
-      }).expect(403);
+      const response = await confirmDeletion(403, user);
 
       expect(messageOf(response)).toMatch(/temporarily locked/);
       expect(store.users.get(user.id)?.status).toBe('ACTIVE');
     });
 
-    it.each([
-      ['no confirmation', {}],
-      ['a code instead of the password', { code: 'ABC123' }],
-      ['both a password and a code', { password: PASSWORD, code: 'ABC123' }],
-    ])('rejects %s for an account with a password', async (_label, body) => {
-      const user = localUser();
-
-      await requestDeletion(tokenFor(user), body).expect(400);
-
-      expect(store.users.get(user.id)?.status).toBe('ACTIVE');
-    });
-
-    it('rejects a password for an account without one, and does not issue codes to accounts with one', async () => {
-      const google = googleUser();
-      const local = localUser();
-
-      await requestDeletion(tokenFor(google), { password: '' }).expect(400);
-      await requestDeletion(tokenFor(google), { password: 'anything' }).expect(
-        400,
-      );
-      await requestCode(tokenFor(local)).expect(400);
-
-      expect(store.users.get(google.id)?.status).toBe('ACTIVE');
-      expect(emailQueue.sendAccountDeletionCode.mock.calls).toHaveLength(0);
-    });
-
-    it('rejects a wrong code, and invalidates the code after 5 wrong guesses', async () => {
+    it('invalidates the code after 5 wrong guesses', async () => {
       const user = googleUser();
       const token = tokenFor(user);
       await requestCode(token).expect(202);
@@ -390,49 +385,139 @@ describe('Account deletion requests (HTTP)', () => {
       }
       // Isolate the code rule from the separate per-user rate limit.
       redis.remove(`${PREFIX}:rate_limit:account_deletion:user:${user.id}`);
-      // Even the right code no longer works.
-      await requestDeletion(token, { code }).expect(403);
 
+      await requestDeletion(token, { code }).expect(403);
       expect(store.users.get(user.id)?.status).toBe('ACTIVE');
     });
 
     it('rejects an expired code (time-controlled)', async () => {
-      const user = googleUser();
+      const user = localUser();
       const token = tokenFor(user);
       await requestCode(token).expect(202);
 
       jest.setSystemTime(T0.getTime() + 10 * 60_000);
 
-      await requestDeletion(tokenFor(user), { code: emailedCode() }).expect(
-        403,
-      );
+      await requestDeletion(tokenFor(user), {
+        password: PASSWORD,
+        code: emailedCode(),
+      }).expect(403);
       expect(store.users.get(user.id)?.status).toBe('ACTIVE');
     });
 
     it('does not accept another user’s code', async () => {
-      const victim = googleUser();
-      const attacker = googleUser();
+      const victim = localUser();
+      const attacker = localUser();
       await requestCode(tokenFor(attacker)).expect(202);
-      const attackerCode = emailedCode();
 
-      await requestDeletion(tokenFor(victim), { code: attackerCode }).expect(
-        403,
-      );
+      await requestDeletion(tokenFor(victim), {
+        password: PASSWORD,
+        code: emailedCode(),
+      }).expect(403);
 
       expect(store.users.get(victim.id)?.status).toBe('ACTIVE');
     });
 
     it('rate-limits confirmation attempts', async () => {
       const user = localUser();
-      const token = tokenFor(user);
       redis.put(
         `${PREFIX}:rate_limit:account_deletion:user:${user.id}`,
         5,
         900,
       );
 
-      await requestDeletion(token, { password: PASSWORD }).expect(429);
+      await confirmDeletion(429, user);
       expect(store.users.get(user.id)?.status).toBe('ACTIVE');
+    });
+  });
+
+  describe('token and session invalidation', () => {
+    it('invalidates the current token and every other session the moment the deletion is approved', async () => {
+      const user = localUser();
+      const token = tokenFor(user);
+      const otherDevice = tokenFor(user);
+      await protectedCall(token).expect(200);
+
+      await confirmDeletion(202, user, token);
+
+      await protectedCall(token).expect(401);
+      await protectedCall(otherDevice).expect(401);
+      expect(refreshTokensOf(user)).toEqual([]);
+      expect(redis.raw(`${PREFIX}:token_version:${user.id}`)).toBe(2);
+    });
+
+    it('does not approve the deletion when the token cache cannot be updated (nothing is committed)', async () => {
+      const user = localUser();
+      const token = tokenFor(user);
+      await requestCode(token).expect(202);
+      redis.failing.add('set');
+
+      const response = await requestDeletion(token, {
+        password: PASSWORD,
+        code: emailedCode(),
+      }).expect(503);
+
+      expect(messageOf(response)).toMatch(/temporarily unavailable/);
+      expect(store.users.get(user.id)).toMatchObject({
+        status: 'ACTIVE',
+        tokenVersion: 1,
+      });
+      expect(requestsOf(user)).toEqual([]);
+      redis.failing.clear();
+      await protectedCall(token).expect(200);
+    });
+
+    it('keeps old tokens out even when a stale read races with the approval (guard fills the cache only if empty)', async () => {
+      const user = localUser();
+      const token = tokenFor(user);
+      await requestCode(token).expect(202);
+      const code = emailedCode();
+      // Cache miss: the guard will read the user from the database.
+      redis.remove(`${PREFIX}:token_version:${user.id}`);
+      // Pause that read after it saw the ACTIVE, version-1 row, until the
+      // deletion has been approved.
+      let approved!: () => void;
+      const approval = new Promise<void>((resolve) => (approved = resolve));
+      let paused = false;
+      store.onUserLookup = async (id) => {
+        if (id === user.id && !paused) {
+          paused = true;
+          await approval;
+        }
+      };
+
+      const staleRequest = protectedCall(token).then((response) => response);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      store.onUserLookup = null;
+      await requestDeletion(token, { password: PASSWORD, code }).expect(202);
+      approved();
+      await staleRequest;
+
+      // The stale read must not have restored the old version in the cache.
+      expect(redis.raw(`${PREFIX}:token_version:${user.id}`)).toBe(2);
+      await protectedCall(token).expect(401);
+    });
+
+    it('rejects a blocked account from the database when the cache is empty', async () => {
+      const user = localUser();
+      const token = tokenFor(user);
+      await confirmDeletion(202, user, token);
+      redis.remove(`${PREFIX}:token_version:${user.id}`);
+
+      await protectedCall(token).expect(401);
+    });
+
+    it('refuses new sign-ins after approval', async () => {
+      const user = localUser();
+      await confirmDeletion(202, user);
+
+      await expect(
+        app
+          .get(AuthService)
+          .login(
+            { email: user.email, password: PASSWORD },
+            { ip: '203.0.113.1', userAgent: 'spec' },
+          ),
+      ).rejects.toMatchObject({ status: 401 });
     });
   });
 
@@ -456,6 +541,7 @@ describe('Account deletion requests (HTTP)', () => {
       });
       config.jwt_access_secret = 'account-deletion-spec-secret';
 
+      await requestCode(forgedToken).expect(401);
       await requestDeletion(forgedToken, { password: PASSWORD }).expect(401);
       await requestDeletion(tokenFor(user, 0), { password: PASSWORD }).expect(
         401,
@@ -473,30 +559,29 @@ describe('Account deletion requests (HTTP)', () => {
       async (extra) => {
         const attacker = localUser();
         const victim = localUser();
-        const body = JSON.parse(
-          JSON.stringify({ password: PASSWORD, ...extra }).replace(
-            'VICTIM',
-            victim.id,
-          ),
-        ) as object;
 
-        await requestDeletion(tokenFor(attacker), body).expect(400);
+        await confirmDeletion(400, attacker, tokenFor(attacker), {
+          ...(JSON.parse(
+            JSON.stringify(extra).replace('VICTIM', victim.id),
+          ) as object),
+        });
 
         expect(store.users.get(victim.id)?.status).toBe('ACTIVE');
         expect(store.users.get(attacker.id)?.status).toBe('ACTIVE');
       },
     );
 
-    it('does not let a user confirm another account with their own password', async () => {
+    it('only ever deletes the token owner’s account, even with another user’s proof', async () => {
       const attacker = localUser();
-      // The victim has a different password; the attacker's token names
-      // only the attacker, so the victim can never be affected.
       const victim = localUser({
         password: bcrypt.hashSync('victim-password', 4),
       });
+      await requestCode(tokenFor(victim)).expect(202);
+      const victimCode = emailedCode();
 
       await requestDeletion(tokenFor(attacker), {
         password: 'victim-password',
+        code: victimCode,
       }).expect(403);
 
       expect(store.users.get(victim.id)?.status).toBe('ACTIVE');
@@ -514,149 +599,118 @@ describe('Account deletion requests (HTTP)', () => {
 
   describe('multiple requests', () => {
     it('answers concurrent requests with one and the same deletion', async () => {
-      const user = localUser();
+      const user = googleUser();
       const token = tokenFor(user);
-      // Hold every transaction until all five requests have passed
-      // authentication and identity verification.
+      await requestCode(token).expect(202);
+      const code = emailedCode();
+      // The code is single-use: pre-verify concurrency at the transaction,
+      // where all five requests meet after passing authentication.
       let arrived = 0;
       let release!: () => void;
       const gate = new Promise<void>((resolve) => (release = resolve));
       store.beforeTransaction = async () => {
         arrived += 1;
-        if (arrived === 5) release();
+        if (arrived === 2) release();
         await gate;
       };
+      const verify = jest
+        .spyOn(app.get(AccountDeletionCodeService), 'verify')
+        .mockResolvedValue(true);
 
-      const responses = await Promise.all(
-        Array.from({ length: 5 }, () =>
-          requestDeletion(token, { password: PASSWORD }),
-        ),
-      );
+      const responses = await Promise.all([
+        requestDeletion(token, { code }),
+        requestDeletion(token, { code }),
+      ]);
 
-      expect(responses.map((response) => response.status)).toEqual(
-        Array(5).fill(202),
-      );
+      expect(responses.map((response) => response.status)).toEqual([202, 202]);
       expect(
         new Set(responses.map((response) => viewOf(response).id)).size,
       ).toBe(1);
-      expect(
-        store.requests.filter((item) => item.authId === user.id),
-      ).toHaveLength(1);
-      // Blocked once: the token version moved by exactly one.
+      expect(requestsOf(user)).toHaveLength(1);
       expect(store.users.get(user.id)?.tokenVersion).toBe(2);
+      verify.mockRestore();
     });
 
-    it('rejects a repeated request after acceptance (the session is revoked) without a second deletion', async () => {
+    it('rejects a repeated request after approval without a second deletion', async () => {
       const user = localUser();
       const token = tokenFor(user);
-      await requestDeletion(token, { password: PASSWORD }).expect(202);
+      await confirmDeletion(202, user, token);
 
       await requestDeletion(token, { password: PASSWORD }).expect(401);
-      // No new session can be obtained either: login is refused.
-      await expect(
-        app
-          .get(AuthService)
-          .login(
-            { email: user.email, password: PASSWORD },
-            { ip: '203.0.113.1', userAgent: 'spec' },
-          ),
-      ).rejects.toMatchObject({ status: 401 });
+      await requestCode(token).expect(401);
 
-      expect(
-        store.requests.filter((item) => item.authId === user.id),
-      ).toHaveLength(1);
+      expect(requestsOf(user)).toHaveLength(1);
       expect(store.users.get(user.id)?.tokenVersion).toBe(2);
     });
 
-    it('returns the same deletion when a request still gets through (stale session cache)', async () => {
+    it('re-blocks a reactivated account on a new request, reusing its open request', async () => {
       const user = localUser();
-      const token = tokenFor(user);
-      const first = await requestDeletion(token, { password: PASSWORD }).expect(
-        202,
-      );
-      // Simulate a cache that still has the old version.
-      redis.put(`${PREFIX}:token_version:${user.id}`, 1, 3600);
+      const first = await confirmDeletion(202, user);
+      store.users.get(user.id)!.status = 'ACTIVE';
+      signIn(store.users.get(user.id)!);
 
-      const again = await requestDeletion(token, { password: PASSWORD }).expect(
-        202,
-      );
+      const again = await confirmDeletion(202, user);
 
       expect(viewOf(again).id).toBe(viewOf(first).id);
-      expect(
-        store.requests.filter((item) => item.authId === user.id),
-      ).toHaveLength(1);
-      expect(store.users.get(user.id)?.tokenVersion).toBe(2);
+      expect(store.users.get(user.id)).toMatchObject({
+        status: 'PENDING_DELETION',
+        tokenVersion: 3,
+      });
+      expect(requestsOf(user)).toHaveLength(1);
     });
   });
 
   describe('processing status and resumption', () => {
-    it('keeps the account blocked and records a pending revocation when Redis fails, then resumes it', async () => {
+    it('records a pending session cleanup when removing refresh sessions fails, and resumes it', async () => {
       const user = localUser();
       const token = tokenFor(user);
+      await requestCode(token).expect(202);
       redis.failing.add('eval');
 
       const response = await requestDeletion(token, {
         password: PASSWORD,
+        code: emailedCode(),
       }).expect(202);
 
       expect(viewOf(response).sessionsRevoked).toBe(false);
-      const [recorded] = store.requests.filter(
-        (item) => item.authId === user.id,
-      );
+      const [recorded] = requestsOf(user);
       expect(recorded).toMatchObject({
         sessionsRevokedAt: null,
         attempts: 1,
         lastError: 'Session revocation failed; it will be retried',
       });
-      expect(store.users.get(user.id)?.status).toBe('PENDING_DELETION');
-      expect(refreshTokensOf(user)).toHaveLength(2);
+      // Access tokens are invalid already (published in the transaction).
+      await protectedCall(token).expect(401);
 
-      // Redis recovers; the recovery sweep resumes the revocation.
       redis.failing.clear();
-      await expect(recovery.resume()).resolves.toBe(1);
+      const result = await recovery.resume();
 
-      expect(
-        store.requests.find((item) => item.id === recorded.id),
-      ).toMatchObject({
+      expect(result.sessionsRevoked).toBe(1);
+      expect(requestsOf(user)[0]).toMatchObject({
         sessionsRevokedAt: T0,
         lastError: null,
       });
       expect(refreshTokensOf(user)).toEqual([]);
-      await protectedCall(token).expect(401);
-      // Nothing left to resume.
-      await expect(recovery.resume()).resolves.toBe(0);
+      // The sweep also hands the request to erasure.
+      expect(erasure.process.mock.calls).toContainEqual([recorded.id, T0]);
     });
 
-    it('never grants access on a cache-miss: a blocked account is rejected from the database', async () => {
+    it('rolls back the block, and the token cache, if recording the request fails', async () => {
       const user = localUser();
       const token = tokenFor(user);
-      redis.failing.add('set');
-      const response = await requestDeletion(token, {
-        password: PASSWORD,
-      }).expect(202);
-      // The cache could not be updated, so revocation is recorded as pending.
-      expect(viewOf(response).sessionsRevoked).toBe(false);
-      redis.failing.clear();
-      // The cached version expired meanwhile.
-      jest.setSystemTime(T0.getTime() + 3_600_000);
-
-      await protectedCall(token).expect(401);
-    });
-
-    it('rolls back the block if recording the request fails', async () => {
-      const user = localUser();
-      const token = tokenFor(user);
+      await requestCode(token).expect(202);
       store.failNextRequestInsert = true;
 
-      await requestDeletion(token, { password: PASSWORD }).expect(500);
+      await requestDeletion(token, {
+        password: PASSWORD,
+        code: emailedCode(),
+      }).expect(500);
 
       expect(store.users.get(user.id)).toMatchObject({
         status: 'ACTIVE',
         tokenVersion: 1,
       });
-      expect(store.requests.filter((item) => item.authId === user.id)).toEqual(
-        [],
-      );
+      expect(requestsOf(user)).toEqual([]);
       await protectedCall(token).expect(200);
     });
 
@@ -666,43 +720,24 @@ describe('Account deletion requests (HTTP)', () => {
         id: randomUUID(),
         authId: user.id,
         status: 'PENDING',
-        verificationMethod: 'PASSWORD',
+        verificationMethod: 'PASSWORD_AND_EMAIL_CODE',
         requestedAt: T0,
         accountBlockedAt: T0,
         sessionsRevokedAt: null,
         processingStartedAt: null,
+        dataErasedAt: null,
+        filesDeletedAt: null,
         completedAt: null,
+        lockedUntil: null,
         attempts: 0,
         lastError: null,
         updatedAt: T0,
       });
 
-      await expect(recovery.resume()).resolves.toBe(0);
+      const result = await recovery.resume();
 
+      expect(result.sessionsRevoked).toBe(0);
       expect(refreshTokensOf(user)).toHaveLength(2);
-    });
-
-    it('re-blocks a reactivated account on a new request, reusing its open request', async () => {
-      const user = localUser();
-      const first = await requestDeletion(tokenFor(user), {
-        password: PASSWORD,
-      }).expect(202);
-      // An administrator reactivated the account; its request is still open.
-      store.users.get(user.id)!.status = 'ACTIVE';
-      signIn(store.users.get(user.id)!);
-
-      const again = await requestDeletion(tokenFor(user), {
-        password: PASSWORD,
-      }).expect(202);
-
-      expect(viewOf(again).id).toBe(viewOf(first).id);
-      expect(store.users.get(user.id)).toMatchObject({
-        status: 'PENDING_DELETION',
-        tokenVersion: 3,
-      });
-      expect(
-        store.requests.filter((item) => item.authId === user.id),
-      ).toHaveLength(1);
     });
   });
 });

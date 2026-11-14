@@ -9,6 +9,7 @@ import { WINSTON_MODULE_PROVIDER } from 'nest-winston';
 import type { Logger } from 'winston';
 import { PrismaService } from '../../common/services/prisma.service';
 import { AccountDeletionService } from './account-deletion.service';
+import { AccountErasureService } from './account-erasure.service';
 
 const SWEEP_INTERVAL_MS = 30_000;
 const BATCH_SIZE = 100;
@@ -18,11 +19,23 @@ const BATCH_SIZE = 100;
  */
 const NO_VALID_TOKEN_VERSION = 0;
 
+export interface DeletionSweepResult {
+  /** Requests whose pending session revocation succeeded. */
+  sessionsRevoked: number;
+  /** Requests fully erased and completed in this pass. */
+  completed: number;
+  /** Requests that still have a pending step (retried next pass). */
+  pending: number;
+}
+
 /**
- * Resumes accepted account deletions whose processing was interrupted.
- * Currently this completes session revocation that failed when the request
- * was accepted (for example during a Redis outage). Runs at startup and every
- * 30 seconds; every step is idempotent.
+ * Drives accepted account deletions to completion, independent of any user
+ * request (the account is signed out). Runs at startup, to resume work
+ * interrupted by a crash or restart, and every 30 seconds:
+ * 1. completes session revocation that failed when a request was accepted;
+ * 2. erases every open request whose processing lease is free or expired
+ *    (AccountErasureService), resuming from its last completed step.
+ * Every step is idempotent and recorded in the database.
  */
 @Injectable()
 export class AccountDeletionRecoveryService
@@ -34,6 +47,7 @@ export class AccountDeletionRecoveryService
   constructor(
     private readonly prisma: PrismaService,
     private readonly deletions: AccountDeletionService,
+    private readonly erasure: AccountErasureService,
     private readonly config: ConfigService,
     @Inject(WINSTON_MODULE_PROVIDER) private readonly logger: Logger,
   ) {}
@@ -51,10 +65,58 @@ export class AccountDeletionRecoveryService
     clearInterval(this.timer);
   }
 
-  /** Returns how many requests had their sessions revoked in this pass. */
-  async resume(): Promise<number> {
-    if (this.running) return 0;
+  async resume(now: Date = new Date()): Promise<DeletionSweepResult> {
+    const result: DeletionSweepResult = {
+      sessionsRevoked: 0,
+      completed: 0,
+      pending: 0,
+    };
+    if (this.running) return result;
     this.running = true;
+    try {
+      result.sessionsRevoked = await this.resumeRevocations();
+      await this.eraseDueRequests(now, result);
+    } finally {
+      this.running = false;
+    }
+    return result;
+  }
+
+  private async eraseDueRequests(
+    now: Date,
+    result: DeletionSweepResult,
+  ): Promise<void> {
+    try {
+      let after: string | undefined;
+      for (;;) {
+        const due = await this.prisma.accountDeletionRequest.findMany({
+          where: {
+            status: { in: ['PENDING', 'PROCESSING'] },
+            OR: [{ lockedUntil: null }, { lockedUntil: { lt: now } }],
+            ...(after ? { id: { gt: after } } : {}),
+          },
+          select: { id: true },
+          orderBy: { id: 'asc' },
+          take: BATCH_SIZE,
+        });
+        for (const request of due) {
+          const outcome = await this.erasure.process(request.id, now);
+          if (outcome === 'COMPLETED') result.completed += 1;
+          if (outcome === 'PENDING') result.pending += 1;
+        }
+        if (due.length < BATCH_SIZE) break;
+        after = due[due.length - 1].id;
+      }
+    } catch {
+      this.logger.warn(
+        'Account erasure could not complete this pass; it will retry',
+        { context: 'AccountDeletionRecovery' },
+      );
+    }
+  }
+
+  /** Returns how many requests had their sessions revoked. */
+  private async resumeRevocations(): Promise<number> {
     let revoked = 0;
     try {
       let after: string | undefined;
@@ -100,8 +162,6 @@ export class AccountDeletionRecoveryService
           context: 'AccountDeletionRecovery',
         },
       );
-    } finally {
-      this.running = false;
     }
     return revoked;
   }

@@ -32,6 +32,14 @@ describeWithDatabase('Account deletion requests (PostgreSQL)', () => {
   let client: PrismaClient;
   let deletions: AccountDeletionService;
   let passwordHash: string;
+  const emailQueue = mock<EmailQueueService>();
+
+  /** The owner's full proof: the password and a freshly emailed code. */
+  async function proof(authId: string, password = PASSWORD) {
+    await deletions.requestConfirmationCode(authId);
+    const code = emailQueue.sendAccountDeletionCode.mock.calls.at(-1)![2];
+    return { password, code };
+  }
 
   beforeAll(async () => {
     schema = await createSchema();
@@ -53,11 +61,12 @@ describeWithDatabase('Account deletion requests (PostgreSQL)', () => {
       mock<EmailQueueService>(),
       mock<CustomLoggerService>(),
     );
+    emailQueue.sendAccountDeletionCode.mockResolvedValue();
     deletions = new AccountDeletionService(
       prisma,
       auth,
       utils,
-      new AccountDeletionCodeService(redis, utils, mock<EmailQueueService>()),
+      new AccountDeletionCodeService(redis, utils, emailQueue),
       mock<Logger>(),
     );
     passwordHash = await bcrypt.hash(PASSWORD, 4);
@@ -87,7 +96,7 @@ describeWithDatabase('Account deletion requests (PostgreSQL)', () => {
 
     const view = await deletions.requestDeletion(
       authId,
-      { password: PASSWORD },
+      await proof(authId),
       META,
     );
 
@@ -100,7 +109,7 @@ describeWithDatabase('Account deletion requests (PostgreSQL)', () => {
     expect(request).toMatchObject({
       authId,
       status: 'PENDING',
-      verificationMethod: 'PASSWORD',
+      verificationMethod: 'PASSWORD_AND_EMAIL_CODE',
       attempts: 0,
     });
     expect(request.sessionsRevokedAt).toBeInstanceOf(Date);
@@ -109,11 +118,22 @@ describeWithDatabase('Account deletion requests (PostgreSQL)', () => {
   it('turns concurrent requests into exactly one deletion (row lock + partial unique index)', async () => {
     const authId = await createUser();
 
+    // Codes are single-use, so concurrency is exercised at the transaction:
+    // identity is treated as verified for all five racing requests.
+    const codes = (
+      deletions as unknown as { codes: AccountDeletionCodeService }
+    ).codes;
+    const verify = jest.spyOn(codes, 'verify').mockResolvedValue(true);
     const views = await Promise.all(
       Array.from({ length: 5 }, () =>
-        deletions.requestDeletion(authId, { password: PASSWORD }, META),
+        deletions.requestDeletion(
+          authId,
+          { password: PASSWORD, code: 'ABC123' },
+          META,
+        ),
       ),
     );
+    verify.mockRestore();
 
     expect(new Set(views.map((view) => view.id)).size).toBe(1);
     expect(
@@ -129,7 +149,7 @@ describeWithDatabase('Account deletion requests (PostgreSQL)', () => {
     const authId = await createUser();
 
     await expect(
-      deletions.requestDeletion(authId, { password: 'wrong' }, META),
+      deletions.requestDeletion(authId, await proof(authId, 'wrong'), META),
     ).rejects.toMatchObject({ status: 403 });
 
     expect(
@@ -152,7 +172,7 @@ describeWithDatabase('Account deletion requests (PostgreSQL)', () => {
     const now = new Date();
     const open = {
       authId,
-      verificationMethod: 'PASSWORD' as const,
+      verificationMethod: 'PASSWORD_AND_EMAIL_CODE' as const,
       requestedAt: now,
       accountBlockedAt: now,
     };
@@ -168,7 +188,7 @@ describeWithDatabase('Account deletion requests (PostgreSQL)', () => {
     const now = new Date();
     const base = {
       authId,
-      verificationMethod: 'PASSWORD' as const,
+      verificationMethod: 'PASSWORD_AND_EMAIL_CODE' as const,
       requestedAt: now,
       accountBlockedAt: now,
     };
@@ -194,7 +214,7 @@ describeWithDatabase('Account deletion requests (PostgreSQL)', () => {
     const authId = await createUser();
     const view = await deletions.requestDeletion(
       authId,
-      { password: PASSWORD },
+      await proof(authId),
       META,
     );
 
@@ -211,7 +231,7 @@ describeWithDatabase('Account deletion requests (PostgreSQL)', () => {
     const authId = await createUser();
     const first = await deletions.requestDeletion(
       authId,
-      { password: PASSWORD },
+      await proof(authId),
       META,
     );
     await client.authUser.update({
@@ -221,7 +241,7 @@ describeWithDatabase('Account deletion requests (PostgreSQL)', () => {
 
     const again = await deletions.requestDeletion(
       authId,
-      { password: PASSWORD },
+      await proof(authId),
       META,
     );
 
