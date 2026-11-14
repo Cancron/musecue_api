@@ -14,6 +14,7 @@ import { MakeupModule } from './makeup/makeup.module';
 import { DatabaseModule } from './common/modules/database.module';
 import { ProfileModule } from './profile/profile.module';
 import { SubscriptionModule } from './subscription/subscription.module';
+import { PrivacyModule } from './privacy/privacy.module';
 
 @Module({
   imports: [
@@ -38,6 +39,7 @@ import { SubscriptionModule } from './subscription/subscription.module';
     MakeupModule,
     ProfileModule,
     SubscriptionModule,
+    PrivacyModule,
   ],
   controllers: [AppController],
   providers: [AppService],

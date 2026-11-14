@@ -26,6 +26,7 @@ model authUser {
   makeupSessions    MakeupSession[]
   aiRuns            AiRun[]
   subscription      UserSubscription?
+  dataExports       DataExport[]
 
   @@index([email, id, providerId])
   @@index([username])

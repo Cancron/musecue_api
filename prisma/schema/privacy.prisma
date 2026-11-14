@@ -1,0 +1,39 @@
+// ================================
+// Personal Data Export
+// ================================
+
+// One user-requested archive of the user's own data (account, profile,
+// makeup history, subscription and private photos). Rows are created by
+// POST /v1/privacy/exports and advanced only by the `privacy-export` BullMQ
+// worker: QUEUED -> PROCESSING -> COMPLETED | FAILED (a retrying attempt goes
+// back to QUEUED). EXPIRED is reserved for the retention job that removes the
+// archive after `expiresAt`; until then, reads derive expiry from the date.
+//
+// `storageKey` locates the ZIP in the private export storage root and is never
+// returned by the API. Consistency rules (one active export per user, the
+// fields a COMPLETED export must have) are enforced in the migration.
+model DataExport {
+  id                String           @id @default(uuid())
+  authId            String
+  status            DataExportStatus @default(QUEUED)
+  progress          Int              @default(0)
+  idempotencyKey    String           @db.VarChar(128)
+  attempts          Int              @default(0)
+  storageKey        String?          @db.VarChar(512)
+  sizeBytes         BigInt?
+  sha256            String?          @db.Char(64)
+  photoCount        Int?
+  missingPhotoCount Int?
+  error             String?          @db.VarChar(500)
+  startedAt         DateTime?
+  completedAt       DateTime?
+  expiresAt         DateTime?
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+
+  authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
+
+  @@unique([authId, idempotencyKey])
+  @@index([authId, createdAt])
+  @@index([status, expiresAt])
+}

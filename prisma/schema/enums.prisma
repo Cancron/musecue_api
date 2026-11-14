@@ -172,3 +172,15 @@ enum SubscriptionEventType {
   CANCELED
   EXPIRED
 }
+
+// ================================
+// Privacy Related Enums
+// ================================
+
+enum DataExportStatus {
+  QUEUED
+  PROCESSING
+  COMPLETED
+  FAILED
+  EXPIRED
+}

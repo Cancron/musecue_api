@@ -17,6 +17,7 @@ The companion mobile application and detailed product specifications live in `..
 - `AiRun` audit records containing operation, provider, model, prompt version, latency, progress, result/error, and status
 - a provider-neutral AI gateway with OpenRouter live mode, multimodal private-image input, strict structured output, runtime validation, bounded retries, and deterministic mock mode
 - a single Pro subscription plan: admin-configured monthly/yearly pricing and free trial, one-time trial activation, date-based Pro access through `ProAccessGuard`, and payment/lifecycle records protected by database rules (see "Subscriptions" under API); checkout, webhooks and billing endpoints are not implemented yet
+- personal data export: an authenticated user can request an asynchronous ZIP archive of their own account, profile, makeup history, subscription records and private photos, and poll its status (see "Personal data export" under API); the archive download link and automatic 24-hour removal are the next step
 
 Migration `20260827174107_add_makeup_workflow` adds the makeup aggregate and removes the dormant job-tracker and subscription starter domains.
 
@@ -158,6 +159,8 @@ The API defaults to `http://localhost:5000`; development Swagger is at `http://l
 Important environment variables are documented in `.env.example`. Never commit the real `.env` or log SMTP credentials, tokens, image contents, or future signed URLs.
 
 `PRIVATE_UPLOAD_DIR` controls the private image root and defaults to `.data/private-images`. The directory is ignored by Git and is never mounted as a public static directory.
+
+`PRIVATE_EXPORT_DIR` holds generated personal data export archives and defaults to `.data/private-exports`. It follows the same private convention (`<authId>/<exportId>/<uuid>.zip`, owner-only file permissions) but is a separate root because archives have their own retention lifecycle.
 
 ### Live AI with OpenRouter
 
@@ -367,18 +370,60 @@ handler(@Req() req: ProAccessRequest) { /* req.proAccess: status, accessSource, 
 
 The guard delegates to `SubscriptionAccessService`, the single Pro access decision. An active free trial and an active paid term unlock the same features, each within its own `[startedAt, expiresAt)` window. Without access, the guard returns `403` with `An active Pro subscription or free trial is required` and the handler does not run. Requests that did not pass `AuthGuard` are rejected with `401`, and lookup errors never grant access. No makeup endpoint uses the guard yet.
 
-Database tests (`test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
+Database tests (`test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`, `test/privacy-export.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
 
 ```bash
-TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json test/subscription-plan test/user-subscription test/subscription-trial test/subscription-status test/pro-access test/trial-lifecycle test/billing test/subscription-security
+TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json test/subscription-plan test/user-subscription test/subscription-trial test/subscription-status test/pro-access test/trial-lifecycle test/billing test/subscription-security test/privacy-export
 ```
 
+Personal data export unit tests (no database or Redis needed):
+
+```bash
+npm test -- --runInBand privacy
+```
+
+
+### Personal data export
+
+Routes require a bearer token. The owner is always the token's user; requests cannot name another user.
+
+| Method | Route                            | Purpose                                          |
+| ------ | -------------------------------- | ------------------------------------------------ |
+| `POST` | `/v1/privacy/exports`            | Queue a ZIP export of the caller's data (`202`)  |
+| `GET`  | `/v1/privacy/exports`            | List the caller's 20 most recent exports         |
+| `GET`  | `/v1/privacy/exports/:exportId`  | Poll one export's status and progress            |
+
+`POST /v1/privacy/exports` takes no body; any body field (for example `userId`) is rejected with `400`. An optional `Idempotency-Key` header (1-128 characters of `A-Z a-z 0-9 _ . : -`) returns the same export on retry. Only one export per user can be `QUEUED` or `PROCESSING` at a time (a partial unique index); further requests, including concurrent ones, return that export instead of starting another. The route uses the strict rate limit. If the queue is unavailable the export is recorded as `FAILED` and the request returns `503`.
+
+Status responses contain `id`, `status` (`QUEUED`, `PROCESSING`, `COMPLETED`, `FAILED` or `EXPIRED`), `progress` (0-100), `requestedAt`, `startedAt`, `completedAt`, `expiresAt`, `sizeBytes`, `sha256`, `photoCount`, `missingPhotoCount` and a client-safe `error`. Storage locations and idempotency keys are never returned. Another user's export returns the same `404` as a missing one, and malformed IDs return `400`. A completed export reports `EXPIRED` once `expiresAt` (completion + 24 hours) has passed.
+
+The `privacy-export` BullMQ worker builds the archive outside the request:
+
+```text
+README.txt
+manifest.json               every file with its size and SHA-256, plus photos that could not be included
+data/account.json           account details and security settings (MFA on/off, last password change)
+data/profile.json           profile and avatar reference
+data/makeup-history.json    sessions, preferences, analyses, recommendations, guides, checks, questions, AI processing records
+data/subscription.json      current access status, subscription record, payments and lifecycle events
+data/sign-in-history.json
+data/email-history.json
+photos/profile/avatar.<ext>
+photos/sessions/<sessionId>/<imageId>.<ext>
+```
+
+Every query is scoped to the owner, and every document is built from an explicit field allowlist. Password hashes, token versions, MFA secrets, OAuth provider subject IDs, storage keys, idempotency keys, raw AI results, payment-provider IDs, SMTP message IDs and activity-log rows (which can describe other users' records) are never exported. A photo is copied only if its storage key is inside the owner's private scope. Photos are streamed one at a time. Missing files are listed in the manifest instead of failing the export.
+
+Each worker attempt claims the export with a new `startedAt`. Progress, publication and failure are conditioned on that value, so a stalled attempt cannot overwrite a newer one. Retryable failures are retried 3 times with exponential backoff; the final failure marks the export `FAILED` with a generic message and deletes partial archives. Every 60 seconds, recovery fails exports older than `PRIVACY_EXPORT_RECOVERY_GRACE_MS` whose job is missing or finished, so users are never blocked by a lost job.
+
+Not implemented yet: the download-link endpoint (`GET /v1/privacy/exports/:exportId/download`) and the retention job that deletes archives and marks exports `EXPIRED` after 24 hours.
 
 ## Domain
 
 ```text
 authUser
 |-- UserSubscription (0..1)
+|-- DataExport
 `-- MakeupSession
     |-- ImageAsset
     |-- MakeupPreferences

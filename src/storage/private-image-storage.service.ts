@@ -1,7 +1,11 @@
 import { Injectable } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
-import { dirname, extname, join, relative, resolve, sep } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
+import {
+  isMissingFileError,
+  resolvePrivateStorageKey,
+} from './private-storage-key';
 
 const EXTENSIONS_BY_MIME = {
   'image/jpeg': '.jpg',
@@ -41,7 +45,7 @@ export class PrivateImageStorageService {
     try {
       await unlink(this.resolveKey(storageKey));
     } catch (error) {
-      if (!this.isMissingFile(error)) throw error;
+      if (!isMissingFileError(error)) throw error;
     }
   }
 
@@ -50,25 +54,10 @@ export class PrivateImageStorageService {
   }
 
   private resolveKey(storageKey: string): string {
-    const normalizedKey = storageKey.replaceAll('/', sep);
-    const absolutePath = resolve(this.root, normalizedKey);
-    const relativePath = relative(this.root, absolutePath);
-    if (
-      relativePath.startsWith(`..${sep}`) ||
-      relativePath === '..' ||
-      extname(absolutePath) === ''
-    ) {
-      throw new Error('Invalid private image storage key');
-    }
-    return absolutePath;
-  }
-
-  private isMissingFile(error: unknown): boolean {
-    return (
-      typeof error === 'object' &&
-      error !== null &&
-      'code' in error &&
-      error.code === 'ENOENT'
+    return resolvePrivateStorageKey(
+      this.root,
+      storageKey,
+      'Invalid private image storage key',
     );
   }
 }
