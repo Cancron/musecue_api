@@ -374,6 +374,8 @@ The guard delegates to `SubscriptionAccessService`, the single Pro access decisi
 | ------ | --------------------------- | ------------------------- | -------------------------------------------------- |
 | `POST` | `/v1/subscription/checkout` | bearer token              | Start (or reuse) a hosted Stripe checkout for Pro  |
 | `POST` | `/v1/subscription/cancel`   | bearer token              | Cancel the caller's own subscription at period end |
+| `GET`  | `/v1/subscription/billing`  | bearer token              | The caller's billing information                   |
+| `GET`  | `/v1/subscription/payments` | bearer token              | The caller's payment history (paged)               |
 | `POST` | `/v1/webhooks/stripe`       | `Stripe-Signature` header | Stripe events; the only way paid Pro is granted    |
 
 `POST /v1/subscription/checkout` accepts exactly `{ "billingInterval": "MONTHLY" }` or `{ "billingInterval": "YEARLY" }`. Any other value, `null`, lowercase values and extra fields (a price, currency, user ID or "paid" flag) are rejected with `400`. The user comes from the access token, and the price from the plan configuration (`monthlyPriceUsdCents` / `yearlyPriceUsdCents`) at the moment the checkout is created. The response (`201`) is:
@@ -453,6 +455,49 @@ Recovery is Stripe collecting the invoice (a retry or a new card):
 
 `customer.subscription.deleted` for the linked subscription, confirmed as `canceled` through the Stripe API, means Stripe stopped retrying (or the subscription was canceled). It sets `proCanceledAt` (access continues until `proExpiresAt`), appends one `CANCELED` event and clears `pastDueSince`, so the user can check out again. Configure Stripe to cancel subscriptions after the final failed retry. With "mark as unpaid" or "leave past due", the user stays past due until the invoice is paid or the subscription is canceled.
 
+#### Billing information and payment history
+
+Both routes are read-only and require a bearer token (`401` without a valid one). They always describe the token user: user, customer or payment IDs are never accepted (unknown query parameters are rejected with `400`; a request body is ignored). They read only PostgreSQL, where only verified Stripe events write (checkout, invoices, failures, cancellation, refunds). They never call Stripe and keep nothing in memory, so the same data gives the same answer after a restart. No Stripe identifiers (customer, subscription, invoice, charge, refund), credentials or raw failure messages are returned.
+
+`GET /v1/subscription/billing`:
+
+```json
+{
+  "status": "PRO",
+  "hasProAccess": true,
+  "accessExpiresAt": "2026-12-01T10:00:00.000Z",
+  "subscriptionState": "ACTIVE",
+  "plan": { "code": "PRO", "billingInterval": "MONTHLY", "priceCents": 1900, "currency": "USD" },
+  "currentPeriod": { "start": "2026-11-01T10:00:00.000Z", "end": "2026-12-01T10:00:00.000Z" },
+  "autoRenew": true,
+  "nextRenewalAt": "2026-12-01T10:00:00.000Z",
+  "canceledAt": null,
+  "pastDueSince": null
+}
+```
+
+- `status`, `hasProAccess` and `accessExpiresAt` follow the same rules as `GET /v1/subscription`.
+- `subscriptionState` is one of:
+  - `NONE`: never paid (including trial-only users);
+  - `ACTIVE`: the paid term is running;
+  - `CANCELED`: the paid term is running but will not renew;
+  - `PAST_DUE`: a renewal failed and Stripe is retrying;
+  - `ENDED`: expired, or revoked by a refund.
+- `plan` is the paid plan: its interval and the price the subscription is billed at. That is the purchase price, which renewals also charge; later admin price changes do not apply. `plan` stays shown after the subscription ended, and is `null` without any paid term.
+- `currentPeriod` is the paid billing period running now, or `null` without active paid access.
+- `nextRenewalAt` is the period end while the subscription will renew (`autoRenew`: active, backed by Stripe, not canceled, not past due).
+- `canceledAt` and `pastDueSince` are the stored cancellation and first-failure times.
+
+`GET /v1/subscription/payments?page=1&limit=20` (`limit` 1–100, default 20) returns `{ items, meta }` in the project's paginated shape (`page`, `limit`, `total`, `totalPages`, `hasPreviousPage`, `hasNextPage`). It covers every payment attempt and refund of the caller, newest first. Ties are ordered by record time and ID, so pages are stable. Each entry has:
+
+- `id`, `type` (`PAYMENT` or `REFUND`), `purpose` (`NEW_SUBSCRIPTION` or `RENEWAL`; for a refund, that of the refunded payment);
+- `status`, `amountCents`, `currency`, `date`, `billingInterval` and the billed `period`:
+  - a payment is `SUCCEEDED`, `FAILED`, `PARTIALLY_REFUNDED` or `REFUNDED`; its date is when it was paid or failed, and it has `refundedAmountCents`;
+  - a refund is `PENDING`, `REQUIRES_ACTION`, `SUCCEEDED`, `FAILED` or `CANCELED`; its date is when Stripe created it, and `paymentId` names the refunded payment entry;
+- for failed payments, a `failureReason` such as `insufficient_funds` or `expired_card`. Decline codes that Stripe advises not to show customers (e.g. `stolen_card`, `fraudulent`) are reported as `card_declined`.
+
+Cancellations do not add entries; they appear in the billing information.
+
 #### Cancellation at period end
 
 `POST /v1/subscription/cancel` (bearer token, no body) cancels the caller's own paid subscription at the end of its current period. The subscription is always the token user's: user or subscription IDs in the body or query are ignored, so nobody can cancel another user's subscription. Response (`200`):
@@ -503,16 +548,17 @@ Migration `20261113120000_add_stripe_checkout` adds `PaymentCustomer` and `Check
 
 Not implemented yet: immediate cancellation (including canceling a past-due subscription to stop Stripe's retries), undoing a cancellation (a cancellation reversed in Stripe is not reflected), the customer portal (so users cannot update their card in-app; Stripe's own emails and hosted invoice page can be used), exposing the past-due state in `GET /v1/subscription`, requesting refunds from MuseCue, disputes (`charge.dispute.*`), canceling the Stripe subscription automatically when a payment is refunded, revoking an active free trial on refund (a trial is not a payment and keeps running), reactions to other `customer.subscription.updated` changes (e.g. `unpaid`), and automatic refunds or cancellation of duplicate payments and subscriptions. Renewal delays within Stripe's retry window (up to 3 days) are handled. If a renewal for an older period arrives after a newer one, the older period is recorded but cannot be merged into the term: the database allows one payment per term change.
 
-Database tests (`test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`, `test/stripe-checkout.e2e-spec.ts`, `test/stripe-renewal.e2e-spec.ts`, `test/stripe-payment-failure.e2e-spec.ts`, `test/stripe-cancellation.e2e-spec.ts`, `test/stripe-refund.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
+Database tests (`test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`, `test/stripe-checkout.e2e-spec.ts`, `test/stripe-renewal.e2e-spec.ts`, `test/stripe-payment-failure.e2e-spec.ts`, `test/stripe-cancellation.e2e-spec.ts`, `test/stripe-refund.e2e-spec.ts`, `test/subscription-billing.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
 
 ```bash
-TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json test/subscription-plan test/user-subscription test/subscription-trial test/subscription-status test/pro-access test/trial-lifecycle test/billing test/subscription-security test/stripe-checkout test/stripe-renewal test/stripe-payment-failure test/stripe-cancellation test/stripe-refund
+TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json test/subscription-plan test/user-subscription test/subscription-trial test/subscription-status test/pro-access test/trial-lifecycle test/billing test/subscription-security test/stripe-checkout test/stripe-renewal test/stripe-payment-failure test/stripe-cancellation test/stripe-refund test/subscription-billing
 ```
 
 The Stripe unit tests do not need a database or a Stripe account; they run the real Stripe SDK against an in-memory emulation of the few Stripe endpoints used (`test/support/fake-stripe-api.ts`):
 
 ```bash
 npm test -- --runInBand stripe
+npm test -- --runInBand subscription-billing
 ```
 
 

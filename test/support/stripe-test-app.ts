@@ -52,6 +52,12 @@ export interface StripeTestApp {
   status(userId: string): Promise<Record<string, unknown>>;
   /** Delivers a signed webhook through POST /v1/webhooks/stripe. */
   sendWebhook(payload: string, signature: string): request.Test;
+  /**
+   * Simulates an application restart: closes the Nest app and its database
+   * connections, then boots a new app and Prisma client on the same schema.
+   * `app` and `client` are replaced; nothing in memory survives.
+   */
+  restart(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -62,6 +68,60 @@ export const dataOf = (response: { body: unknown }) =>
 export async function createStripeTestApp(): Promise<StripeTestApp> {
   const schema = await createSchema();
   await applyMigrations(schema, migrationNames());
+
+  const stripe = { api: new FakeStripeApi(5) };
+  const originalSecret = config.jwt_access_secret;
+  config.jwt_access_secret = `stripe-e2e-${schema}`;
+  const tokens = new AuthUtilsService(mock<RedisService>());
+  const bearer = (userId: string) =>
+    `Bearer ${tokens.createAccessToken({ userId, role: UserRole.USER, tokenVersion: 1 })}`;
+
+  let booted = await boot(schema, stripe);
+  const harness: StripeTestApp = {
+    app: booted.app,
+    client: booted.client,
+    stripe,
+    bearer,
+    startCheckout: (userId, billingInterval) =>
+      request(harness.app.getHttpServer())
+        .post('/v1/subscription/checkout')
+        .set('Authorization', bearer(userId))
+        .send({ billingInterval }),
+    status: (userId) =>
+      request(harness.app.getHttpServer())
+        .get('/v1/subscription')
+        .set('Authorization', bearer(userId))
+        .expect(200)
+        .then((response) => dataOf(response) as Record<string, unknown>),
+    sendWebhook: (payload, signature) =>
+      request(harness.app.getHttpServer())
+        .post('/v1/webhooks/stripe')
+        .set('Content-Type', 'application/json')
+        .set('Stripe-Signature', signature)
+        .set('User-Agent', 'Stripe/1.0 (+https://stripe.com/docs/webhooks)')
+        .send(payload),
+    restart: async () => {
+      await booted.app.close();
+      await booted.client.$disconnect();
+      booted = await boot(schema, stripe);
+      harness.app = booted.app;
+      harness.client = booted.client;
+    },
+    close: async () => {
+      await booted.app.close();
+      await booted.client.$disconnect();
+      await dropSchema(schema);
+      config.jwt_access_secret = originalSecret;
+    },
+  };
+  return harness;
+}
+
+/** A fresh Nest app and Prisma client on an existing migrated schema. */
+async function boot(
+  schema: string,
+  stripe: { api: FakeStripeApi },
+): Promise<{ app: INestApplication<App>; client: PrismaClient }> {
   // Raw SQL (the FOR UPDATE row locks) resolves tables via search_path.
   const url = new URL(TEST_DATABASE_URL as string);
   url.searchParams.set('options', `-c search_path="${schema}"`);
@@ -79,7 +139,6 @@ export async function createStripeTestApp(): Promise<StripeTestApp> {
   })
   class TestInfrastructureModule {}
 
-  const stripe = { api: new FakeStripeApi(5) };
   const stripeClient = new Stripe('sk_test_fake', {
     httpClient: Stripe.createFetchHttpClient(
       (input: string | URL | Request, init?: RequestInit) =>
@@ -99,8 +158,6 @@ export async function createStripeTestApp(): Promise<StripeTestApp> {
 
   const redis = mock<RedisService>();
   redis.get.mockResolvedValue(1 as never);
-  const originalSecret = config.jwt_access_secret;
-  config.jwt_access_secret = `stripe-e2e-${schema}`;
   const moduleRef = await Test.createTestingModule({
     imports: [TestInfrastructureModule, SubscriptionModule],
   })
@@ -129,39 +186,5 @@ export async function createStripeTestApp(): Promise<StripeTestApp> {
   // Listen once: otherwise supertest starts and closes the shared server for
   // every request, which resets concurrent requests (ECONNRESET).
   await app.listen(0, '127.0.0.1');
-
-  const tokens = new AuthUtilsService(mock<RedisService>());
-  const bearer = (userId: string) =>
-    `Bearer ${tokens.createAccessToken({ userId, role: UserRole.USER, tokenVersion: 1 })}`;
-
-  return {
-    app,
-    client,
-    stripe,
-    bearer,
-    startCheckout: (userId, billingInterval) =>
-      request(app.getHttpServer())
-        .post('/v1/subscription/checkout')
-        .set('Authorization', bearer(userId))
-        .send({ billingInterval }),
-    status: (userId) =>
-      request(app.getHttpServer())
-        .get('/v1/subscription')
-        .set('Authorization', bearer(userId))
-        .expect(200)
-        .then((response) => dataOf(response) as Record<string, unknown>),
-    sendWebhook: (payload, signature) =>
-      request(app.getHttpServer())
-        .post('/v1/webhooks/stripe')
-        .set('Content-Type', 'application/json')
-        .set('Stripe-Signature', signature)
-        .set('User-Agent', 'Stripe/1.0 (+https://stripe.com/docs/webhooks)')
-        .send(payload),
-    close: async () => {
-      await app.close();
-      await client.$disconnect();
-      await dropSchema(schema);
-      config.jwt_access_secret = originalSecret;
-    },
-  };
+  return { app, client };
 }

@@ -5,6 +5,7 @@ import {
   HttpCode,
   HttpStatus,
   Post,
+  Query,
   Req,
   UseGuards,
 } from '@nestjs/common';
@@ -13,10 +14,12 @@ import type { Request } from 'express';
 import type { IAccessTokenPayload } from '../auth/interfaces/auth.interface';
 import { AuthGuard } from '../common/guards/auth.guard';
 import { CreateCheckoutSessionDto } from './dto/create-checkout-session.dto';
+import { PaymentHistoryQueryDto } from './dto/payment-history-query.dto';
 import { requestMetadata } from './request-metadata';
 import { StripeCancellationService } from './stripe/stripe-cancellation.service';
 import { StripeCheckoutService } from './stripe/stripe-checkout.service';
 import { SubscriptionAccessService } from './subscription-access.service';
+import { SubscriptionBillingService } from './subscription-billing.service';
 import { SubscriptionTrialService } from './subscription-trial.service';
 
 interface AuthenticatedRequest extends Request {
@@ -34,12 +37,36 @@ export class SubscriptionController {
     private readonly trials: SubscriptionTrialService,
     private readonly checkout: StripeCheckoutService,
     private readonly cancellation: StripeCancellationService,
+    private readonly billing: SubscriptionBillingService,
   ) {}
 
   /** The caller's subscription status, trial eligibility and dates. */
   @Get()
   getMySubscription(@Req() req: AuthenticatedRequest) {
     return this.access.getStatus(req.user.userId);
+  }
+
+  /**
+   * The caller's billing information: plan and interval, price, status,
+   * current paid period, next renewal and cancellation dates. Read from the
+   * database only; never another user's and never provider identifiers.
+   */
+  @Get('billing')
+  getBilling(@Req() req: AuthenticatedRequest) {
+    return this.billing.getBilling(req.user.userId);
+  }
+
+  /**
+   * The caller's payment history, newest first: payments (first payments and
+   * renewals, successful or failed) and refunds, with amount, currency, date
+   * and status. Paged with `page` and `limit`; no other parameters.
+   */
+  @Get('payments')
+  getPaymentHistory(
+    @Req() req: AuthenticatedRequest,
+    @Query() query: PaymentHistoryQueryDto,
+  ) {
+    return this.billing.getPaymentHistory(req.user.userId, query);
   }
 
   /** Starts the one-time free trial for the caller. Takes no request body. */

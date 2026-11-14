@@ -6,6 +6,7 @@ import { ActivityLogService } from '../common/services/activity-log.service';
 import { RedisService } from '../common/services/redis.service';
 import { ProAccessGuard } from './pro-access.guard';
 import { SubscriptionAccessService } from './subscription-access.service';
+import { SubscriptionBillingService } from './subscription-billing.service';
 import { SubscriptionPlanController } from './subscription-plan.controller';
 import { SubscriptionPlanService } from './subscription-plan.service';
 import { SubscriptionTrialService } from './subscription-trial.service';
@@ -31,6 +32,7 @@ import { STRIPE_CLIENT, StripeGateway } from './stripe/stripe.gateway';
   providers: [
     SubscriptionPlanService,
     SubscriptionAccessService,
+    SubscriptionBillingService,
     SubscriptionTrialService,
     ActivityLogService,
     AuthGuard,
