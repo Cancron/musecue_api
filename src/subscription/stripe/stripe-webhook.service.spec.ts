@@ -1,6 +1,5 @@
 import { BillingInterval } from '@prisma/client';
 import { mock } from 'jest-mock-extended';
-import type Stripe from 'stripe';
 import {
   FAKE_WEBHOOK_SECRET,
   FakeStripeApi,
@@ -20,6 +19,7 @@ import { StripeCheckoutService } from './stripe-checkout.service';
 import { StripeRefundService } from './stripe-refund.service';
 import {
   StripeWebhookService,
+  type VerifiedStripeEvent,
   type WebhookOutcome,
 } from './stripe-webhook.service';
 import { StripeGateway } from './stripe.gateway';
@@ -1327,11 +1327,13 @@ describe('StripeWebhookService', () => {
   it.each(['customer.subscription.created', 'payment_intent.succeeded'])(
     'acknowledges and ignores %s',
     async (type) => {
+      // Stands in for a verified test-mode event of an unhandled type.
       const event = {
         id: 'evt_1',
         type,
+        livemode: false,
         data: { object: {} },
-      } as unknown as Stripe.Event;
+      } as unknown as VerifiedStripeEvent;
       await expect(webhooks.handleEvent(event, meta)).resolves.toBe('IGNORED');
       expect(api.requests).toHaveLength(0);
     },

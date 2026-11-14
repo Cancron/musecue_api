@@ -66,6 +66,21 @@ class Table<T extends Row> {
       : Promise.reject(new Error('No record found'));
   };
 
+  /** Like Prisma's native upsert: atomic here (no await between steps). */
+  upsert = ({
+    where,
+    create,
+    update,
+  }: {
+    where: Where;
+    create: Row;
+    update: Row;
+  }) => {
+    const row = this.rows.find((candidate) => matches(candidate, where));
+    if (!row) return this.create({ data: create });
+    return this.apply(row, update).then(() => ({ ...row }));
+  };
+
   create = ({ data }: { data: Row }) => {
     const row = this.defaults(data);
     if (this.conflicts(row)) return Promise.reject(uniqueViolation());
@@ -106,7 +121,15 @@ class Table<T extends Row> {
   };
 
   private apply(row: T, data: Row): Promise<void> {
-    const next = { ...row, ...data, updatedAt: new Date() } as T;
+    // Prisma's `{ increment: n }` numeric update.
+    const values = Object.fromEntries(
+      Object.entries(data).map(([field, value]) =>
+        isPlainObject(value) && typeof value.increment === 'number'
+          ? [field, Number(row[field]) + value.increment]
+          : [field, value],
+      ),
+    );
+    const next = { ...row, ...values, updatedAt: new Date() } as T;
     const others = this.rows.filter((candidate) => candidate !== row);
     if (this.conflicts(next, others)) return Promise.reject(uniqueViolation());
     Object.assign(row, next);
@@ -235,6 +258,21 @@ export function createInMemoryBillingPrisma() {
         ...data,
       }),
       [(row) => `refund:${key(row.provider)}:${key(row.providerRefundId)}`],
+    ),
+    paymentWebhookEvent: new Table<Row>(
+      (data) => ({
+        id: randomUUID(),
+        objectId: null,
+        status: 'RECEIVED',
+        outcome: null,
+        attempts: 1,
+        lastErrorCode: null,
+        receivedAt: now(),
+        processedAt: null,
+        updatedAt: now(),
+        ...data,
+      }),
+      [(row) => `event:${key(row.provider)}:${key(row.providerEventId)}`],
     ),
     subscriptionEvent: new Table<Row>(
       (data) => ({ id: randomUUID(), createdAt: now(), ...data }),

@@ -24,10 +24,12 @@ import { StripeWebhookService } from './stripe-webhook.service';
 import { STRIPE_SETTINGS, type StripeSettings } from './stripe.config';
 import { STRIPE_CLIENT } from './stripe.gateway';
 
+const prisma = mockDeep<PrismaService>();
+
 @Global()
 @Module({
   providers: [
-    { provide: PrismaService, useValue: mockDeep<PrismaService>() },
+    { provide: PrismaService, useValue: prisma },
     { provide: CustomLoggerService, useValue: mock<CustomLoggerService>() },
   ],
   exports: [PrismaService, CustomLoggerService],
@@ -54,6 +56,8 @@ describe('POST /v1/webhooks/stripe (HTTP)', () => {
       id: 'evt_1',
       object: 'event',
       type: 'checkout.session.completed',
+      livemode: false,
+      created: Math.floor(Date.now() / 1000),
       data: { object: { id: 'cs_test_1', object: 'checkout.session' } },
     });
     return {
@@ -108,6 +112,14 @@ describe('POST /v1/webhooks/stripe (HTTP)', () => {
   beforeEach(() => {
     handleEvent.mockReset();
     handleEvent.mockResolvedValue('ACTIVATED');
+    prisma.paymentWebhookEvent.upsert.mockReset();
+    prisma.paymentWebhookEvent.update.mockReset();
+    prisma.paymentWebhookEvent.upsert.mockResolvedValue({
+      id: 'log-1',
+    } as never);
+    prisma.paymentWebhookEvent.update.mockResolvedValue({
+      id: 'log-1',
+    } as never);
   });
 
   it('accepts a signed event without a bearer token and hands it to the service', async () => {
@@ -156,12 +168,74 @@ describe('POST /v1/webhooks/stripe (HTTP)', () => {
       message: 'Invalid webhook signature',
     });
     expect(handleEvent).not.toHaveBeenCalled();
+    // Nothing is written, not even the event log.
+    expect(prisma.paymentWebhookEvent.upsert.mock.calls).toHaveLength(0);
+    expect(prisma.paymentWebhookEvent.update.mock.calls).toHaveLength(0);
   });
 
   it('returns 500 on a processing failure so Stripe retries', async () => {
     handleEvent.mockRejectedValue(new Error('database unavailable'));
     const { payload, signature } = signedBody();
     await post(payload, signature).expect(500);
+  });
+
+  it('never returns internal error details to the caller', async () => {
+    handleEvent.mockRejectedValue(
+      Object.assign(
+        new Error('insert into "PaymentTransaction" failed for user 42'),
+        { code: 'P2002' },
+      ),
+    );
+    const { payload, signature } = signedBody();
+
+    const response = await post(payload, signature).expect(500);
+
+    expect(response.body).toMatchObject({
+      statusCode: 500,
+      message: 'Webhook processing failed',
+    });
+    expect(JSON.stringify(response.body)).not.toMatch(
+      /PaymentTransaction|user 42|P2002/,
+    );
+    // The failure is recorded (as an error class only) for redelivery.
+    expect(prisma.paymentWebhookEvent.update.mock.calls.at(-1)?.[0]).toEqual({
+      where: { id: 'log-1' },
+      data: { status: 'FAILED', processedAt: null, lastErrorCode: 'db:P2002' },
+    });
+  });
+
+  it('logs a verified event before processing it, and its outcome after', async () => {
+    const { payload, signature } = signedBody();
+    const order: string[] = [];
+    prisma.paymentWebhookEvent.upsert.mockImplementation((() => {
+      order.push('logged');
+      return Promise.resolve({ id: 'log-1' });
+    }) as never);
+    handleEvent.mockImplementation(() => {
+      order.push('handled');
+      return Promise.resolve('ACTIVATED');
+    });
+
+    await post(payload, signature).expect(200);
+
+    expect(order).toEqual(['logged', 'handled']);
+    expect(prisma.paymentWebhookEvent.upsert.mock.calls[0]?.[0]).toMatchObject({
+      where: {
+        provider_providerEventId: {
+          provider: 'stripe',
+          providerEventId: 'evt_1',
+        },
+      },
+      create: {
+        type: 'checkout.session.completed',
+        objectId: 'cs_test_1',
+        livemode: false,
+      },
+      update: { attempts: { increment: 1 } },
+    });
+    expect(
+      prisma.paymentWebhookEvent.update.mock.calls.at(-1)?.[0],
+    ).toMatchObject({ data: { status: 'PROCESSED', outcome: 'ACTIVATED' } });
   });
 
   it('is excluded from rate limiting so Stripe retries are never throttled', () => {

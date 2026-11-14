@@ -538,6 +538,45 @@ Repeated or delayed events add no rows or events. Because the current state is a
 
 Handled events: `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `checkout.session.async_payment_failed`, `checkout.session.expired`, `invoice.paid`, `invoice.payment_failed`, `customer.subscription.updated`, `customer.subscription.deleted`, `charge.refunded`, `charge.refund.updated`, `refund.created`, `refund.updated`, `refund.failed`. Other events are acknowledged and ignored. Transient failures return `5xx`, so Stripe retries.
 
+#### Webhook security and reliability
+
+- **Verified first:** every event goes through `StripeWebhookService.receive`. It verifies the `Stripe-Signature` header against the raw body before anything is read or written; a missing, forged, tampered, other-secret or stale (more than 5 minutes old) signature gets `400` and changes nothing. Only `verifyEvent` produces a `VerifiedStripeEvent`, and `handleEvent` accepts nothing else (a compile-time guarantee).
+- **Facts from the API:** payment facts are then always re-read from the Stripe API and matched to what MuseCue stored (customer, subscription, checkout, price, interval, amount). Payloads are never trusted for them.
+- **Events that are not ours:** events of connected accounts (`account` set) or of the other mode (a live event at a test key, or the reverse) are acknowledged without effect (`NOT_FOR_THIS_ACCOUNT`). So is an event naming an object that does not exist in this Stripe account (`UNKNOWN_OBJECT`), instead of being retried for days.
+- **Event log:** each verified event is recorded in `PaymentWebhookEvent` (migration `20261118120000_payment_webhook_events`) before processing. The row has the Stripe event ID, type, object ID, mode and creation time, but no payload. It is then updated with the status (`PROCESSED` or `FAILED`), the outcome, the number of deliveries and, on failure, an error class (never a message).
+- **Failures:** a failure answers a generic `500 Webhook processing failed` (no internal details), or `503` for retry-later cases. Because every change is one transaction, nothing is half-applied, and Stripe's redelivery applies the event once. An event still `FAILED` after Stripe's retries can be resent from the Stripe dashboard (events are kept for 30 days):
+
+  ```sql
+  SELECT "providerEventId", "type", "attempts", "lastErrorCode", "receivedAt"
+    FROM "PaymentWebhookEvent" WHERE "status" = 'FAILED' ORDER BY "receivedAt";
+  ```
+
+- **Early arrivals:** a renewal, or a cancellation made in Stripe, can arrive before the subscription's first payment is recorded. It answers `503` so Stripe delivers it again, instead of being acknowledged and lost.
+
+Review notes (November 2026):
+
+- **What was checked:** every event type for signature handling, payload trust, cross-customer matching, duplicates, concurrency, delays and ordering, and failures after Stripe confirmed a payment. Most of it was already correct:
+  - signature before processing;
+  - re-reading payment facts from Stripe;
+  - customer/subscription matching;
+  - one transaction per change under the user's row lock;
+  - idempotency keyed by Stripe IDs;
+  - terms that are only ever extended by newer paid periods and only ever shortened by refunds.
+- **Problems found and fixed:**
+  1. A processing error returned the raw internal error message (database details and IDs) in the webhook response body.
+  2. A renewal arriving before its subscription's first payment was recorded was answered `200` and so lost for good.
+  3. The same happened to a period-end cancellation made in Stripe.
+  4. Connected-account events were processed like the account's own.
+  5. A refund event for a charge outside this Stripe account was answered `500`, so Stripe retried it for days.
+  6. A verified event that kept failing left no trace once Stripe stopped retrying.
+- **Checks that now run:**
+  - `test/stripe-webhook-reliability.e2e-spec.ts` (PostgreSQL): database failures are injected with real triggers after Stripe confirmed a payment, renewal or refund, and everything rolls back and is applied once on redelivery; it also covers a whole lifecycle delivered reversed, duplicated and concurrently, replays after a refund, and foreign and invalid events.
+  - `src/subscription/stripe/stripe-webhook.reliability.spec.ts` (unit): the same cases.
+- **Known limits:**
+  - Processing uses the provider state at the time of processing, so a refund revokes access when the refund event is processed, not retroactively.
+  - An older renewal applied after a newer one after a gap cannot merge into the term (see above).
+  - Cancellations requested through `POST /v1/subscription/cancel` are saved from Stripe's direct API response, not from a webhook, as required for that endpoint.
+
 Configuration (`.env.example`): `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_CHECKOUT_SUCCESS_URL`, `STRIPE_CHECKOUT_CANCEL_URL` (absolute http(s) URLs), optional `STRIPE_PRO_PRODUCT_ID`, and `STRIPE_CHECKOUT_EXPIRES_MINUTES` (31–1440, default 60). In the Stripe dashboard, create a webhook endpoint for `https://<api>/v1/webhooks/stripe` with the thirteen events above. For local development, forward events with the Stripe CLI and use the printed signing secret:
 
 ```bash
@@ -548,10 +587,10 @@ Migration `20261113120000_add_stripe_checkout` adds `PaymentCustomer` and `Check
 
 Not implemented yet: immediate cancellation (including canceling a past-due subscription to stop Stripe's retries), undoing a cancellation (a cancellation reversed in Stripe is not reflected), the customer portal (so users cannot update their card in-app; Stripe's own emails and hosted invoice page can be used), exposing the past-due state in `GET /v1/subscription`, requesting refunds from MuseCue, disputes (`charge.dispute.*`), canceling the Stripe subscription automatically when a payment is refunded, revoking an active free trial on refund (a trial is not a payment and keeps running), reactions to other `customer.subscription.updated` changes (e.g. `unpaid`), and automatic refunds or cancellation of duplicate payments and subscriptions. Renewal delays within Stripe's retry window (up to 3 days) are handled. If a renewal for an older period arrives after a newer one, the older period is recorded but cannot be merged into the term: the database allows one payment per term change.
 
-Database tests (`test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`, `test/stripe-checkout.e2e-spec.ts`, `test/stripe-renewal.e2e-spec.ts`, `test/stripe-payment-failure.e2e-spec.ts`, `test/stripe-cancellation.e2e-spec.ts`, `test/stripe-refund.e2e-spec.ts`, `test/subscription-billing.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
+Database tests (`test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`, `test/stripe-checkout.e2e-spec.ts`, `test/stripe-renewal.e2e-spec.ts`, `test/stripe-payment-failure.e2e-spec.ts`, `test/stripe-cancellation.e2e-spec.ts`, `test/stripe-refund.e2e-spec.ts`, `test/subscription-billing.e2e-spec.ts`, `test/stripe-webhook-reliability.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
 
 ```bash
-TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json test/subscription-plan test/user-subscription test/subscription-trial test/subscription-status test/pro-access test/trial-lifecycle test/billing test/subscription-security test/stripe-checkout test/stripe-renewal test/stripe-payment-failure test/stripe-cancellation test/stripe-refund test/subscription-billing
+TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json test/subscription-plan test/user-subscription test/subscription-trial test/subscription-status test/pro-access test/trial-lifecycle test/billing test/subscription-security test/stripe-checkout test/stripe-renewal test/stripe-payment-failure test/stripe-cancellation test/stripe-refund test/subscription-billing test/stripe-webhook-reliability
 ```
 
 The Stripe unit tests do not need a database or a Stripe account; they run the real Stripe SDK against an in-memory emulation of the few Stripe endpoints used (`test/support/fake-stripe-api.ts`):

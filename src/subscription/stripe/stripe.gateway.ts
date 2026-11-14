@@ -213,6 +213,14 @@ export class StripeGateway {
     );
   }
 
+  /**
+   * Whether the configured key is a live-mode key (`sk_live_` / `rk_live_`).
+   * Events of the other mode are not about this integration's objects.
+   */
+  get liveMode(): boolean {
+    return /^(sk|rk)_live_/.test(this.settings.secretKey ?? '');
+  }
+
   /** Whether the Stripe API can be called (secret key configured). */
   get apiConfigured(): boolean {
     return this.client !== null;

@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { HttpException, Injectable } from '@nestjs/common';
 import {
   type CheckoutSession,
   CheckoutSessionStatus,
@@ -7,8 +7,10 @@ import {
   SubscriptionEventType,
   SubscriptionStatus,
   type UserSubscription,
+  WebhookEventStatus,
 } from '@prisma/client';
-import type Stripe from 'stripe';
+import Stripe from 'stripe';
+import AppError from '../../common/errors/app.error';
 import {
   ActivityLogService,
   type ActivityLogMetadata,
@@ -64,7 +66,22 @@ export type WebhookOutcome =
   /** A refund of a charge that paid no MuseCue invoice. */
   | 'UNKNOWN_PAYMENT'
   | 'REJECTED'
-  | 'CLOSED';
+  | 'CLOSED'
+  /** A connected-account or other-mode event: not about this integration. */
+  | 'NOT_FOR_THIS_ACCOUNT'
+  /** Stripe reports that the object the event names does not exist. */
+  | 'UNKNOWN_OBJECT';
+
+declare const verifiedBrand: unique symbol;
+
+/**
+ * A Stripe event whose signature was verified against the raw request body.
+ * Only verifyEvent produces it, and only it can be processed, so no code path
+ * can apply an unverified payload.
+ */
+export type VerifiedStripeEvent = Stripe.Event & {
+  readonly [verifiedBrand]: true;
+};
 
 /** The identifying fields of a checkout session in an event payload. */
 type SessionRef = Pick<Stripe.Checkout.Session, 'id' | 'metadata'>;
@@ -139,18 +156,152 @@ export class StripeWebhookService {
     private readonly refunds: StripeRefundService,
   ) {}
 
+  /**
+   * Verifies the `Stripe-Signature` header against the raw body (400 when it
+   * is missing, invalid, tampered, signed with another secret or outside the
+   * replay tolerance). Nothing is read or written before this succeeds.
+   */
   verifyEvent(
     rawBody: Buffer | undefined,
     signature: string | undefined,
-  ): Stripe.Event {
-    return this.stripe.constructEvent(rawBody, signature);
+  ): VerifiedStripeEvent {
+    return this.stripe.constructEvent(
+      rawBody,
+      signature,
+    ) as VerifiedStripeEvent;
+  }
+
+  /**
+   * The webhook endpoint: verify, log the verified event, process it and
+   * record the outcome. A processing failure is recorded as FAILED and
+   * answered with a generic 5xx (no internal details), so Stripe retries; the
+   * transaction that failed left nothing half-written, and a redelivery
+   * applies the event once.
+   */
+  async receive(
+    rawBody: Buffer | undefined,
+    signature: string | undefined,
+    metadata: ActivityLogMetadata,
+  ): Promise<WebhookOutcome> {
+    const event = this.verifyEvent(rawBody, signature);
+    const logged = await this.logReceived(event);
+    try {
+      const outcome = await this.handleEvent(event, metadata);
+      await this.prisma.paymentWebhookEvent.update({
+        where: { id: logged.id },
+        data: {
+          status: WebhookEventStatus.PROCESSED,
+          outcome,
+          processedAt: new Date(),
+          lastErrorCode: null,
+        },
+      });
+      return outcome;
+    } catch (error) {
+      const errorCode = errorCodeOf(error);
+      // Best effort: the database may be what failed.
+      await this.prisma.paymentWebhookEvent
+        .update({
+          where: { id: logged.id },
+          data: {
+            status: WebhookEventStatus.FAILED,
+            processedAt: null,
+            lastErrorCode: errorCode,
+          },
+        })
+        .catch(() => undefined);
+      this.logger.logWithMetadata(
+        'error',
+        'Stripe webhook processing failed; Stripe will retry',
+        {
+          context: LOG_CONTEXT,
+          providerEventId: event.id,
+          type: event.type,
+          errorCode,
+        },
+      );
+      // Retry-later answers keep their own (generic) message; anything else
+      // never exposes internal error details to the caller.
+      if (error instanceof HttpException && error.getStatus() >= 500) {
+        throw error;
+      }
+      throw AppError.internalServerError('Webhook processing failed');
+    }
+  }
+
+  /** Records (or counts another delivery of) a verified event. */
+  private logReceived(event: VerifiedStripeEvent) {
+    const object = event.data.object as { id?: unknown };
+    return this.prisma.paymentWebhookEvent.upsert({
+      where: {
+        provider_providerEventId: {
+          provider: STRIPE_PROVIDER,
+          providerEventId: event.id,
+        },
+      },
+      create: {
+        provider: STRIPE_PROVIDER,
+        providerEventId: event.id,
+        type: event.type.slice(0, 100),
+        objectId:
+          typeof object.id === 'string' ? object.id.slice(0, 255) : null,
+        livemode: event.livemode,
+        eventCreatedAt: new Date(event.created * 1000),
+      },
+      update: {
+        attempts: { increment: 1 },
+        status: WebhookEventStatus.RECEIVED,
+        processedAt: null,
+      },
+    });
   }
 
   async handleEvent(
-    event: Stripe.Event,
+    event: VerifiedStripeEvent,
     metadata: ActivityLogMetadata,
     now: Date = new Date(),
   ): Promise<WebhookOutcome> {
+    // Events of connected accounts or of the other mode (test/live) are not
+    // about this integration's customers, whatever their payload says.
+    if (event.account || event.livemode !== this.stripe.liveMode) {
+      this.logger.logWithMetadata(
+        'warn',
+        'Stripe event for another account or mode ignored',
+        {
+          context: LOG_CONTEXT,
+          providerEventId: event.id,
+          type: event.type,
+          livemode: event.livemode,
+          connectedAccount: Boolean(event.account),
+        },
+      );
+      return 'NOT_FOR_THIS_ACCOUNT';
+    }
+    try {
+      return await this.dispatch(event, metadata, now);
+    } catch (error) {
+      // A verified event naming an object that does not exist in this Stripe
+      // account can never be applied; retrying would only repeat the error.
+      if (
+        error instanceof Stripe.errors.StripeInvalidRequestError &&
+        error.code === 'resource_missing'
+      ) {
+        this.logger.logWithMetadata(
+          'error',
+          'Stripe event names an object that does not exist; ignored',
+          { context: LOG_CONTEXT, providerEventId: event.id, type: event.type },
+        );
+        return 'UNKNOWN_OBJECT';
+      }
+      throw error;
+    }
+  }
+
+  private dispatch(
+    event: VerifiedStripeEvent,
+    metadata: ActivityLogMetadata,
+    now: Date,
+  ): Promise<WebhookOutcome> | WebhookOutcome {
     switch (event.type) {
       case 'checkout.session.completed':
       case 'checkout.session.async_payment_succeeded':
@@ -402,7 +553,26 @@ export class StripeWebhookService {
     // The checkout that created this Stripe subscription fixes its customer,
     // price and interval; later admin price changes do not apply to it.
     const origin = await this.findOrigin(subscriptionId, null);
-    if (!origin) return this.unknownSubscription(subscriptionId, ref.id);
+    if (!origin) {
+      // A renewal of a MuseCue subscription whose first payment is not
+      // recorded yet: acknowledging it would lose the payment for good, so ask
+      // Stripe to deliver it again later.
+      if (await this.findOrigin(subscriptionId, ref)) {
+        this.logger.logWithMetadata(
+          'warn',
+          'Stripe renewal before its first payment was recorded; retry later',
+          {
+            context: LOG_CONTEXT,
+            providerSubscriptionId: subscriptionId,
+            providerPaymentId: ref.id,
+          },
+        );
+        throw AppError.serviceUnavailable(
+          'The first payment of this subscription is not recorded yet; retry later',
+        );
+      }
+      return this.unknownSubscription(subscriptionId, ref.id);
+    }
 
     // Payment facts come from the Stripe API, not from the event payload.
     const invoice = await this.stripe.retrieveInvoice(ref.id);
@@ -808,7 +978,7 @@ export class StripeWebhookService {
       },
       select: { id: true, proCanceledAt: true },
     });
-    if (!linked) return 'IGNORED';
+    if (!linked) return this.cancellationBeforeFirstPayment(ref);
     if (linked.proCanceledAt) return 'ALREADY_PROCESSED';
     if (!ref.cancel_at_period_end) return 'IGNORED';
 
@@ -829,6 +999,44 @@ export class StripeWebhookService {
       : result.outcome === 'ALREADY_CANCELED'
         ? 'ALREADY_PROCESSED'
         : 'IGNORED';
+  }
+
+  /**
+   * A scheduled cancellation of a subscription whose first payment is not
+   * recorded yet (its checkout event is delayed). If Stripe confirms a paid,
+   * MuseCue-created subscription with the cancellation scheduled, ask Stripe
+   * to deliver the event again later instead of losing the cancellation;
+   * anything else (e.g. an abandoned checkout's subscription) is ignored.
+   */
+  private async cancellationBeforeFirstPayment(
+    ref: Stripe.Subscription,
+  ): Promise<WebhookOutcome> {
+    const checkoutId = ref.metadata?.[CHECKOUT_METADATA.CHECKOUT_ID];
+    if (!ref.cancel_at_period_end || !checkoutId) return 'IGNORED';
+    const origin = await this.prisma.checkoutSession.findFirst({
+      where: {
+        id: checkoutId,
+        provider: STRIPE_PROVIDER,
+        providerSubscriptionId: null,
+      },
+    });
+    if (!origin) return 'IGNORED';
+    const current = await this.stripe.retrieveSubscription(ref.id);
+    if (
+      !current.cancel_at_period_end ||
+      !['active', 'past_due'].includes(current.status) ||
+      current.metadata?.[CHECKOUT_METADATA.CHECKOUT_ID] !== origin.id
+    ) {
+      return 'IGNORED';
+    }
+    this.logger.logWithMetadata(
+      'warn',
+      'Stripe cancellation before the first payment was recorded; retry later',
+      { context: LOG_CONTEXT, providerSubscriptionId: ref.id },
+    );
+    throw AppError.serviceUnavailable(
+      'The first payment of this subscription is not recorded yet; retry later',
+    );
   }
 
   /**
@@ -1065,4 +1273,26 @@ export class StripeWebhookService {
     );
     return 'UNKNOWN_CHECKOUT';
   }
+}
+
+/** A short, non-sensitive class or code of an error (never its message). */
+function errorCodeOf(error: unknown): string {
+  let code: string;
+  if (error instanceof Stripe.errors.StripeError) {
+    code = `stripe:${error.rawType ?? error.type}`;
+  } else if (error instanceof HttpException) {
+    code = `http:${error.getStatus()}`;
+  } else if (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    typeof error.code === 'string'
+  ) {
+    code = `db:${error.code}`;
+  } else if (error instanceof Error) {
+    code = error.name;
+  } else {
+    code = 'unknown';
+  }
+  return code.slice(0, 100);
 }

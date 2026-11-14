@@ -214,3 +214,31 @@ model PaymentRefund {
   @@unique([provider, providerRefundId])
   @@index([paymentId])
 }
+
+// A provider webhook event whose signature was verified (e.g. Stripe
+// `evt_...`): written before processing, updated with the outcome, so a
+// verified event that could not be applied stays visible as FAILED until a
+// redelivery processes it. Stores no payload.
+model PaymentWebhookEvent {
+  id              String             @id @default(uuid())
+  provider        String             @db.VarChar(50)
+  providerEventId String             @db.VarChar(255)
+  type            String             @db.VarChar(100)
+  // The object the event is about (e.g. a checkout session or invoice id).
+  objectId        String?            @db.VarChar(255)
+  livemode        Boolean
+  eventCreatedAt  DateTime
+  status          WebhookEventStatus @default(RECEIVED)
+  // What processing did (e.g. ACTIVATED, ALREADY_PROCESSED, IGNORED).
+  outcome         String?            @db.VarChar(50)
+  // Deliveries received, including redeliveries of the same event.
+  attempts        Int                @default(1)
+  // Class or code of the last failure; never a message or payload.
+  lastErrorCode   String?            @db.VarChar(100)
+  receivedAt      DateTime           @default(now())
+  processedAt     DateTime?
+  updatedAt       DateTime           @updatedAt
+
+  @@unique([provider, providerEventId])
+  @@index([status, receivedAt])
+}

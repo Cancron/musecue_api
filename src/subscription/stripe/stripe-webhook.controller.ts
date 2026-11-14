@@ -20,7 +20,8 @@ import { StripeWebhookService } from './stripe-webhook.service';
  * Throttling is skipped so Stripe's retries are never rate-limited.
  *
  * Responds 200 once an event is handled or deliberately ignored, 400 for an
- * invalid signature, and 5xx on transient failures so Stripe retries.
+ * invalid signature (nothing is read or written), and a generic 5xx on
+ * failures so Stripe retries (internal error details are never returned).
  */
 @SkipThrottle()
 @Controller('v1/webhooks/stripe')
@@ -34,8 +35,7 @@ export class StripeWebhookController {
     @Req() req: RawBodyRequest<Request>,
     @Headers('stripe-signature') signature?: string,
   ) {
-    const event = this.webhooks.verifyEvent(req.rawBody, signature);
-    await this.webhooks.handleEvent(event, requestMetadata(req));
+    await this.webhooks.receive(req.rawBody, signature, requestMetadata(req));
     return { received: true };
   }
 }

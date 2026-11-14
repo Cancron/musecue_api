@@ -196,3 +196,10 @@ enum CheckoutSessionStatus {
   EXPIRED
   FAILED
 }
+
+// Processing state of a verified provider webhook event.
+enum WebhookEventStatus {
+  RECEIVED
+  PROCESSED
+  FAILED
+}
