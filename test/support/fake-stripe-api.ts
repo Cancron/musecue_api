@@ -261,9 +261,11 @@ export class FakeStripeApi {
   /** Stripe ends the subscription (e.g. after its last failed retry). */
   cancelSubscription(subscriptionId: string) {
     const now = Math.floor(Date.now() / 1000);
-    Object.assign(this.requireSubscription(subscriptionId), {
+    const subscription = this.requireSubscription(subscriptionId);
+    Object.assign(subscription, {
       status: 'canceled',
-      canceled_at: now,
+      // A scheduled cancellation keeps the time it was requested.
+      canceled_at: subscription.canceled_at ?? now,
       ended_at: now,
     });
   }
@@ -299,6 +301,39 @@ export class FakeStripeApi {
     Object.assign(session, { payment_status: 'paid' });
   }
 
+  /**
+   * POST /v1/subscriptions/:id with `cancel_at_period_end`. Like Stripe:
+   * canceled subscriptions cannot be updated; scheduling a cancellation sets
+   * `cancel_at` to the current period end and `canceled_at` to the request
+   * time; unscheduling clears both.
+   */
+  private updateSubscription(
+    subscriptionId: string,
+    params: Json,
+  ): { status: number; body: Json } {
+    const subscription = this.subscriptions.get(subscriptionId);
+    if (!subscription) {
+      return invalid(404, 'resource_missing', 'No such subscription');
+    }
+    if (subscription.status === 'canceled') {
+      return invalid(
+        400,
+        undefined,
+        'A canceled subscription can only update its cancellation_details and metadata.',
+      );
+    }
+    if (params.cancel_at_period_end !== undefined) {
+      const cancel = params.cancel_at_period_end === 'true';
+      const item = (subscription.items as { data: Json[] }).data[0];
+      Object.assign(subscription, {
+        cancel_at_period_end: cancel,
+        cancel_at: cancel ? item.current_period_end : null,
+        canceled_at: cancel ? Math.floor(Date.now() / 1000) : null,
+      });
+    }
+    return { status: 200, body: { ...subscription } };
+  }
+
   /** Creates the subscription and its first (open) invoice for a session. */
   private startSubscription(session: Json, periodStart?: Date) {
     const lineItem = (session.line_items as Json[])[0];
@@ -325,7 +360,10 @@ export class FakeStripeApi {
       customer: session.customer,
       status: 'incomplete',
       billing_cycle_anchor: start,
+      cancel_at_period_end: false,
+      cancel_at: null,
       canceled_at: null,
+      ended_at: null,
       metadata,
       latest_invoice: invoice.id,
       items: {
@@ -609,6 +647,10 @@ export class FakeStripeApi {
       return found
         ? { status: 200, body: { ...found } }
         : invalid(404, 'resource_missing', 'No such payment_intent');
+    }
+    const update = /^\/v1\/subscriptions\/([^/]+)$/.exec(path);
+    if (update && method === 'POST') {
+      return this.updateSubscription(update[1], params);
     }
     const object = /^\/v1\/(invoices|subscriptions)\/([^/]+)$/.exec(path);
     if (object && method === 'GET') {

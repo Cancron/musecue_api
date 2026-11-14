@@ -48,7 +48,35 @@ export interface ProviderCheckoutSession {
 export const stripeIdempotencyKeys = {
   customer: (authId: string) => `musecue-customer-${authId}`,
   checkout: (checkoutId: string) => `musecue-checkout-${checkoutId}`,
+  /** One cancellation per subscription and paid term. */
+  cancel: (subscriptionId: string, termEndsAt: Date) =>
+    `musecue-cancel-${subscriptionId}-${termEndsAt.getTime()}`,
 };
+
+/** A subscription's cancellation state as Stripe reports it. */
+export interface ProviderSubscriptionCancellation {
+  id: string;
+  status: string;
+  /** Auto-renewal is off: the subscription ends at the current period end. */
+  cancelAtPeriodEnd: boolean;
+  /** When the cancellation was requested (Stripe `canceled_at`). */
+  canceledAt: Date | null;
+  /** When the subscription will end (Stripe `cancel_at`). */
+  cancelAt: Date | null;
+}
+
+const fromSeconds = (value: number | null) =>
+  value === null ? null : new Date(value * 1000);
+
+export const toProviderCancellation = (
+  subscription: Stripe.Subscription,
+): ProviderSubscriptionCancellation => ({
+  id: subscription.id,
+  status: subscription.status,
+  cancelAtPeriodEnd: subscription.cancel_at_period_end,
+  canceledAt: fromSeconds(subscription.canceled_at),
+  cancelAt: fromSeconds(subscription.cancel_at),
+});
 
 export const stripeInterval = (interval: BillingInterval): 'month' | 'year' =>
   interval === BillingInterval.MONTHLY ? 'month' : 'year';
@@ -160,6 +188,34 @@ export class StripeGateway {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Turns auto-renewal off: the subscription stays active and paid until the
+   * end of its current period, then Stripe ends it. Nothing is refunded and
+   * the period is not shortened.
+   */
+  async cancelAtPeriodEnd(
+    subscriptionId: string,
+    termEndsAt: Date,
+  ): Promise<ProviderSubscriptionCancellation> {
+    return toProviderCancellation(
+      await this.requireClient().subscriptions.update(
+        subscriptionId,
+        { cancel_at_period_end: true },
+        {
+          idempotencyKey: stripeIdempotencyKeys.cancel(
+            subscriptionId,
+            termEndsAt,
+          ),
+        },
+      ),
+    );
+  }
+
+  /** Whether the Stripe API can be called (secret key configured). */
+  get apiConfigured(): boolean {
+    return this.client !== null;
   }
 
   /** Stripe only expires `open` sessions; others reject the request. */

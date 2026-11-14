@@ -113,6 +113,9 @@ model PaymentTransaction {
 // Append-only lifecycle log of a subscription. CREATED and RENEWED events
 // reference the SUCCEEDED payment that paid for the period (one event per
 // payment); other events have no payment.
+// A cancellation is logged once: at most one CANCELED event per subscription
+// and cancellation time (partial unique index, migration
+// 20261116120000_subscription_cancellation).
 model SubscriptionEvent {
   id             String                @id @default(uuid())
   subscriptionId String

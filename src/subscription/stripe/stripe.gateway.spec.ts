@@ -278,6 +278,49 @@ describe('StripeGateway', () => {
     });
   });
 
+  describe('cancellation', () => {
+    it('turns auto-renewal off with an idempotency key per subscription and term', async () => {
+      const session = await gateway.createCheckoutSession(
+        await checkoutRequest(),
+      );
+      const subscriptionId = api.completeSession(session.id)
+        .subscription as string;
+      const termEndsAt = new Date('2026-12-01T10:00:00.000Z');
+
+      const first = await gateway.cancelAtPeriodEnd(subscriptionId, termEndsAt);
+      const replay = await gateway.cancelAtPeriodEnd(
+        subscriptionId,
+        termEndsAt,
+      );
+
+      expect(first).toEqual({
+        id: subscriptionId,
+        status: 'active',
+        cancelAtPeriodEnd: true,
+        canceledAt: expect.any(Date) as Date,
+        cancelAt: expect.any(Date) as Date,
+      });
+      expect(replay).toEqual(first);
+      expect(api.requests.slice(-2)).toEqual([
+        expect.objectContaining({
+          method: 'POST',
+          path: `/v1/subscriptions/${subscriptionId}`,
+          params: { cancel_at_period_end: 'true' },
+          idempotencyKey: `musecue-cancel-${subscriptionId}-${termEndsAt.getTime()}`,
+        }),
+        expect.objectContaining({
+          idempotencyKey: `musecue-cancel-${subscriptionId}-${termEndsAt.getTime()}`,
+        }),
+      ]);
+    });
+
+    it('surfaces a Stripe rejection as an error', async () => {
+      await expect(
+        gateway.cancelAtPeriodEnd('sub_missing', new Date()),
+      ).rejects.toBeInstanceOf(Stripe.errors.StripeInvalidRequestError);
+    });
+  });
+
   describe('webhook signatures', () => {
     const signed = () => {
       const payload = JSON.stringify({

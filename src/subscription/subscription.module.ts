@@ -10,6 +10,7 @@ import { SubscriptionPlanController } from './subscription-plan.controller';
 import { SubscriptionPlanService } from './subscription-plan.service';
 import { SubscriptionTrialService } from './subscription-trial.service';
 import { SubscriptionController } from './subscription.controller';
+import { StripeCancellationService } from './stripe/stripe-cancellation.service';
 import { StripeCheckoutService } from './stripe/stripe-checkout.service';
 import { StripeWebhookController } from './stripe/stripe-webhook.controller';
 import { StripeWebhookService } from './stripe/stripe-webhook.service';
@@ -54,6 +55,7 @@ import { STRIPE_CLIENT, StripeGateway } from './stripe/stripe.gateway';
     },
     StripeGateway,
     StripeCheckoutService,
+    StripeCancellationService,
     StripeWebhookService,
   ],
   // Modules with Pro feature endpoints import SubscriptionModule and use

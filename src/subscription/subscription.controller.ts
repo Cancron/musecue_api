@@ -1,10 +1,20 @@
-import { Body, Controller, Get, Post, Req, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  HttpCode,
+  HttpStatus,
+  Post,
+  Req,
+  UseGuards,
+} from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import type { Request } from 'express';
 import type { IAccessTokenPayload } from '../auth/interfaces/auth.interface';
 import { AuthGuard } from '../common/guards/auth.guard';
 import { CreateCheckoutSessionDto } from './dto/create-checkout-session.dto';
 import { requestMetadata } from './request-metadata';
+import { StripeCancellationService } from './stripe/stripe-cancellation.service';
 import { StripeCheckoutService } from './stripe/stripe-checkout.service';
 import { SubscriptionAccessService } from './subscription-access.service';
 import { SubscriptionTrialService } from './subscription-trial.service';
@@ -23,6 +33,7 @@ export class SubscriptionController {
     private readonly access: SubscriptionAccessService,
     private readonly trials: SubscriptionTrialService,
     private readonly checkout: StripeCheckoutService,
+    private readonly cancellation: StripeCancellationService,
   ) {}
 
   /** The caller's subscription status, trial eligibility and dates. */
@@ -49,5 +60,20 @@ export class SubscriptionController {
     @Body() dto: CreateCheckoutSessionDto,
   ) {
     return this.checkout.createCheckout(req.user.userId, dto.billingInterval);
+  }
+
+  /**
+   * Cancels the caller's own paid subscription at the end of its period:
+   * auto-renewal is turned off through Stripe and Pro access continues until
+   * the paid period ends. Takes no request body; the subscription is always
+   * the token user's. Repeating the request returns the same cancellation.
+   */
+  @Post('cancel')
+  @HttpCode(HttpStatus.OK)
+  cancelSubscription(@Req() req: AuthenticatedRequest) {
+    return this.cancellation.cancelAtPeriodEnd(
+      req.user.userId,
+      requestMetadata(req),
+    );
   }
 }

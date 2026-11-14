@@ -17,6 +17,7 @@ import {
 import { CustomLoggerService } from '../../common/services/custom-logger.service';
 import { PrismaService } from '../../common/services/prisma.service';
 import { isProActive } from '../subscription-access.policy';
+import { StripeCancellationService } from './stripe-cancellation.service';
 import { PENDING_CHECKOUT_STATUSES } from './stripe-checkout.service';
 import {
   type InvoiceVerification,
@@ -32,6 +33,7 @@ import {
   CHECKOUT_METADATA,
   STRIPE_PROVIDER,
   StripeGateway,
+  toProviderCancellation,
 } from './stripe.gateway';
 
 const LOG_CONTEXT = 'StripeWebhookService';
@@ -52,6 +54,8 @@ export type WebhookOutcome =
   | 'PAYMENT_FAILED'
   /** The linked provider subscription ended; retries stopped. */
   | 'SUBSCRIPTION_ENDED'
+  /** A period-end cancellation confirmed by Stripe was recorded. */
+  | 'CANCELED'
   | 'REJECTED'
   | 'CLOSED';
 
@@ -102,6 +106,10 @@ export const failedAttemptId = (invoiceId: string, eventId: string) =>
  *   failed renewal marks the subscription past due until Stripe collects the
  *   invoice (recovery: `invoice.paid`, recorded once like any payment) or
  *   ends the subscription (`customer.subscription.deleted`).
+ * - `customer.subscription.updated`: records a period-end cancellation that
+ *   Stripe confirms (e.g. when the response to the user's own cancellation
+ *   request was lost). It never reverses a recorded cancellation, so stale or
+ *   out-of-order updates cannot conflict with it.
  *
  * Each payment, the term change, its event and the audit record are written
  * in one transaction under the user's UserSubscription row lock. A payment is
@@ -117,6 +125,7 @@ export class StripeWebhookService {
     private readonly stripe: StripeGateway,
     private readonly activityLog: ActivityLogService,
     private readonly logger: CustomLoggerService,
+    private readonly cancellation: StripeCancellationService,
   ) {}
 
   verifyEvent(
@@ -164,6 +173,8 @@ export class StripeWebhookService {
         );
       case 'customer.subscription.deleted':
         return this.endSubscription(event.data.object, metadata, now);
+      case 'customer.subscription.updated':
+        return this.syncCancellation(event.data.object, metadata, now);
       default:
         return 'IGNORED';
     }
@@ -753,6 +764,47 @@ export class StripeWebhookService {
       await this.audit(tx, record, next, metadata);
       return 'SUBSCRIPTION_ENDED';
     });
+  }
+
+  /**
+   * `customer.subscription.updated`: if the subscription that backs the paid
+   * term is scheduled to cancel at period end (confirmed by reading it from
+   * Stripe), record the cancellation once. Updates that do not schedule a
+   * cancellation (or arrive after it was recorded) change nothing.
+   */
+  private async syncCancellation(
+    ref: Stripe.Subscription,
+    metadata: ActivityLogMetadata,
+    now: Date,
+  ): Promise<WebhookOutcome> {
+    const linked = await this.prisma.userSubscription.findFirst({
+      where: {
+        paymentProvider: STRIPE_PROVIDER,
+        providerSubscriptionId: ref.id,
+      },
+      select: { id: true, proCanceledAt: true },
+    });
+    if (!linked) return 'IGNORED';
+    if (linked.proCanceledAt) return 'ALREADY_PROCESSED';
+    if (!ref.cancel_at_period_end) return 'IGNORED';
+
+    // The current state comes from the Stripe API: an older event that
+    // scheduled a cancellation later undone in Stripe records nothing.
+    const current = toProviderCancellation(
+      await this.stripe.retrieveSubscription(ref.id),
+    );
+    if (!current.cancelAtPeriodEnd) return 'IGNORED';
+    const result = await this.cancellation.recordCancellation(
+      linked.id,
+      ref.id,
+      current.canceledAt ?? now,
+      { ...metadata, actionedBy: null },
+    );
+    return result.outcome === 'CANCELED'
+      ? 'CANCELED'
+      : result.outcome === 'ALREADY_CANCELED'
+        ? 'ALREADY_PROCESSED'
+        : 'IGNORED';
   }
 
   /**

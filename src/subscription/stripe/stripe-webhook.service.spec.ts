@@ -15,6 +15,7 @@ import type { PrismaService } from '../../common/services/prisma.service';
 import { addBillingInterval } from '../billing.validation';
 import { resolveSubscriptionAccess } from '../subscription-access.policy';
 import { SubscriptionPlanService } from '../subscription-plan.service';
+import { StripeCancellationService } from './stripe-cancellation.service';
 import { StripeCheckoutService } from './stripe-checkout.service';
 import {
   StripeWebhookService,
@@ -63,7 +64,13 @@ describe('StripeWebhookService', () => {
     );
     const prisma = db as unknown as PrismaService;
     checkout = new StripeCheckoutService(prisma, plans, gateway, logger);
-    webhooks = new StripeWebhookService(prisma, gateway, activityLog, logger);
+    webhooks = new StripeWebhookService(
+      prisma,
+      gateway,
+      activityLog,
+      logger,
+      new StripeCancellationService(prisma, gateway, activityLog, logger),
+    );
   });
 
   /** A user with an open checkout; returns ids for the test. */

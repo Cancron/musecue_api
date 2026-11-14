@@ -483,7 +483,6 @@ describeWithDatabase('Subscription security (PostgreSQL, full stack)', () => {
       ['post', '/v1/subscription/pro'],
       ['post', '/v1/subscription/activate'],
       ['post', '/v1/subscription/renew'],
-      ['post', '/v1/subscription/cancel'],
       ['post', '/v1/subscription/payments'],
       ['get', '/v1/subscription/payments'],
       ['patch', '/v1/subscription/payments/any-id'],
@@ -505,6 +504,28 @@ describeWithDatabase('Subscription security (PostgreSQL, full stack)', () => {
         })
         .expect(404);
       await expect(snapshot(userId)).resolves.toEqual(before);
+    });
+
+    // POST /v1/subscription/cancel exists since cancellation at period end was
+    // added; it must not let client-supplied values change anything either.
+    it('cannot change subscription state through the cancel route', async () => {
+      const userId = await createUser(client);
+      const victim = await createUser(client);
+      const before = await snapshot(userId);
+      const victimBefore = await snapshot(victim);
+      await http()
+        .post('/v1/subscription/cancel?status=PRO&userId=' + victim)
+        .set('Authorization', bearer(userId, UserRole.SUPERADMIN))
+        .send({
+          userId: victim,
+          status: 'PRO',
+          proExpiresAt: '2099-01-01T00:00:00Z',
+          amountCents: 1900,
+          paymentStatus: 'SUCCEEDED',
+        })
+        .expect(409);
+      await expect(snapshot(userId)).resolves.toEqual(before);
+      await expect(snapshot(victim)).resolves.toEqual(victimBefore);
     });
 
     it('does not grant Pro access from spoofed headers, query parameters or body', async () => {

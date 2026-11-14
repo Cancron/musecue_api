@@ -16,7 +16,7 @@ The companion mobile application and detailed product specifications live in `..
 - BullMQ jobs for personalization, guide generation, visual checks, and guide questions
 - `AiRun` audit records containing operation, provider, model, prompt version, latency, progress, result/error, and status
 - a provider-neutral AI gateway with OpenRouter live mode, multimodal private-image input, strict structured output, runtime validation, bounded retries, and deterministic mock mode
-- a single Pro subscription plan: admin-configured monthly/yearly pricing and free trial, one-time trial activation, date-based Pro access through `ProAccessGuard`, payment/lifecycle records protected by database rules, and Stripe checkout for the monthly and yearly options with webhook-verified activation, automatic renewals, and failed-payment handling and recovery (see "Subscriptions" and "Stripe checkout" under API); cancellation and refunds through Stripe are not implemented yet
+- a single Pro subscription plan: admin-configured monthly/yearly pricing and free trial, one-time trial activation, date-based Pro access through `ProAccessGuard`, payment/lifecycle records protected by database rules, and Stripe checkout for the monthly and yearly options with webhook-verified activation, automatic renewals, failed-payment handling and recovery, and cancellation at period end (see "Subscriptions" and "Stripe checkout" under API); cancellation and refunds through Stripe are not implemented yet
 
 Migration `20260827174107_add_makeup_workflow` adds the makeup aggregate and removes the dormant job-tracker and subscription starter domains.
 
@@ -372,6 +372,7 @@ The guard delegates to `SubscriptionAccessService`, the single Pro access decisi
 | Method | Route                       | Auth                      | Purpose                                            |
 | ------ | --------------------------- | ------------------------- | -------------------------------------------------- |
 | `POST` | `/v1/subscription/checkout` | bearer token              | Start (or reuse) a hosted Stripe checkout for Pro  |
+| `POST` | `/v1/subscription/cancel`   | bearer token              | Cancel the caller's own subscription at period end |
 | `POST` | `/v1/webhooks/stripe`       | `Stripe-Signature` header | Stripe events; the only way paid Pro is granted    |
 
 `POST /v1/subscription/checkout` accepts exactly `{ "billingInterval": "MONTHLY" }` or `{ "billingInterval": "YEARLY" }`. Any other value, `null`, lowercase values and extra fields (a price, currency, user ID or "paid" flag) are rejected with `400`. The user comes from the access token, and the price from the plan configuration (`monthlyPriceUsdCents` / `yearlyPriceUsdCents`) at the moment the checkout is created. The response (`201`) is:
@@ -451,22 +452,47 @@ Recovery is Stripe collecting the invoice (a retry or a new card):
 
 `customer.subscription.deleted` for the linked subscription, confirmed as `canceled` through the Stripe API, means Stripe stopped retrying (or the subscription was canceled). It sets `proCanceledAt` (access continues until `proExpiresAt`), appends one `CANCELED` event and clears `pastDueSince`, so the user can check out again. Configure Stripe to cancel subscriptions after the final failed retry. With "mark as unpaid" or "leave past due", the user stays past due until the invoice is paid or the subscription is canceled.
 
-Handled events: `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `checkout.session.async_payment_failed`, `checkout.session.expired`, `invoice.paid`, `invoice.payment_failed`, `customer.subscription.deleted`. Other events are acknowledged and ignored. Transient failures return `5xx`, so Stripe retries.
+#### Cancellation at period end
 
-Configuration (`.env.example`): `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_CHECKOUT_SUCCESS_URL`, `STRIPE_CHECKOUT_CANCEL_URL` (absolute http(s) URLs), optional `STRIPE_PRO_PRODUCT_ID`, and `STRIPE_CHECKOUT_EXPIRES_MINUTES` (31–1440, default 60). In the Stripe dashboard, create a webhook endpoint for `https://<api>/v1/webhooks/stripe` with the seven events above. For local development, forward events with the Stripe CLI and use the printed signing secret:
+`POST /v1/subscription/cancel` (bearer token, no body) cancels the caller's own paid subscription at the end of its current period. The subscription is always the token user's: user or subscription IDs in the body or query are ignored, so nobody can cancel another user's subscription. Response (`200`):
+
+```json
+{
+  "status": "PRO",
+  "hasProAccess": true,
+  "autoRenew": false,
+  "canceledAt": "2026-03-10T09:00:00.000Z",
+  "endsAt": "2026-03-31T10:00:00.000Z",
+  "accessExpiresAt": "2026-03-31T10:00:00.000Z",
+  "alreadyCanceled": false
+}
+```
+
+- Only a running paid term backed by a Stripe subscription can be canceled. Otherwise the response is `409 You do not have an active paid Pro subscription to cancel`: no subscription, trial only, an ended term (access ends exactly at `proExpiresAt`), or a term without a Stripe subscription.
+- The API first asks Stripe to set `cancel_at_period_end`, outside any database transaction and with an idempotency key per subscription and term. Nothing is refunded or shortened.
+- The cancellation is recorded only when Stripe confirms it. It sets `UserSubscription.proCanceledAt` to Stripe's cancellation time and appends one `CANCELED` `SubscriptionEvent` with the same time, plus an audit record by the user. `proExpiresAt` never changes: Pro features stay available until the period ends, and `GET /v1/subscription` shows `pro.canceledAt`.
+- If Stripe fails or does not confirm, nothing is recorded and the subscription keeps renewing. The response is `503 The subscription could not be canceled; it is still active and will renew. Please try again`. If Stripe canceled but its response was lost, a retry or Stripe's `customer.subscription.updated` webhook records it.
+- Repeated requests return the same cancellation (`alreadyCanceled: true`) without calling Stripe. Concurrent requests and webhooks are serialized by the user's row lock, and only the first sets `proCanceledAt`. A partial unique index (migration `20261116120000_subscription_cancellation`) also refuses a second `CANCELED` event for the same cancellation.
+- `customer.subscription.updated` (re-read from Stripe) records a period-end cancellation made outside MuseCue, e.g. in the Stripe dashboard. It never reverses a recorded cancellation, so stale or out-of-order updates change nothing.
+- When Stripe ends the subscription at period end (`customer.subscription.deleted`), nothing is added: the cancellation and expiry are already recorded.
+- A canceled but running term still counts as an active subscription, so a new checkout returns `409` until it ends. Trial history, payments and renewal rules are unchanged.
+
+Handled events: `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `checkout.session.async_payment_failed`, `checkout.session.expired`, `invoice.paid`, `invoice.payment_failed`, `customer.subscription.updated`, `customer.subscription.deleted`. Other events are acknowledged and ignored. Transient failures return `5xx`, so Stripe retries.
+
+Configuration (`.env.example`): `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_CHECKOUT_SUCCESS_URL`, `STRIPE_CHECKOUT_CANCEL_URL` (absolute http(s) URLs), optional `STRIPE_PRO_PRODUCT_ID`, and `STRIPE_CHECKOUT_EXPIRES_MINUTES` (31–1440, default 60). In the Stripe dashboard, create a webhook endpoint for `https://<api>/v1/webhooks/stripe` with the eight events above. For local development, forward events with the Stripe CLI and use the printed signing secret:
 
 ```bash
-stripe listen --events checkout.session.completed,checkout.session.async_payment_succeeded,checkout.session.async_payment_failed,checkout.session.expired,invoice.paid,invoice.payment_failed,customer.subscription.deleted --forward-to localhost:5000/v1/webhooks/stripe
+stripe listen --events checkout.session.completed,checkout.session.async_payment_succeeded,checkout.session.async_payment_failed,checkout.session.expired,invoice.paid,invoice.payment_failed,customer.subscription.updated,customer.subscription.deleted --forward-to localhost:5000/v1/webhooks/stripe
 ```
 
 Migration `20261113120000_add_stripe_checkout` adds `PaymentCustomer` and `CheckoutSession`. Database rules enforce one pending checkout per user, forward-only checkout status, an immutable price, interval, customer and provider session, and completion only by a `SUCCEEDED` payment of the same subscription. The webhook needs the raw body, so `main.ts` creates the app with `rawBody: true`.
 
-Not implemented yet: user-initiated cancellation and the customer portal (so users cannot update their card in-app; Stripe's own emails and hosted invoice page can be used), exposing the past-due state in `GET /v1/subscription`, refunds and disputes, reactions to `customer.subscription.updated` (e.g. `unpaid`), and automatic refunds or cancellation of duplicate payments and subscriptions. Renewal delays within Stripe's retry window (up to 3 days) are handled. If a renewal for an older period arrives after a newer one, the older period is recorded but cannot be merged into the term: the database allows one payment per term change.
+Not implemented yet: immediate cancellation (including canceling a past-due subscription to stop Stripe's retries), undoing a cancellation (a cancellation reversed in Stripe is not reflected), the customer portal (so users cannot update their card in-app; Stripe's own emails and hosted invoice page can be used), exposing the past-due state in `GET /v1/subscription`, refunds and disputes, reactions to other `customer.subscription.updated` changes (e.g. `unpaid`), and automatic refunds or cancellation of duplicate payments and subscriptions. Renewal delays within Stripe's retry window (up to 3 days) are handled. If a renewal for an older period arrives after a newer one, the older period is recorded but cannot be merged into the term: the database allows one payment per term change.
 
-Database tests (`test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`, `test/stripe-checkout.e2e-spec.ts`, `test/stripe-renewal.e2e-spec.ts`, `test/stripe-payment-failure.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
+Database tests (`test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`, `test/stripe-checkout.e2e-spec.ts`, `test/stripe-renewal.e2e-spec.ts`, `test/stripe-payment-failure.e2e-spec.ts`, `test/stripe-cancellation.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
 
 ```bash
-TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json test/subscription-plan test/user-subscription test/subscription-trial test/subscription-status test/pro-access test/trial-lifecycle test/billing test/subscription-security test/stripe-checkout test/stripe-renewal test/stripe-payment-failure
+TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json test/subscription-plan test/user-subscription test/subscription-trial test/subscription-status test/pro-access test/trial-lifecycle test/billing test/subscription-security test/stripe-checkout test/stripe-renewal test/stripe-payment-failure test/stripe-cancellation
 ```
 
 The Stripe unit tests do not need a database or a Stripe account; they run the real Stripe SDK against an in-memory emulation of the few Stripe endpoints used (`test/support/fake-stripe-api.ts`):
