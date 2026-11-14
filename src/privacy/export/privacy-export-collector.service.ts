@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import type { Prisma } from '@prisma/client';
 import { extname } from 'node:path';
 import { PrismaService } from '../../common/services/prisma.service';
+import { isOwnedPrivateImageKey } from '../../storage/private-storage-key';
 import type { SubscriptionStatusView } from '../../subscription/interfaces/subscription-status.interface';
 import { SubscriptionAccessService } from '../../subscription/subscription-access.service';
 import { PrivacyExportPermanentError } from './privacy-export.errors';
@@ -224,6 +225,8 @@ const PHOTO_EXTENSIONS: Readonly<Record<string, string>> = {
   'image/webp': '.webp',
 };
 const AVATAR_EXTENSIONS = new Set(['.jpg', '.png', '.webp']);
+/** Scope ProfileService uses when saving avatars. */
+const AVATAR_SCOPE = 'profile';
 
 export type ExportAccount = Prisma.authUserGetPayload<{
   select: typeof ACCOUNT_SELECT;
@@ -372,7 +375,7 @@ export class PrivacyExportCollectorService {
         sessionId: null,
       };
       if (
-        this.isOwnedKey(authId, avatarKey) &&
+        isOwnedPrivateImageKey(avatarKey, authId, AVATAR_SCOPE) &&
         AVATAR_EXTENSIONS.has(extension)
       ) {
         photos.push({
@@ -396,7 +399,11 @@ export class PrivacyExportCollectorService {
         image.storageKey.includes('://')
       ) {
         unavailablePhotos.push({ ...photo, reason: 'NOT_STORED' });
-      } else if (!this.isOwnedKey(authId, image.storageKey)) {
+      } else if (
+        // Session images are saved under <authId>/<sessionId>/; anything
+        // else (another owner or session, traversal, backslashes) is refused.
+        !isOwnedPrivateImageKey(image.storageKey, authId, image.sessionId)
+      ) {
         unavailablePhotos.push({ ...photo, reason: 'UNAVAILABLE' });
       } else {
         const extension = PHOTO_EXTENSIONS[image.mimeType] ?? '.bin';
@@ -434,17 +441,5 @@ export class PrivacyExportCollectorService {
       photos,
       unavailablePhotos,
     };
-  }
-
-  /**
-   * Private keys are written as `<authId>/<scope>/<file>`. Requiring the
-   * owner's prefix means a corrupted or foreign reference can never copy
-   * another user's file into this archive.
-   */
-  private isOwnedKey(authId: string, storageKey: string): boolean {
-    return (
-      storageKey.startsWith(`${authId}/`) &&
-      !storageKey.split('/').some((segment) => segment === '..')
-    );
   }
 }
