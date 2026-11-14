@@ -16,7 +16,10 @@ import { addBillingInterval } from '../billing.validation';
 import { resolveSubscriptionAccess } from '../subscription-access.policy';
 import { SubscriptionPlanService } from '../subscription-plan.service';
 import { StripeCheckoutService } from './stripe-checkout.service';
-import { StripeWebhookService } from './stripe-webhook.service';
+import {
+  StripeWebhookService,
+  type WebhookOutcome,
+} from './stripe-webhook.service';
 import { StripeGateway } from './stripe.gateway';
 
 const { MONTHLY, YEARLY } = BillingInterval;
@@ -599,13 +602,15 @@ describe('StripeWebhookService', () => {
       );
     });
 
-    it('ignores invoice.paid for the first invoice, which the checkout already recorded', async () => {
+    it('does not record the first invoice again when invoice.paid follows the checkout', async () => {
       const { authId, sessionId } = await activated();
       const firstInvoice = api.sessions.get(sessionId)?.invoice as string;
       const before = { ...recordOf(authId) };
       const requestsBefore = api.requests.length;
 
-      await expect(deliverInvoice(firstInvoice)).resolves.toBe('IGNORED');
+      await expect(deliverInvoice(firstInvoice)).resolves.toBe(
+        'ALREADY_PROCESSED',
+      );
 
       expect(paymentsOf(authId)).toHaveLength(1);
       expect(recordOf(authId)).toEqual(before);
@@ -820,6 +825,493 @@ describe('StripeWebhookService', () => {
       expect(recordOf(authId)).toMatchObject(activeTerm);
       expect(eventsOf(authId)).toEqual([]);
       expect(paymentsOf(authId)).toHaveLength(2);
+    });
+  });
+
+  describe('failed payments and recovery', () => {
+    const PERIOD_START = new Date('2026-01-31T10:00:00.000Z');
+    const FIRST_EXPIRY = new Date('2026-02-28T10:00:00.000Z');
+    const RENEWED_EXPIRY = new Date('2026-03-31T10:00:00.000Z');
+
+    /** A user whose first monthly payment was confirmed. */
+    async function subscribed() {
+      const opened = await openCheckout(MONTHLY);
+      const session = api.completeSession(opened.sessionId, {
+        periodStart: PERIOD_START,
+      });
+      await deliver('checkout.session.completed', opened.sessionId);
+      return { ...opened, subscriptionId: session.subscription as string };
+    }
+
+    /** A signed invoice event; resolves the outcome and the Stripe event id. */
+    const invoiceEvent = async (
+      type: string,
+      invoiceId: string,
+      now?: Date,
+    ): Promise<[WebhookOutcome, string]> => {
+      const { payload, signature, eventId } = api.signedInvoiceEvent(
+        type,
+        invoiceId,
+      );
+      const event = webhooks.verifyEvent(Buffer.from(payload), signature);
+      return [await webhooks.handleEvent(event, meta, now), eventId];
+    };
+    const failed = async (invoiceId: string) =>
+      (await invoiceEvent('invoice.payment_failed', invoiceId))[0];
+    const paid = async (invoiceId: string, now?: Date) =>
+      (await invoiceEvent('invoice.paid', invoiceId, now))[0];
+    const ended = (subscriptionId: string) => {
+      const { payload, signature } = api.signedSubscriptionEvent(
+        'customer.subscription.deleted',
+        subscriptionId,
+      );
+      return webhooks.handleEvent(
+        webhooks.verifyEvent(Buffer.from(payload), signature),
+        meta,
+      );
+    };
+
+    const subscriptionRecordOf = (authId: string) =>
+      recordOf(authId)?.id as string;
+    const paymentsOf = (authId: string) =>
+      db.paymentTransaction.rows.filter(
+        (row) => row.subscriptionId === subscriptionRecordOf(authId),
+      );
+    const eventsOf = (authId: string) =>
+      db.subscriptionEvent.rows
+        .filter((row) => row.subscriptionId === subscriptionRecordOf(authId))
+        .map((row) => row.type);
+    const failedRenewal = (subscriptionId: string) =>
+      api.renewSubscription(subscriptionId, { paid: false }).id as string;
+
+    describe('a failed renewal', () => {
+      it('records the failed attempt without extending or ending access', async () => {
+        const { authId, subscriptionId } = await subscribed();
+        const invoiceId = failedRenewal(subscriptionId);
+        const before = { ...recordOf(authId) };
+
+        const [outcome, eventId] = await invoiceEvent(
+          'invoice.payment_failed',
+          invoiceId,
+        );
+
+        expect(outcome).toBe('PAYMENT_FAILED');
+        const attempt = paymentsOf(authId).at(-1);
+        expect(attempt).toMatchObject({
+          provider: 'stripe',
+          providerPaymentId: `${invoiceId}:failed:${eventId}`,
+          providerInvoiceId: invoiceId,
+          status: 'FAILED',
+          amountCents: 1900,
+          billingInterval: 'MONTHLY',
+          periodStart: FIRST_EXPIRY,
+          periodEnd: RENEWED_EXPIRY,
+          failedAt: expect.any(Date) as Date,
+          failureCode: 'insufficient_funds',
+          failureMessage: 'Your card has insufficient funds.',
+        });
+        expect(attempt?.paidAt).toBeUndefined();
+        expect(eventsOf(authId)).toEqual(['CREATED', 'PAYMENT_FAILED']);
+        // Only the past-due marker changes; the paid term does not.
+        expect(recordOf(authId)).toEqual({
+          ...before,
+          pastDueSince: attempt?.failedAt,
+          updatedAt: expect.any(Date) as Date,
+        });
+        // Paid until the old expiry, not a moment longer.
+        expect(
+          accessOf(authId, new Date(FIRST_EXPIRY.getTime() - 1)).hasProAccess,
+        ).toBe(true);
+        expect(accessOf(authId, FIRST_EXPIRY).hasProAccess).toBe(false);
+      });
+
+      it('records every failed retry once and keeps the first past-due time', async () => {
+        const { authId, subscriptionId } = await subscribed();
+        const invoiceId = failedRenewal(subscriptionId);
+        await failed(invoiceId);
+        const firstPastDue = recordOf(authId)?.pastDueSince;
+        api.failInvoiceAttempt(invoiceId, { declineCode: 'expired_card' });
+
+        await expect(failed(invoiceId)).resolves.toBe('PAYMENT_FAILED');
+
+        const attempts = paymentsOf(authId).filter(
+          (row) => row.status === 'FAILED',
+        );
+        expect(attempts.map((row) => row.failureCode)).toEqual([
+          'insufficient_funds',
+          'expired_card',
+        ]);
+        expect(attempts.map((row) => row.providerInvoiceId)).toEqual([
+          invoiceId,
+          invoiceId,
+        ]);
+        expect(recordOf(authId)?.pastDueSince).toEqual(firstPastDue);
+        expect(recordOf(authId)?.proExpiresAt).toEqual(FIRST_EXPIRY);
+        expect(eventsOf(authId)).toEqual([
+          'CREATED',
+          'PAYMENT_FAILED',
+          'PAYMENT_FAILED',
+        ]);
+      });
+
+      it('records a redelivered failure event once', async () => {
+        const { authId, subscriptionId } = await subscribed();
+        const invoiceId = failedRenewal(subscriptionId);
+        const { payload, signature } = api.signedInvoiceEvent(
+          'invoice.payment_failed',
+          invoiceId,
+        );
+        const redeliver = () =>
+          webhooks.handleEvent(
+            webhooks.verifyEvent(Buffer.from(payload), signature),
+            meta,
+          );
+
+        const outcomes = await Promise.all([
+          redeliver(),
+          redeliver(),
+          redeliver(),
+        ]);
+        const requestsAfter = api.requests.length;
+        await expect(redeliver()).resolves.toBe('ALREADY_PROCESSED');
+
+        expect([...outcomes].sort()).toEqual([
+          'ALREADY_PROCESSED',
+          'ALREADY_PROCESSED',
+          'PAYMENT_FAILED',
+        ]);
+        // A replay is recognised without calling Stripe.
+        expect(api.requests).toHaveLength(requestsAfter);
+        expect(
+          paymentsOf(authId).filter((row) => row.status === 'FAILED'),
+        ).toHaveLength(1);
+        expect(eventsOf(authId)).toEqual(['CREATED', 'PAYMENT_FAILED']);
+      });
+
+      it('still records the failure when Stripe cannot say why it failed', async () => {
+        const { authId, subscriptionId } = await subscribed();
+        const invoiceId = failedRenewal(subscriptionId);
+        api.failNext('GET /v1/invoice_payments', 'server');
+
+        await expect(failed(invoiceId)).resolves.toBe('PAYMENT_FAILED');
+        expect(paymentsOf(authId).at(-1)).toMatchObject({
+          status: 'FAILED',
+          failureCode: 'payment_failed',
+          failureMessage: null,
+        });
+      });
+
+      it('does not record a failure Stripe reports for another price', async () => {
+        const { authId, subscriptionId } = await subscribed();
+        const invoiceId = api.renewSubscription(subscriptionId, {
+          paid: false,
+          amount: 900,
+        }).id as string;
+
+        await expect(failed(invoiceId)).resolves.toBe('REJECTED');
+        expect(paymentsOf(authId)).toHaveLength(1);
+        expect(recordOf(authId)?.pastDueSince).toBeNull();
+      });
+    });
+
+    describe('recovery of a failed renewal', () => {
+      it('extends the term once when Stripe finally collects the invoice', async () => {
+        const { authId, subscriptionId } = await subscribed();
+        const invoiceId = failedRenewal(subscriptionId);
+        await failed(invoiceId);
+        api.failInvoiceAttempt(invoiceId);
+        await failed(invoiceId);
+        api.payInvoice(invoiceId);
+
+        await expect(paid(invoiceId)).resolves.toBe('RENEWED');
+
+        expect(recordOf(authId)).toMatchObject({
+          status: 'PRO',
+          proStartedAt: PERIOD_START,
+          proExpiresAt: RENEWED_EXPIRY,
+          pastDueSince: null,
+        });
+        const attempts = paymentsOf(authId).filter(
+          (row) => row.providerInvoiceId === invoiceId,
+        );
+        expect(attempts.map((row) => row.status)).toEqual([
+          'FAILED',
+          'FAILED',
+          'SUCCEEDED',
+        ]);
+        expect(attempts[2]).toMatchObject({
+          providerPaymentId: invoiceId,
+          periodStart: FIRST_EXPIRY,
+          periodEnd: RENEWED_EXPIRY,
+        });
+        expect(eventsOf(authId)).toEqual([
+          'CREATED',
+          'PAYMENT_FAILED',
+          'PAYMENT_FAILED',
+          'RENEWED',
+        ]);
+      });
+
+      it('records a recovered payment once however often it is confirmed', async () => {
+        const { authId, subscriptionId } = await subscribed();
+        const invoiceId = failedRenewal(subscriptionId);
+        await failed(invoiceId);
+        api.payInvoice(invoiceId);
+
+        const outcomes = await Promise.all(
+          Array.from({ length: 5 }, () => paid(invoiceId)),
+        );
+
+        expect([...outcomes].sort()).toEqual([
+          ...Array<string>(4).fill('ALREADY_PROCESSED'),
+          'RENEWED',
+        ]);
+        expect(
+          paymentsOf(authId).filter((row) => row.status === 'SUCCEEDED'),
+        ).toHaveLength(2);
+        expect(
+          eventsOf(authId).filter((type) => type === 'RENEWED'),
+        ).toHaveLength(1);
+        expect(recordOf(authId)?.proExpiresAt).toEqual(RENEWED_EXPIRY);
+      });
+
+      it('restores access from the old expiry when collected after the term lapsed', async () => {
+        const { authId, subscriptionId } = await subscribed();
+        const invoiceId = failedRenewal(subscriptionId);
+        await failed(invoiceId);
+        const lapsed = new Date('2026-03-10T08:00:00.000Z');
+        expect(accessOf(authId, lapsed).hasProAccess).toBe(false);
+
+        api.payInvoice(invoiceId);
+        await expect(paid(invoiceId, lapsed)).resolves.toBe('RENEWED');
+
+        // Extended to the end of the period Stripe collected, never beyond.
+        expect(recordOf(authId)).toMatchObject({
+          proStartedAt: PERIOD_START,
+          proExpiresAt: RENEWED_EXPIRY,
+        });
+        expect(accessOf(authId, lapsed).hasProAccess).toBe(true);
+        expect(
+          accessOf(authId, new Date(RENEWED_EXPIRY.getTime() - 1)).hasProAccess,
+        ).toBe(true);
+        expect(accessOf(authId, RENEWED_EXPIRY).hasProAccess).toBe(false);
+      });
+
+      it('keeps a failure that arrives after the invoice was collected as history only', async () => {
+        const { authId, subscriptionId } = await subscribed();
+        const invoiceId = failedRenewal(subscriptionId);
+        // The failure notification is delayed; Stripe collected meanwhile.
+        const { payload, signature } = api.signedInvoiceEvent(
+          'invoice.payment_failed',
+          invoiceId,
+        );
+        api.payInvoice(invoiceId);
+        await paid(invoiceId);
+        const afterRecovery = { ...recordOf(authId) };
+
+        await expect(
+          webhooks.handleEvent(
+            webhooks.verifyEvent(Buffer.from(payload), signature),
+            meta,
+          ),
+        ).resolves.toBe('PAYMENT_FAILED');
+
+        // Not past due, and the term is unchanged.
+        expect(recordOf(authId)).toEqual(afterRecovery);
+        expect(recordOf(authId)?.pastDueSince).toBeNull();
+        expect(eventsOf(authId)).toEqual([
+          'CREATED',
+          'RENEWED',
+          'PAYMENT_FAILED',
+        ]);
+      });
+    });
+
+    describe('when Stripe gives up', () => {
+      it('ends past due and cancels renewal, keeping access until expiry', async () => {
+        const { authId, subscriptionId } = await subscribed();
+        const invoiceId = api.renewSubscription(subscriptionId, {
+          paid: false,
+          failure: { final: true },
+        }).id as string;
+        await failed(invoiceId);
+        api.cancelSubscription(subscriptionId);
+
+        await expect(ended(subscriptionId)).resolves.toBe('SUBSCRIPTION_ENDED');
+        await expect(ended(subscriptionId)).resolves.toBe('ALREADY_PROCESSED');
+
+        expect(recordOf(authId)).toMatchObject({
+          proStartedAt: PERIOD_START,
+          proExpiresAt: FIRST_EXPIRY,
+          pastDueSince: null,
+          proCanceledAt: expect.any(Date) as Date,
+        });
+        expect(eventsOf(authId)).toEqual([
+          'CREATED',
+          'PAYMENT_FAILED',
+          'CANCELED',
+        ]);
+        expect(
+          accessOf(authId, new Date(FIRST_EXPIRY.getTime() - 1)).hasProAccess,
+        ).toBe(true);
+        expect(accessOf(authId, FIRST_EXPIRY).hasProAccess).toBe(false);
+      });
+
+      it('ignores a deletion event that Stripe does not confirm', async () => {
+        const { authId, subscriptionId } = await subscribed();
+        await expect(ended(subscriptionId)).resolves.toBe('IGNORED');
+        expect(recordOf(authId)?.proCanceledAt).toBeNull();
+        expect(eventsOf(authId)).toEqual(['CREATED']);
+      });
+    });
+
+    describe('a failed first payment', () => {
+      it('records the failure and grants nothing', async () => {
+        const { authId, checkoutId, sessionId } = await openCheckout(YEARLY);
+        const invoice = api.failFirstPayment(sessionId);
+
+        await expect(failed(invoice.id as string)).resolves.toBe(
+          'PAYMENT_FAILED',
+        );
+
+        expect(paymentsOf(authId)).toEqual([
+          expect.objectContaining({
+            status: 'FAILED',
+            providerInvoiceId: invoice.id,
+            amountCents: 19000,
+            billingInterval: 'YEARLY',
+          }),
+        ]);
+        expect(eventsOf(authId)).toEqual(['PAYMENT_FAILED']);
+        expect(recordOf(authId)).toMatchObject({
+          proStartedAt: null,
+          pastDueSince: null,
+        });
+        expect(accessOf(authId).hasProAccess).toBe(false);
+        // The customer can still pay in the same checkout.
+        expect(checkoutRow(checkoutId)?.status).toBe('OPEN');
+      });
+
+      it('activates once when the customer then pays in the same checkout', async () => {
+        const { authId, sessionId } = await openCheckout();
+        const invoiceId = api.failFirstPayment(sessionId).id as string;
+        await failed(invoiceId);
+        api.completeSession(sessionId);
+
+        await expect(
+          deliver('checkout.session.completed', sessionId),
+        ).resolves.toBe('ACTIVATED');
+        await expect(paid(invoiceId)).resolves.toBe('ALREADY_PROCESSED');
+
+        expect(paymentsOf(authId).map((row) => row.status)).toEqual([
+          'FAILED',
+          'SUCCEEDED',
+        ]);
+        expect(eventsOf(authId)).toEqual(['PAYMENT_FAILED', 'CREATED']);
+        expect(accessOf(authId).hasProAccess).toBe(true);
+      });
+
+      it('activates once when invoice.paid confirms the payment first', async () => {
+        const { authId, checkoutId, sessionId } = await openCheckout();
+        const invoiceId = api.failFirstPayment(sessionId).id as string;
+        await failed(invoiceId);
+        api.completeSession(sessionId);
+
+        await expect(paid(invoiceId)).resolves.toBe('ACTIVATED');
+        await expect(
+          deliver('checkout.session.completed', sessionId),
+        ).resolves.toBe('ALREADY_PROCESSED');
+
+        expect(checkoutRow(checkoutId)).toMatchObject({
+          status: 'COMPLETED',
+          providerSessionId: sessionId,
+        });
+        expect(eventsOf(authId)).toEqual(['PAYMENT_FAILED', 'CREATED']);
+        expect(
+          paymentsOf(authId).filter((row) => row.status === 'SUCCEEDED'),
+        ).toHaveLength(1);
+      });
+
+      it('activates once for concurrent checkout and invoice confirmations', async () => {
+        const { authId, sessionId } = await openCheckout();
+        const invoiceId = api.failFirstPayment(sessionId).id as string;
+        await failed(invoiceId);
+        api.completeSession(sessionId);
+
+        const outcomes = await Promise.all([
+          paid(invoiceId),
+          deliver('checkout.session.completed', sessionId),
+          paid(invoiceId),
+          deliver('checkout.session.completed', sessionId),
+        ]);
+
+        expect(outcomes.filter((o) => o === 'ACTIVATED')).toHaveLength(1);
+        expect(
+          eventsOf(authId).filter((type) => type === 'CREATED'),
+        ).toHaveLength(1);
+        expect(
+          paymentsOf(authId).filter((row) => row.status === 'SUCCEEDED'),
+        ).toHaveLength(1);
+      });
+    });
+
+    describe('checkout while past due', () => {
+      /**
+       * Checkout creates real-time Stripe sessions, so these terms are placed
+       * relative to the current time: bought `daysAgo` days ago (monthly).
+       */
+      async function subscribedDaysAgo(daysAgo: number) {
+        const opened = await openCheckout(MONTHLY);
+        const periodStart = new Date(
+          Math.floor((Date.now() - daysAgo * DAY) / 1000) * 1000,
+        );
+        const session = api.completeSession(opened.sessionId, { periodStart });
+        await deliver('checkout.session.completed', opened.sessionId);
+        return { ...opened, subscriptionId: session.subscription as string };
+      }
+
+      it('refuses a new checkout until Stripe collects or ends the subscription', async () => {
+        // The first month lapsed about two weeks ago; its renewal failed and
+        // Stripe may still collect it.
+        const { authId, subscriptionId } = await subscribedDaysAgo(45);
+        const invoiceId = failedRenewal(subscriptionId);
+        await failed(invoiceId);
+        expect(accessOf(authId).hasProAccess).toBe(false);
+        const sessionsBefore = api.sessions.size;
+
+        await expect(
+          checkout.createCheckout(authId, MONTHLY),
+        ).rejects.toMatchObject({
+          status: 409,
+          message: expect.stringContaining(
+            'Stripe is still retrying',
+          ) as string,
+        });
+        expect(api.sessions.size).toBe(sessionsBefore);
+
+        api.cancelSubscription(subscriptionId);
+        await ended(subscriptionId);
+
+        await expect(
+          checkout.createCheckout(authId, MONTHLY),
+        ).resolves.toMatchObject({ status: 'OPEN' });
+      });
+
+      it('allows checkout again once a recovered renewal has lapsed', async () => {
+        // Bought ~70 days ago; the renewal failed, was recovered, and the
+        // recovered period has also ended by now.
+        const { authId, subscriptionId } = await subscribedDaysAgo(70);
+        const invoiceId = failedRenewal(subscriptionId);
+        await failed(invoiceId);
+        api.payInvoice(invoiceId);
+        await expect(paid(invoiceId)).resolves.toBe('RENEWED');
+        expect(recordOf(authId)?.pastDueSince).toBeNull();
+        expect(accessOf(authId).hasProAccess).toBe(false);
+
+        await expect(
+          checkout.createCheckout(authId, MONTHLY),
+        ).resolves.toMatchObject({ status: 'OPEN' });
+      });
     });
   });
 

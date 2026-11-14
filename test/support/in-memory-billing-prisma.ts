@@ -161,6 +161,7 @@ export function createInMemoryBillingPrisma() {
         proCanceledAt: null,
         paymentProvider: null,
         providerSubscriptionId: null,
+        pastDueSince: null,
         createdAt: now(),
         updatedAt: now(),
         ...data,
@@ -212,6 +213,7 @@ export function createInMemoryBillingPrisma() {
       (data) => ({
         id: randomUUID(),
         currency: 'USD',
+        providerInvoiceId: null,
         failedAt: null,
         failureCode: null,
         failureMessage: null,

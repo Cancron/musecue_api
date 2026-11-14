@@ -351,6 +351,34 @@ describe('StripeCheckoutService', () => {
       expect(checkouts()).toHaveLength(0);
     });
 
+    it('refuses a user whose failed renewal Stripe is still retrying (409)', async () => {
+      const userId = await createUser();
+      const now = new Date();
+      await db.userSubscription.create({
+        data: {
+          authId: userId,
+          status: 'EXPIRED',
+          billingInterval: MONTHLY,
+          proStartedAt: new Date(now.getTime() - 40 * DAY),
+          proExpiresAt: new Date(now.getTime() - 10 * DAY),
+          paymentProvider: 'stripe',
+          providerSubscriptionId: 'sub_past_due',
+          pastDueSince: new Date(now.getTime() - 10 * DAY),
+        },
+      });
+
+      for (const interval of [MONTHLY, YEARLY]) {
+        await expect(
+          service.createCheckout(userId, interval, now),
+        ).rejects.toMatchObject({
+          status: 409,
+          message: expect.stringContaining('could charge you twice') as string,
+        });
+      }
+      expect(api.requests).toHaveLength(0);
+      expect(checkouts()).toHaveLength(0);
+    });
+
     it('lets a user whose paid term expired buy again', async () => {
       const userId = await createUser();
       const now = new Date();

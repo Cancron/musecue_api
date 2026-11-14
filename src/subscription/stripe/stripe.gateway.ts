@@ -28,6 +28,13 @@ export interface CheckoutSessionRequest {
   expiresAt: Date;
 }
 
+/** Why a collection attempt failed, as reported by Stripe. */
+export interface PaymentFailureDetails {
+  /** Decline code when available (e.g. `insufficient_funds`), else the error code. */
+  code: string | null;
+  message: string | null;
+}
+
 /** The parts of a Stripe Checkout Session the checkout flow relies on. */
 export interface ProviderCheckoutSession {
   id: string;
@@ -124,6 +131,35 @@ export class StripeGateway {
   /** A subscription with its items and their prices, read from Stripe. */
   retrieveSubscription(subscriptionId: string): Promise<Stripe.Subscription> {
     return this.requireClient().subscriptions.retrieve(subscriptionId);
+  }
+
+  /**
+   * Why the latest collection attempt of an invoice failed (the PaymentIntent's
+   * `last_payment_error`). Best effort: returns null when Stripe does not say
+   * or cannot be asked, so a failure is recorded even without its reason.
+   */
+  async retrievePaymentFailure(
+    invoiceId: string,
+  ): Promise<PaymentFailureDetails | null> {
+    try {
+      const client = this.requireClient();
+      const payments = await client.invoicePayments.list({
+        invoice: invoiceId,
+        limit: 1,
+      });
+      const intent = payments.data[0]?.payment.payment_intent;
+      const intentId = typeof intent === 'string' ? intent : intent?.id;
+      if (!intentId) return null;
+      const error = (await client.paymentIntents.retrieve(intentId))
+        .last_payment_error;
+      if (!error) return null;
+      return {
+        code: error.decline_code ?? error.code ?? null,
+        message: error.message ?? null,
+      };
+    } catch {
+      return null;
+    }
   }
 
   /** Stripe only expires `open` sessions; others reject the request. */

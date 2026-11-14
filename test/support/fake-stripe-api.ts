@@ -30,6 +30,15 @@ export interface RecordedRequest {
  * connection: the request never reaches Stripe. lost: Stripe processes it but
  * the response is lost (timeout). server: 500. invalid: 400 rejection.
  */
+/** How a collection attempt fails (a card decline by default). */
+export interface PaymentFailureOptions {
+  code?: string;
+  declineCode?: string;
+  message?: string;
+  /** No further automatic retry is scheduled. */
+  final?: boolean;
+}
+
 type FailureKind = 'connection' | 'lost' | 'server' | 'invalid';
 
 interface StoredResponse {
@@ -72,6 +81,7 @@ export class FakeStripeApi {
   readonly sessions = new Map<string, Json>();
   readonly subscriptions = new Map<string, Json>();
   readonly invoices = new Map<string, Json>();
+  readonly paymentIntents = new Map<string, Json>();
   private readonly idempotency = new Map<string, StoredResponse>();
   private readonly failures = new Map<string, FailureKind[]>();
   private counter = 0;
@@ -118,6 +128,7 @@ export class FakeStripeApi {
   /**
    * The customer pays on the hosted page. With `paymentStatus: 'unpaid'` the
    * session completes with a delayed payment method that has not settled.
+   * After failFirstPayment, the same subscription and invoice are collected.
    */
   completeSession(
     sessionId: string,
@@ -132,51 +143,191 @@ export class FakeStripeApi {
       throw new Error(`Session ${sessionId} is ${str(session.status)}`);
     }
     const paid = (options.paymentStatus ?? 'paid') === 'paid';
+    if (!session.invoice) this.startSubscription(session, options.periodStart);
+    const invoice = this.requireInvoice(str(session.invoice));
+    if (paid) {
+      this.collect(invoice, options.invoiceAmount);
+    }
+    Object.assign(session, {
+      status: 'complete',
+      payment_status: paid ? 'paid' : 'unpaid',
+      url: null,
+    });
+    return session;
+  }
+
+  /**
+   * The first payment attempt on the hosted page is declined: Stripe creates
+   * the subscription (`incomplete`) and its first invoice, which stays open.
+   * The session stays open so the customer can try another card.
+   */
+  failFirstPayment(
+    sessionId: string,
+    failure: PaymentFailureOptions = {},
+    periodStart?: Date,
+  ): Json {
+    const session = this.requireSession(sessionId);
+    if (session.status !== 'open') {
+      throw new Error(`Session ${sessionId} is ${str(session.status)}`);
+    }
+    if (!session.invoice) this.startSubscription(session, periodStart);
+    return this.failInvoiceAttempt(str(session.invoice), failure);
+  }
+
+  /**
+   * Stripe bills the next period of a subscription: a `subscription_cycle`
+   * invoice for [current period end, next anchored end). Returns the invoice.
+   * `paid: false` makes the first collection attempt fail (renewal failure).
+   */
+  renewSubscription(
+    subscriptionId: string,
+    options: {
+      paid?: boolean;
+      amount?: number;
+      failure?: PaymentFailureOptions;
+    } = {},
+  ): Json {
+    const subscription = this.requireSubscription(subscriptionId);
+    const item = (subscription.items as { data: Json[] }).data[0];
+    const price = item.price as Json;
+    const interval = str((price.recurring as Json).interval);
+    const start = Number(item.current_period_end);
+    const end = anchoredPeriodEnd(
+      Number(subscription.billing_cycle_anchor),
+      start,
+      interval,
+    );
+    const invoice = this.newInvoice({
+      billingReason: 'subscription_cycle',
+      customer: str(subscription.customer),
+      subscriptionId,
+      metadata: (subscription.metadata as Json | undefined) ?? {},
+      amount: options.amount ?? Number(price.unit_amount),
+      start,
+      end,
+    });
+    Object.assign(item, {
+      current_period_start: start,
+      current_period_end: end,
+    });
+    subscription.latest_invoice = invoice.id;
+    if (options.paid ?? true) {
+      this.collect(invoice);
+    } else {
+      this.failInvoiceAttempt(str(invoice.id), options.failure);
+    }
+    return invoice;
+  }
+
+  /**
+   * One more collection attempt on an open invoice fails (Stripe's automatic
+   * retry). `final: true` means Stripe schedules no further retry.
+   */
+  failInvoiceAttempt(
+    invoiceId: string,
+    failure: PaymentFailureOptions = {},
+  ): Json {
+    const invoice = this.requireInvoice(invoiceId);
+    if (invoice.status !== 'open') {
+      throw new Error(`Invoice ${invoiceId} is ${str(invoice.status)}`);
+    }
+    const now = Math.floor(Date.now() / 1000);
+    Object.assign(invoice, {
+      attempted: true,
+      attempt_count: Number(invoice.attempt_count) + 1,
+      next_payment_attempt: failure.final ? null : now + 3 * 24 * 60 * 60,
+    });
+    Object.assign(this.paymentIntentOf(invoice), {
+      status: 'requires_payment_method',
+      last_payment_error: {
+        type: 'card_error',
+        code: failure.code ?? 'card_declined',
+        decline_code: failure.declineCode ?? 'insufficient_funds',
+        message: failure.message ?? 'Your card has insufficient funds.',
+      },
+    });
+    const subscription = this.subscriptions.get(this.subscriptionOf(invoice));
+    if (subscription && invoice.billing_reason === 'subscription_cycle') {
+      subscription.status = 'past_due';
+    }
+    return invoice;
+  }
+
+  /** An open invoice is finally collected (a Stripe retry or a new card). */
+  payInvoice(invoiceId: string) {
+    this.collect(this.requireInvoice(invoiceId));
+  }
+
+  /** Stripe ends the subscription (e.g. after its last failed retry). */
+  cancelSubscription(subscriptionId: string) {
+    const now = Math.floor(Date.now() / 1000);
+    Object.assign(this.requireSubscription(subscriptionId), {
+      status: 'canceled',
+      canceled_at: now,
+      ended_at: now,
+    });
+  }
+
+  /** A signed event for an invoice, carrying the invoice as it is now. */
+  signedInvoiceEvent(
+    type: string,
+    invoiceId: string,
+    overrides: Json = {},
+  ): { payload: string; signature: string; eventId: string } {
+    return this.sign(type, {
+      ...withoutInternals(this.requireInvoice(invoiceId)),
+      ...overrides,
+    });
+  }
+
+  /** A signed event for a subscription, carrying it as it is now. */
+  signedSubscriptionEvent(
+    type: string,
+    subscriptionId: string,
+    overrides: Json = {},
+  ): { payload: string; signature: string; eventId: string } {
+    return this.sign(type, {
+      ...this.requireSubscription(subscriptionId),
+      ...overrides,
+    });
+  }
+
+  /** The delayed payment of an `unpaid` completed session settles. */
+  settleDelayedPayment(sessionId: string) {
+    const session = this.requireSession(sessionId);
+    this.collect(this.requireInvoice(str(session.invoice)));
+    Object.assign(session, { payment_status: 'paid' });
+  }
+
+  /** Creates the subscription and its first (open) invoice for a session. */
+  private startSubscription(session: Json, periodStart?: Date) {
     const lineItem = (session.line_items as Json[])[0];
     const priceData = lineItem.price_data as Json;
     const amount = Number(priceData.unit_amount);
     const interval = str((priceData.recurring as Json).interval);
-    const start = Math.floor(
-      (options.periodStart ?? new Date()).getTime() / 1000,
-    );
+    const start = Math.floor((periodStart ?? new Date()).getTime() / 1000);
     const end = anchoredPeriodEnd(start, start, interval);
     const subscriptionId = this.id('sub');
-    const invoiceId = this.id('in');
-    const created = Math.floor(Date.now() / 1000);
-
-    this.invoices.set(invoiceId, {
-      id: invoiceId,
-      object: 'invoice',
-      billing_reason: 'subscription_create',
-      customer: session.customer,
-      currency: 'usd',
-      amount_paid: paid ? (options.invoiceAmount ?? amount) : 0,
-      status: paid ? 'paid' : 'open',
-      status_transitions: { paid_at: paid ? created : null },
-      parent: {
-        type: 'subscription_details',
-        subscription_details: { subscription: subscriptionId, metadata: {} },
-      },
-      lines: {
-        object: 'list',
-        data: [
-          {
-            id: this.id('il'),
-            object: 'line_item',
-            amount,
-            period: { start, end },
-          },
-        ],
-      },
+    const metadata =
+      (session.subscription_data as Json | undefined)?.metadata ?? {};
+    const invoice = this.newInvoice({
+      billingReason: 'subscription_create',
+      customer: str(session.customer),
+      subscriptionId,
+      metadata: metadata as Json,
+      amount,
+      start,
+      end,
     });
     this.subscriptions.set(subscriptionId, {
       id: subscriptionId,
       object: 'subscription',
       customer: session.customer,
-      status: paid ? 'active' : 'incomplete',
+      status: 'incomplete',
       billing_cycle_anchor: start,
-      metadata: (session.subscription_data as Json | undefined)?.metadata ?? {},
-      latest_invoice: invoiceId,
+      canceled_at: null,
+      metadata,
+      latest_invoice: invoice.id,
       items: {
         object: 'list',
         data: [
@@ -198,53 +349,48 @@ export class FakeStripeApi {
       },
     });
     Object.assign(session, {
-      status: 'complete',
-      payment_status: paid ? 'paid' : 'unpaid',
       subscription: subscriptionId,
-      invoice: invoiceId,
-      url: null,
+      invoice: invoice.id,
     });
-    return session;
   }
 
-  /**
-   * Stripe bills the next period of a subscription: a `subscription_cycle`
-   * invoice for [current period end, next anchored end). Returns the invoice.
-   * `paid: false` leaves the invoice open (failed renewal payment).
-   */
-  renewSubscription(
-    subscriptionId: string,
-    options: { paid?: boolean; amount?: number } = {},
-  ): Json {
-    const subscription = this.subscriptions.get(subscriptionId);
-    if (!subscription)
-      throw new Error(`Unknown subscription ${subscriptionId}`);
-    const item = (subscription.items as { data: Json[] }).data[0];
-    const price = item.price as Json;
-    const interval = str((price.recurring as Json).interval);
-    const start = Number(item.current_period_end);
-    const end = anchoredPeriodEnd(
-      Number(subscription.billing_cycle_anchor),
-      start,
-      interval,
-    );
-    const paid = options.paid ?? true;
-    const amount = options.amount ?? Number(price.unit_amount);
+  private newInvoice(input: {
+    billingReason: string;
+    customer: string;
+    subscriptionId: string;
+    /** Snapshot of the subscription metadata, as Stripe copies it. */
+    metadata: Json;
+    amount: number;
+    start: number;
+    end: number;
+  }): Json {
     const invoiceId = this.id('in');
-    this.invoices.set(invoiceId, {
+    const paymentIntentId = this.id('pi');
+    this.paymentIntents.set(paymentIntentId, {
+      id: paymentIntentId,
+      object: 'payment_intent',
+      status: 'requires_payment_method',
+      last_payment_error: null,
+    });
+    const invoice: Json = {
       id: invoiceId,
       object: 'invoice',
-      billing_reason: 'subscription_cycle',
-      customer: subscription.customer,
+      billing_reason: input.billingReason,
+      customer: input.customer,
       currency: 'usd',
-      amount_paid: paid ? amount : 0,
-      status: paid ? 'paid' : 'open',
-      status_transitions: {
-        paid_at: paid ? Math.floor(Date.now() / 1000) : null,
-      },
+      amount_due: input.amount,
+      amount_paid: 0,
+      status: 'open',
+      attempted: false,
+      attempt_count: 0,
+      next_payment_attempt: null,
+      status_transitions: { paid_at: null },
       parent: {
         type: 'subscription_details',
-        subscription_details: { subscription: subscriptionId, metadata: {} },
+        subscription_details: {
+          subscription: input.subscriptionId,
+          metadata: input.metadata,
+        },
       },
       lines: {
         object: 'list',
@@ -252,66 +398,60 @@ export class FakeStripeApi {
           {
             id: this.id('il'),
             object: 'line_item',
-            amount,
-            period: { start, end },
+            amount: input.amount,
+            period: { start: input.start, end: input.end },
           },
         ],
       },
-    });
-    Object.assign(item, {
-      current_period_start: start,
-      current_period_end: end,
-    });
-    Object.assign(subscription, {
-      latest_invoice: invoiceId,
-      status: paid ? 'active' : 'past_due',
-    });
-    return this.invoices.get(invoiceId) as Json;
+      // Not part of the Stripe invoice object; used to emulate invoice payments.
+      _paymentIntent: paymentIntentId,
+    };
+    this.invoices.set(invoiceId, invoice);
+    return invoice;
   }
 
-  /** A failed renewal invoice is paid later (e.g. after a card update). */
-  payInvoice(invoiceId: string) {
-    const invoice = this.invoices.get(invoiceId);
-    if (!invoice) throw new Error(`Unknown invoice ${invoiceId}`);
+  /** Marks an invoice paid (in full, or `amount`) and its subscription active. */
+  private collect(invoice: Json, amount?: number) {
     const line = (invoice.lines as { data: Json[] }).data[0];
     Object.assign(invoice, {
       status: 'paid',
-      amount_paid: line.amount,
+      attempted: true,
+      attempt_count: Number(invoice.attempt_count) + 1,
+      next_payment_attempt: null,
+      amount_paid: amount ?? line.amount,
       status_transitions: { paid_at: Math.floor(Date.now() / 1000) },
     });
-    const subscriptionId = str(
-      ((invoice.parent as Json).subscription_details as Json).subscription,
-    );
-    Object.assign(this.subscriptions.get(subscriptionId) ?? {}, {
+    Object.assign(this.paymentIntentOf(invoice), {
+      status: 'succeeded',
+      last_payment_error: null,
+    });
+    Object.assign(this.subscriptions.get(this.subscriptionOf(invoice)) ?? {}, {
       status: 'active',
     });
   }
 
-  /** A signed event for an invoice, carrying the invoice as it is now. */
-  signedInvoiceEvent(
-    type: string,
-    invoiceId: string,
-    overrides: Json = {},
-  ): { payload: string; signature: string } {
-    const invoice = this.invoices.get(invoiceId);
-    if (!invoice) throw new Error(`Unknown invoice ${invoiceId}`);
-    return this.sign(type, { ...invoice, ...overrides });
+  private subscriptionOf(invoice: Json): string {
+    return str(
+      ((invoice.parent as Json).subscription_details as Json).subscription,
+    );
   }
 
-  /** The delayed payment of an `unpaid` completed session settles. */
-  settleDelayedPayment(sessionId: string) {
-    const session = this.requireSession(sessionId);
-    const invoice = this.invoices.get(str(session.invoice));
-    const subscription = this.subscriptions.get(str(session.subscription));
-    if (!invoice || !subscription) throw new Error('Session is not completed');
-    const lineItem = (session.line_items as Json[])[0];
-    Object.assign(invoice, {
-      status: 'paid',
-      amount_paid: Number((lineItem.price_data as Json).unit_amount),
-      status_transitions: { paid_at: Math.floor(Date.now() / 1000) },
-    });
-    Object.assign(subscription, { status: 'active' });
-    Object.assign(session, { payment_status: 'paid' });
+  private paymentIntentOf(invoice: Json): Json {
+    return this.paymentIntents.get(str(invoice._paymentIntent)) ?? {};
+  }
+
+  private requireInvoice(invoiceId: string): Json {
+    const invoice = this.invoices.get(invoiceId);
+    if (!invoice) throw new Error(`Unknown invoice ${invoiceId}`);
+    return invoice;
+  }
+
+  private requireSubscription(subscriptionId: string): Json {
+    const subscription = this.subscriptions.get(subscriptionId);
+    if (!subscription) {
+      throw new Error(`Unknown subscription ${subscriptionId}`);
+    }
+    return subscription;
   }
 
   /** Stripe expires an open session once `expires_at` has passed. */
@@ -335,8 +475,9 @@ export class FakeStripeApi {
   }
 
   private sign(type: string, object: Json) {
+    const eventId = this.id('evt');
     const payload = JSON.stringify({
-      id: this.id('evt'),
+      id: eventId,
       object: 'event',
       api_version: '2026-10-28.endive',
       created: Math.floor(Date.now() / 1000),
@@ -348,7 +489,7 @@ export class FakeStripeApi {
       payload,
       secret: FAKE_WEBHOOK_SECRET,
     });
-    return { payload, signature };
+    return { payload, signature, eventId };
   }
 
   readonly fetch = async (
@@ -372,7 +513,7 @@ export class FakeStripeApi {
     const idempotencyKey = headers.get('idempotency-key');
     this.requests.push({ method, path: url.pathname, params, idempotencyKey });
 
-    const operation = `${method} ${url.pathname.replace(/\/(cs_test|cus|in|sub)_[^/]+/, '/:id')}`;
+    const operation = `${method} ${url.pathname.replace(/\/(cs_test|cus|in|sub|pi)_[^/]+/, '/:id')}`;
     const failure = this.failures.get(operation)?.shift();
     if (failure === 'connection') throw new TypeError('fetch failed');
     if (failure === 'server') {
@@ -441,13 +582,41 @@ export class FakeStripeApi {
     if (method === 'POST' && path === '/v1/checkout/sessions') {
       return this.createSession(params);
     }
+    if (method === 'GET' && path === '/v1/invoice_payments') {
+      const invoice = this.invoices.get(str(params.invoice));
+      const data = invoice
+        ? [
+            {
+              id: `inpay_${str(invoice.id)}`,
+              object: 'invoice_payment',
+              invoice: invoice.id,
+              status: invoice.status === 'paid' ? 'paid' : 'open',
+              payment: {
+                type: 'payment_intent',
+                payment_intent: invoice._paymentIntent,
+              },
+            },
+          ]
+        : [];
+      return {
+        status: 200,
+        body: { object: 'list', data, has_more: false, url: path },
+      };
+    }
+    const intent = /^\/v1\/payment_intents\/([^/]+)$/.exec(path);
+    if (intent && method === 'GET') {
+      const found = this.paymentIntents.get(intent[1]);
+      return found
+        ? { status: 200, body: { ...found } }
+        : invalid(404, 'resource_missing', 'No such payment_intent');
+    }
     const object = /^\/v1\/(invoices|subscriptions)\/([^/]+)$/.exec(path);
     if (object && method === 'GET') {
       const store =
         object[1] === 'invoices' ? this.invoices : this.subscriptions;
       const found = store.get(object[2]);
       return found
-        ? { status: 200, body: { ...found } }
+        ? { status: 200, body: withoutInternals(found) }
         : invalid(404, 'resource_missing', `No such ${object[1]}`);
     }
     const match = /^\/v1\/checkout\/sessions\/([^/]+)(\/expire)?$/.exec(path);
@@ -526,16 +695,18 @@ export class FakeStripeApi {
     delete copy.line_items;
     delete copy.subscription_data;
     if (paths.includes('invoice') && session.invoice) {
-      copy.invoice = { ...this.invoices.get(str(session.invoice)) };
+      copy.invoice = withoutInternals(
+        this.requireInvoice(str(session.invoice)),
+      );
     }
     if (paths.includes('subscription') && session.subscription) {
       const subscription: Json = {
         ...this.subscriptions.get(str(session.subscription)),
       };
       if (paths.includes('subscription.latest_invoice')) {
-        subscription.latest_invoice = {
-          ...this.invoices.get(str(subscription.latest_invoice)),
-        };
+        subscription.latest_invoice = withoutInternals(
+          this.requireInvoice(str(subscription.latest_invoice)),
+        );
       }
       copy.subscription = subscription;
     }
@@ -600,4 +771,11 @@ function json(status: number, body: Json, replayed = false): Response {
       ...(replayed ? { 'idempotent-replayed': 'true' } : {}),
     },
   });
+}
+
+/** Drops fields the fake keeps for itself (prefixed with `_`). */
+function withoutInternals(object: Json): Json {
+  return Object.fromEntries(
+    Object.entries(object).filter(([key]) => !key.startsWith('_')),
+  );
 }

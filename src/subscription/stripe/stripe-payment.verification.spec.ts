@@ -6,8 +6,10 @@ import {
 } from '../../../test/support/fake-stripe-api';
 import {
   type ExpectedCheckout,
+  type ExpectedInvoice,
   type ExpectedRenewal,
   verifyStripeCheckout,
+  verifyStripeInvoice,
   verifyStripeRenewal,
 } from './stripe-payment.verification';
 import { StripeGateway } from './stripe.gateway';
@@ -483,5 +485,139 @@ describe('verifyStripeRenewal', () => {
         amountCents: 2900,
       }),
     ).toEqual({ outcome: 'REJECTED', reason: 'AMOUNT_MISMATCH' });
+  });
+});
+
+describe('verifyStripeInvoice', () => {
+  let api: FakeStripeApi;
+  let gateway: StripeGateway;
+  let expected: ExpectedInvoice;
+  let subscriptionId: string;
+  let sessionId: string;
+
+  beforeEach(async () => {
+    api = new FakeStripeApi();
+    gateway = new StripeGateway(
+      {
+        secretKey: 'sk_test_fake',
+        webhookSecret: FAKE_WEBHOOK_SECRET,
+        successUrl: 'https://app.example/ok',
+        cancelUrl: 'https://app.example/cancel',
+        productId: null,
+        checkoutExpiresMinutes: 60,
+      },
+      api.client(),
+    );
+    const customerId = await gateway.createCustomer('user-1', 'u@example.com');
+    const session = await gateway.createCheckoutSession({
+      checkoutId: 'checkout-1',
+      authId: 'user-1',
+      customerId,
+      billingInterval: BillingInterval.MONTHLY,
+      amountCents: 1900,
+      expiresAt: new Date(Date.now() + 3_600_000),
+    });
+    sessionId = session.id;
+    api.failFirstPayment(session.id, {}, new Date('2026-01-31T10:00:00Z'));
+    subscriptionId = api.sessions.get(session.id)?.subscription as string;
+    expected = {
+      providerSubscriptionId: subscriptionId,
+      providerCustomerId: customerId,
+      billingInterval: BillingInterval.MONTHLY,
+      amountCents: 1900,
+      currency: 'USD',
+      checkoutId: 'checkout-1',
+    };
+  });
+
+  const read = async (invoiceId: string) => ({
+    invoice: await gateway.retrieveInvoice(invoiceId),
+    subscription: await gateway.retrieveSubscription(subscriptionId),
+  });
+  const firstInvoiceId = () => api.sessions.get(sessionId)?.invoice as string;
+
+  it('reports an open first invoice as UNPAID with its retry schedule', async () => {
+    const { invoice, subscription } = await read(firstInvoiceId());
+    expect(verifyStripeInvoice(invoice, subscription, expected)).toEqual({
+      outcome: 'UNPAID',
+      invoice: {
+        providerInvoiceId: firstInvoiceId(),
+        providerSubscriptionId: subscriptionId,
+        kind: 'INITIAL',
+        amountCents: 1900,
+        currency: 'USD',
+        billingInterval: 'MONTHLY',
+        periodStart: new Date('2026-01-31T10:00:00.000Z'),
+        periodEnd: new Date('2026-02-28T10:00:00.000Z'),
+        paidAt: null,
+        attemptCount: 1,
+        nextRetryAt: expect.any(Date) as Date,
+      },
+    });
+  });
+
+  it('reports the same invoice as PAID once it is collected', async () => {
+    api.completeSession(sessionId);
+    const { invoice, subscription } = await read(firstInvoiceId());
+    expect(verifyStripeInvoice(invoice, subscription, expected)).toMatchObject({
+      outcome: 'PAID',
+      invoice: { kind: 'INITIAL', paidAt: expect.any(Date) as Date },
+    });
+  });
+
+  it('reports a failed renewal as an UNPAID RENEWAL and no retry after the last attempt', async () => {
+    api.completeSession(sessionId);
+    const renewal = api.renewSubscription(subscriptionId, {
+      paid: false,
+      failure: { final: true },
+    });
+    const { invoice, subscription } = await read(renewal.id as string);
+    expect(verifyStripeInvoice(invoice, subscription, expected)).toMatchObject({
+      outcome: 'UNPAID',
+      invoice: {
+        kind: 'RENEWAL',
+        periodStart: new Date('2026-02-28T10:00:00.000Z'),
+        periodEnd: new Date('2026-03-31T10:00:00.000Z'),
+        nextRetryAt: null,
+      },
+    });
+  });
+
+  it('treats an uncollectible invoice as UNPAID', async () => {
+    const { invoice, subscription } = await read(firstInvoiceId());
+    invoice.status = 'uncollectible';
+    expect(verifyStripeInvoice(invoice, subscription, expected).outcome).toBe(
+      'UNPAID',
+    );
+  });
+
+  it.each<
+    [string, (invoice: Stripe.Invoice, s: Stripe.Subscription) => void, string]
+  >([
+    ['a void invoice', (i) => (i.status = 'void'), 'INVOICE_NOT_PAYABLE'],
+    ['a draft invoice', (i) => (i.status = 'draft'), 'INVOICE_NOT_PAYABLE'],
+    [
+      'a manual invoice',
+      (i) => (i.billing_reason = 'manual'),
+      'NOT_A_SUBSCRIPTION_PAYMENT',
+    ],
+    ['another amount due', (i) => (i.amount_due = 100), 'AMOUNT_MISMATCH'],
+    [
+      'a subscription created by another checkout',
+      (_i, s) => (s.metadata = { checkoutSessionId: 'checkout-2' }),
+      'SUBSCRIPTION_MISMATCH',
+    ],
+    [
+      "another customer's invoice",
+      (i) => (i.customer = 'cus_other'),
+      'CUSTOMER_MISMATCH',
+    ],
+  ])('rejects %s', async (_label, mutate, reason) => {
+    const { invoice, subscription } = await read(firstInvoiceId());
+    mutate(invoice, subscription);
+    expect(verifyStripeInvoice(invoice, subscription, expected)).toEqual({
+      outcome: 'REJECTED',
+      reason,
+    });
   });
 });

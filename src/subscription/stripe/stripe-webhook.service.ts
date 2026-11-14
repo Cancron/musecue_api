@@ -19,11 +19,15 @@ import { PrismaService } from '../../common/services/prisma.service';
 import { isProActive } from '../subscription-access.policy';
 import { PENDING_CHECKOUT_STATUSES } from './stripe-checkout.service';
 import {
+  type InvoiceVerification,
+  type VerifiedStripeInvoice,
   type VerifiedStripePayment,
   type VerifiedStripeRenewal,
   verifyStripeCheckout,
+  verifyStripeInvoice,
   verifyStripeRenewal,
 } from './stripe-payment.verification';
+import type { PaymentFailureDetails } from './stripe.gateway';
 import {
   CHECKOUT_METADATA,
   STRIPE_PROVIDER,
@@ -44,6 +48,10 @@ export type WebhookOutcome =
   | 'ALREADY_PROCESSED'
   | 'DUPLICATE_PAYMENT'
   | 'AWAITING_PAYMENT'
+  /** A failed collection attempt was recorded; nothing was granted. */
+  | 'PAYMENT_FAILED'
+  /** The linked provider subscription ended; retries stopped. */
+  | 'SUBSCRIPTION_ENDED'
   | 'REJECTED'
   | 'CLOSED';
 
@@ -61,6 +69,17 @@ const idOf = (value: string | { id: string } | null | undefined) =>
 
 const iso = (date: Date | null) => date?.toISOString() ?? null;
 
+const truncate = (value: string | null | undefined, length: number) =>
+  value ? value.slice(0, length) : null;
+
+/**
+ * The payment id of one failed collection attempt: the invoice plus the
+ * Stripe event that reported it, so a redelivered event is recorded once and
+ * every failed attempt keeps its own immutable record.
+ */
+export const failedAttemptId = (invoiceId: string, eventId: string) =>
+  `${invoiceId}:failed:${eventId}`;
+
 /**
  * Handles Stripe webhooks. This is the only place that grants or extends paid
  * Pro access, and only after:
@@ -75,7 +94,14 @@ const iso = (date: Date | null) => date?.toISOString() ?? null;
  *   starts the paid term (CREATED event).
  * - `invoice.paid` with `billing_reason = subscription_cycle`: recurring
  *   payment, extends the paid term to the period end reported by Stripe
- *   (RENEWED event).
+ *   (RENEWED event). For `subscription_create` it confirms the first payment
+ *   like the checkout events (whichever arrives first records it).
+ * - `invoice.payment_failed`: one failed collection attempt (first payment
+ *   or renewal), recorded as its own FAILED PaymentTransaction with a
+ *   PAYMENT_FAILED event. It never grants, extends or shortens access; a
+ *   failed renewal marks the subscription past due until Stripe collects the
+ *   invoice (recovery: `invoice.paid`, recorded once like any payment) or
+ *   ends the subscription (`customer.subscription.deleted`).
  *
  * Each payment, the term change, its event and the audit record are written
  * in one transaction under the user's UserSubscription row lock. A payment is
@@ -126,7 +152,18 @@ export class StripeWebhookService {
           now,
         );
       case 'invoice.paid':
-        return this.confirmRenewal(event.data.object, metadata, now);
+        return event.data.object.billing_reason === 'subscription_create'
+          ? this.confirmFirstInvoice(event.data.object, metadata, now)
+          : this.confirmRenewal(event.data.object, metadata, now);
+      case 'invoice.payment_failed':
+        return this.recordPaymentFailure(
+          event.id,
+          new Date(event.created * 1000),
+          event.data.object,
+          metadata,
+        );
+      case 'customer.subscription.deleted':
+        return this.endSubscription(event.data.object, metadata, now);
       default:
         return 'IGNORED';
     }
@@ -267,6 +304,7 @@ export class StripeWebhookService {
         proCanceledAt: null,
         paymentProvider: STRIPE_PROVIDER,
         providerSubscriptionId: payment.providerSubscriptionId,
+        pastDueSince: null,
       };
       await tx.userSubscription.update({
         where: { id: record.id },
@@ -299,7 +337,9 @@ export class StripeWebhookService {
         status: CheckoutSessionStatus.COMPLETED,
         completedAt: now,
         paymentId,
-        providerSessionId: payment.providerSessionId,
+        ...(payment.providerSessionId
+          ? { providerSessionId: payment.providerSessionId }
+          : {}),
         providerSubscriptionId: payment.providerSubscriptionId,
       },
     });
@@ -326,25 +366,8 @@ export class StripeWebhookService {
 
     // The checkout that created this Stripe subscription fixes its customer,
     // price and interval; later admin price changes do not apply to it.
-    const origin = await this.prisma.checkoutSession.findFirst({
-      where: {
-        provider: STRIPE_PROVIDER,
-        providerSubscriptionId: subscriptionId,
-      },
-      orderBy: { createdAt: 'asc' },
-    });
-    if (!origin) {
-      this.logger.logWithMetadata(
-        'warn',
-        'Stripe renewal for an unknown subscription',
-        {
-          context: LOG_CONTEXT,
-          providerSubscriptionId: subscriptionId,
-          providerPaymentId: ref.id,
-        },
-      );
-      return 'UNKNOWN_SUBSCRIPTION';
-    }
+    const origin = await this.findOrigin(subscriptionId, null);
+    if (!origin) return this.unknownSubscription(subscriptionId, ref.id);
 
     // Payment facts come from the Stripe API, not from the event payload.
     const invoice = await this.stripe.retrieveInvoice(ref.id);
@@ -355,6 +378,7 @@ export class StripeWebhookService {
       billingInterval: origin.billingInterval,
       amountCents: origin.amountCents,
       currency: origin.currency,
+      checkoutId: origin.id,
     });
     if (verification.outcome === 'REJECTED') {
       this.logger.logWithMetadata(
@@ -445,8 +469,17 @@ export class StripeWebhookService {
         payment.periodEnd.getTime() <= record.proExpiresAt.getTime()
       ) {
         // A delayed delivery for a period the term already covers: record it,
-        // but never move the term backwards or overwrite it.
+        // but never move the term backwards or overwrite it. The collection
+        // still ends a past-due state.
         await tx.subscriptionEvent.create({ data: renewedEvent });
+        if (record.pastDueSince !== null) {
+          const cleared = { pastDueSince: null };
+          await tx.userSubscription.update({
+            where: { id: record.id },
+            data: cleared,
+          });
+          await this.audit(tx, record, cleared, metadata);
+        }
         return 'ALREADY_COVERED';
       }
 
@@ -465,6 +498,8 @@ export class StripeWebhookService {
           ? (record.proStartedAt as Date)
           : payment.periodStart,
         proExpiresAt: payment.periodEnd,
+        // A collected renewal (including a recovered one) ends past due.
+        pastDueSince: null,
       };
       await tx.userSubscription.update({
         where: { id: record.id },
@@ -474,6 +509,338 @@ export class StripeWebhookService {
       await this.audit(tx, record, next, metadata);
       return 'RENEWED';
     });
+  }
+
+  // -------------------------------------------------------------------------
+  // First payment confirmed by its invoice
+  // -------------------------------------------------------------------------
+
+  /**
+   * `invoice.paid` for the first invoice. Usually the checkout events record
+   * it; this also confirms a first payment collected after it had failed (or
+   * when the invoice event arrives first). Both paths record the same invoice
+   * once, so the term and its CREATED event are never duplicated.
+   */
+  private async confirmFirstInvoice(
+    ref: Stripe.Invoice,
+    metadata: ActivityLogMetadata,
+    now: Date,
+  ): Promise<WebhookOutcome> {
+    const subscriptionId = idOf(ref.parent?.subscription_details?.subscription);
+    if (!subscriptionId || !ref.id) return 'IGNORED';
+    if (await this.findPayment(this.prisma, ref.id)) return 'ALREADY_PROCESSED';
+
+    const origin = await this.findOrigin(subscriptionId, ref);
+    if (!origin) return this.unknownSubscription(subscriptionId, ref.id);
+    const verification = await this.verifyInvoice(
+      ref.id,
+      subscriptionId,
+      origin,
+    );
+    if (
+      verification.outcome !== 'PAID' ||
+      verification.invoice.kind !== 'INITIAL'
+    ) {
+      return this.rejectInvoice(ref.id, verification);
+    }
+    const invoice = verification.invoice;
+    return this.recordFirstPayment(
+      origin,
+      {
+        providerSessionId: origin.providerSessionId,
+        providerPaymentId: invoice.providerInvoiceId,
+        providerSubscriptionId: invoice.providerSubscriptionId,
+        amountCents: invoice.amountCents,
+        currency: invoice.currency,
+        billingInterval: invoice.billingInterval,
+        periodStart: invoice.periodStart,
+        periodEnd: invoice.periodEnd,
+        paidAt: invoice.paidAt,
+      },
+      metadata,
+      now,
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Failed payments
+  // -------------------------------------------------------------------------
+
+  /**
+   * `invoice.payment_failed`: one collection attempt of the first invoice or
+   * of a renewal failed. Records it as a FAILED attempt and a PAYMENT_FAILED
+   * event; a renewal of the linked subscription that is still unpaid marks it
+   * past due. The paid term is never touched: users keep access until
+   * proExpiresAt, and a failed attempt never grants or extends it.
+   */
+  private async recordPaymentFailure(
+    eventId: string,
+    failedAt: Date,
+    ref: Stripe.Invoice,
+    metadata: ActivityLogMetadata,
+  ): Promise<WebhookOutcome> {
+    if (
+      ref.billing_reason !== 'subscription_create' &&
+      ref.billing_reason !== 'subscription_cycle'
+    ) {
+      return 'IGNORED';
+    }
+    const subscriptionId = idOf(ref.parent?.subscription_details?.subscription);
+    if (!subscriptionId || !ref.id) return 'IGNORED';
+    const attemptId = failedAttemptId(ref.id, eventId);
+    if (await this.findPayment(this.prisma, attemptId)) {
+      return 'ALREADY_PROCESSED';
+    }
+
+    const origin = await this.findOrigin(subscriptionId, ref);
+    if (!origin) return this.unknownSubscription(subscriptionId, ref.id);
+    const verification = await this.verifyInvoice(
+      ref.id,
+      subscriptionId,
+      origin,
+    );
+    if (verification.outcome === 'REJECTED') {
+      return this.rejectInvoice(ref.id, verification);
+    }
+    // Only ask why while the invoice is still unpaid; best effort.
+    const details =
+      verification.outcome === 'UNPAID'
+        ? await this.stripe.retrievePaymentFailure(ref.id)
+        : null;
+    return this.recordFailedAttempt(
+      origin.subscriptionId,
+      verification.invoice,
+      verification.outcome === 'UNPAID',
+      { attemptId, failedAt, details },
+      metadata,
+    );
+  }
+
+  private recordFailedAttempt(
+    subscriptionRecordId: string,
+    invoice: VerifiedStripeInvoice,
+    stillUnpaid: boolean,
+    attempt: {
+      attemptId: string;
+      failedAt: Date;
+      details: PaymentFailureDetails | null;
+    },
+    metadata: ActivityLogMetadata,
+  ): Promise<WebhookOutcome> {
+    return this.prisma.$transaction(async (tx) => {
+      await this.lockSubscription(tx, subscriptionRecordId);
+      if (await this.findPayment(tx, attempt.attemptId)) {
+        return 'ALREADY_PROCESSED';
+      }
+      const record = await tx.userSubscription.findUniqueOrThrow({
+        where: { id: subscriptionRecordId },
+      });
+
+      const saved = await tx.paymentTransaction.create({
+        data: {
+          subscriptionId: record.id,
+          provider: STRIPE_PROVIDER,
+          providerPaymentId: attempt.attemptId,
+          providerInvoiceId: invoice.providerInvoiceId,
+          status: PaymentStatus.FAILED,
+          amountCents: invoice.amountCents,
+          currency: invoice.currency,
+          billingInterval: invoice.billingInterval,
+          periodStart: invoice.periodStart,
+          periodEnd: invoice.periodEnd,
+          failedAt: attempt.failedAt,
+          failureCode: truncate(attempt.details?.code ?? 'payment_failed', 100),
+          failureMessage: truncate(attempt.details?.message, 500),
+        },
+      });
+      await tx.subscriptionEvent.create({
+        data: {
+          subscriptionId: record.id,
+          type: SubscriptionEventType.PAYMENT_FAILED,
+          occurredAt: attempt.failedAt,
+        },
+      });
+
+      // A failed renewal of the subscription that backs the paid term is past
+      // due while Stripe keeps retrying. A failure reported after the invoice
+      // was collected (a delayed event) changes nothing.
+      const pastDue =
+        invoice.kind === 'RENEWAL' &&
+        stillUnpaid &&
+        record.paymentProvider === STRIPE_PROVIDER &&
+        record.providerSubscriptionId === invoice.providerSubscriptionId &&
+        record.pastDueSince === null;
+      if (pastDue) {
+        const next = { pastDueSince: attempt.failedAt };
+        await tx.userSubscription.update({
+          where: { id: record.id },
+          data: next,
+        });
+        await this.audit(tx, record, next, metadata);
+      }
+
+      this.logger.logWithMetadata('warn', 'Stripe payment attempt failed', {
+        context: LOG_CONTEXT,
+        subscriptionId: record.id,
+        paymentId: saved.id,
+        providerInvoiceId: invoice.providerInvoiceId,
+        kind: invoice.kind,
+        attemptCount: invoice.attemptCount,
+        nextRetryAt: iso(invoice.nextRetryAt),
+        failureCode: saved.failureCode,
+      });
+      return 'PAYMENT_FAILED';
+    });
+  }
+
+  /**
+   * `customer.subscription.deleted` for the subscription that backs the paid
+   * term (e.g. Stripe gave up after its last retry): no further renewal, so
+   * the term is marked canceled and past due ends. Access still runs until
+   * proExpiresAt.
+   */
+  private async endSubscription(
+    ref: Stripe.Subscription,
+    metadata: ActivityLogMetadata,
+    now: Date,
+  ): Promise<WebhookOutcome> {
+    const linked = await this.prisma.userSubscription.findFirst({
+      where: {
+        paymentProvider: STRIPE_PROVIDER,
+        providerSubscriptionId: ref.id,
+      },
+      select: { id: true },
+    });
+    if (!linked) return 'IGNORED';
+    // The subscription state comes from the Stripe API, not the payload.
+    const subscription = await this.stripe.retrieveSubscription(ref.id);
+    if (
+      subscription.status !== 'canceled' &&
+      subscription.status !== 'incomplete_expired'
+    ) {
+      return 'IGNORED';
+    }
+    const endedAt = subscription.ended_at ?? subscription.canceled_at;
+    const canceledAt = endedAt ? new Date(endedAt * 1000) : now;
+
+    return this.prisma.$transaction(async (tx) => {
+      await this.lockSubscription(tx, linked.id);
+      const record = await tx.userSubscription.findUniqueOrThrow({
+        where: { id: linked.id },
+      });
+      if (record.providerSubscriptionId !== ref.id) return 'IGNORED';
+      const cancel =
+        record.proStartedAt !== null && record.proCanceledAt === null;
+      if (!cancel && record.pastDueSince === null) return 'ALREADY_PROCESSED';
+
+      const next = {
+        pastDueSince: null,
+        ...(cancel ? { proCanceledAt: canceledAt } : {}),
+      };
+      await tx.userSubscription.update({
+        where: { id: record.id },
+        data: next,
+      });
+      if (cancel) {
+        await tx.subscriptionEvent.create({
+          data: {
+            subscriptionId: record.id,
+            type: SubscriptionEventType.CANCELED,
+            occurredAt: canceledAt,
+          },
+        });
+      }
+      await this.audit(tx, record, next, metadata);
+      return 'SUBSCRIPTION_ENDED';
+    });
+  }
+
+  /**
+   * The checkout that created a Stripe subscription. Its customer, price and
+   * interval are what every invoice of the subscription must match. Before the
+   * first payment is recorded the checkout is not linked yet; it is then found
+   * through the checkout id in the invoice's subscription metadata, which
+   * verification re-checks against the subscription read from Stripe.
+   */
+  private async findOrigin(
+    subscriptionId: string,
+    ref: Stripe.Invoice | null,
+  ): Promise<CheckoutSession | null> {
+    const linked = await this.prisma.checkoutSession.findFirst({
+      where: {
+        provider: STRIPE_PROVIDER,
+        providerSubscriptionId: subscriptionId,
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+    if (linked) return linked;
+    const checkoutId =
+      ref?.parent?.subscription_details?.metadata?.[
+        CHECKOUT_METADATA.CHECKOUT_ID
+      ];
+    if (!checkoutId) return null;
+    return this.prisma.checkoutSession.findFirst({
+      where: {
+        id: checkoutId,
+        provider: STRIPE_PROVIDER,
+        providerSubscriptionId: null,
+      },
+    });
+  }
+
+  /** Reads the invoice and subscription from Stripe and checks them. */
+  private async verifyInvoice(
+    invoiceId: string,
+    subscriptionId: string,
+    origin: CheckoutSession,
+  ): Promise<InvoiceVerification> {
+    const invoice = await this.stripe.retrieveInvoice(invoiceId);
+    const subscription = await this.stripe.retrieveSubscription(subscriptionId);
+    return verifyStripeInvoice(invoice, subscription, {
+      providerSubscriptionId: subscriptionId,
+      providerCustomerId: origin.providerCustomerId,
+      billingInterval: origin.billingInterval,
+      amountCents: origin.amountCents,
+      currency: origin.currency,
+      checkoutId: origin.id,
+    });
+  }
+
+  private rejectInvoice(
+    invoiceId: string,
+    verification: InvoiceVerification,
+  ): WebhookOutcome {
+    this.logger.logWithMetadata(
+      'error',
+      'Stripe invoice failed verification; nothing recorded',
+      {
+        context: LOG_CONTEXT,
+        providerInvoiceId: invoiceId,
+        reason:
+          verification.outcome === 'REJECTED'
+            ? verification.reason
+            : verification.outcome === 'UNPAID'
+              ? 'INVOICE_NOT_PAID'
+              : 'UNEXPECTED_INVOICE_KIND',
+      },
+    );
+    return 'REJECTED';
+  }
+
+  private unknownSubscription(
+    subscriptionId: string,
+    invoiceId: string,
+  ): WebhookOutcome {
+    this.logger.logWithMetadata(
+      'warn',
+      'Stripe invoice for an unknown subscription',
+      {
+        context: LOG_CONTEXT,
+        providerSubscriptionId: subscriptionId,
+        providerPaymentId: invoiceId,
+      },
+    );
+    return 'UNKNOWN_SUBSCRIPTION';
   }
 
   // -------------------------------------------------------------------------
@@ -514,6 +881,7 @@ export class StripeWebhookService {
         subscriptionId: subscriptionRecordId,
         provider: STRIPE_PROVIDER,
         providerPaymentId: payment.providerPaymentId,
+        providerInvoiceId: payment.providerPaymentId,
         status: PaymentStatus.SUCCEEDED,
         amountCents: payment.amountCents,
         currency: payment.currency,
@@ -537,7 +905,9 @@ export class StripeWebhookService {
       'billingInterval',
       'proStartedAt',
       'proExpiresAt',
+      'proCanceledAt',
       'providerSubscriptionId',
+      'pastDueSince',
     ];
     const text = (value: unknown) =>
       value instanceof Date ? iso(value) : ((value as string | null) ?? null);

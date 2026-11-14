@@ -228,6 +228,56 @@ describe('StripeGateway', () => {
     });
   });
 
+  describe('payment failure details', () => {
+    const failedInvoice = async () => {
+      const session = await gateway.createCheckoutSession(
+        await checkoutRequest(),
+      );
+      return api.failFirstPayment(session.id, {
+        code: 'card_declined',
+        declineCode: 'stolen_card',
+        message: 'Your card was declined.',
+      }).id as string;
+    };
+
+    it('reads why the latest attempt failed from its PaymentIntent', async () => {
+      const invoiceId = await failedInvoice();
+      await expect(gateway.retrievePaymentFailure(invoiceId)).resolves.toEqual({
+        code: 'stolen_card',
+        message: 'Your card was declined.',
+      });
+      expect(
+        api.requests.slice(-2).map((r) => `${r.method} ${r.path}`),
+      ).toEqual([
+        'GET /v1/invoice_payments',
+        expect.stringMatching(/^GET \/v1\/payment_intents\/pi_/) as string,
+      ]);
+    });
+
+    it('returns null instead of failing when Stripe cannot be asked', async () => {
+      const invoiceId = await failedInvoice();
+      api.failNext('GET /v1/invoice_payments', 'connection');
+      await expect(
+        gateway.retrievePaymentFailure(invoiceId),
+      ).resolves.toBeNull();
+      api.failNext('GET /v1/payment_intents/:id', 'server');
+      await expect(
+        gateway.retrievePaymentFailure(invoiceId),
+      ).resolves.toBeNull();
+    });
+
+    it('returns null when the attempt has no recorded error', async () => {
+      const session = await gateway.createCheckoutSession(
+        await checkoutRequest({ checkoutId: 'checkout-paid' }),
+      );
+      api.completeSession(session.id);
+      const invoiceId = api.sessions.get(session.id)?.invoice as string;
+      await expect(
+        gateway.retrievePaymentFailure(invoiceId),
+      ).resolves.toBeNull();
+    });
+  });
+
   describe('webhook signatures', () => {
     const signed = () => {
       const payload = JSON.stringify({

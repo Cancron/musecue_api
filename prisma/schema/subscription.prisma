@@ -54,6 +54,10 @@ model UserSubscription {
   // Link to the payment provider's recurring subscription (set by checkout).
   paymentProvider        String? @db.VarChar(50)
   providerSubscriptionId String? @db.VarChar(255)
+  // Set when a renewal of the linked provider subscription failed and is
+  // still being retried; cleared once a payment is collected or the provider
+  // subscription ends. Never changes the paid term.
+  pastDueSince           DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -78,6 +82,9 @@ model PaymentTransaction {
   subscriptionId      String
   provider            String          @db.VarChar(50)
   providerPaymentId   String          @db.VarChar(255)
+  // The provider invoice this attempt tried to collect (Stripe `in_...`).
+  // A failed attempt and the later successful one share it.
+  providerInvoiceId   String?         @db.VarChar(255)
   status              PaymentStatus   @default(PENDING)
   amountCents         Int
   currency            String          @default("USD") @db.Char(3)
@@ -100,6 +107,7 @@ model PaymentTransaction {
   @@unique([provider, providerPaymentId])
   @@index([subscriptionId, createdAt])
   @@index([status])
+  @@index([provider, providerInvoiceId])
 }
 
 // Append-only lifecycle log of a subscription. CREATED and RENEWED events

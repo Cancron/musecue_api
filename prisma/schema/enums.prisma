@@ -171,6 +171,7 @@ enum SubscriptionEventType {
   RENEWED
   CANCELED
   EXPIRED
+  PAYMENT_FAILED
 }
 
 // One hosted checkout attempt with the payment provider. CREATING, OPEN and

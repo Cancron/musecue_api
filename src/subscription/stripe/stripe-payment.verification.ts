@@ -15,7 +15,8 @@ export interface ExpectedCheckout {
 
 /** A payment proven by Stripe, ready to be recorded as SUCCEEDED. */
 export interface VerifiedStripePayment {
-  providerSessionId: string;
+  /** Null when the payment was confirmed from its invoice, not the session. */
+  providerSessionId: string | null;
   /** Stripe invoice id (`in_...`): the charge for the first billing period. */
   providerPaymentId: string;
   providerSubscriptionId: string;
@@ -191,14 +192,153 @@ const paidAtOf = (invoice: Stripe.Invoice): Date | null => {
   return paidAt ? new Date(paidAt * 1000) : null;
 };
 
-/** The Stripe subscription a renewal must belong to, as stored at checkout. */
-export interface ExpectedRenewal {
+/** The Stripe subscription an invoice must belong to, as stored at checkout. */
+export interface ExpectedInvoice {
   providerSubscriptionId: string;
   providerCustomerId: string;
   billingInterval: BillingInterval;
   /** The price fixed when the subscription was bought. */
   amountCents: number;
   currency: string;
+  /**
+   * The MuseCue checkout that created the subscription. When given, the
+   * subscription's metadata must name it.
+   */
+  checkoutId?: string;
+}
+
+/** The Stripe subscription a renewal must belong to, as stored at checkout. */
+export type ExpectedRenewal = ExpectedInvoice;
+
+/** `subscription_create` is the first payment, `subscription_cycle` a renewal. */
+export type InvoiceKind = 'INITIAL' | 'RENEWAL';
+
+/** A subscription invoice of the stored subscription, as Stripe reports it. */
+export interface VerifiedStripeInvoice {
+  providerInvoiceId: string;
+  providerSubscriptionId: string;
+  kind: InvoiceKind;
+  amountCents: number;
+  currency: 'USD';
+  billingInterval: BillingInterval;
+  periodStart: Date;
+  periodEnd: Date;
+  paidAt: Date | null;
+  /** Collection attempts so far (Stripe `attempt_count`). */
+  attemptCount: number;
+  /** When Stripe retries next; null when no retry is scheduled. */
+  nextRetryAt: Date | null;
+}
+
+export type InvoiceRejectionReason =
+  | 'NOT_A_SUBSCRIPTION_PAYMENT'
+  | 'SUBSCRIPTION_MISMATCH'
+  | 'CUSTOMER_MISMATCH'
+  | 'INVOICE_NOT_PAYABLE'
+  | 'CURRENCY_MISMATCH'
+  | 'AMOUNT_MISMATCH'
+  | 'PRICE_MISMATCH'
+  | 'INVALID_PERIOD';
+
+export type InvoiceVerification =
+  /** Collected in full. */
+  | { outcome: 'PAID'; invoice: VerifiedStripeInvoice }
+  /** Still open (or uncollectible): nothing has been collected. */
+  | { outcome: 'UNPAID'; invoice: VerifiedStripeInvoice }
+  | { outcome: 'REJECTED'; reason: InvoiceRejectionReason };
+
+const rejectInvoice = (
+  reason: InvoiceRejectionReason,
+): InvoiceVerification => ({ outcome: 'REJECTED', reason });
+
+const INVOICE_KINDS: Record<string, InvoiceKind> = {
+  subscription_create: 'INITIAL',
+  subscription_cycle: 'RENEWAL',
+};
+
+/**
+ * Decides what an invoice and its subscription, both read from the Stripe
+ * API, say about a payment of the stored subscription:
+ *
+ * - it is the first (`subscription_create`) or a recurring
+ *   (`subscription_cycle`) invoice of this Stripe subscription and customer;
+ * - it is for the price the subscription was bought for, in USD, and the
+ *   subscription still has exactly one item at that price and interval;
+ * - its single line covers a valid billing period (dates as Stripe reports);
+ * - PAID when collected in full, UNPAID while open or uncollectible. Void or
+ *   draft invoices are rejected.
+ */
+export function verifyStripeInvoice(
+  invoice: Stripe.Invoice,
+  subscription: Stripe.Subscription,
+  expected: ExpectedInvoice,
+): InvoiceVerification {
+  const kind = INVOICE_KINDS[invoice.billing_reason ?? ''];
+  if (!kind) return rejectInvoice('NOT_A_SUBSCRIPTION_PAYMENT');
+  if (
+    idOf(invoice.parent?.subscription_details?.subscription) !==
+      expected.providerSubscriptionId ||
+    subscription.id !== expected.providerSubscriptionId ||
+    (expected.checkoutId !== undefined &&
+      subscription.metadata?.[CHECKOUT_METADATA.CHECKOUT_ID] !==
+        expected.checkoutId)
+  ) {
+    return rejectInvoice('SUBSCRIPTION_MISMATCH');
+  }
+  if (
+    idOf(invoice.customer) !== expected.providerCustomerId ||
+    idOf(subscription.customer) !== expected.providerCustomerId
+  ) {
+    return rejectInvoice('CUSTOMER_MISMATCH');
+  }
+  const paid = invoice.status === 'paid';
+  if (
+    !paid &&
+    invoice.status !== 'open' &&
+    invoice.status !== 'uncollectible'
+  ) {
+    return rejectInvoice('INVOICE_NOT_PAYABLE');
+  }
+  const currency = expected.currency.toLowerCase();
+  if (invoice.currency !== currency) return rejectInvoice('CURRENCY_MISMATCH');
+  if (
+    (paid ? invoice.amount_paid : invoice.amount_due) !== expected.amountCents
+  ) {
+    return rejectInvoice('AMOUNT_MISMATCH');
+  }
+
+  const items = subscription.items.data;
+  const price = items.length === 1 ? items[0].price : null;
+  if (
+    !price ||
+    (items[0].quantity ?? 1) !== 1 ||
+    price.currency !== currency ||
+    price.unit_amount !== expected.amountCents ||
+    price.recurring?.interval !== stripeInterval(expected.billingInterval) ||
+    price.recurring.interval_count !== 1
+  ) {
+    return rejectInvoice('PRICE_MISMATCH');
+  }
+
+  const period = stripePeriod(invoice, expected.billingInterval);
+  if (!period) return rejectInvoice('INVALID_PERIOD');
+
+  const nextRetry = invoice.next_payment_attempt;
+  return {
+    outcome: paid ? 'PAID' : 'UNPAID',
+    invoice: {
+      providerInvoiceId: invoice.id,
+      providerSubscriptionId: expected.providerSubscriptionId,
+      kind,
+      amountCents: expected.amountCents,
+      currency: 'USD',
+      billingInterval: expected.billingInterval,
+      ...period,
+      paidAt: paid ? paidAtOf(invoice) : null,
+      attemptCount: invoice.attempt_count,
+      nextRetryAt: nextRetry ? new Date(nextRetry * 1000) : null,
+    },
+  };
 }
 
 /** A verified recurring payment, ready to be recorded as SUCCEEDED. */
@@ -233,14 +373,8 @@ const rejectRenewal = (
 ): RenewalVerification => ({ outcome: 'REJECTED', reason });
 
 /**
- * Decides whether an invoice and its subscription, both read from the Stripe
- * API, prove a paid renewal of the stored subscription:
- *
- * - a `subscription_cycle` invoice of this Stripe subscription and customer;
- * - `paid`, in full, in USD, at the price the subscription was bought for;
- * - the subscription still has exactly one item at that price and interval;
- * - its single line covers a valid billing period, whose dates are used as
- *   reported by Stripe.
+ * Whether an invoice proves a paid renewal of the stored subscription: a
+ * `subscription_cycle` invoice that verifyStripeInvoice reports as PAID.
  */
 export function verifyStripeRenewal(
   invoice: Stripe.Invoice,
@@ -250,52 +384,29 @@ export function verifyStripeRenewal(
   if (invoice.billing_reason !== 'subscription_cycle') {
     return rejectRenewal('NOT_A_RENEWAL');
   }
-  if (
-    idOf(invoice.parent?.subscription_details?.subscription) !==
-      expected.providerSubscriptionId ||
-    subscription.id !== expected.providerSubscriptionId
-  ) {
-    return rejectRenewal('SUBSCRIPTION_MISMATCH');
+  const result = verifyStripeInvoice(invoice, subscription, expected);
+  if (result.outcome === 'REJECTED') {
+    return rejectRenewal(
+      result.reason === 'INVOICE_NOT_PAYABLE'
+        ? 'INVOICE_NOT_PAID'
+        : result.reason === 'NOT_A_SUBSCRIPTION_PAYMENT'
+          ? 'NOT_A_RENEWAL'
+          : result.reason,
+    );
   }
-  if (
-    idOf(invoice.customer) !== expected.providerCustomerId ||
-    idOf(subscription.customer) !== expected.providerCustomerId
-  ) {
-    return rejectRenewal('CUSTOMER_MISMATCH');
-  }
-  if (invoice.status !== 'paid') return rejectRenewal('INVOICE_NOT_PAID');
-  const currency = expected.currency.toLowerCase();
-  if (invoice.currency !== currency) return rejectRenewal('CURRENCY_MISMATCH');
-  if (invoice.amount_paid !== expected.amountCents) {
-    return rejectRenewal('AMOUNT_MISMATCH');
-  }
-
-  const items = subscription.items.data;
-  const price = items.length === 1 ? items[0].price : null;
-  if (
-    !price ||
-    (items[0].quantity ?? 1) !== 1 ||
-    price.currency !== currency ||
-    price.unit_amount !== expected.amountCents ||
-    price.recurring?.interval !== stripeInterval(expected.billingInterval) ||
-    price.recurring.interval_count !== 1
-  ) {
-    return rejectRenewal('PRICE_MISMATCH');
-  }
-
-  const period = stripePeriod(invoice, expected.billingInterval);
-  if (!period) return rejectRenewal('INVALID_PERIOD');
-
+  if (result.outcome === 'UNPAID') return rejectRenewal('INVOICE_NOT_PAID');
+  const verified = result.invoice;
   return {
     outcome: 'PAID',
     payment: {
-      providerPaymentId: invoice.id,
-      providerSubscriptionId: expected.providerSubscriptionId,
-      amountCents: expected.amountCents,
-      currency: 'USD',
-      billingInterval: expected.billingInterval,
-      ...period,
-      paidAt: paidAtOf(invoice),
+      providerPaymentId: verified.providerInvoiceId,
+      providerSubscriptionId: verified.providerSubscriptionId,
+      amountCents: verified.amountCents,
+      currency: verified.currency,
+      billingInterval: verified.billingInterval,
+      periodStart: verified.periodStart,
+      periodEnd: verified.periodEnd,
+      paidAt: verified.paidAt,
     },
   };
 }

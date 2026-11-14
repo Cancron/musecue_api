@@ -43,6 +43,10 @@ export const CHECKOUT_ERRORS = {
     AppError.forbidden('The Pro plan is not currently available'),
   alreadySubscribed: () =>
     AppError.conflict('You already have an active Pro subscription'),
+  renewalPastDue: () =>
+    AppError.conflict(
+      'Your last Pro renewal payment failed and Stripe is still retrying it; a new checkout could charge you twice',
+    ),
   paymentProcessing: () =>
     AppError.conflict(
       'Your previous checkout payment is still being processed',
@@ -90,7 +94,8 @@ type SettleResult =
  *
  * Rules:
  * - the user, price and currency come from the backend, never the client;
- * - users with an active paid term cannot start a checkout;
+ * - users with an active paid term cannot start a checkout, nor can users
+ *   whose last renewal failed while Stripe is still retrying it (past due);
  * - a user has at most one pending checkout. A repeated request for the same
  *   option reuses the open Stripe session (with its original price and
  *   expiry); a different option first expires the open Stripe session and
@@ -192,9 +197,13 @@ export class StripeCheckoutService {
         proStartedAt: true,
         proExpiresAt: true,
         proCanceledAt: true,
+        pastDueSince: true,
       },
     });
     if (isProActive(record, now)) throw CHECKOUT_ERRORS.alreadySubscribed();
+    // Stripe may still collect the failed renewal: a second subscription
+    // bought now could be charged on top of it.
+    if (record?.pastDueSince) throw CHECKOUT_ERRORS.renewalPastDue();
     return { email: user.email, plan, record };
   }
 
