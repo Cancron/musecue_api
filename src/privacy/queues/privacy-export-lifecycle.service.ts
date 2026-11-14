@@ -14,15 +14,27 @@ export interface FailExportGuard {
 }
 
 const CLEANUP_BATCH_SIZE = 100;
+/** Upper bound of exports cleaned up per call, so one sweep stays bounded. */
+const CLEANUP_MAX_PER_RUN = 1_000;
+
+export interface PendingCleanupResult {
+  /** Exports whose files were deleted (and recorded) in this run. */
+  deleted: number;
+  /** Exports whose deletion failed; they stay pending for the next run. */
+  failed: number;
+}
 
 /**
- * Terminal failure and file cleanup of personal-data exports.
+ * Terminal states (FAILED, EXPIRED) and file cleanup of personal-data exports.
  *
  * Failing an export first records FAILED with a client-safe message and code
  * (so the user always sees why), then deletes every file of the export,
- * including partial archives. `filesDeletedAt` is set only after the deletion
- * succeeded; exports whose cleanup failed are retried by
- * retryPendingCleanups(), which the recovery sweep runs periodically.
+ * including partial archives. Expiring an export first records EXPIRED (the
+ * archive reference is kept), then its files are deleted. In both cases
+ * `filesDeletedAt` is set only after the deletion succeeded, so exports whose
+ * cleanup failed or never ran are found and retried by retryPendingCleanups(),
+ * which the retention sweep runs periodically. Every deletion is limited to
+ * one export's own directory.
  */
 @Injectable()
 export class PrivacyExportLifecycleService {
@@ -64,23 +76,33 @@ export class PrivacyExportLifecycleService {
       },
     });
     if (!changed.count) return false;
-    await this.deleteFailedExportFiles(exportId, current.authId);
+    await this.deleteExportFiles(exportId, current.authId);
     return true;
   }
 
   /**
-   * Deletes every file of a FAILED export and records it. On error the
-   * export stays pending (`filesDeletedAt` null) for a later retry.
+   * Marks every COMPLETED export whose archive has reached `expiresAt` as
+   * EXPIRED. Idempotent; the files are deleted by retryPendingCleanups().
    */
-  async deleteFailedExportFiles(
-    exportId: string,
-    authId: string,
-  ): Promise<boolean> {
+  async expireDueExports(now: Date = new Date()): Promise<number> {
+    const expired = await this.prisma.dataExport.updateMany({
+      where: { status: 'COMPLETED', expiresAt: { lte: now } },
+      data: { status: 'EXPIRED' },
+    });
+    return expired.count;
+  }
+
+  /**
+   * Deletes every file of a FAILED or EXPIRED export and records it. On error
+   * the export stays pending (`filesDeletedAt` null, reference kept) for a
+   * later retry.
+   */
+  async deleteExportFiles(exportId: string, authId: string): Promise<boolean> {
     try {
       await this.storage.deleteExportScope(authId, exportId);
     } catch (error) {
       this.logger.warn(
-        'Files of a failed personal data export could not be deleted yet; cleanup will be retried',
+        'Personal data export files could not be deleted yet; cleanup will be retried',
         {
           context: 'PrivacyExportLifecycle',
           exportId,
@@ -91,27 +113,46 @@ export class PrivacyExportLifecycleService {
       return false;
     }
     await this.prisma.dataExport.updateMany({
-      where: { id: exportId, status: 'FAILED', filesDeletedAt: null },
+      where: {
+        id: exportId,
+        status: { in: ['FAILED', 'EXPIRED'] },
+        filesDeletedAt: null,
+      },
       data: { filesDeletedAt: new Date() },
     });
     return true;
   }
 
-  /** Retries cleanup of FAILED exports whose files are not yet deleted. */
-  async retryPendingCleanups(): Promise<number> {
-    const pending = await this.prisma.dataExport.findMany({
-      where: { status: 'FAILED', filesDeletedAt: null },
-      select: { id: true, authId: true },
-      orderBy: { completedAt: 'asc' },
-      take: CLEANUP_BATCH_SIZE,
-    });
-    let cleaned = 0;
-    for (const item of pending) {
-      if (await this.deleteFailedExportFiles(item.id, item.authId)) {
-        cleaned += 1;
+  /**
+   * Deletes the files of FAILED and EXPIRED exports that are not yet
+   * recorded as deleted. Walks the pending exports in ID order, so an export
+   * whose deletion keeps failing never blocks the others.
+   */
+  async retryPendingCleanups(): Promise<PendingCleanupResult> {
+    const result: PendingCleanupResult = { deleted: 0, failed: 0 };
+    let after: string | undefined;
+    while (result.deleted + result.failed < CLEANUP_MAX_PER_RUN) {
+      const pending = await this.prisma.dataExport.findMany({
+        where: {
+          status: { in: ['FAILED', 'EXPIRED'] },
+          filesDeletedAt: null,
+          ...(after ? { id: { gt: after } } : {}),
+        },
+        select: { id: true, authId: true },
+        orderBy: { id: 'asc' },
+        take: CLEANUP_BATCH_SIZE,
+      });
+      for (const item of pending) {
+        if (await this.deleteExportFiles(item.id, item.authId)) {
+          result.deleted += 1;
+        } else {
+          result.failed += 1;
+        }
       }
+      if (pending.length < CLEANUP_BATCH_SIZE) break;
+      after = pending[pending.length - 1].id;
     }
-    return cleaned;
+    return result;
   }
 
   /**

@@ -29,6 +29,21 @@ export class DataExportTable {
     return value === expected;
   }
 
+  /** Supports the operators the export code uses: lt, lte, gt. */
+  private compare(value: unknown, operators: Record<string, unknown>): boolean {
+    const key = (item: unknown) =>
+      item instanceof Date ? item.getTime() : (item as string | number);
+    return Object.entries(operators).every(([operator, operand]) => {
+      if (value === null || value === undefined) return false;
+      const left = key(value);
+      const right = key(operand);
+      if (operator === 'lt') return left < right;
+      if (operator === 'lte') return left <= right;
+      if (operator === 'gt') return left > right;
+      throw new Error(`Unsupported operator "${operator}" in fixture`);
+    });
+  }
+
   private matches(row: DataExport, where: Where = {}): boolean {
     return Object.entries(where).every(([field, expected]) => {
       const value = row[field as keyof DataExport];
@@ -43,14 +58,9 @@ export class DataExportTable {
       if (
         expected !== null &&
         typeof expected === 'object' &&
-        !(expected instanceof Date) &&
-        'lt' in expected
+        !(expected instanceof Date)
       ) {
-        return (
-          value instanceof Date &&
-          expected.lt instanceof Date &&
-          value.getTime() < expected.lt.getTime()
-        );
+        return this.compare(value, expected as Record<string, unknown>);
       }
       return this.equal(value, expected);
     });
@@ -65,6 +75,15 @@ export class DataExportTable {
     }
     if (row.errorCode && row.status !== 'FAILED') {
       throw new Error('DataExport_error_code_only_when_failed violated');
+    }
+    if (
+      row.status === 'EXPIRED' &&
+      (!row.storageKey || !row.sha256 || !row.completedAt || !row.expiresAt)
+    ) {
+      throw new Error('DataExport_expired_keeps_archive_reference violated');
+    }
+    if (row.filesDeletedAt && !['FAILED', 'EXPIRED'].includes(row.status)) {
+      throw new Error('DataExport_files_deleted_only_when_terminal violated');
     }
     const active = this.rows.filter(
       (other) => other.authId === row.authId && ACTIVE.includes(other.status),
@@ -115,10 +134,17 @@ export class DataExportTable {
     orderBy?: Record<string, 'asc' | 'desc'>;
   }) => {
     const found = this.rows.filter((row) => this.matches(row, where));
+    const [field, direction] = Object.entries(orderBy ?? {})[0] ?? [];
     const ordered =
-      orderBy && Object.values(orderBy)[0] === 'desc'
-        ? [...found].reverse()
-        : found;
+      field === 'id'
+        ? [...found].sort((a, b) =>
+            direction === 'desc'
+              ? b.id.localeCompare(a.id)
+              : a.id.localeCompare(b.id),
+          )
+        : direction === 'desc'
+          ? [...found].reverse()
+          : found;
     return Promise.resolve(ordered.slice(0, take));
   };
 

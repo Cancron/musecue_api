@@ -23,8 +23,8 @@ const BATCH_SIZE = 100;
  * active per user) and clients stop polling. Healthy waiting, delayed or
  * active jobs are left alone; a Redis outage postpones recovery.
  *
- * Each pass also retries file cleanup of FAILED exports whose earlier
- * cleanup did not succeed, so incomplete archives are eventually removed.
+ * File cleanup of failed and expired exports is done by
+ * PrivacyExportRetentionService, which needs no Redis.
  */
 @Injectable()
 export class PrivacyExportRecoveryService
@@ -102,16 +102,6 @@ export class PrivacyExportRecoveryService
     } catch {
       this.logger.warn(
         'Personal data export recovery could not complete; it will retry',
-        { context: 'PrivacyExportRecovery' },
-      );
-    }
-    // File cleanup needs only PostgreSQL and storage, so a Redis outage
-    // above does not postpone it.
-    try {
-      await this.lifecycle.retryPendingCleanups();
-    } catch {
-      this.logger.warn(
-        'Personal data export file cleanup could not complete; it will retry',
         { context: 'PrivacyExportRecovery' },
       );
     } finally {

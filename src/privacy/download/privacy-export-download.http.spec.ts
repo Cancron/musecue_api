@@ -33,6 +33,7 @@ import { PRIVACY_EXPORT_RETENTION_MS } from '../privacy-export.constants';
 import { PrivacyExportController } from '../privacy-export.controller';
 import { PrivacyExportService } from '../privacy-export.service';
 import { PrivacyExportLifecycleService } from '../queues/privacy-export-lifecycle.service';
+import { PrivacyExportRetentionService } from '../queues/privacy-export-retention.service';
 import { PrivacyExportQueueService } from '../queues/privacy-export.queue';
 import {
   type DownloadLinkView,
@@ -45,6 +46,7 @@ const OTHER = '0b0b0b0b-0000-4000-8000-00000000000b';
 const T0 = new Date('2026-09-01T12:00:00.000Z');
 const MINUTE = 60_000;
 const FIFTEEN_MINUTES = 15 * MINUTE;
+const DAY_MS = 24 * 60 * MINUTE;
 
 const prisma = mockDeep<PrismaService>();
 const redis = mock<RedisService>();
@@ -578,6 +580,93 @@ describe('Privacy export downloads (HTTP, time-controlled)', () => {
       expect(logged).toContain(`/v1/privacy/exports/${created.id}/archive`);
       expect(logged).not.toContain(signature);
       expect(logged).toContain('signature=%5BREDACTED%5D');
+    });
+  });
+
+  describe('24-hour retention (time-controlled, no user request needed)', () => {
+    const HOUR = 60 * MINUTE;
+    const retention = () => {
+      const logger = mock<Logger>();
+      return new PrivacyExportRetentionService(
+        prisma,
+        new PrivacyExportLifecycleService(prisma, storage, logger),
+        storage,
+        new ConfigService({}),
+        logger,
+      );
+    };
+    const statusOf = async (exportId: string) =>
+      (
+        (
+          await http()
+            .get(`/v1/privacy/exports/${exportId}`)
+            .set('Authorization', bearer(OWNER))
+            .expect(200)
+        ).body as { data: { status: string; sha256: string | null } }
+      ).data;
+
+    it('keeps download links at 15 minutes during the retention period', async () => {
+      const created = await completedExport(OWNER, T0);
+      jest.setSystemTime(T0.getTime() + HOUR);
+
+      const link = linkOf(await requestLink(created.id).expect(200));
+
+      expect(new Date(link.expiresAt).getTime()).toBe(
+        T0.getTime() + HOUR + FIFTEEN_MINUTES,
+      );
+    });
+
+    it('serves the archive until 24 hours after export, refuses it from then on, and the sweep deletes it', async () => {
+      const created = await completedExport(OWNER, T0);
+      const file = join(root, created.storageKey);
+
+      // 15 minutes before expiry: a full-length link, usable to the end.
+      jest.setSystemTime(T0.getTime() + DAY_MS - FIFTEEN_MINUTES);
+      const link = linkOf(await requestLink(created.id).expect(200));
+      expect(link.expiresAt).toBe(
+        new Date(T0.getTime() + DAY_MS).toISOString(),
+      );
+      jest.setSystemTime(T0.getTime() + DAY_MS - 1);
+      await download(link.url).expect(200);
+
+      // Exactly 24 hours: unavailable even before any cleanup has run.
+      jest.setSystemTime(T0.getTime() + DAY_MS);
+      await download(link.url).expect(410);
+      await requestLink(created.id).expect(410);
+      expect(await statusOf(created.id)).toMatchObject({
+        status: 'EXPIRED',
+        sha256: null,
+      });
+      await expect(stat(file)).resolves.toBeDefined();
+
+      // The scheduled sweep deletes the file without any user request.
+      const result = await retention().sweep(new Date());
+
+      expect(result).toMatchObject({ expired: 1, filesDeleted: 1 });
+      await expect(stat(file)).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(table.get(created.id)).toMatchObject({
+        status: 'EXPIRED',
+        storageKey: created.storageKey,
+      });
+      expect(await statusOf(created.id)).toMatchObject({ status: 'EXPIRED' });
+      await requestLink(created.id).expect(410);
+    });
+
+    it('sweeping again changes nothing and leaves other users’ downloads working', async () => {
+      const mine = await completedExport(OWNER, T0);
+      jest.setSystemTime(T0.getTime() + 23 * HOUR);
+      const theirs = await completedExport(OTHER, new Date());
+      jest.setSystemTime(T0.getTime() + DAY_MS);
+      const sweeper = retention();
+      await sweeper.sweep(new Date());
+
+      const again = await sweeper.sweep(new Date(Date.now() + MINUTE));
+
+      expect(again).toMatchObject({ expired: 0, filesDeleted: 0 });
+      expect(table.get(mine.id).status).toBe('EXPIRED');
+      const theirLink = linkOf(await requestLink(theirs.id, OTHER).expect(200));
+      const response = await download(theirLink.url, OTHER).expect(200);
+      expect(response.body).toEqual(theirs.bytes);
     });
   });
 

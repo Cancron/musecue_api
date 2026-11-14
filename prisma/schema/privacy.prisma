@@ -6,8 +6,11 @@
 // makeup history, subscription and private photos). Rows are created by
 // POST /v1/privacy/exports and advanced only by the `privacy-export` BullMQ
 // worker: QUEUED -> PROCESSING -> COMPLETED | FAILED (a retrying attempt goes
-// back to QUEUED). EXPIRED is reserved for the retention job that removes the
-// archive after `expiresAt`; until then, reads derive expiry from the date.
+// back to QUEUED) -> EXPIRED. A COMPLETED export expires 24 hours after
+// completion (`expiresAt`): reads and downloads treat it as expired from that
+// moment, and the retention sweep marks it EXPIRED, deletes its files and sets
+// `filesDeletedAt`. An EXPIRED export keeps `storageKey`, so a cleanup that
+// failed or did not run is retried from the database, never lost.
 //
 // `storageKey` locates the ZIP in the private export storage root and is never
 // returned by the API. A FAILED export always carries a client-safe `error`

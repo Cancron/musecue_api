@@ -29,6 +29,7 @@ import { ConfigService } from '@nestjs/config';
 import { PrivacyExportDownloadService } from '../src/privacy/download/privacy-export-download.service';
 import { PrivacyExportLinkSigner } from '../src/privacy/download/privacy-export-link.signer';
 import { PrivacyExportLifecycleService } from '../src/privacy/queues/privacy-export-lifecycle.service';
+import { PrivacyExportRetentionService } from '../src/privacy/queues/privacy-export-retention.service';
 import { PrivacyExportProcessor } from '../src/privacy/queues/privacy-export.processor';
 import type { PrivacyExportQueueService } from '../src/privacy/queues/privacy-export.queue';
 import { PrivateImageStorageService } from '../src/storage/private-image-storage.service';
@@ -261,6 +262,7 @@ describeWithDatabase('Personal data export (PostgreSQL)', () => {
   let images: PrivateImageStorageService;
   let lifecycle: PrivacyExportLifecycleService;
   let downloads: PrivacyExportDownloadService;
+  let retention: PrivacyExportRetentionService;
   const queued: PrivacyExportJob[] = [];
   const env = {
     images: process.env.PRIVATE_UPLOAD_DIR,
@@ -296,6 +298,13 @@ describeWithDatabase('Personal data export (PostgreSQL)', () => {
       logger,
     );
     exportsService = new PrivacyExportService(prisma, queue, lifecycle, logger);
+    retention = new PrivacyExportRetentionService(
+      prisma,
+      lifecycle,
+      exportStorage,
+      new ConfigService({}),
+      logger,
+    );
     downloads = new PrivacyExportDownloadService(
       prisma,
       new PrivacyExportLinkSigner(
@@ -1022,6 +1031,120 @@ describeWithDatabase('Personal data export (PostgreSQL)', () => {
         new Date(expires * 1000),
       ),
     ).rejects.toMatchObject({ status: 410 });
+  });
+
+  it('expires archives 24 hours after export and deletes them in the retention sweep, without any request', async () => {
+    const owner = await createUser('hash');
+    const other = await createUser('hash');
+    const mine = await exportsService.requestExport(owner);
+    await runQueuedJob(queued.find((job) => job.exportId === mine.id)!);
+    const theirs = await exportsService.requestExport(other);
+    await runQueuedJob(queued.find((job) => job.exportId === theirs.id)!);
+    // The other user's archive was exported two hours later.
+    const theirRow = await client.dataExport.findUniqueOrThrow({
+      where: { id: theirs.id },
+    });
+    await client.dataExport.update({
+      where: { id: theirs.id },
+      data: {
+        completedAt: new Date(theirRow.completedAt!.getTime() + 2 * 3_600_000),
+        expiresAt: new Date(theirRow.expiresAt!.getTime() + 2 * 3_600_000),
+      },
+    });
+    const row = await client.dataExport.findUniqueOrThrow({
+      where: { id: mine.id },
+    });
+    expect(row.expiresAt!.getTime() - row.completedAt!.getTime()).toBe(
+      PRIVACY_EXPORT_RETENTION_MS,
+    );
+
+    // One millisecond before expiry nothing changes.
+    await retention.sweep(new Date(row.expiresAt!.getTime() - 1));
+    expect(
+      await client.dataExport.findUniqueOrThrow({ where: { id: mine.id } }),
+    ).toMatchObject({ status: 'COMPLETED', filesDeletedAt: null });
+    expect(await exportFiles(owner, mine.id)).toHaveLength(1);
+
+    // At expiry: EXPIRED, files deleted, reference kept.
+    const result = await retention.sweep(row.expiresAt!);
+    expect(result).toMatchObject({ expired: 1, filesDeleted: 1 });
+    const expired = await client.dataExport.findUniqueOrThrow({
+      where: { id: mine.id },
+    });
+    expect(expired).toMatchObject({
+      status: 'EXPIRED',
+      storageKey: row.storageKey,
+      sha256: row.sha256,
+    });
+    expect(expired.filesDeletedAt).toBeInstanceOf(Date);
+    expect(await exportFiles(owner, mine.id)).toEqual([]);
+    await expect(
+      downloads.createLink(owner, mine.id, row.expiresAt!),
+    ).rejects.toMatchObject({ status: 410 });
+
+    // The other user's (later) export is untouched, and repeating is a no-op.
+    expect(
+      await client.dataExport.findUniqueOrThrow({ where: { id: theirs.id } }),
+    ).toMatchObject({ status: 'COMPLETED', filesDeletedAt: null });
+    expect(await exportFiles(other, theirs.id)).toHaveLength(1);
+    const again = await retention.sweep(row.expiresAt!);
+    expect(again).toMatchObject({ expired: 0, filesDeleted: 0 });
+    expect(await exportFiles(other, theirs.id)).toHaveLength(1);
+  });
+
+  it('enforces that expired exports keep their archive reference', async () => {
+    const owner = await createUser('hash');
+    const now = new Date();
+    await expect(
+      client.dataExport.create({
+        data: {
+          authId: owner,
+          idempotencyKey: 'expired-without-reference',
+          status: 'EXPIRED',
+          completedAt: now,
+          expiresAt: new Date(now.getTime() + 1),
+        },
+      }),
+    ).rejects.toThrow(/DataExport_expired_keeps_archive_reference/);
+    await expect(
+      client.dataExport.create({
+        data: {
+          authId: owner,
+          idempotencyKey: 'deleted-but-active',
+          filesDeletedAt: now,
+        },
+      }),
+    ).rejects.toThrow(/DataExport_files_deleted_only_when_terminal/);
+  });
+
+  it('still deletes the archive files of a deleted account (storage scan), and only those', async () => {
+    const leaving = await createUser('hash');
+    const staying = await createUser('hash');
+    const gone = await exportsService.requestExport(leaving);
+    await runQueuedJob(queued.find((job) => job.exportId === gone.id)!);
+    const kept = await exportsService.requestExport(staying);
+    await runQueuedJob(queued.find((job) => job.exportId === kept.id)!);
+
+    // Deleting the account cascades to its export records; the files stay.
+    await client.authUser.delete({ where: { id: leaving } });
+    expect(await exportFiles(leaving, gone.id)).toHaveLength(1);
+
+    // A fresh instance (as after a restart) scans storage on its first sweep.
+    const freshInstance = new PrivacyExportRetentionService(
+      prisma,
+      lifecycle,
+      exportStorage,
+      new ConfigService({}),
+      mock<Logger>(),
+    );
+    const result = await freshInstance.sweep(
+      new Date(Date.now() + 2 * 3_600_000),
+    );
+
+    expect(result?.storageScanned).toBe(true);
+    expect(result?.storageScopesRemoved).toBe(1);
+    expect(await exportFiles(leaving, gone.id)).toEqual([]);
+    expect(await exportFiles(staying, kept.id)).toHaveLength(1);
   });
 
   it('removes export records when the account is deleted', async () => {

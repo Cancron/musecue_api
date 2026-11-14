@@ -17,7 +17,7 @@ The companion mobile application and detailed product specifications live in `..
 - `AiRun` audit records containing operation, provider, model, prompt version, latency, progress, result/error, and status
 - a provider-neutral AI gateway with OpenRouter live mode, multimodal private-image input, strict structured output, runtime validation, bounded retries, and deterministic mock mode
 - a single Pro subscription plan: admin-configured monthly/yearly pricing and free trial, one-time trial activation, date-based Pro access through `ProAccessGuard`, and payment/lifecycle records protected by database rules (see "Subscriptions" under API); checkout, webhooks and billing endpoints are not implemented yet
-- personal data export: an authenticated user can request an asynchronous ZIP archive of their own account, profile, makeup history, subscription records and private photos, poll its status, and download it through a signed link valid for at most 15 minutes (see "Personal data export" under API); automatic 24-hour removal is the next step
+- personal data export: an authenticated user can request an asynchronous ZIP archive of their own account, profile, makeup history, subscription records and private photos, poll its status, and download it through a signed link valid for at most 15 minutes; archives expire 24 hours after export and are deleted by a scheduled retention sweep (see "Personal data export" under API)
 
 Migration `20260827174107_add_makeup_workflow` adds the makeup aggregate and removes the dormant job-tracker and subscription starter domains.
 
@@ -435,7 +435,7 @@ The database requires every `FAILED` export to have `error`, `errorCode` and `co
 File cleanup and duplicates:
 
 - Archives are written as `<uuid>.zip.partial` and renamed to `<uuid>.zip` only when complete, so an incomplete archive never has the final name.
-- A failed attempt deletes its own partial archive. When an export finally fails, its status and reason are recorded first, then every file of the export is deleted and `filesDeletedAt` is set. If deletion fails, the export stays `FAILED` (the user still sees the reason) and the recovery sweep retries the cleanup every 60 seconds until it succeeds.
+- A failed attempt deletes its own partial archive. When an export finally fails, its status and reason are recorded first, then every file of the export is deleted and `filesDeletedAt` is set. If deletion fails, the export stays `FAILED` (the user still sees the reason) and the retention sweep retries the cleanup until it succeeds.
 - After a successful publication, files left by earlier attempts (for example a crashed worker's partial archive) are removed, so a completed export has exactly one file.
 - Repeated requests never create duplicate jobs: the same `Idempotency-Key` returns the same export (including a failed one), only one export per user can be waiting or running, and each export has exactly one BullMQ job (`jobId` = export ID). Redelivered jobs for completed or failed exports do nothing. A new request after a failure creates one new export.
 
@@ -464,7 +464,17 @@ Every 60 seconds, recovery fails exports older than `PRIVACY_EXPORT_RECOVERY_GRA
 - Signed URLs are never logged: request logging and the exception filter redact `signature` (and `token`/`access_token`/`refresh_token`) query values.
 - Archives stay private in storage. They live under `PRIVATE_EXPORT_DIR`, outside any static directory, in owner-only directories (`0700`) and files (`0600`), with random, unguessable names. Only finished `.zip` files are served, and only as regular files opened without following symbolic links.
 
-Not implemented yet: the retention job that deletes archives and marks exports `EXPIRED` after 24 hours.
+#### Retention: expiry and cleanup
+
+An archive expires **24 hours after it was exported** (`expiresAt` = completion + 24 hours). From that moment the export reads as `EXPIRED`, and new links and existing links are refused with `410`. Download links themselves still last at most 15 minutes and never outlive the archive.
+
+Deletion does not depend on any user request. `PrivacyExportRetentionService` runs a sweep at startup, to catch up after downtime, and then every `PRIVACY_EXPORT_CLEANUP_INTERVAL_MS` (default 60 seconds) on every instance. It needs only PostgreSQL and storage, not Redis.
+
+1. **Expire.** `COMPLETED` exports with `expiresAt <= now` become `EXPIRED` (one guarded update). The row keeps `storageKey` and `sha256`; the database requires this for `EXPIRED` rows.
+2. **Delete files.** For every `FAILED`/`EXPIRED` export with `filesDeletedAt` null, that export's own directory (`<authId>/<exportId>/`) is deleted. Then `filesDeletedAt` is recorded. If deletion fails, nothing is recorded: the export stays pending with its reference and is retried on the next sweep. Pending exports are walked in ID order (up to 1,000 per sweep), so one export that keeps failing never blocks others.
+3. **Storage scan** (at most every `PRIVACY_EXPORT_ORPHAN_SCAN_INTERVAL_MS`, default 1 hour, and on an instance's first sweep). Export directories whose record no longer exists are removed once unchanged for 1 hour. This happens, for example, when deleting an account cascades away its export rows. Files reappearing for exports already cleaned up are removed too. Directories of waiting, running and downloadable exports, and anything without the `<authId>/<exportId>` layout, are never touched.
+
+Sweeps are idempotent and can run concurrently on several instances. Repeating a sweep changes nothing, and each step only ever affects the expired or failed export it is about, never other users' exports. All instances must share the same `PRIVACY_EXPORT_DIR` storage, because a sweep on one instance must be able to delete files that another instance wrote.
 
 ## Domain
 

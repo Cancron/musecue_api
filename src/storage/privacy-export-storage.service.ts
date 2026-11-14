@@ -13,6 +13,7 @@ import {
   rename,
   rm,
   rmdir,
+  stat,
   unlink,
 } from 'node:fs/promises';
 import { once } from 'node:events';
@@ -44,6 +45,14 @@ export interface OpenedArchive {
 
 /** Read-only, and never through a symbolic link where the OS supports it. */
 const OPEN_ARCHIVE_FLAGS = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0);
+
+/** The files of one export, as found in storage (`<authId>/<exportId>/`). */
+export interface StoredExportScope {
+  authId: string;
+  exportId: string;
+  /** Last modification of the export's directory. */
+  modifiedAt: Date;
+}
 
 export interface DeleteExportScopeOptions {
   /** A finished archive of this export to keep; every other file is removed. */
@@ -180,6 +189,46 @@ export class PrivacyExportStorageService {
     for (const entry of entries) {
       const path = join(directory, entry);
       if (path !== keepPath) await rm(path, { recursive: true, force: true });
+    }
+  }
+
+  /**
+   * Lists the export directories in storage, so files whose database record
+   * no longer exists (for example after account deletion) can still be found
+   * and removed. Entries that do not have the `<authId>/<exportId>` layout are
+   * ignored, never touched.
+   */
+  async listExportScopes(): Promise<StoredExportScope[]> {
+    const scopes: StoredExportScope[] = [];
+    for (const authId of await this.directoriesIn(this.root)) {
+      const ownerDirectory = resolve(this.root, authId);
+      for (const exportId of await this.directoriesIn(ownerDirectory)) {
+        try {
+          const info = await stat(resolve(ownerDirectory, exportId));
+          scopes.push({ authId, exportId, modifiedAt: info.mtime });
+        } catch (error) {
+          if (!isMissingFileError(error)) throw error;
+        }
+      }
+    }
+    return scopes;
+  }
+
+  /** Removes an owner's export directory if it is empty. */
+  async removeEmptyOwnerDirectory(authId: string): Promise<void> {
+    if (!SAFE_SEGMENT.test(authId)) return;
+    await rmdir(resolve(this.root, authId)).catch(() => undefined);
+  }
+
+  private async directoriesIn(directory: string): Promise<string[]> {
+    try {
+      const entries = await readdir(directory, { withFileTypes: true });
+      return entries
+        .filter((entry) => entry.isDirectory() && SAFE_SEGMENT.test(entry.name))
+        .map((entry) => entry.name);
+    } catch (error) {
+      if (isMissingFileError(error)) return [];
+      throw error;
     }
   }
 

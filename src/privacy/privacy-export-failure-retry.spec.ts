@@ -1,5 +1,5 @@
 import { ConfigService } from '@nestjs/config';
-import type { Job, Queue } from 'bullmq';
+import type { Job } from 'bullmq';
 import { mock } from 'jest-mock-extended';
 import {
   mkdir,
@@ -32,7 +32,7 @@ import type { PrivacyExportJob } from './interfaces/privacy-export.interface';
 import { PRIVACY_EXPORT_FAILURES } from './privacy-export.constants';
 import { PrivacyExportService } from './privacy-export.service';
 import { PrivacyExportLifecycleService } from './queues/privacy-export-lifecycle.service';
-import { PrivacyExportRecoveryService } from './queues/privacy-export-recovery.service';
+import { PrivacyExportRetentionService } from './queues/privacy-export-retention.service';
 import { PrivacyExportProcessor } from './queues/privacy-export.processor';
 import type { PrivacyExportQueueService } from './queues/privacy-export.queue';
 
@@ -202,7 +202,7 @@ describe('Privacy export failures, cleanup and retries', () => {
       expect(table.get(id).filesDeletedAt).toBeInstanceOf(Date);
     });
 
-    it('keeps the FAILED status visible when file cleanup fails, and the recovery sweep deletes the files later', async () => {
+    it('keeps the FAILED status visible when file cleanup fails, and the retention sweep deletes the files later', async () => {
       const id = await requestExport();
       jest.spyOn(images, 'read').mockRejectedValue(ioError('EIO'));
       jest.spyOn(exportStorage, 'delete').mockRejectedValue(ioError('EBUSY'));
@@ -220,14 +220,14 @@ describe('Privacy export failures, cleanup and retries', () => {
       });
       expect(await filesOf(id)).toHaveLength(1);
 
-      const recovery = new PrivacyExportRecoveryService(
+      const retention = new PrivacyExportRetentionService(
         prisma,
         lifecycle,
-        mock<Queue<PrivacyExportJob>>(),
+        exportStorage,
         new ConfigService({}),
         mock<Logger>(),
       );
-      await recovery.reconcile();
+      await retention.sweep();
 
       expect(scopeCleanup.mock.calls).toHaveLength(2);
       expect(await filesOf(id)).toEqual([]);

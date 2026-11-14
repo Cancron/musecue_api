@@ -35,7 +35,6 @@ describe('PrivacyExportRecoveryService (privacy export recovery)', () => {
       { id: 'running', updatedAt: STALE },
     ] as never);
     lifecycle.fail.mockResolvedValue(true);
-    lifecycle.retryPendingCleanups.mockResolvedValue(0);
     queue.getJob.mockImplementation((id: string) =>
       Promise.resolve(
         id === 'lost'
@@ -65,29 +64,19 @@ describe('PrivacyExportRecoveryService (privacy export recovery)', () => {
     ]);
   });
 
-  it('retries pending file cleanup of failed exports on every pass', async () => {
-    await service().reconcile(NOW);
-
-    expect(lifecycle.retryPendingCleanups.mock.calls).toHaveLength(1);
-  });
-
-  it('treats a Redis error as "unknown", not as a missing job, but still retries file cleanup', async () => {
+  it('treats a Redis error as "unknown", not as a missing job', async () => {
     queue.getJob.mockRejectedValue(new Error('redis unavailable'));
 
     await service().reconcile(NOW);
 
     expect(lifecycle.fail.mock.calls).toHaveLength(0);
-    expect(lifecycle.retryPendingCleanups.mock.calls).toHaveLength(1);
     expect(logger.warn.mock.calls.length).toBeGreaterThan(0);
   });
 
-  it('keeps running after a cleanup error and allows the next pass', async () => {
-    lifecycle.retryPendingCleanups.mockRejectedValueOnce(new Error('db down'));
-    const recovery = service();
+  it('leaves file cleanup to the retention sweep', async () => {
+    await service().reconcile(NOW);
 
-    await recovery.reconcile(NOW);
-    await recovery.reconcile(NOW);
-
-    expect(lifecycle.retryPendingCleanups.mock.calls).toHaveLength(2);
+    expect(lifecycle.retryPendingCleanups.mock.calls).toHaveLength(0);
+    expect(lifecycle.expireDueExports.mock.calls).toHaveLength(0);
   });
 });

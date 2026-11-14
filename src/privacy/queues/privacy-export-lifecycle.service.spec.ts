@@ -98,15 +98,24 @@ describe('PrivacyExportLifecycleService (privacy export failure and cleanup)', (
       .mockRejectedValueOnce(new Error('still busy'));
     await lifecycle.fail(row.id, 'GENERATION_FAILED');
 
-    await expect(lifecycle.retryPendingCleanups()).resolves.toBe(0);
+    await expect(lifecycle.retryPendingCleanups()).resolves.toEqual({
+      deleted: 0,
+      failed: 1,
+    });
     expect(table.get(row.id).filesDeletedAt).toBeNull();
 
-    await expect(lifecycle.retryPendingCleanups()).resolves.toBe(1);
+    await expect(lifecycle.retryPendingCleanups()).resolves.toEqual({
+      deleted: 1,
+      failed: 0,
+    });
     expect(table.get(row.id).filesDeletedAt).toBeInstanceOf(Date);
     expect(storage.deleteExportScope.mock.calls).toHaveLength(3);
 
     // Nothing left to do afterwards.
-    await expect(lifecycle.retryPendingCleanups()).resolves.toBe(0);
+    await expect(lifecycle.retryPendingCleanups()).resolves.toEqual({
+      deleted: 0,
+      failed: 0,
+    });
     expect(storage.deleteExportScope.mock.calls).toHaveLength(3);
   });
 
