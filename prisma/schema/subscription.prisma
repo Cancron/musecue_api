@@ -55,10 +55,6 @@ model UserSubscription {
   paymentProvider        String? @db.VarChar(50)
   providerSubscriptionId String? @db.VarChar(255)
 
-  // The provider's customer record, created once on the user's first
-  // checkout attempt and reused for every later one (set by checkout).
-  stripeCustomerId String? @unique @db.VarChar(255)
-
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -80,9 +76,6 @@ model UserSubscription {
 model PaymentTransaction {
   id                  String          @id @default(uuid())
   subscriptionId      String
-  // The checkout session whose completion produced this payment, when there
-  // was one (a future renewal invoice would have none).
-  checkoutSessionId   String?         @unique
   provider            String          @db.VarChar(50)
   providerPaymentId   String          @db.VarChar(255)
   status              PaymentStatus   @default(PENDING)
@@ -101,47 +94,12 @@ model PaymentTransaction {
   updatedAt           DateTime        @updatedAt
 
   subscription    UserSubscription   @relation(fields: [subscriptionId], references: [id], onDelete: Restrict)
-  checkoutSession CheckoutSession?   @relation(fields: [checkoutSessionId], references: [id], onDelete: SetNull)
   event           SubscriptionEvent?
+  checkoutSession CheckoutSession?
 
   @@unique([provider, providerPaymentId])
   @@index([subscriptionId, createdAt])
   @@index([status])
-}
-
-// A Stripe Checkout Session started by an authenticated user for the Pro
-// plan's monthly or yearly option. Tracks the checkout itself, separate from
-// the verified payment it may produce: creating a session never grants
-// access, only a webhook-verified SUCCEEDED PaymentTransaction does (see
-// PaymentTransaction.checkoutSessionId). At most one PENDING session exists
-// per subscription at a time (database rule): starting a checkout for a
-// different billing option expires the old session first, and a repeated
-// request for the same option while one is still valid reuses it instead of
-// creating another.
-model CheckoutSession {
-  id                String                @id @default(uuid())
-  subscriptionId    String
-  provider          String                @db.VarChar(50)
-  providerSessionId String                @db.VarChar(255)
-  billingInterval   BillingInterval
-  // The plan's price for billingInterval at the moment this session was
-  // created; the completed payment must match it exactly.
-  amountCents       Int
-  currency          String                @default("USD") @db.Char(3)
-  status            CheckoutSessionStatus @default(PENDING)
-  // The provider-hosted checkout page; reused as-is while the session is
-  // still PENDING and unexpired.
-  url               String                @db.VarChar(2048)
-  expiresAt         DateTime
-  completedAt       DateTime?
-  createdAt         DateTime              @default(now())
-  updatedAt         DateTime              @updatedAt
-
-  subscription UserSubscription    @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
-  payment      PaymentTransaction?
-
-  @@unique([provider, providerSessionId])
-  @@index([subscriptionId, status])
 }
 
 // Append-only lifecycle log of a subscription. CREATED and RENEWED events
@@ -159,4 +117,62 @@ model SubscriptionEvent {
   payment      PaymentTransaction? @relation(fields: [paymentId], references: [id], onDelete: Restrict)
 
   @@index([subscriptionId, occurredAt])
+}
+
+// The user's customer record at a payment provider (e.g. Stripe `cus_...`).
+// Every user has their own customer: one per user and provider, and a
+// provider customer belongs to exactly one user.
+model PaymentCustomer {
+  id                 String   @id @default(uuid())
+  authId             String
+  provider           String   @db.VarChar(50)
+  providerCustomerId String   @db.VarChar(255)
+  createdAt          DateTime @default(now())
+
+  authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
+
+  @@unique([authId, provider])
+  @@unique([provider, providerCustomerId])
+}
+
+// One hosted checkout for the Pro plan. The price and interval are fixed when
+// the checkout is created from the backend plan configuration; the provider
+// session is created with an idempotency key derived from `id`, so retries
+// and concurrent requests resolve to the same provider session.
+//
+// A subscription has at most one pending checkout (CREATING, OPEN or
+// PROCESSING; partial unique index in the migration). A checkout never grants
+// access on its own: only a verified provider webhook records a SUCCEEDED
+// PaymentTransaction, links it here and moves the checkout to COMPLETED.
+// Status only moves forward and the price, interval, customer and provider
+// session never change (database trigger).
+model CheckoutSession {
+  id                     String                @id @default(uuid())
+  subscriptionId         String
+  provider               String                @db.VarChar(50)
+  providerSessionId      String?               @db.VarChar(255)
+  providerCustomerId     String                @db.VarChar(255)
+  providerSubscriptionId String?               @db.VarChar(255)
+  status                 CheckoutSessionStatus @default(CREATING)
+  billingInterval        BillingInterval
+  amountCents            Int
+  currency               String                @default("USD") @db.Char(3)
+  // Hosted payment page; only returned while the checkout is OPEN.
+  url                    String?
+  expiresAt              DateTime
+  completedAt            DateTime?
+  // Set when the checkout becomes EXPIRED or FAILED, with a short code
+  // explaining why (e.g. REPLACED, PROVIDER_EXPIRED, ASYNC_PAYMENT_FAILED).
+  closedAt               DateTime?
+  closedReason           String?               @db.VarChar(100)
+  paymentId              String?               @unique
+  createdAt              DateTime              @default(now())
+  updatedAt              DateTime              @updatedAt
+
+  subscription UserSubscription    @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  payment      PaymentTransaction? @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+
+  @@unique([provider, providerSessionId])
+  @@index([subscriptionId, createdAt])
+  @@index([status, expiresAt])
 }

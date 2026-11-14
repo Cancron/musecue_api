@@ -16,7 +16,7 @@ The companion mobile application and detailed product specifications live in `..
 - BullMQ jobs for personalization, guide generation, visual checks, and guide questions
 - `AiRun` audit records containing operation, provider, model, prompt version, latency, progress, result/error, and status
 - a provider-neutral AI gateway with OpenRouter live mode, multimodal private-image input, strict structured output, runtime validation, bounded retries, and deterministic mock mode
-- a single Pro subscription plan: admin-configured monthly/yearly pricing and free trial, one-time trial activation, date-based Pro access through `ProAccessGuard`, and payment/lifecycle records protected by database rules; authenticated Stripe Checkout for the monthly/yearly options with a per-user Stripe customer, duplicate-checkout protection, and Pro access granted only by a signature-verified webhook (see "Subscriptions" under API). Renewals, cancellation and the billing portal are not implemented yet
+- a single Pro subscription plan: admin-configured monthly/yearly pricing and free trial, one-time trial activation, date-based Pro access through `ProAccessGuard`, payment/lifecycle records protected by database rules, and Stripe checkout for the monthly and yearly options with webhook-verified activation and automatic renewals (see "Subscriptions" and "Stripe checkout" under API); cancellation and refunds through Stripe are not implemented yet
 
 Migration `20260827174107_add_makeup_workflow` adds the makeup aggregate and removes the dormant job-tracker and subscription starter domains.
 
@@ -321,7 +321,7 @@ Each user has at most one `UserSubscription` record (migration `20260914120000_a
 
 Subscription history is permanent at the database level (migration `20260916120000_protect_subscription_history`, a trigger that Prisma does not model). Once a trial has started, its dates never change and `trialUsed` stays `true`. A paid term can be renewed or replaced but never cleared, and the record cannot be deleted while its user exists; deleting the user still cascades. As a result, no code path can re-open trial eligibility or extend a trial.
 
-Billing records for the future payment integration (migration `20260918120000_add_payments_and_subscription_events`; no checkout, webhooks or billing endpoints yet):
+Billing records (migration `20260918120000_add_payments_and_subscription_events`; written by the Stripe checkout described below):
 
 - `PaymentTransaction` records one charge attempt for one billing period. It stores the amount in cents, currency, status (`PENDING`, `SUCCEEDED`, `FAILED`, `PARTIALLY_REFUNDED`, `REFUNDED`), `provider` + `providerPaymentId`, the period, timestamps, and failure and refund details.
   - `(provider, providerPaymentId)` is unique, and only one verified payment may cover a given period.
@@ -330,51 +330,7 @@ Billing records for the future payment integration (migration `20260918120000_ad
 - `SubscriptionEvent` is an append-only lifecycle log: `TRIAL_STARTED`, `CREATED`, `RENEWED`, `CANCELED`, `EXPIRED`. `CREATED` and `RENEWED` reference the `SUCCEEDED` payment for the period, and each payment backs at most one event.
 - `UserSubscription` gains `paymentProvider` and `providerSubscriptionId` (unique together) to link the provider's recurring subscription.
 - A paid term (`proStartedAt`/`proExpiresAt`) can only be created or extended by a `SUCCEEDED` payment of the same subscription and interval that covers the newly granted range and ends exactly at `proExpiresAt`. A new term may not start before its paid period, and a renewal's period must start no later than the current expiry, so it cannot bridge an unpaid gap. Early renewals and monthly-to-yearly changes may overlap. Pending, failed and refunded payments never grant or renew Pro access. Cancelling keeps access until `proExpiresAt`.
-- A billing period ends exactly one calendar month or year after it starts, using PostgreSQL calendar arithmetic (migration `20260920120000_calendar_billing_periods_and_gap_free_terms`). Month-ends clamp: Jan 31 → Feb 28, or Feb 29 in a leap year. Feb 29 + 1 year → Feb 28. `src/subscription/billing.validation.ts` (`addBillingInterval`, `isValidBillingPeriod`, `getPaidTermRejection`, pricing and status-transition checks) applies the same rules for checkout and the webhook.
-
-#### Stripe checkout
-
-`POST /v1/subscription/checkout` (bearer token, body `{ "billingInterval": "MONTHLY" | "YEARLY" }`) starts, or reuses, a Stripe Checkout Session for the caller's chosen billing option and returns it:
-
-```json
-{
-  "billingInterval": "MONTHLY",
-  "amountCents": 1900,
-  "currency": "USD",
-  "url": "https://checkout.stripe.com/c/pay/cs_test_…",
-  "expiresAt": "2026-03-02T09:30:00.000Z",
-  "reused": false
-}
-```
-
-The response never grants Pro access by itself — redirect the user to `url` and wait for the webhook. Rejections:
-
-| Status | Message                                                                          |
-| ------ | --------------------------------------------------------------------------------- |
-| `403`  | `Only active accounts can start checkout` (status `ACTIVE`, verified email, not soft-deleted) |
-| `403`  | `The Pro plan is not currently available`                                         |
-| `409`  | `An active Pro subscription is already in place`                                  |
-| `409`  | `A checkout request is already being processed. Please try again in a moment.`    |
-
-Implementation (migration `20260922090000_add_stripe_checkout_sessions`, `src/subscription/checkout.service.ts`):
-
-- Every user gets at most one Stripe customer, stored on `UserSubscription.stripeCustomerId` (created on the user's first checkout attempt and reused afterwards; unique at the database level).
-- `CheckoutSession` tracks the attempt itself, separately from any payment it may produce: `provider` + `providerSessionId` (unique), `billingInterval`, the quoted `amountCents`/`currency`, `status` (`PENDING`, `COMPLETED`, `EXPIRED`, `CANCELED`), the hosted `url`, and `expiresAt`. Its identifying fields are immutable and its status only moves forward from `PENDING`, enforced by a database trigger mirroring `PaymentTransaction_protect`.
-- **Duplicate checkout requests are prevented in layers**: a per-user Redis lock serializes repeated or concurrent requests from the same user; a `PENDING` session for the *same* billing option is reused as-is while it is still valid; a `PENDING` session for a *different* option is expired (on Stripe and locally) before a new one is created; and a partial unique index, `CheckoutSession_one_pending_per_subscription` (`WHERE status = 'PENDING'`), rejects a second `PENDING` row at the database level even if the lock is somehow bypassed, so concurrent requests cannot create two valid sessions.
-- A user with an active paid Pro term cannot start another checkout (`409`); this is re-checked after expiring a superseded session, in case a webhook completed it in the meantime.
-
-#### Stripe webhook and Pro activation
-
-`POST /v1/subscription/stripe/webhook` is called by Stripe directly (no bearer token). Every request's `Stripe-Signature` header is verified against `STRIPE_WEBHOOK_SECRET` before anything is read from it (`src/subscription/stripe/stripe-client.service.ts`); an invalid signature is rejected with `400` and nothing is processed. This is the **only** way a checkout activates Pro access — a browser redirect to the success URL and a client reporting its own session id are both ignored; the API never reads `{CHECKOUT_SESSION_ID}` from a returning request.
-
-On a verified `checkout.session.completed` event with `payment_status: "paid"` (`src/subscription/stripe/stripe-webhook.service.ts`), in one transaction:
-
-1. The matching `CheckoutSession` is claimed with a conditional update (`PENDING` → `COMPLETED`); a re-delivered event, or one for a session that is no longer `PENDING`, is a no-op, so a duplicate webhook delivery cannot process the same payment twice.
-2. The charged amount and currency are checked against the session's quoted price; a mismatch rejects the whole transaction (no payment, no access) rather than trusting Stripe's response blindly.
-3. A `SUCCEEDED` `PaymentTransaction` is recorded for the period `[now, now + billingInterval)`, linked to the `CheckoutSession` — inserted before the subscription is updated, as the existing paid-term trigger requires.
-4. `UserSubscription` is updated to `PRO` with the new `proStartedAt`/`proExpiresAt`, `paymentProvider` and `providerSubscriptionId`, and a `CREATED` (or `RENEWED`, if a paid term already existed) `SubscriptionEvent` is written referencing the payment.
-
-Renewal webhooks (`invoice.payment_succeeded` and similar) are not implemented yet; this covers checkout and initial paid activation only.
+- A billing period is one calendar month or year as Stripe bills it (migration `20261114120000_stripe_anchored_billing_periods`, which replaces the exact rule of `20260920120000_calendar_billing_periods_and_gap_free_terms`). It either ends exactly one calendar interval after it starts (month-ends clamp: Jan 31 → Feb 28, or Feb 29 in a leap year; Feb 29 + 1 year → Feb 28), or it is anchored on a day the start month lacks. Stripe bills a subscription started on Jan 31 on Feb 28, then Mar 31, so Feb 28 → Mar 31 is valid. Such a period starts on its month's last day and ends later in the next month (next year for yearly) at the same time of day. Periods like Mar 1 → Mar 29 or Jan 31 → Mar 3 are still rejected. `src/subscription/billing.validation.ts` (`addBillingInterval`, `isValidBillingPeriod`, `getPaidTermRejection`, pricing and status-transition checks) applies the same rules in the application.
 
 `GET /v1/subscription` (bearer token) returns the caller's own subscription. The user comes only from the access token; query parameters cannot select another user. `status` is evaluated at request time from the stored dates, not the stored `status` column. Expiry therefore needs no background job, and reads never rewrite the record or its trial history.
 
@@ -411,13 +367,89 @@ handler(@Req() req: ProAccessRequest) { /* req.proAccess: status, accessSource, 
 
 The guard delegates to `SubscriptionAccessService`, the single Pro access decision. An active free trial and an active paid term unlock the same features, each within its own `[startedAt, expiresAt)` window. Without access, the guard returns `403` with `An active Pro subscription or free trial is required` and the handler does not run. Requests that did not pass `AuthGuard` are rejected with `401`, and lookup errors never grant access. No makeup endpoint uses the guard yet.
 
-Database tests (`test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`, `test/stripe-checkout.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
+### Stripe checkout
 
-```bash
-TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json test/subscription-plan test/user-subscription test/subscription-trial test/subscription-status test/pro-access test/trial-lifecycle test/billing test/subscription-security test/stripe-checkout
+| Method | Route                       | Auth                      | Purpose                                            |
+| ------ | --------------------------- | ------------------------- | -------------------------------------------------- |
+| `POST` | `/v1/subscription/checkout` | bearer token              | Start (or reuse) a hosted Stripe checkout for Pro  |
+| `POST` | `/v1/webhooks/stripe`       | `Stripe-Signature` header | Stripe events; the only way paid Pro is granted    |
+
+`POST /v1/subscription/checkout` accepts exactly `{ "billingInterval": "MONTHLY" }` or `{ "billingInterval": "YEARLY" }`. Any other value, `null`, lowercase values and extra fields (a price, currency, user ID or "paid" flag) are rejected with `400`. The user comes from the access token, and the price from the plan configuration (`monthlyPriceUsdCents` / `yearlyPriceUsdCents`) at the moment the checkout is created. The response (`201`) is:
+
+```json
+{
+  "checkoutSessionId": "6f0c…",
+  "provider": "stripe",
+  "status": "OPEN",
+  "billingInterval": "MONTHLY",
+  "amountCents": 1900,
+  "currency": "USD",
+  "url": "https://checkout.stripe.com/c/pay/cs_…",
+  "expiresAt": "2026-11-13T13:00:00.000Z",
+  "reused": false
+}
 ```
 
-Stripe-specific unit tests (checkout and the webhook; the Stripe SDK itself is always mocked) live under `src/subscription/` and `src/subscription/stripe/` with `stripe` in every file name, so they can be run on their own:
+The app opens `url`. Returning to the success URL does not activate anything: the app should poll `GET /v1/subscription` until `status` is `PRO`.
+
+Rules:
+
+- Every user has their own Stripe customer (`PaymentCustomer`), created on the first checkout and reused afterwards. It is unique per user, and a Stripe customer belongs to exactly one user.
+- Users with an active paid term, including a canceled term that has not expired, receive `409 You already have an active Pro subscription`. Trial users and users whose paid term expired can buy.
+- A user has at most one pending checkout (a partial unique index on `CheckoutSession`). Repeating the request for the same option returns the same checkout with `reused: true`, as long as Stripe confirms it is still open, however little time it has left. It keeps the price it was created with: an admin price change applies only to checkouts created afterwards. Choosing the other option first expires the open Stripe session and creates the new one only after Stripe has confirmed the expiration. If the expiration cannot be confirmed, nothing new is created and the old checkout stays pending. This covers Stripe being unreachable, an error, a lost response and a result other than `expired`. The response is `503 The previous checkout could not be closed; please try again shortly`, or `409` when Stripe shows the old session was just paid or expired by a concurrent request. A later request replaces the old checkout once Stripe reports it expired. The old checkout is closed in the same transaction that creates its replacement.
+- Concurrent requests are serialized by the user's `UserSubscription` row lock, which is held only for short database work, never during Stripe calls. Stripe objects are created with idempotency keys derived from the user or the checkout, so concurrent or retried requests get the same Stripe customer and session. At most one payable session exists per user.
+- If the user paid but the webhook has not arrived yet, new checkouts receive `409 Your previous checkout payment is still being processed` and nothing is granted.
+- Stripe failures return `503`. A checkout whose creation may have reached Stripe (timeout, network or server error) is kept and recovered through the same idempotency key on the next request. A definitive rejection marks it `FAILED`.
+
+Other responses: `403` for inactive, unverified or soft-deleted accounts and while the plan is disabled, and `503 Payments are not configured` until the Stripe settings below are present.
+
+Activation happens only in `POST /v1/webhooks/stripe`. The endpoint has no bearer token and is excluded from rate limiting. Each event is verified against the raw request body and the `Stripe-Signature` header, with Stripe's 5-minute replay tolerance; an invalid signature returns `400`. The API then re-reads the session, its subscription and its first invoice from the Stripe API, never trusting the event payload. It grants Pro only if all of these match the stored checkout:
+
+- the session is complete with `payment_status = paid`, for the user's own customer;
+- the subscription has exactly one item at the stored price and interval;
+- the first invoice (`subscription_create`) is paid in full in USD.
+
+One transaction then records the `SUCCEEDED` `PaymentTransaction` (provider `stripe`, invoice ID, amount, currency, interval, and the billing period exactly as Stripe reports it), sets the paid term and the Stripe subscription link on `UserSubscription`, appends a `CREATED` `SubscriptionEvent`, completes the checkout and writes an audit record. The existing database trigger independently checks that the payment covers the term. Replayed or concurrent deliveries record the payment once.
+
+A payment that fails verification is logged and acknowledged, and access is not granted. A payment that arrives while another paid term is active is recorded but never stacks a second term; it is logged as needing a refund.
+
+#### Automatic renewals
+
+Stripe charges the subscription at the end of each period. The API extends Pro only when it receives `invoice.paid` for a `subscription_cycle` invoice, re-reads the invoice and subscription from the Stripe API, and verifies all of the following:
+
+- the invoice belongs to the Stripe subscription bought through MuseCue and to the user's own customer;
+- it is `paid`, in full, in USD, at the price the subscription was bought for (admin price changes do not apply to existing subscriptions);
+- the subscription still has one item at that price and interval;
+- the invoice covers a valid billing period.
+
+One transaction under the user's row lock then records the `SUCCEEDED` `PaymentTransaction` (invoice ID and the period dates Stripe reports), extends `proExpiresAt` to the period end, appends a `RENEWED` `SubscriptionEvent` and writes an audit record. The trial fields and `proStartedAt` of a running term are never changed, and the database trigger again checks that the payment covers the extension.
+
+- Until the payment is confirmed nothing changes. A failed or open invoice grants nothing, and access ends at `proExpiresAt`. When a late payment arrives, the term is extended from its old expiry.
+- The invoice ID identifies the payment, so repeated, concurrent or delayed deliveries record it once. They never create a second renewal event or overwrite the subscription. A replay makes no Stripe API call.
+- A delayed event for an older period that the term already covers is recorded in the payment history, but never shortens or moves the term.
+- A renewal arriving after a gap (a period starting after `proExpiresAt`) starts a new term at the period Stripe reports.
+- `invoice.paid` for the first invoice (`subscription_create`) is ignored, because its checkout session already recorded it.
+- A second charge for an already paid period is not recorded, and a renewal of a duplicate Stripe subscription never extends access. Both are logged at error level for a refund.
+
+Handled events: `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `checkout.session.async_payment_failed`, `checkout.session.expired`, `invoice.paid`. Other events are acknowledged and ignored. Transient failures return `5xx`, so Stripe retries.
+
+Configuration (`.env.example`): `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_CHECKOUT_SUCCESS_URL`, `STRIPE_CHECKOUT_CANCEL_URL` (absolute http(s) URLs), optional `STRIPE_PRO_PRODUCT_ID`, and `STRIPE_CHECKOUT_EXPIRES_MINUTES` (31–1440, default 60). In the Stripe dashboard, create a webhook endpoint for `https://<api>/v1/webhooks/stripe` with the five events above. For local development, forward events with the Stripe CLI and use the printed signing secret:
+
+```bash
+stripe listen --events checkout.session.completed,checkout.session.async_payment_succeeded,checkout.session.async_payment_failed,checkout.session.expired,invoice.paid --forward-to localhost:5000/v1/webhooks/stripe
+```
+
+Migration `20261113120000_add_stripe_checkout` adds `PaymentCustomer` and `CheckoutSession`. Database rules enforce one pending checkout per user, forward-only checkout status, an immutable price, interval, customer and provider session, and completion only by a `SUCCEEDED` payment of the same subscription. The webhook needs the raw body, so `main.ts` creates the app with `rawBody: true`.
+
+Not implemented yet: cancellation and the customer portal, refunds and disputes, dunning notifications for failed renewals, and automatic refunds or cancellation of duplicate payments and subscriptions. Renewal delays within Stripe's retry window (up to 3 days) are handled. If a renewal for an older period arrives after a newer one, the older period is recorded but cannot be merged into the term: the database allows one payment per term change.
+
+Database tests (`test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`, `test/stripe-checkout.e2e-spec.ts`, `test/stripe-renewal.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
+
+```bash
+TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json test/subscription-plan test/user-subscription test/subscription-trial test/subscription-status test/pro-access test/trial-lifecycle test/billing test/subscription-security test/stripe-checkout test/stripe-renewal
+```
+
+The Stripe unit tests do not need a database or a Stripe account; they run the real Stripe SDK against an in-memory emulation of the few Stripe endpoints used (`test/support/fake-stripe-api.ts`):
 
 ```bash
 npm test -- --runInBand stripe
@@ -428,6 +460,7 @@ npm test -- --runInBand stripe
 
 ```text
 authUser
+|-- PaymentCustomer (0..1 per provider)
 |-- UserSubscription (0..1)
 `-- MakeupSession
     |-- ImageAsset

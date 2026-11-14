@@ -173,9 +173,14 @@ enum SubscriptionEventType {
   EXPIRED
 }
 
+// One hosted checkout attempt with the payment provider. CREATING, OPEN and
+// PROCESSING are pending: a user has at most one pending checkout (partial
+// unique index). COMPLETED, EXPIRED and FAILED are terminal.
 enum CheckoutSessionStatus {
-  PENDING
+  CREATING
+  OPEN
+  PROCESSING
   COMPLETED
   EXPIRED
-  CANCELED
+  FAILED
 }

@@ -125,6 +125,12 @@ export function isTrialAccountEligible(account: TrialAccount | null): boolean {
   );
 }
 
+/**
+ * Buying Pro uses the same account rule as the trial: an ACTIVE, verified,
+ * not soft-deleted account.
+ */
+export const isPurchaseAccountEligible = isTrialAccountEligible;
+
 export type TrialIneligibilityReason =
   | 'PLAN_DISABLED'
   | 'TRIAL_DISABLED'

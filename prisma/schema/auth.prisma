@@ -26,6 +26,7 @@ model authUser {
   makeupSessions    MakeupSession[]
   aiRuns            AiRun[]
   subscription      UserSubscription?
+  paymentCustomers  PaymentCustomer[]
 
   @@index([email, id, providerId])
   @@index([username])

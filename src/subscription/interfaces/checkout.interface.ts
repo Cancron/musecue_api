@@ -1,16 +1,18 @@
 import type { BillingInterval } from '@prisma/client';
 
-/** The caller-facing result of starting (or reusing) a Pro checkout. */
+/** A payable hosted checkout returned to the authenticated user. */
 export interface CheckoutSessionView {
+  /** MuseCue checkout id (not the provider's session id). */
+  checkoutSessionId: string;
+  provider: 'stripe';
+  status: 'OPEN';
   billingInterval: BillingInterval;
+  /** Price fixed from the backend plan configuration when created. */
   amountCents: number;
-  currency: string;
-  /** The Stripe-hosted checkout page to redirect the user to. */
+  currency: 'USD';
+  /** Stripe-hosted payment page. Completing it does not grant access by itself. */
   url: string;
   expiresAt: string;
-  /**
-   * True when an existing pending session for the same billing option was
-   * returned instead of creating a new one.
-   */
+  /** True when an existing pending checkout for the same option was returned. */
   reused: boolean;
 }

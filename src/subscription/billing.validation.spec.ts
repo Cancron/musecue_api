@@ -137,6 +137,84 @@ describe('billing periods', () => {
     expect(isValidBillingPeriod(utc(start), utc(end), interval)).toBe(true);
   });
 
+  // Stripe anchors a subscription to its original billing day, so a period
+  // that starts on a short month's last day can end later in the next month.
+  it.each([
+    [
+      'Feb 28 -> Mar 31 (anchored on the 31st)',
+      '2026-02-28T10:00:00.000',
+      '2026-03-31T10:00:00.000',
+      MONTHLY,
+    ],
+    [
+      'Feb 28 -> Mar 30 (anchored on the 30th)',
+      '2026-02-28T10:00:00.000',
+      '2026-03-30T10:00:00.000',
+      MONTHLY,
+    ],
+    [
+      'Apr 30 -> May 31 (anchored on the 31st)',
+      '2026-04-30T23:59:59.000',
+      '2026-05-31T23:59:59.000',
+      MONTHLY,
+    ],
+    [
+      'Feb 29 -> Mar 31 (leap year, anchored on the 31st)',
+      '2028-02-29T00:00:00.000',
+      '2028-03-31T00:00:00.000',
+      MONTHLY,
+    ],
+    [
+      'Feb 28, 2027 -> Feb 29, 2028 (anchored on a leap day)',
+      '2027-02-28T12:00:00.000',
+      '2028-02-29T12:00:00.000',
+      YEARLY,
+    ],
+  ])('accepts the Stripe anchored period %s', (_case, start, end, interval) => {
+    expect(isValidBillingPeriod(utc(start), utc(end), interval)).toBe(true);
+  });
+
+  it.each([
+    [
+      'an anchored period at another time of day',
+      '2026-02-28T10:00:00.000',
+      '2026-03-31T10:00:01.000',
+      MONTHLY,
+    ],
+    [
+      'an anchored period that skips a month',
+      '2026-02-28T10:00:00.000',
+      '2026-04-30T10:00:00.000',
+      MONTHLY,
+    ],
+    [
+      'a later end when the start is not a month end',
+      '2026-02-27T10:00:00.000',
+      '2026-03-28T10:00:00.000',
+      MONTHLY,
+    ],
+    [
+      'Jul 30 -> Aug 31 (Jul 30 is not the last day of July)',
+      '2026-07-30T10:00:00.000',
+      '2026-08-31T10:00:00.000',
+      MONTHLY,
+    ],
+    [
+      'a yearly period anchored into March',
+      '2027-02-28T12:00:00.000',
+      '2028-03-01T12:00:00.000',
+      YEARLY,
+    ],
+    [
+      'a monthly-length yearly period',
+      '2026-02-28T10:00:00.000',
+      '2026-03-31T10:00:00.000',
+      YEARLY,
+    ],
+  ])('still rejects %s', (_case, start, end, interval) => {
+    expect(isValidBillingPeriod(utc(start), utc(end), interval)).toBe(false);
+  });
+
   it('rejects a period that ends before it starts', () => {
     const start = utc('2026-05-01T00:00:00.000');
     expect(

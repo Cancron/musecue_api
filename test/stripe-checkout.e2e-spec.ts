@@ -1,405 +1,605 @@
-import { PrismaPg } from '@prisma/adapter-pg';
+import { INestApplication } from '@nestjs/common';
 import {
   BillingInterval,
-  CheckoutSessionStatus,
-  PaymentStatus,
+  Prisma,
   PrismaClient,
-  SubscriptionStatus,
+  userStatus,
 } from '@prisma/client';
-import { mock } from 'jest-mock-extended';
-import { ActivityLogService } from '../src/common/services/activity-log.service';
-import type { CustomLoggerService } from '../src/common/services/custom-logger.service';
-import type { PrismaService } from '../src/common/services/prisma.service';
-import type { RedisService } from '../src/common/services/redis.service';
+import request from 'supertest';
+import type { App } from 'supertest/types';
 import { addBillingInterval } from '../src/subscription/billing.validation';
-import { CheckoutService } from '../src/subscription/checkout.service';
-import { StripeClientService } from '../src/subscription/stripe/stripe-client.service';
-import { StripeWebhookService } from '../src/subscription/stripe/stripe-webhook.service';
-import { SubscriptionPlanService } from '../src/subscription/subscription-plan.service';
+import { FakeStripeApi } from './support/fake-stripe-api';
+import { describeWithDatabase } from './support/migrated-schema';
 import {
-  TEST_DATABASE_URL,
-  applyMigrations,
-  createSchema,
-  describeWithDatabase,
-  dropSchema,
-  migrationNames,
-} from './support/migrated-schema';
-import { createUser } from './support/subscription-fixtures';
+  createStripeTestApp,
+  dataOf,
+  type StripeTestApp,
+} from './support/stripe-test-app';
+import {
+  createUser,
+  givenPaidProHistory,
+} from './support/subscription-fixtures';
 
 jest.setTimeout(120_000);
 
-const { MONTHLY, YEARLY } = BillingInterval;
-
 /**
- * Authenticated Stripe checkout and its webhook activation against a real
- * PostgreSQL database, exercising the migration added in
- * 20260922090000_add_stripe_checkout_sessions and the existing paid-term
- * trigger from 20260918120000/20260920120000. The Stripe SDK itself is
- * mocked; everything downstream of it (Prisma, the new tables, and the
- * database triggers) is real.
+ * Stripe checkout end to end: the real Nest HTTP stack, services, Prisma and
+ * migrated PostgreSQL schema (row locks, partial unique index, triggers),
+ * with Stripe replaced by FakeStripeApi behind the real Stripe SDK.
  */
-describeWithDatabase(
-  'Stripe checkout and webhook activation (PostgreSQL)',
-  () => {
-    let schema: string;
-    let client: PrismaClient;
-    let prisma: PrismaService;
-    let checkout: CheckoutService;
-    let webhook: StripeWebhookService;
-    let stripe: ReturnType<typeof mock<StripeClientService>>;
-    const redis = mock<RedisService>();
+describeWithDatabase('Stripe checkout (PostgreSQL, HTTP)', () => {
+  let harness: StripeTestApp;
+  let client: PrismaClient;
+  let app: INestApplication<App>;
+  let api: FakeStripeApi;
 
-    const T0 = new Date('2026-03-01T09:30:00.000Z');
-    const meta = { ip: '127.0.0.1', userAgent: 'jest' };
+  beforeAll(async () => {
+    harness = await createStripeTestApp();
+    client = harness.client;
+    app = harness.app;
+  });
 
-    let sessionCounter = 0;
-    const stubStripeSession = (overrides: Record<string, unknown> = {}) => {
-      sessionCounter += 1;
-      return {
-        id: `cs_test_${sessionCounter}`,
-        url: `https://checkout.stripe.com/c/pay/cs_test_${sessionCounter}`,
-        expires_at: Math.floor(T0.getTime() / 1000) + 24 * 60 * 60,
-        ...overrides,
-      };
-    };
+  afterAll(async () => {
+    await harness?.close();
+  });
 
-    let customerCounter = 0;
-    // Real Stripe customer ids are unique; a fixed stub value across tests
-    // would collide against UserSubscription.stripeCustomerId's unique
-    // constraint for different users, which share this test database.
-    const stubCustomerId = () => {
-      customerCounter += 1;
-      return `cus_test_${customerCounter}`;
-    };
+  beforeEach(() => {
+    api = new FakeStripeApi(5);
+    harness.stripe.api = api;
+  });
 
-    beforeAll(async () => {
-      schema = await createSchema();
-      await applyMigrations(schema, migrationNames());
+  const startCheckout = (userId: string, billingInterval: string) =>
+    harness.startCheckout(userId, billingInterval);
+  const status = (userId: string) => harness.status(userId);
+  const sendWebhook = (type: string, sessionId: string) => {
+    const { payload, signature } = api.signedEvent(type, sessionId);
+    return harness.sendWebhook(payload, signature);
+  };
 
-      client = new PrismaClient({
-        adapter: new PrismaPg(
-          { connectionString: TEST_DATABASE_URL as string },
-          { schema },
-        ),
+  const checkoutsOf = async (userId: string) =>
+    client.checkoutSession.findMany({
+      where: { subscription: { authId: userId } },
+      orderBy: { createdAt: 'asc' },
+    });
+  const providerSessionOf = async (checkoutSessionId: string) =>
+    (
+      await client.checkoutSession.findUniqueOrThrow({
+        where: { id: checkoutSessionId },
+      })
+    ).providerSessionId as string;
+
+  describe('purchase', () => {
+    it('grants Pro only after the signed, verified webhook', async () => {
+      const userId = await createUser(client);
+
+      const started = await startCheckout(userId, 'MONTHLY').expect(201);
+      const view = dataOf(started);
+      expect(view).toMatchObject({
+        provider: 'stripe',
+        status: 'OPEN',
+        billingInterval: 'MONTHLY',
+        amountCents: 1900,
+        currency: 'USD',
+        reused: false,
       });
-      prisma = client as unknown as PrismaService;
-    });
+      const sessionId = await providerSessionOf(view.checkoutSessionId);
 
-    afterAll(async () => {
-      await client?.$disconnect();
-      if (schema) await dropSchema(schema);
-    });
+      // The user pays and the browser returns to the success URL.
+      const periodStart = new Date();
+      periodStart.setUTCMilliseconds(0);
+      api.completeSession(sessionId, { periodStart });
+      await expect(status(userId)).resolves.toMatchObject({
+        status: 'FREE',
+        hasProAccess: false,
+      });
 
-    beforeEach(() => {
-      redis.setNX.mockReset().mockResolvedValue(true);
-      redis.del.mockReset().mockResolvedValue(1);
-      stripe = mock<StripeClientService>();
-      const activityLog = new ActivityLogService(
-        prisma,
-        mock<CustomLoggerService>(),
+      // An unsigned "payment succeeded" call changes nothing.
+      await request(app.getHttpServer())
+        .post('/v1/webhooks/stripe')
+        .set('Content-Type', 'application/json')
+        .send(api.signedEvent('checkout.session.completed', sessionId).payload)
+        .expect(400);
+      await expect(status(userId)).resolves.toMatchObject({
+        hasProAccess: false,
+      });
+
+      await sendWebhook('checkout.session.completed', sessionId).expect(200);
+
+      const periodEnd = addBillingInterval(
+        periodStart,
+        BillingInterval.MONTHLY,
       );
-      const plans = new SubscriptionPlanService(prisma, activityLog);
-      checkout = new CheckoutService(prisma, plans, stripe, activityLog, redis);
-      webhook = new StripeWebhookService(
-        prisma,
-        stripe,
-        activityLog,
-        mock<CustomLoggerService>(),
-      );
-    });
-
-    const newUser = () => createUser(client);
-
-    describe('starting checkout', () => {
-      it('persists a PENDING CheckoutSession with the plan’s current monthly price', async () => {
-        const authId = await newUser();
-        const customerId = stubCustomerId();
-        stripe.createCustomer.mockResolvedValue({ id: customerId } as never);
-        stripe.createCheckoutSession.mockResolvedValue(
-          stubStripeSession() as never,
-        );
-
-        const result = await checkout.startCheckout(authId, MONTHLY, meta, T0);
-
-        expect(result).toMatchObject({
-          billingInterval: MONTHLY,
-          amountCents: 1900,
-          currency: 'USD',
-          reused: false,
-        });
-
-        const subscription = await client.userSubscription.findUniqueOrThrow({
-          where: { authId },
-          include: { checkoutSessions: true },
-        });
-        expect(subscription.stripeCustomerId).toBe(customerId);
-        expect(subscription.checkoutSessions).toHaveLength(1);
-        expect(subscription.checkoutSessions[0]).toMatchObject({
-          status: CheckoutSessionStatus.PENDING,
-          billingInterval: MONTHLY,
-          amountCents: 1900,
-        });
-      });
-
-      it('reuses the pending session on a repeated request for the same option', async () => {
-        const authId = await newUser();
-        stripe.createCustomer.mockResolvedValue({
-          id: stubCustomerId(),
-        } as never);
-        stripe.createCheckoutSession.mockResolvedValue(
-          stubStripeSession() as never,
-        );
-
-        const first = await checkout.startCheckout(authId, MONTHLY, meta, T0);
-        const second = await checkout.startCheckout(authId, MONTHLY, meta, T0);
-
-        expect(second).toMatchObject({ url: first.url, reused: true });
-        expect(stripe.createCheckoutSession.mock.calls).toHaveLength(1);
-
-        const subscription = await client.userSubscription.findUniqueOrThrow({
-          where: { authId },
-          include: { checkoutSessions: true },
-        });
-        expect(subscription.checkoutSessions).toHaveLength(1);
-      });
-
-      it('expires the old session and creates a new one when the billing option changes', async () => {
-        const authId = await newUser();
-        stripe.createCustomer.mockResolvedValue({
-          id: stubCustomerId(),
-        } as never);
-        stripe.createCheckoutSession
-          .mockResolvedValueOnce(stubStripeSession() as never)
-          .mockResolvedValueOnce(stubStripeSession() as never);
-
-        await checkout.startCheckout(authId, MONTHLY, meta, T0);
-        await checkout.startCheckout(authId, YEARLY, meta, T0);
-
-        expect(stripe.expireCheckoutSession.mock.calls).toHaveLength(1);
-
-        const subscription = await client.userSubscription.findUniqueOrThrow({
-          where: { authId },
-          include: { checkoutSessions: { orderBy: { createdAt: 'asc' } } },
-        });
-        expect(subscription.checkoutSessions).toHaveLength(2);
-        expect(subscription.checkoutSessions[0]).toMatchObject({
-          billingInterval: MONTHLY,
-          status: CheckoutSessionStatus.EXPIRED,
-        });
-        expect(subscription.checkoutSessions[1]).toMatchObject({
-          billingInterval: YEARLY,
-          status: CheckoutSessionStatus.PENDING,
-        });
-      });
-
-      it('the database rejects a second PENDING session even if application code is bypassed', async () => {
-        const authId = await newUser();
-        stripe.createCustomer.mockResolvedValue({
-          id: stubCustomerId(),
-        } as never);
-        stripe.createCheckoutSession.mockResolvedValue(
-          stubStripeSession() as never,
-        );
-        await checkout.startCheckout(authId, MONTHLY, meta, T0);
-
-        const subscription = await client.userSubscription.findUniqueOrThrow({
-          where: { authId },
-        });
-
-        await expect(
-          client.checkoutSession.create({
-            data: {
-              subscriptionId: subscription.id,
-              provider: 'stripe',
-              providerSessionId: 'cs_test_bypass',
-              billingInterval: YEARLY,
-              amountCents: 19000,
-              currency: 'USD',
-              url: 'https://checkout.stripe.com/c/pay/cs_test_bypass',
-              expiresAt: addBillingInterval(T0, MONTHLY),
-            },
-          }),
-        ).rejects.toThrow();
-      });
-
-      it('rejects starting checkout for a user with an active paid Pro term', async () => {
-        const authId = await newUser();
-        await client.userSubscription.create({ data: { authId } });
-        const subscription = await client.userSubscription.findUniqueOrThrow({
-          where: { authId },
-        });
-        await client.paymentTransaction.create({
-          data: {
-            subscriptionId: subscription.id,
-            provider: 'stripe',
-            providerPaymentId: 'pi_existing',
-            status: PaymentStatus.SUCCEEDED,
-            amountCents: 1900,
-            billingInterval: MONTHLY,
-            periodStart: T0,
-            periodEnd: addBillingInterval(T0, MONTHLY),
-            paidAt: T0,
-          },
-        });
-        await client.userSubscription.update({
-          where: { authId },
-          data: {
-            status: SubscriptionStatus.PRO,
-            billingInterval: MONTHLY,
-            proStartedAt: T0,
-            proExpiresAt: addBillingInterval(T0, MONTHLY),
-          },
-        });
-
-        await expect(
-          checkout.startCheckout(authId, MONTHLY, meta, T0),
-        ).rejects.toMatchObject({ status: 409 });
-        expect(stripe.createCheckoutSession.mock.calls).toHaveLength(0);
-      });
-    });
-
-    describe('webhook activation', () => {
-      const completedEvent = (
-        authId: string,
-        providerSessionId: string,
-        overrides: Record<string, unknown> = {},
-      ) => ({
-        id: `evt_${providerSessionId}`,
-        type: 'checkout.session.completed',
-        data: {
-          object: {
-            id: providerSessionId,
-            payment_status: 'paid',
-            payment_intent: `pi_${providerSessionId}`,
-            invoice: null,
-            subscription: `sub_${providerSessionId}`,
-            amount_total: 1900,
-            currency: 'usd',
-            ...overrides,
-          },
+      await expect(status(userId)).resolves.toMatchObject({
+        status: 'PRO',
+        hasProAccess: true,
+        accessSource: 'PRO',
+        accessExpiresAt: periodEnd.toISOString(),
+        pro: {
+          active: true,
+          billingInterval: 'MONTHLY',
+          startedAt: periodStart.toISOString(),
+          expiresAt: periodEnd.toISOString(),
         },
       });
 
-      it('grants Pro access only after the webhook verifies payment, never at checkout time', async () => {
-        const authId = await newUser();
-        stripe.createCustomer.mockResolvedValue({
-          id: stubCustomerId(),
-        } as never);
-        const stripeSession = stubStripeSession();
-        stripe.createCheckoutSession.mockResolvedValue(stripeSession as never);
-
-        await checkout.startCheckout(authId, MONTHLY, meta, T0);
-
-        const beforeWebhook = await client.userSubscription.findUniqueOrThrow({
-          where: { authId },
-        });
-        expect(beforeWebhook.status).toBe(SubscriptionStatus.FREE);
-        expect(beforeWebhook.proStartedAt).toBeNull();
-
-        stripe.constructWebhookEvent.mockReturnValue(
-          completedEvent(authId, stripeSession.id) as never,
-        );
-        await webhook.handleWebhook(Buffer.from('{}'), 'sig_1', T0);
-
-        const afterWebhook = await client.userSubscription.findUniqueOrThrow({
-          where: { authId },
-          include: { payments: true, events: true, checkoutSessions: true },
-        });
-        expect(afterWebhook.status).toBe(SubscriptionStatus.PRO);
-        expect(afterWebhook.proStartedAt).toEqual(T0);
-        expect(afterWebhook.proExpiresAt).toEqual(
-          addBillingInterval(T0, MONTHLY),
-        );
-        expect(afterWebhook.paymentProvider).toBe('stripe');
-        expect(afterWebhook.providerSubscriptionId).toBe(
-          `sub_${stripeSession.id}`,
-        );
-
-        expect(afterWebhook.payments).toHaveLength(1);
-        expect(afterWebhook.payments[0]).toMatchObject({
-          status: PaymentStatus.SUCCEEDED,
-          providerPaymentId: `pi_${stripeSession.id}`,
+      const record = await client.userSubscription.findUniqueOrThrow({
+        where: { authId: userId },
+        include: { payments: true, events: true, checkoutSessions: true },
+      });
+      const stripeSession = api.sessions.get(sessionId) as Record<
+        string,
+        string
+      >;
+      expect(record).toMatchObject({
+        paymentProvider: 'stripe',
+        providerSubscriptionId: stripeSession.subscription,
+      });
+      expect(record.payments).toEqual([
+        expect.objectContaining({
+          provider: 'stripe',
+          providerPaymentId: stripeSession.invoice,
+          status: 'SUCCEEDED',
           amountCents: 1900,
-        });
-        expect(afterWebhook.events).toHaveLength(1);
-        expect(afterWebhook.events[0]).toMatchObject({ type: 'CREATED' });
-        expect(afterWebhook.checkoutSessions[0]).toMatchObject({
-          status: CheckoutSessionStatus.COMPLETED,
-        });
+          currency: 'USD',
+          periodStart,
+          periodEnd,
+        }),
+      ]);
+      expect(record.events).toEqual([
+        expect.objectContaining({
+          type: 'CREATED',
+          paymentId: record.payments[0].id,
+        }),
+      ]);
+      expect(record.checkoutSessions).toEqual([
+        expect.objectContaining({
+          status: 'COMPLETED',
+          paymentId: record.payments[0].id,
+        }),
+      ]);
+      await expect(
+        client.paymentCustomer.findMany({ where: { authId: userId } }),
+      ).resolves.toEqual([
+        expect.objectContaining({
+          provider: 'stripe',
+          providerCustomerId: stripeSession.customer,
+        }),
+      ]);
+      const audit = await client.activityLogEvent.findMany({
+        where: { tableName: 'UserSubscription', recordId: record.id },
       });
+      expect(audit).toEqual([
+        expect.objectContaining({
+          action: 'update',
+          actionedBy: null,
+          userAgent: expect.stringContaining('Stripe') as string,
+        }),
+      ]);
 
-      it('never activates from a browser redirect or a client-supplied session id, only from a verified webhook', async () => {
-        const authId = await newUser();
-        stripe.createCustomer.mockResolvedValue({
-          id: stubCustomerId(),
-        } as never);
-        const stripeSession = stubStripeSession();
-        stripe.createCheckoutSession.mockResolvedValue(stripeSession as never);
-        await checkout.startCheckout(authId, MONTHLY, meta, T0);
+      // A paid subscriber cannot start another checkout.
+      for (const interval of ['MONTHLY', 'YEARLY']) {
+        await startCheckout(userId, interval).expect(409);
+      }
+    });
 
-        // Simulate the only "client-facing" surface: re-requesting the same
-        // checkout (as a returning browser might) and reading the status
-        // endpoint's underlying data. Neither does anything but read/reuse.
-        await checkout.startCheckout(authId, MONTHLY, meta, T0);
+    it('activates a yearly purchase with a calendar period the database accepts', async () => {
+      const userId = await createUser(client);
+      const view = dataOf(await startCheckout(userId, 'YEARLY').expect(201));
+      const sessionId = await providerSessionOf(view.checkoutSessionId);
+      // A leap day start: Feb 29 + 1 year clamps to Feb 28.
+      const periodStart = new Date('2024-02-29T08:15:00.000Z');
+      api.completeSession(sessionId, { periodStart });
 
-        const record = await client.userSubscription.findUniqueOrThrow({
-          where: { authId },
-        });
-        expect(record.status).toBe(SubscriptionStatus.FREE);
-        expect(record.proStartedAt).toBeNull();
-      });
+      await sendWebhook('checkout.session.completed', sessionId).expect(200);
 
-      it('is idempotent under a duplicate webhook delivery for the same event', async () => {
-        const authId = await newUser();
-        stripe.createCustomer.mockResolvedValue({
-          id: stubCustomerId(),
-        } as never);
-        const stripeSession = stubStripeSession();
-        stripe.createCheckoutSession.mockResolvedValue(stripeSession as never);
-        await checkout.startCheckout(authId, MONTHLY, meta, T0);
-
-        stripe.constructWebhookEvent.mockReturnValue(
-          completedEvent(authId, stripeSession.id) as never,
-        );
-        await webhook.handleWebhook(Buffer.from('{}'), 'sig_1', T0);
-        await webhook.handleWebhook(Buffer.from('{}'), 'sig_1', T0);
-
-        const payments = await client.paymentTransaction.findMany({
-          where: { providerPaymentId: `pi_${stripeSession.id}` },
-        });
-        expect(payments).toHaveLength(1);
-      });
-
-      it('rolls back everything when the charged amount does not match the quote', async () => {
-        const authId = await newUser();
-        stripe.createCustomer.mockResolvedValue({
-          id: stubCustomerId(),
-        } as never);
-        const stripeSession = stubStripeSession();
-        stripe.createCheckoutSession.mockResolvedValue(stripeSession as never);
-        await checkout.startCheckout(authId, MONTHLY, meta, T0);
-
-        stripe.constructWebhookEvent.mockReturnValue(
-          completedEvent(authId, stripeSession.id, {
-            amount_total: 1,
-          }) as never,
-        );
-        await expect(
-          webhook.handleWebhook(Buffer.from('{}'), 'sig_1', T0),
-        ).rejects.toMatchObject({ status: 409 });
-
-        const record = await client.userSubscription.findUniqueOrThrow({
-          where: { authId },
-          include: { payments: true, checkoutSessions: true },
-        });
-        expect(record.status).toBe(SubscriptionStatus.FREE);
-        expect(record.payments).toHaveLength(0);
-        // The session is still PENDING: the (failed) transaction rolled the
-        // COMPLETED claim back too.
-        expect(record.checkoutSessions[0]?.status).toBe(
-          CheckoutSessionStatus.PENDING,
-        );
+      await expect(
+        client.userSubscription.findUniqueOrThrow({
+          where: { authId: userId },
+        }),
+      ).resolves.toMatchObject({
+        billingInterval: 'YEARLY',
+        proStartedAt: periodStart,
+        proExpiresAt: new Date('2025-02-28T08:15:00.000Z'),
       });
     });
-  },
-);
+
+    it('lets a user with expired paid history buy again', async () => {
+      const userId = await createUser(client);
+      const now = new Date();
+      await givenPaidProHistory(
+        client,
+        userId,
+        {
+          billingInterval: BillingInterval.MONTHLY,
+          startedAt: new Date(now.getTime() - 90 * 86_400_000),
+        },
+        now,
+      );
+      const view = dataOf(await startCheckout(userId, 'MONTHLY').expect(201));
+      const sessionId = await providerSessionOf(view.checkoutSessionId);
+      api.completeSession(sessionId);
+
+      await sendWebhook('checkout.session.completed', sessionId).expect(200);
+
+      await expect(status(userId)).resolves.toMatchObject({ status: 'PRO' });
+      await expect(
+        client.subscriptionEvent.count({
+          where: { subscription: { authId: userId }, type: 'CREATED' },
+        }),
+      ).resolves.toBe(2);
+    });
+
+    it('records one payment for duplicate concurrent webhook deliveries', async () => {
+      const userId = await createUser(client);
+      const view = dataOf(await startCheckout(userId, 'MONTHLY').expect(201));
+      const sessionId = await providerSessionOf(view.checkoutSessionId);
+      api.completeSession(sessionId);
+
+      const responses = await Promise.all(
+        Array.from({ length: 6 }, () =>
+          sendWebhook('checkout.session.completed', sessionId),
+        ),
+      );
+
+      expect(responses.map((response) => response.status)).toEqual(
+        Array(6).fill(200),
+      );
+      await expect(
+        client.paymentTransaction.count({
+          where: { subscription: { authId: userId } },
+        }),
+      ).resolves.toBe(1);
+      await expect(
+        client.subscriptionEvent.count({
+          where: { subscription: { authId: userId } },
+        }),
+      ).resolves.toBe(1);
+    });
+
+    it('rejects inactive accounts before anything is created', async () => {
+      const userId = await createUser(client, userStatus.ACTIVE, {
+        verified: false,
+      });
+      await startCheckout(userId, 'MONTHLY').expect(403);
+      expect(api.requests).toHaveLength(0);
+      await expect(checkoutsOf(userId)).resolves.toHaveLength(0);
+    });
+  });
+
+  describe('duplicate checkouts', () => {
+    it('returns one checkout to concurrent requests for the same option', async () => {
+      const userId = await createUser(client);
+
+      const responses = await Promise.all(
+        Array.from({ length: 8 }, () => startCheckout(userId, 'YEARLY')),
+      );
+
+      expect(responses.map((response) => response.status)).toEqual(
+        Array(8).fill(201),
+      );
+      const ids = new Set(
+        responses.map((response) => dataOf(response).checkoutSessionId),
+      );
+      expect(ids.size).toBe(1);
+      await expect(checkoutsOf(userId)).resolves.toHaveLength(1);
+      expect(api.sessions.size).toBe(1);
+      expect(api.customers.size).toBe(1);
+      await expect(
+        client.paymentCustomer.count({ where: { authId: userId } }),
+      ).resolves.toBe(1);
+    });
+
+    it('expires the previous session when the user switches option', async () => {
+      const userId = await createUser(client);
+      const monthly = dataOf(
+        await startCheckout(userId, 'MONTHLY').expect(201),
+      );
+      const monthlySession = await providerSessionOf(monthly.checkoutSessionId);
+
+      const yearly = dataOf(await startCheckout(userId, 'YEARLY').expect(201));
+
+      expect(api.sessions.get(monthlySession)?.status).toBe('expired');
+      expect(() => api.completeSession(monthlySession)).toThrow(/expired/);
+      await expect(checkoutsOf(userId)).resolves.toEqual([
+        expect.objectContaining({
+          id: monthly.checkoutSessionId,
+          status: 'EXPIRED',
+          closedReason: 'REPLACED',
+        }),
+        expect.objectContaining({
+          id: yearly.checkoutSessionId,
+          status: 'OPEN',
+          billingInterval: 'YEARLY',
+          amountCents: 19000,
+        }),
+      ]);
+    });
+
+    it('never leaves two payable sessions under concurrent mixed requests', async () => {
+      const userId = await createUser(client);
+      const intervals = [
+        'MONTHLY',
+        'YEARLY',
+        'YEARLY',
+        'MONTHLY',
+        'YEARLY',
+        'MONTHLY',
+      ];
+
+      const responses = await Promise.all(
+        intervals.map((interval) => startCheckout(userId, interval)),
+      );
+
+      for (const response of responses)
+        expect([201, 409]).toContain(response.status);
+      expect(responses.some((response) => response.status === 201)).toBe(true);
+      expect(api.openSessions()).toHaveLength(1);
+      const pending = (await checkoutsOf(userId)).filter((row) =>
+        ['CREATING', 'OPEN', 'PROCESSING'].includes(row.status),
+      );
+      expect(pending).toHaveLength(1);
+      expect(pending[0].providerSessionId).toBe(api.openSessions()[0].id);
+
+      // Whatever the race, only the surviving session can be paid, once.
+      api.completeSession(pending[0].providerSessionId as string);
+      await sendWebhook(
+        'checkout.session.completed',
+        pending[0].providerSessionId as string,
+      ).expect(200);
+      await expect(status(userId)).resolves.toMatchObject({ status: 'PRO' });
+      await expect(
+        client.paymentTransaction.count({
+          where: { subscription: { authId: userId } },
+        }),
+      ).resolves.toBe(1);
+    });
+  });
+
+  describe('price changes and failed expirations', () => {
+    afterEach(async () => {
+      await client.subscriptionPlan.deleteMany();
+    });
+
+    const changePrices = (monthly: number, yearly: number) =>
+      client.subscriptionPlan.upsert({
+        where: { code: 'PRO' },
+        create: {
+          code: 'PRO',
+          monthlyPriceUsdCents: monthly,
+          yearlyPriceUsdCents: yearly,
+        },
+        update: { monthlyPriceUsdCents: monthly, yearlyPriceUsdCents: yearly },
+      });
+
+    it('reuses the open session at its old price and prices only new sessions at the new price', async () => {
+      const userId = await createUser(client);
+      const first = dataOf(await startCheckout(userId, 'MONTHLY').expect(201));
+      await changePrices(2900, 29000);
+
+      const again = dataOf(await startCheckout(userId, 'MONTHLY').expect(201));
+      expect(again).toMatchObject({
+        checkoutSessionId: first.checkoutSessionId,
+        url: first.url,
+        amountCents: 1900,
+        reused: true,
+      });
+
+      const yearly = dataOf(await startCheckout(userId, 'YEARLY').expect(201));
+      expect(yearly).toMatchObject({ amountCents: 29000, reused: false });
+      const monthly = dataOf(
+        await startCheckout(userId, 'MONTHLY').expect(201),
+      );
+      expect(monthly).toMatchObject({ amountCents: 2900, reused: false });
+
+      await expect(checkoutsOf(userId)).resolves.toEqual([
+        expect.objectContaining({ amountCents: 1900, status: 'EXPIRED' }),
+        expect.objectContaining({ amountCents: 29000, status: 'EXPIRED' }),
+        expect.objectContaining({ amountCents: 2900, status: 'OPEN' }),
+      ]);
+      expect(api.openSessions()).toEqual([
+        expect.objectContaining({ amount_total: 2900 }),
+      ]);
+    });
+
+    it.each(['connection', 'server', 'lost'] as const)(
+      'creates no new session when expiring the old one fails (%s)',
+      async (failure) => {
+        const userId = await createUser(client);
+        const monthly = dataOf(
+          await startCheckout(userId, 'MONTHLY').expect(201),
+        );
+        api.failNext('POST /v1/checkout/sessions/:id/expire', failure);
+
+        const response = await startCheckout(userId, 'YEARLY');
+
+        expect([409, 503]).toContain(response.status);
+        expect(api.count('POST', '/v1/checkout/sessions')).toBe(1);
+        await expect(checkoutsOf(userId)).resolves.toEqual([
+          expect.objectContaining({
+            id: monthly.checkoutSessionId,
+            status: 'OPEN',
+          }),
+        ]);
+        expect(api.openSessions().length).toBeLessThanOrEqual(1);
+      },
+    );
+  });
+
+  describe('database rules', () => {
+    async function subscriptionWithCheckout() {
+      const authId = await createUser(client);
+      const subscription = await client.userSubscription.create({
+        data: { authId },
+      });
+      const checkout = await client.checkoutSession.create({
+        data: {
+          subscriptionId: subscription.id,
+          provider: 'stripe',
+          providerCustomerId: `cus_${authId}`,
+          billingInterval: 'MONTHLY',
+          amountCents: 1900,
+          expiresAt: new Date(Date.now() + 3_600_000),
+        },
+      });
+      return { authId, subscription, checkout };
+    }
+
+    it('allows only one pending checkout per user', async () => {
+      const { subscription, checkout } = await subscriptionWithCheckout();
+      await expect(
+        client.checkoutSession.create({
+          data: {
+            subscriptionId: subscription.id,
+            provider: 'stripe',
+            providerCustomerId: checkout.providerCustomerId,
+            billingInterval: 'YEARLY',
+            amountCents: 19000,
+            expiresAt: checkout.expiresAt,
+          },
+        }),
+      ).rejects.toMatchObject({ code: 'P2002' });
+    });
+
+    it('allows a new pending checkout once the previous one is closed', async () => {
+      const { subscription, checkout } = await subscriptionWithCheckout();
+      await client.checkoutSession.update({
+        where: { id: checkout.id },
+        data: {
+          status: 'EXPIRED',
+          closedAt: new Date(),
+          closedReason: 'REPLACED',
+        },
+      });
+      await expect(
+        client.checkoutSession.create({
+          data: {
+            subscriptionId: subscription.id,
+            provider: 'stripe',
+            providerCustomerId: checkout.providerCustomerId,
+            billingInterval: 'YEARLY',
+            amountCents: 19000,
+            expiresAt: checkout.expiresAt,
+          },
+        }),
+      ).resolves.toMatchObject({ status: 'CREATING' });
+    });
+
+    const IMMUTABLE =
+      /price, interval, customer, expiry, provider session and payment cannot change/;
+    it.each<[string, Prisma.CheckoutSessionUpdateInput, RegExp]>([
+      [
+        'an OPEN checkout without a hosted page URL',
+        { status: 'OPEN', providerSessionId: 'cs_1' },
+        /CheckoutSession_open_has_url/,
+      ],
+      [
+        'an OPEN checkout without a provider session',
+        { status: 'OPEN', url: 'https://x' },
+        /CheckoutSession_provider_session_present/,
+      ],
+      [
+        'COMPLETED without a payment',
+        {
+          status: 'COMPLETED',
+          providerSessionId: 'cs_1',
+          completedAt: new Date(),
+        },
+        /CheckoutSession_completed_has_payment/,
+      ],
+      [
+        'EXPIRED without a close time',
+        { status: 'EXPIRED' },
+        /CheckoutSession_closed_at/,
+      ],
+      ['a change of price', { amountCents: 1 }, IMMUTABLE],
+      ['a change of billing option', { billingInterval: 'YEARLY' }, IMMUTABLE],
+      ['a change of customer', { providerCustomerId: 'cus_other' }, IMMUTABLE],
+    ])('rejects %s', async (_label, data, reason) => {
+      const { checkout } = await subscriptionWithCheckout();
+      await expect(
+        client.checkoutSession.update({ where: { id: checkout.id }, data }),
+      ).rejects.toThrow(reason);
+    });
+
+    it('only moves forward and never reopens a closed checkout', async () => {
+      const { checkout } = await subscriptionWithCheckout();
+      await client.checkoutSession.update({
+        where: { id: checkout.id },
+        data: { status: 'OPEN', providerSessionId: 'cs_fwd', url: 'https://x' },
+      });
+      await client.checkoutSession.update({
+        where: { id: checkout.id },
+        data: { status: 'EXPIRED', closedAt: new Date() },
+      });
+      await expect(
+        client.checkoutSession.update({
+          where: { id: checkout.id },
+          data: { status: 'OPEN', closedAt: null },
+        }),
+      ).rejects.toThrow(/cannot change from EXPIRED to OPEN/);
+      await expect(
+        client.checkoutSession.update({
+          where: { id: checkout.id },
+          data: { providerSessionId: 'cs_other' },
+        }),
+      ).rejects.toThrow();
+    });
+
+    it('can only be completed by a SUCCEEDED payment of the same subscription', async () => {
+      const { subscription, checkout } = await subscriptionWithCheckout();
+      const start = new Date('2026-03-01T00:00:00.000Z');
+      const pendingPayment = await client.paymentTransaction.create({
+        data: {
+          subscriptionId: subscription.id,
+          provider: 'stripe',
+          providerPaymentId: `in_${checkout.id}`,
+          amountCents: 1900,
+          billingInterval: 'MONTHLY',
+          periodStart: start,
+          periodEnd: addBillingInterval(start, 'MONTHLY'),
+        },
+      });
+      await expect(
+        client.checkoutSession.update({
+          where: { id: checkout.id },
+          data: {
+            status: 'COMPLETED',
+            completedAt: new Date(),
+            providerSessionId: 'cs_done',
+            paymentId: pendingPayment.id,
+          },
+        }),
+      ).rejects.toThrow(/SUCCEEDED payment of the same subscription/);
+    });
+
+    it('links every user to their own Stripe customer', async () => {
+      const first = await createUser(client);
+      const second = await createUser(client);
+      await client.paymentCustomer.create({
+        data: {
+          authId: first,
+          provider: 'stripe',
+          providerCustomerId: 'cus_shared',
+        },
+      });
+      await expect(
+        client.paymentCustomer.create({
+          data: {
+            authId: first,
+            provider: 'stripe',
+            providerCustomerId: 'cus_second',
+          },
+        }),
+      ).rejects.toMatchObject({ code: 'P2002' });
+      await expect(
+        client.paymentCustomer.create({
+          data: {
+            authId: second,
+            provider: 'stripe',
+            providerCustomerId: 'cus_shared',
+          },
+        }),
+      ).rejects.toMatchObject({ code: 'P2002' });
+    });
+  });
+});

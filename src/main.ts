@@ -15,8 +15,7 @@ import { setupSwagger } from './common/config/swagger.config';
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, {
     bufferLogs: true,
-    // Needed to verify the Stripe webhook signature, which is computed over
-    // the exact bytes Stripe sent (req.rawBody), not the parsed JSON body.
+    // Keeps the unparsed body on req.rawBody for Stripe webhook signatures.
     rawBody: true,
   });
 

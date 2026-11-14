@@ -3,9 +3,9 @@ import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import type { Request } from 'express';
 import type { IAccessTokenPayload } from '../auth/interfaces/auth.interface';
 import { AuthGuard } from '../common/guards/auth.guard';
-import { CheckoutService } from './checkout.service';
 import { CreateCheckoutSessionDto } from './dto/create-checkout-session.dto';
 import { requestMetadata } from './request-metadata';
+import { StripeCheckoutService } from './stripe/stripe-checkout.service';
 import { SubscriptionAccessService } from './subscription-access.service';
 import { SubscriptionTrialService } from './subscription-trial.service';
 
@@ -22,7 +22,7 @@ export class SubscriptionController {
   constructor(
     private readonly access: SubscriptionAccessService,
     private readonly trials: SubscriptionTrialService,
-    private readonly checkout: CheckoutService,
+    private readonly checkout: StripeCheckoutService,
   ) {}
 
   /** The caller's subscription status, trial eligibility and dates. */
@@ -38,19 +38,16 @@ export class SubscriptionController {
   }
 
   /**
-   * Starts (or reuses) a Stripe Checkout Session for the caller's chosen
-   * billing option. Pro access is granted only once the payment is verified
-   * by the Stripe webhook, never by this response.
+   * Starts (or reuses) a Stripe checkout for the Pro plan at the backend
+   * price of the chosen billing option. Returns the hosted payment URL. Pro
+   * access is granted only after Stripe's verified webhook confirms payment,
+   * never by this call or by the checkout's success redirect.
    */
   @Post('checkout')
-  startCheckout(
+  createCheckout(
     @Req() req: AuthenticatedRequest,
-    @Body() body: CreateCheckoutSessionDto,
+    @Body() dto: CreateCheckoutSessionDto,
   ) {
-    return this.checkout.startCheckout(
-      req.user.userId,
-      body.billingInterval,
-      requestMetadata(req),
-    );
+    return this.checkout.createCheckout(req.user.userId, dto.billingInterval);
   }
 }

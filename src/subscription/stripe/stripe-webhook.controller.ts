@@ -5,34 +5,37 @@ import {
   HttpStatus,
   Post,
   Req,
+  type RawBodyRequest,
 } from '@nestjs/common';
-import { ApiExcludeController } from '@nestjs/swagger';
-import type { RawBodyRequest } from '@nestjs/common';
+import { ApiExcludeEndpoint } from '@nestjs/swagger';
+import { SkipThrottle } from '@nestjs/throttler';
 import type { Request } from 'express';
-import AppError from '../../common/errors/app.error';
+import { requestMetadata } from '../request-metadata';
 import { StripeWebhookService } from './stripe-webhook.service';
 
 /**
- * Stripe calls this endpoint directly (no user session, no JWT). The
- * signature on every request is verified against `STRIPE_WEBHOOK_SECRET`
- * before anything is processed; this is the only way a checkout ever
- * activates Pro access.
+ * Stripe webhook endpoint. Not behind AuthGuard: Stripe authenticates each
+ * request with the `Stripe-Signature` header, verified against the raw body
+ * before anything is read. Requires `rawBody: true` in NestFactory.create.
+ * Throttling is skipped so Stripe's retries are never rate-limited.
+ *
+ * Responds 200 once an event is handled or deliberately ignored, 400 for an
+ * invalid signature, and 5xx on transient failures so Stripe retries.
  */
-@ApiExcludeController()
-@Controller('v1/subscription/stripe/webhook')
+@SkipThrottle()
+@Controller('v1/webhooks/stripe')
 export class StripeWebhookController {
-  constructor(private readonly webhook: StripeWebhookService) {}
+  constructor(private readonly webhooks: StripeWebhookService) {}
 
   @Post()
   @HttpCode(HttpStatus.OK)
-  async handle(
+  @ApiExcludeEndpoint()
+  async receive(
     @Req() req: RawBodyRequest<Request>,
-    @Headers('stripe-signature') signature: string | undefined,
-  ): Promise<{ received: true }> {
-    if (!req.rawBody) {
-      throw AppError.badRequest('Missing request body');
-    }
-    await this.webhook.handleWebhook(req.rawBody, signature);
+    @Headers('stripe-signature') signature?: string,
+  ) {
+    const event = this.webhooks.verifyEvent(req.rawBody, signature);
+    await this.webhooks.handleEvent(event, requestMetadata(req));
     return { received: true };
   }
 }
