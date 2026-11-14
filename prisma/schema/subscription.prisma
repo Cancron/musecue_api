@@ -55,12 +55,17 @@ model UserSubscription {
   paymentProvider        String? @db.VarChar(50)
   providerSubscriptionId String? @db.VarChar(255)
 
+  // The provider's customer record, created once on the user's first
+  // checkout attempt and reused for every later one (set by checkout).
+  stripeCustomerId String? @unique @db.VarChar(255)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  authUser authUser             @relation(fields: [authId], references: [id], onDelete: Cascade)
-  payments PaymentTransaction[]
-  events   SubscriptionEvent[]
+  authUser         authUser             @relation(fields: [authId], references: [id], onDelete: Cascade)
+  payments         PaymentTransaction[]
+  events           SubscriptionEvent[]
+  checkoutSessions CheckoutSession[]
 
   @@unique([paymentProvider, providerSubscriptionId])
   @@index([status])
@@ -75,6 +80,9 @@ model UserSubscription {
 model PaymentTransaction {
   id                  String          @id @default(uuid())
   subscriptionId      String
+  // The checkout session whose completion produced this payment, when there
+  // was one (a future renewal invoice would have none).
+  checkoutSessionId   String?         @unique
   provider            String          @db.VarChar(50)
   providerPaymentId   String          @db.VarChar(255)
   status              PaymentStatus   @default(PENDING)
@@ -92,12 +100,48 @@ model PaymentTransaction {
   createdAt           DateTime        @default(now())
   updatedAt           DateTime        @updatedAt
 
-  subscription UserSubscription   @relation(fields: [subscriptionId], references: [id], onDelete: Restrict)
-  event        SubscriptionEvent?
+  subscription    UserSubscription   @relation(fields: [subscriptionId], references: [id], onDelete: Restrict)
+  checkoutSession CheckoutSession?   @relation(fields: [checkoutSessionId], references: [id], onDelete: SetNull)
+  event           SubscriptionEvent?
 
   @@unique([provider, providerPaymentId])
   @@index([subscriptionId, createdAt])
   @@index([status])
+}
+
+// A Stripe Checkout Session started by an authenticated user for the Pro
+// plan's monthly or yearly option. Tracks the checkout itself, separate from
+// the verified payment it may produce: creating a session never grants
+// access, only a webhook-verified SUCCEEDED PaymentTransaction does (see
+// PaymentTransaction.checkoutSessionId). At most one PENDING session exists
+// per subscription at a time (database rule): starting a checkout for a
+// different billing option expires the old session first, and a repeated
+// request for the same option while one is still valid reuses it instead of
+// creating another.
+model CheckoutSession {
+  id                String                @id @default(uuid())
+  subscriptionId    String
+  provider          String                @db.VarChar(50)
+  providerSessionId String                @db.VarChar(255)
+  billingInterval   BillingInterval
+  // The plan's price for billingInterval at the moment this session was
+  // created; the completed payment must match it exactly.
+  amountCents       Int
+  currency          String                @default("USD") @db.Char(3)
+  status            CheckoutSessionStatus @default(PENDING)
+  // The provider-hosted checkout page; reused as-is while the session is
+  // still PENDING and unexpired.
+  url               String                @db.VarChar(2048)
+  expiresAt         DateTime
+  completedAt       DateTime?
+  createdAt         DateTime              @default(now())
+  updatedAt         DateTime              @updatedAt
+
+  subscription UserSubscription    @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  payment      PaymentTransaction?
+
+  @@unique([provider, providerSessionId])
+  @@index([subscriptionId, status])
 }
 
 // Append-only lifecycle log of a subscription. CREATED and RENEWED events

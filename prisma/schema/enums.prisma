@@ -172,3 +172,10 @@ enum SubscriptionEventType {
   CANCELED
   EXPIRED
 }
+
+enum CheckoutSessionStatus {
+  PENDING
+  COMPLETED
+  EXPIRED
+  CANCELED
+}
