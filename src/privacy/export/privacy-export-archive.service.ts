@@ -102,6 +102,8 @@ export class PrivacyExportArchiveService {
         { compress: true, mtime },
       );
       const summary = await zip.finish();
+      // Only a fully written archive gets its final (non-.partial) name.
+      await this.exports.commitArchive(target.storageKey);
       return {
         storageKey: target.storageKey,
         sizeBytes: summary.sizeBytes,
@@ -113,6 +115,9 @@ export class PrivacyExportArchiveService {
         ).length,
       };
     } catch (error) {
+      // Remove this attempt's incomplete archive. If that fails too, the
+      // worker's final-failure or post-publication cleanup of the export's
+      // directory (retried by the recovery sweep) removes it later.
       await zip.abort();
       await this.exports.delete(target.storageKey).catch(() => undefined);
       throw error;

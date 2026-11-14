@@ -5,9 +5,10 @@ import {
   ValidationPipe,
 } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import type { DataExport, DataExportStatus } from '@prisma/client';
+import type { DataExport } from '@prisma/client';
 import { mock, mockDeep } from 'jest-mock-extended';
 import { randomUUID } from 'node:crypto';
+import { DataExportTable } from '../../test/support/data-export-table';
 import request from 'supertest';
 import type { App } from 'supertest/types';
 import type { Logger } from 'winston';
@@ -23,16 +24,16 @@ import { RedisService } from '../common/services/redis.service';
 import { PrivacyExportStorageService } from '../storage/privacy-export-storage.service';
 import type { DataExportView } from './interfaces/privacy-export.interface';
 import {
-  PRIVACY_EXPORT_QUEUE_FAILURE_MESSAGE,
+  PRIVACY_EXPORT_FAILURES,
   PRIVACY_EXPORT_RETENTION_MS,
 } from './privacy-export.constants';
 import { PrivacyExportController } from './privacy-export.controller';
 import { PrivacyExportService } from './privacy-export.service';
+import { PrivacyExportLifecycleService } from './queues/privacy-export-lifecycle.service';
 import { PrivacyExportQueueService } from './queues/privacy-export.queue';
 
 const USER_A = '0a0a0a0a-0000-4000-8000-00000000000a';
 const USER_B = '0b0b0b0b-0000-4000-8000-00000000000b';
-const ACTIVE: DataExportStatus[] = ['QUEUED', 'PROCESSING'];
 const anyString: unknown = expect.any(String);
 
 /** The enveloped `data` of a successful response. */
@@ -41,129 +42,20 @@ const dataOf = (response: { body: unknown }) =>
 const messageOf = (response: { body: unknown }) =>
   (response.body as { message: string }).message;
 
-/**
- * In-memory DataExport table with the same uniqueness rules as the
- * migration: (authId, idempotencyKey) and one QUEUED/PROCESSING export per user.
- */
-class DataExportTable {
-  rows: DataExport[] = [];
-
-  private conflict(): Error {
-    return Object.assign(new Error('Unique constraint failed'), {
-      code: 'P2002',
-    });
-  }
-
-  private matches(row: DataExport, where: Record<string, unknown>): boolean {
-    return Object.entries(where).every(([field, expected]) => {
-      const value = row[field as keyof DataExport];
-      if (expected && typeof expected === 'object' && 'in' in expected) {
-        return (expected.in as unknown[]).includes(value);
-      }
-      return value === expected;
-    });
-  }
-
-  findUnique = ({ where }: { where: Record<string, unknown> }) => {
-    const compound = where.authId_idempotencyKey as
-      | { authId: string; idempotencyKey: string }
-      | undefined;
-    return Promise.resolve(
-      this.rows.find((row) =>
-        compound
-          ? row.authId === compound.authId &&
-            row.idempotencyKey === compound.idempotencyKey
-          : row.id === where.id,
-      ) ?? null,
-    );
-  };
-
-  findFirst = ({ where }: { where: Record<string, unknown> }) =>
-    Promise.resolve(
-      [...this.rows].reverse().find((row) => this.matches(row, where)) ?? null,
-    );
-
-  findMany = ({
-    where,
-    take,
-  }: {
-    where: Record<string, unknown>;
-    take?: number;
-  }) =>
-    Promise.resolve(
-      [...this.rows]
-        .reverse()
-        .filter((row) => this.matches(row, where))
-        .slice(0, take),
-    );
-
-  create = async ({
-    data,
-  }: {
-    data: { authId: string; idempotencyKey: string };
-  }) => {
-    // Yield like a real database round trip so concurrent requests interleave.
-    await new Promise((resolve) => setImmediate(resolve));
-    if (
-      this.rows.some(
-        (row) =>
-          row.authId === data.authId &&
-          (row.idempotencyKey === data.idempotencyKey ||
-            ACTIVE.includes(row.status)),
-      )
-    ) {
-      throw this.conflict();
-    }
-    const now = new Date(Date.now() + this.rows.length);
-    const row: DataExport = {
-      id: randomUUID(),
-      authId: data.authId,
-      status: 'QUEUED',
-      progress: 0,
-      idempotencyKey: data.idempotencyKey,
-      attempts: 0,
-      storageKey: null,
-      sizeBytes: null,
-      sha256: null,
-      photoCount: null,
-      missingPhotoCount: null,
-      error: null,
-      startedAt: null,
-      completedAt: null,
-      expiresAt: null,
-      createdAt: now,
-      updatedAt: now,
-    };
-    this.rows.push(row);
-    return row;
-  };
-
-  updateMany = ({
-    where,
-    data,
-  }: {
-    where: Record<string, unknown>;
-    data: Partial<DataExport>;
-  }) => {
-    const targets = this.rows.filter((row) => this.matches(row, where));
-    for (const row of targets) Object.assign(row, data);
-    return Promise.resolve({ count: targets.length });
-  };
-
-  complete(id: string, completedAt: Date) {
-    Object.assign(this.rows.find((row) => row.id === id)!, {
-      status: 'COMPLETED',
-      progress: 100,
-      storageKey: `${USER_A}/${id}/archive.zip`,
-      sizeBytes: BigInt(2048),
-      sha256: 'f'.repeat(64),
-      photoCount: 4,
-      missingPhotoCount: 0,
-      startedAt: completedAt,
-      completedAt,
-      expiresAt: new Date(completedAt.getTime() + PRIVACY_EXPORT_RETENTION_MS),
-    } satisfies Partial<DataExport>);
-  }
+/** Marks an export as published, as the worker would. */
+function complete(table: DataExportTable, id: string, completedAt: Date) {
+  Object.assign(table.get(id), {
+    status: 'COMPLETED',
+    progress: 100,
+    storageKey: `${USER_A}/${id}/archive.zip`,
+    sizeBytes: BigInt(2048),
+    sha256: 'f'.repeat(64),
+    photoCount: 4,
+    missingPhotoCount: 0,
+    startedAt: completedAt,
+    completedAt,
+    expiresAt: new Date(completedAt.getTime() + PRIVACY_EXPORT_RETENTION_MS),
+  } satisfies Partial<DataExport>);
 }
 
 const prisma = mockDeep<PrismaService>();
@@ -207,6 +99,7 @@ describe('Privacy export endpoints (HTTP)', () => {
         PrivacyExportService,
         AuthGuard,
         { provide: PrivacyExportQueueService, useValue: queue },
+        PrivacyExportLifecycleService,
         { provide: PrivacyExportStorageService, useValue: storage },
       ],
     }).compile();
@@ -235,11 +128,7 @@ describe('Privacy export endpoints (HTTP)', () => {
     table = new DataExportTable();
     // AuthGuard: the token version cached for every user is 1.
     redis.get.mockResolvedValue(1 as never);
-    prisma.dataExport.findUnique.mockImplementation(table.findUnique as never);
-    prisma.dataExport.findFirst.mockImplementation(table.findFirst as never);
-    prisma.dataExport.findMany.mockImplementation(table.findMany as never);
-    prisma.dataExport.create.mockImplementation(table.create as never);
-    prisma.dataExport.updateMany.mockImplementation(table.updateMany as never);
+    table.attach(prisma);
     queue.enqueue.mockResolvedValue();
     storage.deleteExportScope.mockResolvedValue();
   });
@@ -300,7 +189,9 @@ describe('Privacy export endpoints (HTTP)', () => {
         sha256: null,
         photoCount: null,
         missingPhotoCount: null,
+        attempts: 0,
         error: null,
+        errorCode: null,
       });
       expect(table.rows).toEqual([
         expect.objectContaining({ id: body.data.id, authId: USER_A }),
@@ -338,7 +229,7 @@ describe('Privacy export endpoints (HTTP)', () => {
     it('returns the same export for a repeated Idempotency-Key', async () => {
       const key = randomUUID();
       const first = await requestExport(USER_A, key).expect(202);
-      table.complete(dataOf(first).id, new Date());
+      complete(table, dataOf(first).id, new Date());
       const retry = await requestExport(USER_A, key).expect(202);
 
       expect(dataOf(retry).id).toBe(dataOf(first).id);
@@ -401,7 +292,7 @@ describe('Privacy export endpoints (HTTP)', () => {
 
     it('allows a new export once the previous one has finished', async () => {
       const first = await requestExport(USER_A).expect(202);
-      table.complete(dataOf(first).id, new Date());
+      complete(table, dataOf(first).id, new Date());
 
       const second = await requestExport(USER_A).expect(202);
 
@@ -425,12 +316,119 @@ describe('Privacy export endpoints (HTTP)', () => {
       expect(table.rows).toEqual([
         expect.objectContaining({
           status: 'FAILED',
-          error: PRIVACY_EXPORT_QUEUE_FAILURE_MESSAGE,
+          error: PRIVACY_EXPORT_FAILURES.QUEUE_UNAVAILABLE,
+          errorCode: 'QUEUE_UNAVAILABLE',
         }),
       ]);
       // The failed export no longer blocks a retry.
       await requestExport(USER_A).expect(202);
       expect(table.rows).toHaveLength(2);
+    });
+  });
+
+  describe('failed, repeated and retried requests', () => {
+    const fail = (id: string) =>
+      table.updateMany({
+        where: { id },
+        data: {
+          status: 'FAILED',
+          error: PRIVACY_EXPORT_FAILURES.GENERATION_FAILED,
+          errorCode: 'GENERATION_FAILED',
+          completedAt: new Date(),
+          attempts: 3,
+        },
+      });
+
+    it('shows a failed export with its reason and code', async () => {
+      const created = await requestExport(USER_A).expect(202);
+      await fail(dataOf(created).id);
+
+      const response = await http()
+        .get(`/v1/privacy/exports/${dataOf(created).id}`)
+        .set('Authorization', bearer(USER_A))
+        .expect(200);
+
+      expect(dataOf(response)).toMatchObject({
+        status: 'FAILED',
+        attempts: 3,
+        error: PRIVACY_EXPORT_FAILURES.GENERATION_FAILED,
+        errorCode: 'GENERATION_FAILED',
+        sha256: null,
+        sizeBytes: null,
+      });
+    });
+
+    it('answers a retried request (same Idempotency-Key) with the failed export instead of queueing again', async () => {
+      const key = randomUUID();
+      const created = await requestExport(USER_A, key).expect(202);
+      await fail(dataOf(created).id);
+
+      const retried = await requestExport(USER_A, key).expect(202);
+
+      expect(dataOf(retried)).toMatchObject({
+        id: dataOf(created).id,
+        status: 'FAILED',
+        errorCode: 'GENERATION_FAILED',
+      });
+      expect(table.rows).toHaveLength(1);
+      expect(queue.enqueue.mock.calls).toHaveLength(1);
+    });
+
+    it('starts exactly one new export when the user asks again after a failure', async () => {
+      const created = await requestExport(USER_A).expect(202);
+      await fail(dataOf(created).id);
+
+      const [again, repeated] = [
+        await requestExport(USER_A).expect(202),
+        await requestExport(USER_A).expect(202),
+      ];
+
+      expect(dataOf(again).id).not.toBe(dataOf(created).id);
+      expect(dataOf(repeated).id).toBe(dataOf(again).id);
+      expect(table.rows.map((row) => row.status)).toEqual(['FAILED', 'QUEUED']);
+      expect(queue.enqueue.mock.calls.map(([job]) => job.exportId)).toEqual([
+        dataOf(created).id,
+        dataOf(again).id,
+      ]);
+    });
+
+    it.each(['QUEUED', 'PROCESSING'] as const)(
+      'does not queue a second job while the export is %s',
+      async (status) => {
+        const created = await requestExport(USER_A).expect(202);
+        await table.updateMany({
+          where: { id: dataOf(created).id },
+          data: { status, progress: status === 'PROCESSING' ? 40 : 0 },
+        });
+
+        for (let i = 0; i < 3; i += 1) {
+          const repeated = await requestExport(USER_A).expect(202);
+          expect(dataOf(repeated)).toMatchObject({
+            id: dataOf(created).id,
+            status,
+          });
+        }
+        expect(table.rows).toHaveLength(1);
+        expect(queue.enqueue.mock.calls).toHaveLength(1);
+      },
+    );
+
+    it('records a queueing failure with its reason and removes any export files', async () => {
+      queue.enqueue.mockRejectedValueOnce(new Error('redis down'));
+
+      await requestExport(USER_A).expect(503);
+
+      const [failed] = table.rows;
+      expect(failed).toMatchObject({
+        status: 'FAILED',
+        errorCode: 'QUEUE_UNAVAILABLE',
+        error: PRIVACY_EXPORT_FAILURES.QUEUE_UNAVAILABLE,
+        completedAt: expect.any(Date) as unknown,
+        filesDeletedAt: expect.any(Date) as unknown,
+      });
+      expect(storage.deleteExportScope.mock.calls).toEqual([
+        [USER_A, failed.id],
+      ]);
     });
   });
 
@@ -483,7 +481,7 @@ describe('Privacy export endpoints (HTTP)', () => {
       const created = await requestExport(USER_A).expect(202);
       const id = dataOf(created).id;
       const completedAt = new Date();
-      table.complete(id, completedAt);
+      complete(table, id, completedAt);
 
       const response = await http()
         .get(`/v1/privacy/exports/${id}`)
@@ -511,7 +509,8 @@ describe('Privacy export endpoints (HTTP)', () => {
     it('reports a completed export as EXPIRED once its retention has passed', async () => {
       const created = await requestExport(USER_A).expect(202);
       const id = dataOf(created).id;
-      table.complete(
+      complete(
+        table,
         id,
         new Date(Date.now() - PRIVACY_EXPORT_RETENTION_MS - 1_000),
       );
@@ -531,7 +530,7 @@ describe('Privacy export endpoints (HTTP)', () => {
   describe('GET /v1/privacy/exports', () => {
     it('lists only the caller’s exports, newest first', async () => {
       const first = await requestExport(USER_A).expect(202);
-      table.complete(dataOf(first).id, new Date());
+      complete(table, dataOf(first).id, new Date());
       await requestExport(USER_B).expect(202);
       const second = await requestExport(USER_A).expect(202);
 

@@ -10,13 +10,9 @@ import { Queue } from 'bullmq';
 import { WINSTON_MODULE_PROVIDER } from 'nest-winston';
 import type { Logger } from 'winston';
 import { PrismaService } from '../../common/services/prisma.service';
-import { PrivacyExportStorageService } from '../../storage/privacy-export-storage.service';
 import type { PrivacyExportJob } from '../interfaces/privacy-export.interface';
-import {
-  PRIVACY_EXPORT_INTERRUPTED_MESSAGE,
-  PRIVACY_EXPORT_QUEUE,
-} from '../privacy-export.constants';
-import { failExport } from './privacy-export-lifecycle';
+import { PRIVACY_EXPORT_QUEUE } from '../privacy-export.constants';
+import { PrivacyExportLifecycleService } from './privacy-export-lifecycle.service';
 
 const MIN_GRACE_MS = 120_000;
 const BATCH_SIZE = 100;
@@ -26,6 +22,9 @@ const BATCH_SIZE = 100;
  * so they stop blocking the owner's next request (only one export may be
  * active per user) and clients stop polling. Healthy waiting, delayed or
  * active jobs are left alone; a Redis outage postpones recovery.
+ *
+ * Each pass also retries file cleanup of FAILED exports whose earlier
+ * cleanup did not succeed, so incomplete archives are eventually removed.
  */
 @Injectable()
 export class PrivacyExportRecoveryService
@@ -36,7 +35,7 @@ export class PrivacyExportRecoveryService
 
   constructor(
     private readonly prisma: PrismaService,
-    private readonly storage: PrivacyExportStorageService,
+    private readonly lifecycle: PrivacyExportLifecycleService,
     @InjectQueue(PRIVACY_EXPORT_QUEUE)
     private readonly queue: Queue<PrivacyExportJob>,
     private readonly config: ConfigService,
@@ -82,13 +81,9 @@ export class PrivacyExportRecoveryService
           const job = await this.queue.getJob(item.id);
           const state = job ? await job.getState() : 'unknown';
           if (['failed', 'completed', 'unknown'].includes(state)) {
-            const failed = await failExport(
-              this.prisma,
-              this.storage,
-              item.id,
-              PRIVACY_EXPORT_INTERRUPTED_MESSAGE,
-              { updatedAt: item.updatedAt },
-            );
+            const failed = await this.lifecycle.fail(item.id, 'INTERRUPTED', {
+              updatedAt: item.updatedAt,
+            });
             if (failed) {
               this.logger.warn(
                 'Recovered an interrupted personal data export',
@@ -107,6 +102,16 @@ export class PrivacyExportRecoveryService
     } catch {
       this.logger.warn(
         'Personal data export recovery could not complete; it will retry',
+        { context: 'PrivacyExportRecovery' },
+      );
+    }
+    // File cleanup needs only PostgreSQL and storage, so a Redis outage
+    // above does not postpone it.
+    try {
+      await this.lifecycle.retryPendingCleanups();
+    } catch {
+      this.logger.warn(
+        'Personal data export file cleanup could not complete; it will retry',
         { context: 'PrivacyExportRecovery' },
       );
     } finally {

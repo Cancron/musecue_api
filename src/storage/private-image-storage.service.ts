@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
-import { dirname, join, resolve, sep } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import {
   isMissingFileError,
   resolvePrivateStorageKey,
@@ -28,15 +28,18 @@ export class PrivateImageStorageService {
     mimeType: SupportedImageMime,
     bytes: Buffer,
   ): Promise<string> {
-    const storageKey = join(
+    // Storage keys always use `/`, whatever the platform. Only the resolved
+    // filesystem path uses the platform separator (`\\` on Windows), so keys
+    // stay portable and pass the same validation on every OS.
+    const storageKey = [
       authId,
       scopeId,
       `${randomUUID()}${EXTENSIONS_BY_MIME[mimeType]}`,
-    );
+    ].join('/');
     const absolutePath = this.resolveKey(storageKey);
     await mkdir(dirname(absolutePath), { recursive: true });
     await writeFile(absolutePath, bytes, { flag: 'wx' });
-    return storageKey.replaceAll(sep, '/');
+    return storageKey;
   }
 
   async delete(storageKey: string): Promise<void> {

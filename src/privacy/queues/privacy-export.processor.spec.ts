@@ -9,10 +9,8 @@ import type {
   PrivacyExportJob,
   PrivacyExportProgress,
 } from '../interfaces/privacy-export.interface';
-import {
-  PRIVACY_EXPORT_FAILURE_MESSAGE,
-  PRIVACY_EXPORT_RETENTION_MS,
-} from '../privacy-export.constants';
+import { PRIVACY_EXPORT_RETENTION_MS } from '../privacy-export.constants';
+import type { PrivacyExportLifecycleService } from './privacy-export-lifecycle.service';
 import { PrivacyExportProcessor } from './privacy-export.processor';
 
 const OWNER = 'owner-id';
@@ -35,6 +33,7 @@ describe('PrivacyExportProcessor (privacy export worker)', () => {
   let prisma: ReturnType<typeof mockDeep<PrismaService>>;
   let archive: ReturnType<typeof mock<PrivacyExportArchiveService>>;
   let storage: ReturnType<typeof mock<PrivacyExportStorageService>>;
+  let lifecycle: ReturnType<typeof mock<PrivacyExportLifecycleService>>;
   let logger: ReturnType<typeof mock<Logger>>;
   let processor: PrivacyExportProcessor;
 
@@ -66,8 +65,16 @@ describe('PrivacyExportProcessor (privacy export worker)', () => {
       authId: OWNER,
     } as never);
     storage.delete.mockResolvedValue();
-    storage.deleteExportScope.mockResolvedValue();
-    processor = new PrivacyExportProcessor(prisma, archive, storage, logger);
+    lifecycle = mock<PrivacyExportLifecycleService>();
+    lifecycle.fail.mockResolvedValue(true);
+    lifecycle.removeStaleAttemptFiles.mockResolvedValue();
+    processor = new PrivacyExportProcessor(
+      prisma,
+      archive,
+      storage,
+      lifecycle,
+      logger,
+    );
   });
 
   afterEach(() => jest.useRealTimers());
@@ -118,6 +125,11 @@ describe('PrivacyExportProcessor (privacy export worker)', () => {
       },
     });
     expect(PRIVACY_EXPORT_RETENTION_MS).toBe(24 * 60 * 60 * 1000);
+    // Files of earlier attempts are removed, keeping only the published one.
+    expect(lifecycle.removeStaleAttemptFiles.mock.calls).toEqual([
+      [OWNER, EXPORT_ID, ARCHIVE.storageKey],
+    ]);
+    expect(lifecycle.fail.mock.calls).toHaveLength(0);
   });
 
   it('does nothing when the export is missing, finished, or owned by someone else', async () => {
@@ -171,6 +183,8 @@ describe('PrivacyExportProcessor (privacy export worker)', () => {
     // the export nor asks BullMQ to retry.
     await expect(processor.process(job().job)).resolves.toBeUndefined();
     expect(updates().some((args) => args.data.status === 'FAILED')).toBe(false);
+    expect(lifecycle.fail.mock.calls).toHaveLength(0);
+    expect(lifecycle.removeStaleAttemptFiles.mock.calls).toHaveLength(0);
     expect(updates().some((args) => args.data.status === 'COMPLETED')).toBe(
       false,
     );
@@ -190,6 +204,8 @@ describe('PrivacyExportProcessor (privacy export worker)', () => {
 
     expect(storage.delete.mock.calls).toContainEqual([ARCHIVE.storageKey]);
     expect(updates().some((args) => args.data.status === 'FAILED')).toBe(false);
+    expect(lifecycle.fail.mock.calls).toHaveLength(0);
+    expect(lifecycle.removeStaleAttemptFiles.mock.calls).toHaveLength(0);
   });
 
   it('returns a retryable failure to the queue and rethrows for BullMQ backoff', async () => {
@@ -204,10 +220,13 @@ describe('PrivacyExportProcessor (privacy export worker)', () => {
       where: { id: EXPORT_ID, status: 'PROCESSING', startedAt: NOW },
       data: { status: 'QUEUED', progress: 0, startedAt: null },
     });
+    // Not final: the export is not failed and nothing else is deleted (the
+    // archive service already removed this attempt's partial file).
+    expect(lifecycle.fail.mock.calls).toHaveLength(0);
     expect(storage.deleteExportScope.mock.calls).toHaveLength(0);
   });
 
-  it('fails the export with a generic message on the final attempt and removes partial files', async () => {
+  it('fails the export with a generic reason on the final attempt (which also deletes its files)', async () => {
     const error = Object.assign(
       new Error(`EACCES: permission denied, open '/srv/${OWNER}/secret.jpg'`),
       { code: 'EACCES' },
@@ -216,21 +235,8 @@ describe('PrivacyExportProcessor (privacy export worker)', () => {
 
     await expect(processor.process(job(2).job)).rejects.toBe(error);
 
-    expect(updates().at(-1)).toEqual({
-      where: {
-        id: EXPORT_ID,
-        status: { in: ['QUEUED', 'PROCESSING'] },
-        startedAt: NOW,
-      },
-      data: {
-        status: 'FAILED',
-        error: PRIVACY_EXPORT_FAILURE_MESSAGE,
-        completedAt: NOW,
-      },
-    });
-    expect(storage.deleteExportScope.mock.calls).toContainEqual([
-      OWNER,
-      EXPORT_ID,
+    expect(lifecycle.fail.mock.calls).toEqual([
+      [EXPORT_ID, 'GENERATION_FAILED', { startedAt: NOW }],
     ]);
     expect(logger.error.mock.calls).toContainEqual([
       'Personal data export failed',
@@ -240,6 +246,7 @@ describe('PrivacyExportProcessor (privacy export worker)', () => {
         attempt: 3,
         errorName: 'Error',
         errorCode: 'EACCES',
+        failureCode: 'GENERATION_FAILED',
       },
     ]);
     // Private paths from error messages never reach the logs.
@@ -257,8 +264,26 @@ describe('PrivacyExportProcessor (privacy export worker)', () => {
     );
 
     expect(discard).toHaveBeenCalledTimes(1);
-    expect(updates().at(-1)?.data.status).toBe('FAILED');
+    expect(lifecycle.fail.mock.calls).toEqual([
+      [EXPORT_ID, 'ACCOUNT_UNAVAILABLE', { startedAt: NOW }],
+    ]);
   });
+
+  it.each(['ENOSPC', 'EDQUOT'])(
+    'reports a full export storage (%s) as STORAGE_FULL once retries are exhausted',
+    async (code) => {
+      const error = Object.assign(new Error('no space'), { code });
+      archive.build.mockRejectedValue(error);
+
+      await expect(processor.process(job(0).job)).rejects.toBe(error);
+      expect(lifecycle.fail.mock.calls).toHaveLength(0);
+
+      await expect(processor.process(job(2).job)).rejects.toBe(error);
+      expect(lifecycle.fail.mock.calls).toEqual([
+        [EXPORT_ID, 'STORAGE_FULL', { startedAt: NOW }],
+      ]);
+    },
+  );
 
   it('removes the published archive if completion cannot be recorded', async () => {
     archive.build.mockResolvedValue(ARCHIVE);

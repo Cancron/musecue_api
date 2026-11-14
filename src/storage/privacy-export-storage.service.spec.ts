@@ -23,14 +23,18 @@ describe('PrivacyExportStorageService (privacy export archives)', () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  const write = async (authId = OWNER, exportId = EXPORT_ID) => {
+  /** Writes an archive; commits it unless `commit` is false. */
+  const write = async (authId = OWNER, exportId = EXPORT_ID, commit = true) => {
     const target = await storage.createArchive(authId, exportId);
     target.stream.end(Buffer.from('zip-bytes'));
     await new Promise<void>((resolve) =>
       target.stream.once('close', () => resolve()),
     );
+    if (commit) await storage.commitArchive(target.storageKey);
     return target.storageKey;
   };
+  const files = (authId = OWNER, exportId = EXPORT_ID) =>
+    readdir(join(root, authId, exportId)).then((names) => names.sort());
 
   it('writes owner-scoped, per-attempt archive keys inside the configured root', async () => {
     const first = await write();
@@ -41,6 +45,60 @@ describe('PrivacyExportStorageService (privacy export archives)', () => {
     );
     expect(second).not.toBe(first);
     expect(await readFile(join(root, first))).toEqual(Buffer.from('zip-bytes'));
+  });
+
+  it('writes an incomplete archive under a .partial name until it is committed', async () => {
+    const key = await write(OWNER, EXPORT_ID, false);
+    const name = key.split('/').pop()!;
+
+    expect(await files()).toEqual([`${name}.partial`]);
+    await storage.commitArchive(key);
+    expect(await files()).toEqual([name]);
+  });
+
+  it('deletes an archive whether or not it was committed', async () => {
+    const partial = await write(OWNER, EXPORT_ID, false);
+    const finished = await write();
+
+    await storage.delete(partial);
+    await storage.delete(finished);
+
+    await expect(files()).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('keeps only the published archive when asked to, removing partial files of other attempts', async () => {
+    await write(OWNER, EXPORT_ID, false);
+    await write(OWNER, EXPORT_ID, false);
+    const published = await write();
+
+    await storage.deleteExportScope(OWNER, EXPORT_ID, { keep: published });
+
+    expect(await files()).toEqual([published.split('/').pop()]);
+    expect(await readFile(join(root, published))).toEqual(
+      Buffer.from('zip-bytes'),
+    );
+  });
+
+  it('refuses to keep a file that belongs to another export', async () => {
+    const otherExport = '44444444-4444-4444-8444-444444444444';
+    await write();
+    const foreign = await write(OWNER, otherExport);
+
+    await expect(
+      storage.deleteExportScope(OWNER, EXPORT_ID, { keep: foreign }),
+    ).rejects.toThrow('does not belong to this export');
+    expect(await files()).toHaveLength(1);
+  });
+
+  it('treats cleanup of an export without files as done', async () => {
+    await expect(
+      storage.deleteExportScope(OWNER, EXPORT_ID),
+    ).resolves.toBeUndefined();
+    await expect(
+      storage.deleteExportScope(OWNER, EXPORT_ID, {
+        keep: `${OWNER}/${EXPORT_ID}/x.zip`,
+      }),
+    ).resolves.toBeUndefined();
   });
 
   it('creates archives readable only by the service account', async () => {
@@ -91,5 +149,9 @@ describe('PrivacyExportStorageService (privacy export archives)', () => {
 
     expect(await readdir(join(root, OWNER))).toEqual([otherExport]);
     expect(await readFile(join(root, kept))).toEqual(Buffer.from('zip-bytes'));
+
+    await storage.deleteExportScope(OWNER, otherExport);
+    // The owner's directory is dropped once the last export is gone.
+    expect(await readdir(root)).toEqual([]);
   });
 });

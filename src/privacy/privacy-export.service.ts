@@ -5,13 +5,9 @@ import { randomUUID } from 'node:crypto';
 import type { Logger } from 'winston';
 import AppError from '../common/errors/app.error';
 import { PrismaService } from '../common/services/prisma.service';
-import { PrivacyExportStorageService } from '../storage/privacy-export-storage.service';
 import type { DataExportView } from './interfaces/privacy-export.interface';
-import {
-  PRIVACY_EXPORT_LIST_LIMIT,
-  PRIVACY_EXPORT_QUEUE_FAILURE_MESSAGE,
-} from './privacy-export.constants';
-import { failExport } from './queues/privacy-export-lifecycle';
+import { PRIVACY_EXPORT_LIST_LIMIT } from './privacy-export.constants';
+import { PrivacyExportLifecycleService } from './queues/privacy-export-lifecycle.service';
 import { PrivacyExportQueueService } from './queues/privacy-export.queue';
 
 /**
@@ -24,7 +20,7 @@ export class PrivacyExportService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly queue: PrivacyExportQueueService,
-    private readonly storage: PrivacyExportStorageService,
+    private readonly lifecycle: PrivacyExportLifecycleService,
     @Inject(WINSTON_MODULE_PROVIDER) private readonly logger: Logger,
   ) {}
 
@@ -60,12 +56,7 @@ export class PrivacyExportService {
     try {
       await this.queue.enqueue({ exportId: created.id, authId });
     } catch (error) {
-      await failExport(
-        this.prisma,
-        this.storage,
-        created.id,
-        PRIVACY_EXPORT_QUEUE_FAILURE_MESSAGE,
-      );
+      await this.lifecycle.fail(created.id, 'QUEUE_UNAVAILABLE');
       this.logger.error('Personal data export could not be queued', {
         context: 'PrivacyExportService',
         exportId: created.id,
@@ -138,7 +129,9 @@ export class PrivacyExportService {
       sha256: expired ? null : record.sha256,
       photoCount: record.photoCount,
       missingPhotoCount: record.missingPhotoCount,
+      attempts: record.attempts,
       error: record.error,
+      errorCode: record.errorCode,
     };
   }
 

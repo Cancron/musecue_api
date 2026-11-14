@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { createWriteStream, type WriteStream } from 'node:fs';
-import { mkdir, rm, rmdir, unlink } from 'node:fs/promises';
+import { mkdir, readdir, rename, rm, rmdir, unlink } from 'node:fs/promises';
 import { once } from 'node:events';
 import { dirname, join, resolve } from 'node:path';
 import {
@@ -11,11 +11,22 @@ import {
 
 const SAFE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
+/** Suffix of an archive that is still being written (or was abandoned). */
+export const PARTIAL_ARCHIVE_SUFFIX = '.partial';
+
 export interface PrivacyExportArchiveTarget {
-  /** Private storage key; persist it, never return it to clients. */
+  /** Private key of the finished archive; persist it, never return it to clients. */
   storageKey: string;
-  /** Exclusive (`wx`, mode 0600) write stream for the archive bytes. */
+  /**
+   * Exclusive (`wx`, mode 0600) write stream for the archive bytes. It writes
+   * `<storageKey>.partial`; commitArchive() renames it to `storageKey`.
+   */
   stream: WriteStream;
+}
+
+export interface DeleteExportScopeOptions {
+  /** A finished archive of this export to keep; every other file is removed. */
+  keep?: string;
 }
 
 /**
@@ -24,9 +35,13 @@ export interface PrivacyExportArchiveTarget {
  * Follows the private image convention (`<authId>/<scopeId>/<uuid>.<ext>`
  * under a configurable, never-public root) but uses its own root,
  * `PRIVATE_EXPORT_DIR`, so archives of all a user's data have a separate
- * retention lifecycle from the face images they are built from. Every attempt
- * writes a new key, so a superseded worker can never overwrite an archive
- * that another attempt already published.
+ * retention lifecycle from the face images they are built from.
+ *
+ * An archive is written under a `.partial` name and renamed only once it is
+ * complete, so an incomplete archive is never mistaken for a finished one.
+ * Every attempt writes a new key, so a superseded worker can never overwrite
+ * an archive that another attempt already published. Keys always use `/`;
+ * only resolved filesystem paths use the platform separator.
  */
 @Injectable()
 export class PrivacyExportStorageService {
@@ -40,9 +55,11 @@ export class PrivacyExportStorageService {
     exportId: string,
   ): Promise<PrivacyExportArchiveTarget> {
     const storageKey = `${this.scopeKey(authId, exportId)}/${randomUUID()}.zip`;
-    const absolutePath = this.resolveKey(storageKey);
-    await mkdir(dirname(absolutePath), { recursive: true, mode: 0o700 });
-    const stream = createWriteStream(absolutePath, {
+    const partialPath = this.resolveKey(
+      `${storageKey}${PARTIAL_ARCHIVE_SUFFIX}`,
+    );
+    await mkdir(dirname(partialPath), { recursive: true, mode: 0o700 });
+    const stream = createWriteStream(partialPath, {
       flags: 'wx',
       mode: 0o600,
     });
@@ -50,22 +67,66 @@ export class PrivacyExportStorageService {
     return { storageKey, stream };
   }
 
-  /** Removes one archive; a missing file is not an error. */
+  /** Publishes a fully written archive under its final key (atomic rename). */
+  async commitArchive(storageKey: string): Promise<void> {
+    await rename(
+      this.resolveKey(`${storageKey}${PARTIAL_ARCHIVE_SUFFIX}`),
+      this.resolveKey(storageKey),
+    );
+  }
+
+  /**
+   * Removes one archive, finished or partial; missing files are not an error.
+   * The per-export directory is dropped once it is empty.
+   */
   async delete(storageKey: string): Promise<void> {
     const absolutePath = this.resolveKey(storageKey);
-    try {
-      await unlink(absolutePath);
-    } catch (error) {
-      if (!isMissingFileError(error)) throw error;
+    for (const path of [
+      absolutePath,
+      this.resolveKey(`${storageKey}${PARTIAL_ARCHIVE_SUFFIX}`),
+    ]) {
+      try {
+        await unlink(path);
+      } catch (error) {
+        if (!isMissingFileError(error)) throw error;
+      }
     }
-    // Drop the per-export directory once it is empty; keep it otherwise.
     await rmdir(dirname(absolutePath)).catch(() => undefined);
   }
 
-  /** Removes every archive (including partial ones) written for an export. */
-  async deleteExportScope(authId: string, exportId: string): Promise<void> {
-    const directory = resolve(this.root, this.scopeKey(authId, exportId));
-    await rm(directory, { recursive: true, force: true });
+  /**
+   * Removes the files of one export: everything, or everything except
+   * `options.keep` (for example partial files left by earlier attempts once
+   * an archive was published). A missing directory is not an error.
+   */
+  async deleteExportScope(
+    authId: string,
+    exportId: string,
+    options: DeleteExportScopeOptions = {},
+  ): Promise<void> {
+    const scope = this.scopeKey(authId, exportId);
+    const directory = resolve(this.root, scope);
+    if (!options.keep) {
+      await rm(directory, { recursive: true, force: true });
+      await rmdir(resolve(this.root, authId)).catch(() => undefined);
+      return;
+    }
+
+    const keepPath = this.resolveKey(options.keep);
+    if (dirname(keepPath) !== directory) {
+      throw new Error('The kept archive does not belong to this export');
+    }
+    let entries: string[];
+    try {
+      entries = await readdir(directory);
+    } catch (error) {
+      if (isMissingFileError(error)) return;
+      throw error;
+    }
+    for (const entry of entries) {
+      const path = join(directory, entry);
+      if (path !== keepPath) await rm(path, { recursive: true, force: true });
+    }
   }
 
   private scopeKey(authId: string, exportId: string): string {

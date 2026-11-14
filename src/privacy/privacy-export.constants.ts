@@ -1,3 +1,5 @@
+import type { DataExportErrorCode } from '@prisma/client';
+
 /** BullMQ queue that builds personal-data export archives. */
 export const PRIVACY_EXPORT_QUEUE = 'privacy-export';
 export const PRIVACY_EXPORT_JOB = 'BUILD_ARCHIVE';
@@ -11,13 +13,21 @@ export const PRIVACY_EXPORT_FORMAT_VERSION = 1;
 export const PRIVACY_EXPORT_MAX_ATTEMPTS = 3;
 export const PRIVACY_EXPORT_LIST_LIMIT = 20;
 
-/** Client-facing failure text. Internal causes (paths, SQL) are never exposed. */
-export const PRIVACY_EXPORT_FAILURE_MESSAGE =
-  'The export could not be generated. Please request a new export.';
-export const PRIVACY_EXPORT_INTERRUPTED_MESSAGE =
-  'The export was interrupted. Please request a new export.';
-export const PRIVACY_EXPORT_QUEUE_FAILURE_MESSAGE =
-  'The export could not be queued. Please request a new export.';
+/**
+ * Why an export failed, with the message shown to the user. Internal causes
+ * (paths, SQL, provider errors) are never exposed.
+ */
+export const PRIVACY_EXPORT_FAILURES = {
+  GENERATION_FAILED:
+    'The export could not be generated. Please request a new export.',
+  STORAGE_FULL:
+    'The export could not be generated because storage is temporarily full. Please request a new export later.',
+  ACCOUNT_UNAVAILABLE:
+    'The export could not be generated because the account is no longer available.',
+  INTERRUPTED: 'The export was interrupted. Please request a new export.',
+  QUEUE_UNAVAILABLE:
+    'The export could not be queued. Please request a new export.',
+} as const satisfies Record<DataExportErrorCode, string>;
 
 /** `Idempotency-Key` header format accepted by POST /v1/privacy/exports. */
 export const PRIVACY_EXPORT_IDEMPOTENCY_KEY_PATTERN =

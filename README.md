@@ -160,6 +160,8 @@ Important environment variables are documented in `.env.example`. Never commit t
 
 `PRIVATE_UPLOAD_DIR` controls the private image root and defaults to `.data/private-images`. The directory is ignored by Git and is never mounted as a public static directory.
 
+Private storage keys always use `/` (for example `<authId>/<sessionId>/<uuid>.jpg`) on every operating system; only the resolved filesystem path uses the platform separator. Keys containing `\`, `.`/`..` or empty segments are rejected, so the same stored keys work on Linux, macOS and Windows.
+
 `PRIVATE_EXPORT_DIR` holds generated personal data export archives and defaults to `.data/private-exports`. It follows the same private convention (`<authId>/<exportId>/<uuid>.zip`, owner-only file permissions) but is a separate root because archives have their own retention lifecycle.
 
 ### Live AI with OpenRouter
@@ -395,7 +397,7 @@ Routes require a bearer token. The owner is always the token's user; requests ca
 
 `POST /v1/privacy/exports` takes no body; any body field (for example `userId`) is rejected with `400`. An optional `Idempotency-Key` header (1-128 characters of `A-Z a-z 0-9 _ . : -`) returns the same export on retry. Only one export per user can be `QUEUED` or `PROCESSING` at a time (a partial unique index); further requests, including concurrent ones, return that export instead of starting another. The route uses the strict rate limit. If the queue is unavailable the export is recorded as `FAILED` and the request returns `503`.
 
-Status responses contain `id`, `status` (`QUEUED`, `PROCESSING`, `COMPLETED`, `FAILED` or `EXPIRED`), `progress` (0-100), `requestedAt`, `startedAt`, `completedAt`, `expiresAt`, `sizeBytes`, `sha256`, `photoCount`, `missingPhotoCount` and a client-safe `error`. Storage locations and idempotency keys are never returned. Another user's export returns the same `404` as a missing one, and malformed IDs return `400`. A completed export reports `EXPIRED` once `expiresAt` (completion + 24 hours) has passed.
+Status responses contain `id`, `status` (`QUEUED`, `PROCESSING`, `COMPLETED`, `FAILED` or `EXPIRED`), `progress` (0-100), `requestedAt`, `startedAt`, `completedAt`, `expiresAt`, `sizeBytes`, `sha256`, `photoCount`, `missingPhotoCount`, `attempts`, and, for a `FAILED` export, a client-safe `error` message with a machine-readable `errorCode`. Storage locations and idempotency keys are never returned. Another user's export returns the same `404` as a missing one, and malformed IDs return `400`. A completed export reports `EXPIRED` once `expiresAt` (completion + 24 hours) has passed.
 
 The `privacy-export` BullMQ worker builds the archive outside the request:
 
@@ -414,7 +416,28 @@ photos/sessions/<sessionId>/<imageId>.<ext>
 
 Every query is scoped to the owner, and every document is built from an explicit field allowlist. Password hashes, token versions, MFA secrets, OAuth provider subject IDs, storage keys, idempotency keys, raw AI results, payment-provider IDs, SMTP message IDs and activity-log rows (which can describe other users' records) are never exported. A photo is copied only if its storage key has exactly the format the image storage writes for that owner and scope (`<authId>/<sessionId or profile>/<file>.<jpg|png|webp>`). Keys with backslashes, `.`/`..`/empty segments, another owner or session, absolute paths or drive letters are refused. The shared private-storage resolver also rejects backslashes and dot segments on every platform. Photos are streamed one at a time. Missing files are listed in the manifest instead of failing the export.
 
-Each worker attempt claims the export with a new `startedAt`. Progress, publication and failure are conditioned on that value, so a stalled attempt cannot overwrite a newer one. Retryable failures are retried 3 times with exponential backoff; the final failure marks the export `FAILED` with a generic message and deletes partial archives. Every 60 seconds, recovery fails exports older than `PRIVACY_EXPORT_RECOVERY_GRACE_MS` whose job is missing or finished, so users are never blocked by a lost job.
+Each worker attempt claims the export with a new `startedAt`. Progress, publication and failure are conditioned on that value, so a stalled attempt cannot overwrite a newer one. Retryable failures are retried 3 times with exponential backoff; between attempts the export shows `QUEUED` again with an increased `attempts`.
+
+Failure reasons (`errorCode`, each with a fixed user-facing `error` message):
+
+| `errorCode`           | When                                                         |
+| --------------------- | ------------------------------------------------------------ |
+| `GENERATION_FAILED`   | The archive could not be built after all retries             |
+| `STORAGE_FULL`        | The export storage ran out of space (`ENOSPC`/`EDQUOT`)      |
+| `ACCOUNT_UNAVAILABLE` | The account no longer exists (not retried)                   |
+| `INTERRUPTED`         | The job was lost or ended without finishing (recovery sweep) |
+| `QUEUE_UNAVAILABLE`   | The export could not be queued (the request returned `503`)  |
+
+The database requires every `FAILED` export to have `error`, `errorCode` and `completedAt`, and no archive.
+
+File cleanup and duplicates:
+
+- Archives are written as `<uuid>.zip.partial` and renamed to `<uuid>.zip` only when complete, so an incomplete archive never has the final name.
+- A failed attempt deletes its own partial archive. When an export finally fails, its status and reason are recorded first, then every file of the export is deleted and `filesDeletedAt` is set. If deletion fails, the export stays `FAILED` (the user still sees the reason) and the recovery sweep retries the cleanup every 60 seconds until it succeeds.
+- After a successful publication, files left by earlier attempts (for example a crashed worker's partial archive) are removed, so a completed export has exactly one file.
+- Repeated requests never create duplicate jobs: the same `Idempotency-Key` returns the same export (including a failed one), only one export per user can be waiting or running, and each export has exactly one BullMQ job (`jobId` = export ID). Redelivered jobs for completed or failed exports do nothing. A new request after a failure creates one new export.
+
+Every 60 seconds, recovery fails exports older than `PRIVACY_EXPORT_RECOVERY_GRACE_MS` whose job is missing or finished (`INTERRUPTED`), so users are never blocked by a lost job.
 
 Not implemented yet: the download-link endpoint (`GET /v1/privacy/exports/:exportId/download`) and the retention job that deletes archives and marks exports `EXPIRED` after 24 hours.
 

@@ -1,5 +1,6 @@
 import { Processor, WorkerHost } from '@nestjs/bullmq';
 import { Inject } from '@nestjs/common';
+import type { DataExportErrorCode } from '@prisma/client';
 import type { Job } from 'bullmq';
 import { WINSTON_MODULE_PROVIDER } from 'nest-winston';
 import type { Logger } from 'winston';
@@ -12,14 +13,19 @@ import {
 } from '../export/privacy-export.errors';
 import type { PrivacyExportJob } from '../interfaces/privacy-export.interface';
 import {
-  PRIVACY_EXPORT_FAILURE_MESSAGE,
   PRIVACY_EXPORT_QUEUE,
   PRIVACY_EXPORT_RETENTION_MS,
 } from '../privacy-export.constants';
-import { failExport } from './privacy-export-lifecycle';
+import {
+  errorCode,
+  PrivacyExportLifecycleService,
+} from './privacy-export-lifecycle.service';
 
 /** Persist progress in steps of at least this many points. */
 const PROGRESS_STEP = 5;
+
+/** Filesystem errors that mean the export storage is out of space. */
+const STORAGE_FULL_CODES = new Set(['ENOSPC', 'EDQUOT']);
 
 /**
  * Builds personal-data export archives outside the request cycle.
@@ -35,6 +41,7 @@ export class PrivacyExportProcessor extends WorkerHost {
     private readonly prisma: PrismaService,
     private readonly archive: PrivacyExportArchiveService,
     private readonly storage: PrivacyExportStorageService,
+    private readonly lifecycle: PrivacyExportLifecycleService,
     @Inject(WINSTON_MODULE_PROVIDER) private readonly logger: Logger,
   ) {
     super();
@@ -84,6 +91,13 @@ export class PrivacyExportProcessor extends WorkerHost {
         },
       });
       if (!published.count) throw new PrivacyExportSupersededError();
+      // A completed export keeps exactly one file: drop partial archives
+      // that earlier (crashed or failed) attempts may have left behind.
+      await this.lifecycle.removeStaleAttemptFiles(
+        authId,
+        exportId,
+        result.storageKey,
+      );
       this.logger.info('Personal data export completed', {
         context: 'PrivacyExportProcessor',
         exportId,
@@ -94,6 +108,9 @@ export class PrivacyExportProcessor extends WorkerHost {
       });
     } catch (error) {
       if (storageKey) {
+        // The archive was built but could not be published: remove it. If
+        // that fails as well, the final-failure cleanup removes the whole
+        // export directory.
         await this.storage.delete(storageKey).catch(() => undefined);
       }
       if (error instanceof PrivacyExportSupersededError) {
@@ -137,7 +154,7 @@ export class PrivacyExportProcessor extends WorkerHost {
       exportId,
       attempt: job.attemptsMade + 1,
       errorName: error instanceof Error ? error.name : typeof error,
-      errorCode: this.errorCode(error),
+      errorCode: errorCode(error),
     };
 
     if (permanent) job.discard();
@@ -148,26 +165,25 @@ export class PrivacyExportProcessor extends WorkerHost {
       });
       this.logger.warn('Personal data export will retry', diagnostics);
     } else {
-      await failExport(
-        this.prisma,
-        this.storage,
-        exportId,
-        PRIVACY_EXPORT_FAILURE_MESSAGE,
-        { startedAt },
-      );
-      this.logger.error('Personal data export failed', diagnostics);
+      const code = this.failureCode(error);
+      await this.lifecycle.fail(exportId, code, { startedAt });
+      this.logger.error('Personal data export failed', {
+        ...diagnostics,
+        failureCode: code,
+      });
     }
     return error instanceof Error
       ? error
       : new Error('Personal data export failed');
   }
 
-  private errorCode(error: unknown): string | undefined {
-    return typeof error === 'object' &&
-      error !== null &&
-      'code' in error &&
-      typeof error.code === 'string'
-      ? error.code
-      : undefined;
+  private failureCode(error: unknown): DataExportErrorCode {
+    if (error instanceof PrivacyExportPermanentError) {
+      return 'ACCOUNT_UNAVAILABLE';
+    }
+    const code = errorCode(error);
+    return code && STORAGE_FULL_CODES.has(code)
+      ? 'STORAGE_FULL'
+      : 'GENERATION_FAILED';
   }
 }

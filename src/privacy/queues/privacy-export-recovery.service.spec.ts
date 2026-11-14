@@ -3,24 +3,22 @@ import type { Job, Queue } from 'bullmq';
 import { mock, mockDeep } from 'jest-mock-extended';
 import type { Logger } from 'winston';
 import type { PrismaService } from '../../common/services/prisma.service';
-import type { PrivacyExportStorageService } from '../../storage/privacy-export-storage.service';
 import type { PrivacyExportJob } from '../interfaces/privacy-export.interface';
-import { PRIVACY_EXPORT_INTERRUPTED_MESSAGE } from '../privacy-export.constants';
+import type { PrivacyExportLifecycleService } from './privacy-export-lifecycle.service';
 import { PrivacyExportRecoveryService } from './privacy-export-recovery.service';
 
 const NOW = new Date('2026-09-01T12:00:00.000Z');
-const anyDate: unknown = expect.any(Date);
 const STALE = new Date(NOW.getTime() - 10 * 60_000);
 
 describe('PrivacyExportRecoveryService (privacy export recovery)', () => {
   const prisma = mockDeep<PrismaService>();
-  const storage = mock<PrivacyExportStorageService>();
+  const lifecycle = mock<PrivacyExportLifecycleService>();
   const queue = mock<Queue<PrivacyExportJob>>();
   const logger = mock<Logger>();
   const service = () =>
     new PrivacyExportRecoveryService(
       prisma,
-      storage,
+      lifecycle,
       queue,
       new ConfigService({}),
       logger,
@@ -36,11 +34,8 @@ describe('PrivacyExportRecoveryService (privacy export recovery)', () => {
       { id: 'waiting', updatedAt: STALE },
       { id: 'running', updatedAt: STALE },
     ] as never);
-    prisma.dataExport.findUnique.mockResolvedValue({
-      authId: 'owner',
-    } as never);
-    prisma.dataExport.updateMany.mockResolvedValue({ count: 1 });
-    storage.deleteExportScope.mockResolvedValue();
+    lifecycle.fail.mockResolvedValue(true);
+    lifecycle.retryPendingCleanups.mockResolvedValue(0);
     queue.getJob.mockImplementation((id: string) =>
       Promise.resolve(
         id === 'lost'
@@ -54,7 +49,7 @@ describe('PrivacyExportRecoveryService (privacy export recovery)', () => {
     );
   });
 
-  it('fails only stale exports whose job is gone or finished, and frees the owner', async () => {
+  it('fails only stale exports whose job is gone or finished, as INTERRUPTED', async () => {
     await service().reconcile(NOW);
 
     expect(prisma.dataExport.findMany.mock.calls[0][0]).toMatchObject({
@@ -63,34 +58,36 @@ describe('PrivacyExportRecoveryService (privacy export recovery)', () => {
         updatedAt: { lt: new Date(NOW.getTime() - 120_000) },
       },
     });
-    const failed = prisma.dataExport.updateMany.mock.calls.map(
-      ([args]) => args.where?.id,
-    );
-    expect(failed).toEqual(['lost', 'failed-job']);
-    expect(prisma.dataExport.updateMany.mock.calls[0][0]).toEqual({
-      where: {
-        id: 'lost',
-        status: { in: ['QUEUED', 'PROCESSING'] },
-        updatedAt: STALE,
-      },
-      data: {
-        status: 'FAILED',
-        error: PRIVACY_EXPORT_INTERRUPTED_MESSAGE,
-        completedAt: anyDate,
-      },
-    });
-    expect(storage.deleteExportScope.mock.calls).toContainEqual([
-      'owner',
-      'lost',
+    // Guarded by updatedAt so an export that moved on is not failed.
+    expect(lifecycle.fail.mock.calls).toEqual([
+      ['lost', 'INTERRUPTED', { updatedAt: STALE }],
+      ['failed-job', 'INTERRUPTED', { updatedAt: STALE }],
     ]);
   });
 
-  it('treats a Redis error as "unknown", not as a missing job', async () => {
+  it('retries pending file cleanup of failed exports on every pass', async () => {
+    await service().reconcile(NOW);
+
+    expect(lifecycle.retryPendingCleanups.mock.calls).toHaveLength(1);
+  });
+
+  it('treats a Redis error as "unknown", not as a missing job, but still retries file cleanup', async () => {
     queue.getJob.mockRejectedValue(new Error('redis unavailable'));
 
     await service().reconcile(NOW);
 
-    expect(prisma.dataExport.updateMany.mock.calls).toHaveLength(0);
+    expect(lifecycle.fail.mock.calls).toHaveLength(0);
+    expect(lifecycle.retryPendingCleanups.mock.calls).toHaveLength(1);
     expect(logger.warn.mock.calls.length).toBeGreaterThan(0);
+  });
+
+  it('keeps running after a cleanup error and allows the next pass', async () => {
+    lifecycle.retryPendingCleanups.mockRejectedValueOnce(new Error('db down'));
+    const recovery = service();
+
+    await recovery.reconcile(NOW);
+    await recovery.reconcile(NOW);
+
+    expect(lifecycle.retryPendingCleanups.mock.calls).toHaveLength(2);
   });
 });

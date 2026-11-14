@@ -1,4 +1,4 @@
-import type { DataExportStatus } from '@prisma/client';
+import type { DataExportErrorCode, DataExportStatus } from '@prisma/client';
 
 /** The status of a personal-data export as returned by the API. */
 export interface DataExportView {
@@ -18,7 +18,12 @@ export interface DataExportView {
   sha256: string | null;
   photoCount: number | null;
   missingPhotoCount: number | null;
+  /** Processing attempts so far (an export is retried automatically). */
+  attempts: number;
+  /** Client-safe reason when `status` is FAILED. */
   error: string | null;
+  /** Machine-readable reason when `status` is FAILED. */
+  errorCode: DataExportErrorCode | null;
 }
 
 export interface PrivacyExportJob {

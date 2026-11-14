@@ -3,7 +3,14 @@ import { PrismaClient } from '@prisma/client';
 import type { Job } from 'bullmq';
 import { mock } from 'jest-mock-extended';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { Logger } from 'winston';
@@ -13,8 +20,12 @@ import type { PrismaService } from '../src/common/services/prisma.service';
 import { PrivacyExportArchiveService } from '../src/privacy/export/privacy-export-archive.service';
 import { PrivacyExportCollectorService } from '../src/privacy/export/privacy-export-collector.service';
 import type { PrivacyExportJob } from '../src/privacy/interfaces/privacy-export.interface';
-import { PRIVACY_EXPORT_RETENTION_MS } from '../src/privacy/privacy-export.constants';
+import {
+  PRIVACY_EXPORT_FAILURES,
+  PRIVACY_EXPORT_RETENTION_MS,
+} from '../src/privacy/privacy-export.constants';
 import { PrivacyExportService } from '../src/privacy/privacy-export.service';
+import { PrivacyExportLifecycleService } from '../src/privacy/queues/privacy-export-lifecycle.service';
 import { PrivacyExportProcessor } from '../src/privacy/queues/privacy-export.processor';
 import type { PrivacyExportQueueService } from '../src/privacy/queues/privacy-export.queue';
 import { PrivateImageStorageService } from '../src/storage/private-image-storage.service';
@@ -243,6 +254,9 @@ describeWithDatabase('Personal data export (PostgreSQL)', () => {
   let root: string;
   let exportsService: PrivacyExportService;
   let processor: PrivacyExportProcessor;
+  let exportStorage: PrivacyExportStorageService;
+  let images: PrivateImageStorageService;
+  let lifecycle: PrivacyExportLifecycleService;
   const queued: PrivacyExportJob[] = [];
   const env = {
     images: process.env.PRIVATE_UPLOAD_DIR,
@@ -269,14 +283,15 @@ describeWithDatabase('Personal data export (PostgreSQL)', () => {
       queued.push(job);
       return Promise.resolve();
     });
-    const exportStorage = new PrivacyExportStorageService();
+    exportStorage = new PrivacyExportStorageService();
+    images = new PrivateImageStorageService();
     const logger = mock<Logger>();
-    exportsService = new PrivacyExportService(
+    lifecycle = new PrivacyExportLifecycleService(
       prisma,
-      queue,
       exportStorage,
       logger,
     );
+    exportsService = new PrivacyExportService(prisma, queue, lifecycle, logger);
     const subscriptions = new SubscriptionAccessService(
       prisma,
       new SubscriptionPlanService(
@@ -288,10 +303,11 @@ describeWithDatabase('Personal data export (PostgreSQL)', () => {
       prisma,
       new PrivacyExportArchiveService(
         new PrivacyExportCollectorService(prisma, subscriptions),
-        new PrivateImageStorageService(),
+        images,
         exportStorage,
       ),
       exportStorage,
+      lifecycle,
       logger,
     );
   });
@@ -328,13 +344,23 @@ describeWithDatabase('Personal data export (PostgreSQL)', () => {
     return user.id;
   }
 
-  const runQueuedJob = async (job: PrivacyExportJob) =>
+  const runQueuedJob = async (job: PrivacyExportJob, attemptsMade = 0) =>
     processor.process({
       data: job,
       opts: { attempts: 3 },
-      attemptsMade: 0,
+      attemptsMade,
       discard: jest.fn(),
     } as unknown as Job<PrivacyExportJob>);
+
+  /** Files stored for an export (a missing directory means none). */
+  const exportFiles = async (authId: string, exportId: string) => {
+    try {
+      return await readdir(join(root, 'exports', authId, exportId));
+    } catch (error) {
+      if ((error as { code?: string }).code === 'ENOENT') return [];
+      throw error;
+    }
+  };
 
   interface SeededUser {
     id: string;
@@ -802,11 +828,130 @@ describeWithDatabase('Personal data export (PostgreSQL)', () => {
           authId: owner,
           idempotencyKey: 'expiry-before-completion',
           status: 'FAILED',
+          error: 'failed',
+          errorCode: 'GENERATION_FAILED',
           completedAt: now,
           expiresAt: new Date(now.getTime() - 1),
         },
       }),
     ).rejects.toThrow(/DataExport_expiry_after_completion/);
+    // A failed export always says why, only failures have a code, and a
+    // failed export never points at an archive.
+    await expect(
+      client.dataExport.create({
+        data: { authId: owner, idempotencyKey: 'no-reason', status: 'FAILED' },
+      }),
+    ).rejects.toThrow(/DataExport_failed_has_reason/);
+    await expect(
+      client.dataExport.create({
+        data: {
+          authId: owner,
+          idempotencyKey: 'code-without-failure',
+          errorCode: 'INTERRUPTED',
+        },
+      }),
+    ).rejects.toThrow(/DataExport_error_code_only_when_failed/);
+    await expect(
+      client.dataExport.create({
+        data: {
+          authId: owner,
+          idempotencyKey: 'failed-with-archive',
+          status: 'FAILED',
+          error: 'failed',
+          errorCode: 'GENERATION_FAILED',
+          completedAt: now,
+          storageKey: `${owner}/x/archive.zip`,
+        },
+      }),
+    ).rejects.toThrow(/DataExport_failed_has_no_archive/);
+  });
+
+  it('records a failed export with its reason, deletes its files, and completes a later retry with one archive', async () => {
+    const owner = await createUser('hash');
+    const session = await client.makeupSession.create({
+      data: { authId: owner },
+    });
+    const photoKey = `${owner}/${session.id}/${randomUUID()}.jpg`;
+    await putImage(photoKey, Buffer.from('photo'));
+    await client.imageAsset.create({
+      data: {
+        sessionId: session.id,
+        purpose: 'INITIAL_ANALYSIS',
+        source: 'PRIVATE_UPLOAD',
+        storageKey: photoKey,
+        mimeType: 'image/jpeg',
+        width: 1,
+        height: 1,
+        sizeBytes: 5,
+      },
+    });
+    const ioError = () => Object.assign(new Error('EIO'), { code: 'EIO' });
+
+    // 1. Every attempt fails, and its partial archive cannot even be
+    //    removed right away: the final failure still cleans up.
+    const failing = await exportsService.requestExport(owner);
+    const failingJob = queued.find((job) => job.exportId === failing.id)!;
+    const read = jest.spyOn(images, 'read').mockRejectedValue(ioError());
+    const remove = jest
+      .spyOn(exportStorage, 'delete')
+      .mockRejectedValue(ioError());
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await expect(runQueuedJob(failingJob, attempt)).rejects.toMatchObject({
+        code: 'EIO',
+      });
+    }
+    remove.mockRestore();
+    read.mockRestore();
+
+    const failed = await client.dataExport.findUniqueOrThrow({
+      where: { id: failing.id },
+    });
+    expect(failed).toMatchObject({
+      status: 'FAILED',
+      attempts: 3,
+      errorCode: 'GENERATION_FAILED',
+      error: PRIVACY_EXPORT_FAILURES.GENERATION_FAILED,
+      storageKey: null,
+    });
+    expect(failed.filesDeletedAt).toBeInstanceOf(Date);
+    expect(await exportFiles(owner, failing.id)).toEqual([]);
+    await expect(
+      exportsService.getExport(owner, failing.id),
+    ).resolves.toMatchObject({
+      status: 'FAILED',
+      errorCode: 'GENERATION_FAILED',
+      error: PRIVACY_EXPORT_FAILURES.GENERATION_FAILED,
+    });
+    // Redelivering the failed job creates nothing.
+    await runQueuedJob(failingJob);
+    expect(await exportFiles(owner, failing.id)).toEqual([]);
+
+    // 2. A new request is not blocked; its first attempt fails, the retry
+    //    completes, and exactly one archive remains.
+    const retried = await exportsService.requestExport(owner);
+    expect(retried.id).not.toBe(failing.id);
+    const retryJob = queued.find((job) => job.exportId === retried.id)!;
+    jest.spyOn(images, 'read').mockRejectedValueOnce(ioError());
+    await expect(runQueuedJob(retryJob, 0)).rejects.toMatchObject({
+      code: 'EIO',
+    });
+    expect(
+      await client.dataExport.findUniqueOrThrow({ where: { id: retried.id } }),
+    ).toMatchObject({ status: 'QUEUED', errorCode: null, error: null });
+    await runQueuedJob(retryJob, 1);
+    jest.restoreAllMocks();
+
+    const completed = await client.dataExport.findUniqueOrThrow({
+      where: { id: retried.id },
+    });
+    expect(completed).toMatchObject({ status: 'COMPLETED', attempts: 2 });
+    expect(await exportFiles(owner, retried.id)).toEqual([
+      completed.storageKey!.split('/').pop(),
+    ]);
+    // Only one job per export was ever queued.
+    expect(
+      queued.filter((job) => job.authId === owner).map((job) => job.exportId),
+    ).toEqual([failing.id, retried.id]);
   });
 
   it('removes export records when the account is deleted', async () => {

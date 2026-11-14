@@ -10,6 +10,7 @@ import { PrivacyExportCollectorService } from './export/privacy-export-collector
 import { PRIVACY_EXPORT_QUEUE } from './privacy-export.constants';
 import { PrivacyExportController } from './privacy-export.controller';
 import { PrivacyExportService } from './privacy-export.service';
+import { PrivacyExportLifecycleService } from './queues/privacy-export-lifecycle.service';
 import { PrivacyExportRecoveryService } from './queues/privacy-export-recovery.service';
 import { PrivacyExportProcessor } from './queues/privacy-export.processor';
 import { PrivacyExportQueueService } from './queues/privacy-export.queue';
@@ -28,6 +29,7 @@ import { PrivacyExportQueueService } from './queues/privacy-export.queue';
     PrivacyExportQueueService,
     PrivacyExportProcessor,
     PrivacyExportRecoveryService,
+    PrivacyExportLifecycleService,
     PrivacyExportCollectorService,
     PrivacyExportArchiveService,
     AuthGuard,
