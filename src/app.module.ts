@@ -15,6 +15,7 @@ import { DatabaseModule } from './common/modules/database.module';
 import { ProfileModule } from './profile/profile.module';
 import { SubscriptionModule } from './subscription/subscription.module';
 import { PrivacyModule } from './privacy/privacy.module';
+import { AccountDeletionModule } from './privacy/account-deletion/account-deletion.module';
 
 @Module({
   imports: [
@@ -40,6 +41,7 @@ import { PrivacyModule } from './privacy/privacy.module';
     ProfileModule,
     SubscriptionModule,
     PrivacyModule,
+    AccountDeletionModule,
   ],
   controllers: [AppController],
   providers: [AppService],

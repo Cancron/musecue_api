@@ -33,6 +33,21 @@ export class EmailProcessor extends WorkerHost {
         case 'welcome':
           await this.handleWelcomeEmail(job);
           break;
+        case 'account-deletion-code': {
+          const data = job.data;
+          await this.emailService.sendAccountDeletionCodeEmail(
+            data.email,
+            data.username,
+            data.code,
+            data.expiresInMinutes,
+          );
+          // The code itself is never logged.
+          this.logger.info('Account deletion code email sent', {
+            context: 'EmailProcessor',
+            jobId: job.id,
+          });
+          break;
+        }
         default:
           this.logger.warn(
             `Unknown email job type: ${String((job.data as { type?: string }).type || 'undefined')}`,

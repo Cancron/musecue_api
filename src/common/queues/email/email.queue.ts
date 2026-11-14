@@ -17,7 +17,18 @@ export interface WelcomeEmailJob {
   authId?: string;
 }
 
-export type EmailJob = VerificationEmailJob | WelcomeEmailJob;
+export interface AccountDeletionCodeEmailJob {
+  type: 'account-deletion-code';
+  email: string;
+  username: string;
+  code: string;
+  expiresInMinutes: number;
+}
+
+export type EmailJob =
+  | VerificationEmailJob
+  | WelcomeEmailJob
+  | AccountDeletionCodeEmailJob;
 
 @Injectable()
 export class EmailQueueService {
@@ -46,6 +57,34 @@ export class EmailQueueService {
         },
         removeOnComplete: 100,
         removeOnFail: 500,
+      },
+    );
+  }
+
+  /**
+   * Queues the one-time code that confirms an account deletion. The job holds
+   * a secret, so it is removed from Redis as soon as it finishes or fails.
+   */
+  async sendAccountDeletionCode(
+    email: string,
+    username: string,
+    code: string,
+    expiresInMinutes: number,
+  ): Promise<void> {
+    await this.emailQueue.add(
+      'send-account-deletion-code',
+      {
+        type: 'account-deletion-code',
+        email,
+        username,
+        code,
+        expiresInMinutes,
+      } as AccountDeletionCodeEmailJob,
+      {
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 2000 },
+        removeOnComplete: true,
+        removeOnFail: true,
       },
     );
   }

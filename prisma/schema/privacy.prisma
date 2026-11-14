@@ -47,3 +47,38 @@ model DataExport {
   @@index([status, expiresAt])
   @@index([status, filesDeletedAt])
 }
+
+// ================================
+// Account Deletion Request
+// ================================
+
+// The owner's request to permanently delete their account, and the state of
+// its processing so an interrupted deletion can be resumed.
+//
+// Accepting a request blocks the account in the same transaction
+// (authUser.status = PENDING_DELETION, tokenVersion + 1), then revokes every
+// session (`sessionsRevokedAt`). Erasing the account's data completes the
+// request (`completedAt`).
+//
+// Deliberately no foreign key to authUser: the request must outlive the
+// account it deletes (as the record that the deletion happened and to resume
+// it), so it stores only the pseudonymous account ID and no personal data.
+// At most one request per account is open (not COMPLETED) at a time
+// (partial unique index in the migration).
+model AccountDeletionRequest {
+  id                  String                      @id @default(uuid())
+  authId              String
+  status              AccountDeletionStatus       @default(PENDING)
+  verificationMethod  AccountDeletionVerification
+  requestedAt         DateTime                    @default(now())
+  accountBlockedAt    DateTime
+  sessionsRevokedAt   DateTime?
+  processingStartedAt DateTime?
+  completedAt         DateTime?
+  attempts            Int                         @default(0)
+  lastError           String?                     @db.VarChar(500)
+  updatedAt           DateTime                    @updatedAt
+
+  @@index([authId])
+  @@index([status, sessionsRevokedAt])
+}

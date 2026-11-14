@@ -15,6 +15,8 @@ enum userStatus {
   SUSPENDED
   DELETED
   BLOCKED
+  // The owner asked for permanent deletion; the account is locked out.
+  PENDING_DELETION
 }
 
 enum mfaMethod {
@@ -191,4 +193,16 @@ enum DataExportErrorCode {
   ACCOUNT_UNAVAILABLE
   INTERRUPTED
   QUEUE_UNAVAILABLE
+}
+
+enum AccountDeletionStatus {
+  // Accepted: the account is blocked and awaits erasure.
+  PENDING
+  PROCESSING
+  COMPLETED
+}
+
+enum AccountDeletionVerification {
+  PASSWORD
+  EMAIL_CODE
 }

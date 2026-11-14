@@ -530,7 +530,9 @@ export class GoogleOAuthService {
         );
       }
 
-      if (user.status === 'DELETED' || user.status === 'INACTIVE') {
+      // Any other non-active state (DELETED, INACTIVE, PENDING_DELETION, or
+      // a future status) must never receive tokens.
+      if (user.status !== 'ACTIVE') {
         throw AppError.unauthorized('Invalid credentials');
       }
     }

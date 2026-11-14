@@ -18,6 +18,7 @@ The companion mobile application and detailed product specifications live in `..
 - a provider-neutral AI gateway with OpenRouter live mode, multimodal private-image input, strict structured output, runtime validation, bounded retries, and deterministic mock mode
 - a single Pro subscription plan: admin-configured monthly/yearly pricing and free trial, one-time trial activation, date-based Pro access through `ProAccessGuard`, and payment/lifecycle records protected by database rules (see "Subscriptions" under API); checkout, webhooks and billing endpoints are not implemented yet
 - personal data export: an authenticated user can request an asynchronous ZIP archive of their own account, profile, makeup history, subscription records and private photos, poll its status, and download it through a signed link valid for at most 15 minutes; archives expire 24 hours after export and are deleted by a scheduled retention sweep (see "Personal data export" under API)
+- account deletion requests: the owner confirms their identity (password, or an emailed code for accounts without one), the account is blocked at once (`PENDING_DELETION`, all sessions revoked) and the request is recorded for resumable processing (see "Account deletion" under API); erasing the account's data is the next step
 
 Migration `20260827174107_add_makeup_workflow` adds the makeup aggregate and removes the dormant job-tracker and subscription starter domains.
 
@@ -372,10 +373,10 @@ handler(@Req() req: ProAccessRequest) { /* req.proAccess: status, accessSource, 
 
 The guard delegates to `SubscriptionAccessService`, the single Pro access decision. An active free trial and an active paid term unlock the same features, each within its own `[startedAt, expiresAt)` window. Without access, the guard returns `403` with `An active Pro subscription or free trial is required` and the handler does not run. Requests that did not pass `AuthGuard` are rejected with `401`, and lookup errors never grant access. No makeup endpoint uses the guard yet.
 
-Database tests (`test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`, `test/privacy-export.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
+Database tests (`test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`, `test/privacy-export.e2e-spec.ts`, `test/account-deletion.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
 
 ```bash
-TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json test/subscription-plan test/user-subscription test/subscription-trial test/subscription-status test/pro-access test/trial-lifecycle test/billing test/subscription-security test/privacy-export
+TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json test/subscription-plan test/user-subscription test/subscription-trial test/subscription-status test/pro-access test/trial-lifecycle test/billing test/subscription-security test/privacy-export test/account-deletion
 ```
 
 Personal data export unit tests (no database or Redis needed):
@@ -476,12 +477,36 @@ Deletion does not depend on any user request. `PrivacyExportRetentionService` ru
 
 Sweeps are idempotent and can run concurrently on several instances. Repeating a sweep changes nothing, and each step only ever affects the expired or failed export it is about, never other users' exports. All instances must share the same `PRIVACY_EXPORT_DIR` storage, because a sweep on one instance must be able to delete files that another instance wrote.
 
+### Account deletion
+
+Routes require a bearer token. The account is always the token's user. A request cannot name another account, and any extra body field (for example `userId`) is rejected with `400`.
+
+| Method | Route | Purpose |
+| ------ | ----- | ------- |
+| `POST` | `/v1/privacy/account-deletion/confirmation-code` | Email a one-time confirmation code (accounts without a password, e.g. Google sign-in) |
+| `POST` | `/v1/privacy/account-deletion` | Confirm identity and request permanent deletion (`202`) |
+
+**Identity verification** follows the login conventions:
+
+- Accounts with a password send `{ "password": "..." }`. The check uses constant-time bcrypt, and wrong passwords count toward the same lockout as failed logins (5 failures lock the account for 30 minutes and revoke its tokens).
+- Accounts without a password (Google sign-in) first request a code, which is emailed to the account's address, then send `{ "code": "A1B2C3" }`. Codes are 6 characters, stored only as a hash bound to the account, valid 10 minutes, single-use and limited to 5 guesses. At most 3 codes can be requested per 15 minutes.
+- Sending the wrong kind of proof returns `400`; a wrong password or code returns `403` (`Identity verification failed`). Confirmations are limited to 5 per 15 minutes (`429`).
+
+**Acceptance and blocking.** In one transaction, the account moves from `ACTIVE` to `PENDING_DELETION` (a guarded update), its `tokenVersion` is incremented, and an `AccountDeletionRequest` is recorded. Then every refresh token is revoked and the cached token version is overwritten, so the current and all other sessions stop working at once. Login, token refresh and Google sign-in refuse any account that is not `ACTIVE`. The response is `202` with `{ id, status, requestedAt, accountBlockedAt, sessionsRevoked }`.
+
+**Multiple requests.** Only one open (not `COMPLETED`) request per account can exist; a partial unique index enforces this. Concurrent requests are serialized by the row lock and all receive the same request. A repeated request after acceptance is refused with `401`, because the session has been revoked.
+
+**Processing status.** The request stores `status` (`PENDING` → `PROCESSING` → `COMPLETED`), `accountBlockedAt`, `sessionsRevokedAt`, `processingStartedAt`, `completedAt`, `attempts` and `lastError`. If revoking sessions fails, for example while Redis is down, the account stays blocked in the database, `sessionsRevokedAt` stays null, and `AccountDeletionRecoveryService` resumes the revocation at startup and every 30 seconds. The request has no foreign key to the account and holds no personal data, so it outlives the account it deletes.
+
+Not implemented yet: erasing the account's data and files and completing the request.
+
 ## Domain
 
 ```text
 authUser
 |-- UserSubscription (0..1)
 |-- DataExport
+|-- (AccountDeletionRequest: references authId without a foreign key)
 `-- MakeupSession
     |-- ImageAsset
     |-- MakeupPreferences
