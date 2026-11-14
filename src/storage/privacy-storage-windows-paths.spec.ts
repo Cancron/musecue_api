@@ -65,12 +65,26 @@ jest.mock('node:fs/promises', () => {
       return Promise.resolve();
     },
     rmdir: () => Promise.resolve(),
+    open: (file: string, flags: number) => {
+      mockOpenFlags.push(flags);
+      const data = mockFiles.get(file);
+      if (!data) return Promise.reject(missing(file));
+      const { Readable } =
+        jest.requireActual<typeof import('node:stream')>('node:stream');
+      return Promise.resolve({
+        stat: () => Promise.resolve({ isFile: () => true, size: data.length }),
+        createReadStream: () => Readable.from([data]),
+        close: () => Promise.resolve(),
+      });
+    },
   };
 });
 jest.mock('node:fs', () => {
   const { Writable } =
     jest.requireActual<typeof import('node:stream')>('node:stream');
   return {
+    // Windows has no O_NOFOLLOW.
+    constants: { O_RDONLY: 0 },
     createWriteStream: (file: string) => {
       const chunks: Buffer[] = [];
       const stream = new Writable({
@@ -99,6 +113,7 @@ import { PrivacyExportStorageService } from './privacy-export-storage.service';
 
 const mockFiles = new Map<string, Buffer>();
 const mockDirectories = new Set<string>();
+const mockOpenFlags: number[] = [];
 
 const IMAGE_ROOT = 'C:\\MuseCue\\private-images';
 const EXPORT_ROOT = 'D:\\MuseCue Data\\private-exports';
@@ -230,6 +245,25 @@ describe('Private storage on Windows (privacy export prerequisites)', () => {
 
       await storage.deleteExportScope(OWNER, EXPORT_ID);
       expect(mockFiles.size).toBe(0);
+    });
+
+    it('opens a published archive for download (no O_NOFOLLOW on Windows)', async () => {
+      const storage = new PrivacyExportStorageService();
+      const key = await writeArchive(storage);
+
+      // Not yet committed: only a .partial file exists, nothing is served.
+      await expect(storage.openArchive(key)).resolves.toBeNull();
+      await storage.commitArchive(key);
+
+      const opened = await storage.openArchive(key);
+      expect(opened?.sizeBytes).toBe(3);
+      const chunks: Buffer[] = [];
+      for await (const chunk of opened!.stream) chunks.push(chunk as Buffer);
+      expect(Buffer.concat(chunks).toString()).toBe('zip');
+      expect(mockOpenFlags.at(-1)).toBe(0);
+      await expect(storage.openArchive(`${key}${'.partial'}`)).rejects.toThrow(
+        'Invalid private export storage key',
+      );
     });
   });
 });

@@ -27,6 +27,7 @@ import {
   PRIVACY_EXPORT_FAILURES,
   PRIVACY_EXPORT_RETENTION_MS,
 } from './privacy-export.constants';
+import { PrivacyExportDownloadService } from './download/privacy-export-download.service';
 import { PrivacyExportController } from './privacy-export.controller';
 import { PrivacyExportService } from './privacy-export.service';
 import { PrivacyExportLifecycleService } from './queues/privacy-export-lifecycle.service';
@@ -100,6 +101,10 @@ describe('Privacy export endpoints (HTTP)', () => {
         AuthGuard,
         { provide: PrivacyExportQueueService, useValue: queue },
         PrivacyExportLifecycleService,
+        {
+          provide: PrivacyExportDownloadService,
+          useValue: mock<PrivacyExportDownloadService>(),
+        },
         { provide: PrivacyExportStorageService, useValue: storage },
       ],
     }).compile();

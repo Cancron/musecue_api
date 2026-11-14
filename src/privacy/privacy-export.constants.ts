@@ -11,6 +11,14 @@ export const PRIVACY_EXPORT_RETENTION_MS = 24 * 60 * 60 * 1000;
 export const PRIVACY_EXPORT_FORMAT_VERSION = 1;
 
 export const PRIVACY_EXPORT_MAX_ATTEMPTS = 3;
+
+/**
+ * Signed download links live at most 15 minutes (and never beyond the
+ * archive's own expiry). PRIVACY_EXPORT_DOWNLOAD_TTL_SECONDS may shorten this
+ * but cannot raise it.
+ */
+export const PRIVACY_EXPORT_DOWNLOAD_MAX_TTL_SECONDS = 15 * 60;
+export const PRIVACY_EXPORT_DOWNLOAD_MIN_TTL_SECONDS = 60;
 export const PRIVACY_EXPORT_LIST_LIMIT = 20;
 
 /**

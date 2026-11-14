@@ -5,6 +5,8 @@ import { QueueModule } from '../common/modules';
 import { RedisService } from '../common/services/redis.service';
 import { StorageModule } from '../storage/storage.module';
 import { SubscriptionModule } from '../subscription/subscription.module';
+import { PrivacyExportDownloadService } from './download/privacy-export-download.service';
+import { PrivacyExportLinkSigner } from './download/privacy-export-link.signer';
 import { PrivacyExportArchiveService } from './export/privacy-export-archive.service';
 import { PrivacyExportCollectorService } from './export/privacy-export-collector.service';
 import { PRIVACY_EXPORT_QUEUE } from './privacy-export.constants';
@@ -30,6 +32,8 @@ import { PrivacyExportQueueService } from './queues/privacy-export.queue';
     PrivacyExportProcessor,
     PrivacyExportRecoveryService,
     PrivacyExportLifecycleService,
+    PrivacyExportDownloadService,
+    PrivacyExportLinkSigner,
     PrivacyExportCollectorService,
     PrivacyExportArchiveService,
     AuthGuard,

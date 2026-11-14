@@ -1,4 +1,13 @@
-import { mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises';
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PrivacyExportStorageService } from './privacy-export-storage.service';
@@ -99,6 +108,52 @@ describe('PrivacyExportStorageService (privacy export archives)', () => {
         keep: `${OWNER}/${EXPORT_ID}/x.zip`,
       }),
     ).resolves.toBeUndefined();
+  });
+
+  describe('openArchive', () => {
+    const read = async (stream: NodeJS.ReadableStream) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of stream) chunks.push(chunk as Buffer);
+      return Buffer.concat(chunks);
+    };
+
+    it('opens a published archive with its size', async () => {
+      const key = await write();
+
+      const opened = await storage.openArchive(key);
+
+      expect(opened?.sizeBytes).toBe('zip-bytes'.length);
+      expect(await read(opened!.stream)).toEqual(Buffer.from('zip-bytes'));
+    });
+
+    it('never serves an unfinished archive or a missing file', async () => {
+      const partial = await write(OWNER, EXPORT_ID, false);
+
+      await expect(storage.openArchive(partial)).resolves.toBeNull();
+      await expect(storage.openArchive(`${partial}.partial`)).rejects.toThrow(
+        'Invalid private export storage key',
+      );
+      await expect(
+        storage.openArchive(`${OWNER}/${EXPORT_ID}/missing.zip`),
+      ).resolves.toBeNull();
+    });
+
+    it('does not follow a symbolic link planted in place of an archive', async () => {
+      if (process.platform === 'win32') return;
+      const secret = join(root, 'outside-secret.txt');
+      await writeFile(secret, 'not an archive');
+      const key = `${OWNER}/${EXPORT_ID}/planted.zip`;
+      await mkdir(join(root, OWNER, EXPORT_ID), { recursive: true });
+      await symlink(secret, join(root, key));
+
+      await expect(storage.openArchive(key)).resolves.toBeNull();
+    });
+
+    it('rejects keys outside the export root', async () => {
+      await expect(storage.openArchive('../../etc/passwd.zip')).rejects.toThrow(
+        'Invalid private export storage key',
+      );
+    });
   });
 
   it('creates archives readable only by the service account', async () => {

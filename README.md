@@ -17,7 +17,7 @@ The companion mobile application and detailed product specifications live in `..
 - `AiRun` audit records containing operation, provider, model, prompt version, latency, progress, result/error, and status
 - a provider-neutral AI gateway with OpenRouter live mode, multimodal private-image input, strict structured output, runtime validation, bounded retries, and deterministic mock mode
 - a single Pro subscription plan: admin-configured monthly/yearly pricing and free trial, one-time trial activation, date-based Pro access through `ProAccessGuard`, and payment/lifecycle records protected by database rules (see "Subscriptions" under API); checkout, webhooks and billing endpoints are not implemented yet
-- personal data export: an authenticated user can request an asynchronous ZIP archive of their own account, profile, makeup history, subscription records and private photos, and poll its status (see "Personal data export" under API); the archive download link and automatic 24-hour removal are the next step
+- personal data export: an authenticated user can request an asynchronous ZIP archive of their own account, profile, makeup history, subscription records and private photos, poll its status, and download it through a signed link valid for at most 15 minutes (see "Personal data export" under API); automatic 24-hour removal is the next step
 
 Migration `20260827174107_add_makeup_workflow` adds the makeup aggregate and removes the dormant job-tracker and subscription starter domains.
 
@@ -394,6 +394,8 @@ Routes require a bearer token. The owner is always the token's user; requests ca
 | `POST` | `/v1/privacy/exports`            | Queue a ZIP export of the caller's data (`202`)  |
 | `GET`  | `/v1/privacy/exports`            | List the caller's 20 most recent exports         |
 | `GET`  | `/v1/privacy/exports/:exportId`  | Poll one export's status and progress            |
+| `GET`  | `/v1/privacy/exports/:exportId/download` | Get a signed download link (max 15 minutes) |
+| `GET`  | `/v1/privacy/exports/:exportId/archive?expires&signature` | Download the archive with the signed link |
 
 `POST /v1/privacy/exports` takes no body; any body field (for example `userId`) is rejected with `400`. An optional `Idempotency-Key` header (1-128 characters of `A-Z a-z 0-9 _ . : -`) returns the same export on retry. Only one export per user can be `QUEUED` or `PROCESSING` at a time (a partial unique index); further requests, including concurrent ones, return that export instead of starting another. The route uses the strict rate limit. If the queue is unavailable the export is recorded as `FAILED` and the request returns `503`.
 
@@ -439,7 +441,30 @@ File cleanup and duplicates:
 
 Every 60 seconds, recovery fails exports older than `PRIVACY_EXPORT_RECOVERY_GRACE_MS` whose job is missing or finished (`INTERRUPTED`), so users are never blocked by a lost job.
 
-Not implemented yet: the download-link endpoint (`GET /v1/privacy/exports/:exportId/download`) and the retention job that deletes archives and marks exports `EXPIRED` after 24 hours.
+#### Downloading a completed export
+
+`GET /v1/privacy/exports/:exportId/download` returns a temporary link for the caller's own completed export:
+
+```json
+{
+  "url": "/v1/privacy/exports/<id>/archive?expires=1788264900&signature=<43 base64url chars>",
+  "method": "GET",
+  "expiresAt": "2026-09-01T12:15:00.000Z",
+  "fileName": "musecue-data-export-2026-09-01.zip",
+  "sizeBytes": 123456,
+  "sha256": "<archive checksum>"
+}
+```
+
+- The link expires after `PRIVACY_EXPORT_DOWNLOAD_TTL_SECONDS` (default and maximum 900 seconds, minimum 60), and never later than the archive's own `expiresAt`. The URL is relative to the API base URL. It is never built from the request's `Host` header.
+- `QUEUED`/`PROCESSING` and `FAILED` exports return `409`, expired exports return `410`, and another user's or an unknown export returns the same `404` as a missing one.
+- The signature is an HMAC-SHA256 over the export ID, the owner's user ID, the archive's SHA-256 and the expiry. The key is `PRIVACY_EXPORT_DOWNLOAD_SECRET`, or a purpose-bound key derived from `JWT_ACCESS_SECRET` with HKDF. Verification is constant-time. Rotating the key invalidates issued links.
+- **Using the link also requires the owner's bearer token.** The signature is checked against the caller's user ID, so a link that leaks (logs, screenshots, shared devices) is useless to anyone else. Without a token the response is `401`, with another user's token, a tampered expiry or signature, or another export's ID it is `403`, and after the link expires it is `410`. A link stops working early when the export expires or its archive is replaced or missing.
+- The archive is streamed with `Content-Type: application/zip`, `Content-Disposition: attachment`, `Cache-Control: private, no-store`, `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`. Its size must still match the recorded size.
+- Signed URLs are never logged: request logging and the exception filter redact `signature` (and `token`/`access_token`/`refresh_token`) query values.
+- Archives stay private in storage. They live under `PRIVATE_EXPORT_DIR`, outside any static directory, in owner-only directories (`0700`) and files (`0600`), with random, unguessable names. Only finished `.zip` files are served, and only as regular files opened without following symbolic links.
+
+Not implemented yet: the retention job that deletes archives and marks exports `EXPIRED` after 24 hours.
 
 ## Domain
 

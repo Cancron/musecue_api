@@ -25,6 +25,9 @@ import {
   PRIVACY_EXPORT_RETENTION_MS,
 } from '../src/privacy/privacy-export.constants';
 import { PrivacyExportService } from '../src/privacy/privacy-export.service';
+import { ConfigService } from '@nestjs/config';
+import { PrivacyExportDownloadService } from '../src/privacy/download/privacy-export-download.service';
+import { PrivacyExportLinkSigner } from '../src/privacy/download/privacy-export-link.signer';
 import { PrivacyExportLifecycleService } from '../src/privacy/queues/privacy-export-lifecycle.service';
 import { PrivacyExportProcessor } from '../src/privacy/queues/privacy-export.processor';
 import type { PrivacyExportQueueService } from '../src/privacy/queues/privacy-export.queue';
@@ -257,6 +260,7 @@ describeWithDatabase('Personal data export (PostgreSQL)', () => {
   let exportStorage: PrivacyExportStorageService;
   let images: PrivateImageStorageService;
   let lifecycle: PrivacyExportLifecycleService;
+  let downloads: PrivacyExportDownloadService;
   const queued: PrivacyExportJob[] = [];
   const env = {
     images: process.env.PRIVATE_UPLOAD_DIR,
@@ -292,6 +296,17 @@ describeWithDatabase('Personal data export (PostgreSQL)', () => {
       logger,
     );
     exportsService = new PrivacyExportService(prisma, queue, lifecycle, logger);
+    downloads = new PrivacyExportDownloadService(
+      prisma,
+      new PrivacyExportLinkSigner(
+        new ConfigService({
+          PRIVACY_EXPORT_DOWNLOAD_SECRET:
+            'e2e-download-signing-secret-0123456789',
+        }),
+      ),
+      exportStorage,
+      new ConfigService({}),
+    );
     const subscriptions = new SubscriptionAccessService(
       prisma,
       new SubscriptionPlanService(
@@ -952,6 +967,61 @@ describeWithDatabase('Personal data export (PostgreSQL)', () => {
     expect(
       queued.filter((job) => job.authId === owner).map((job) => job.exportId),
     ).toEqual([failing.id, retried.id]);
+  });
+
+  it('downloads a completed archive only for its owner, only with a valid unexpired link', async () => {
+    const owner = await createUser('hash');
+    const other = await createUser('hash');
+    const requested = await exportsService.requestExport(owner);
+    await runQueuedJob(queued.find((job) => job.exportId === requested.id)!);
+    const row = await client.dataExport.findUniqueOrThrow({
+      where: { id: requested.id },
+    });
+    const archiveOnDisk = await readFile(
+      join(root, 'exports', row.storageKey!),
+    );
+    const issuedAt = new Date();
+
+    // Another user can neither obtain a link nor use the owner's link.
+    await expect(
+      downloads.createLink(other, requested.id, issuedAt),
+    ).rejects.toMatchObject({ status: 404 });
+    const link = await downloads.createLink(owner, requested.id, issuedAt);
+    expect(new Date(link.expiresAt).getTime()).toBeLessThanOrEqual(
+      issuedAt.getTime() + 15 * 60_000,
+    );
+    const params = new URL(link.url, 'http://api.invalid').searchParams;
+    const expires = Number(params.get('expires'));
+    const signature = params.get('signature')!;
+    await expect(
+      downloads.openDownload(other, requested.id, expires, signature, issuedAt),
+    ).rejects.toMatchObject({ status: 403 });
+
+    // The owner receives exactly the stored archive.
+    const opened = await downloads.openDownload(
+      owner,
+      requested.id,
+      expires,
+      signature,
+      issuedAt,
+    );
+    const chunks: Buffer[] = [];
+    for await (const chunk of opened.archive.stream) {
+      chunks.push(chunk as Buffer);
+    }
+    expect(Buffer.concat(chunks)).toEqual(archiveOnDisk);
+    expect(opened.sha256).toBe(row.sha256);
+
+    // Once the link expires it is refused, even for the owner.
+    await expect(
+      downloads.openDownload(
+        owner,
+        requested.id,
+        expires,
+        signature,
+        new Date(expires * 1000),
+      ),
+    ).rejects.toMatchObject({ status: 410 });
   });
 
   it('removes export records when the account is deleted', async () => {

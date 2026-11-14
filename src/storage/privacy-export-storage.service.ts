@@ -1,7 +1,20 @@
 import { Injectable } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
-import { createWriteStream, type WriteStream } from 'node:fs';
-import { mkdir, readdir, rename, rm, rmdir, unlink } from 'node:fs/promises';
+import {
+  constants as fsConstants,
+  createWriteStream,
+  type ReadStream,
+  type WriteStream,
+} from 'node:fs';
+import {
+  mkdir,
+  open,
+  readdir,
+  rename,
+  rm,
+  rmdir,
+  unlink,
+} from 'node:fs/promises';
 import { once } from 'node:events';
 import { dirname, join, resolve } from 'node:path';
 import {
@@ -23,6 +36,14 @@ export interface PrivacyExportArchiveTarget {
    */
   stream: WriteStream;
 }
+
+export interface OpenedArchive {
+  stream: ReadStream;
+  sizeBytes: number;
+}
+
+/** Read-only, and never through a symbolic link where the OS supports it. */
+const OPEN_ARCHIVE_FLAGS = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0);
 
 export interface DeleteExportScopeOptions {
   /** A finished archive of this export to keep; every other file is removed. */
@@ -73,6 +94,39 @@ export class PrivacyExportStorageService {
       this.resolveKey(`${storageKey}${PARTIAL_ARCHIVE_SUFFIX}`),
       this.resolveKey(storageKey),
     );
+  }
+
+  /**
+   * Opens a published archive for streaming, or returns null when it no
+   * longer exists. Only finished `.zip` archives (never `.partial` files),
+   * regular files, and no symbolic links are served.
+   */
+  async openArchive(storageKey: string): Promise<OpenedArchive | null> {
+    if (!storageKey.endsWith('.zip')) {
+      throw new Error('Invalid private export storage key');
+    }
+    const path = this.resolveKey(storageKey);
+    let handle: Awaited<ReturnType<typeof open>>;
+    try {
+      handle = await open(path, OPEN_ARCHIVE_FLAGS);
+    } catch (error) {
+      // ELOOP: the path is a symbolic link, which is never served.
+      if (isMissingFileError(error) || errorCode(error) === 'ELOOP') {
+        return null;
+      }
+      throw error;
+    }
+    try {
+      const stats = await handle.stat();
+      if (!stats.isFile()) {
+        await handle.close();
+        return null;
+      }
+      return { stream: handle.createReadStream(), sizeBytes: stats.size };
+    } catch (error) {
+      await handle.close();
+      throw error;
+    }
   }
 
   /**
@@ -143,4 +197,13 @@ export class PrivacyExportStorageService {
       'Invalid private export storage key',
     );
   }
+}
+
+function errorCode(error: unknown): string | undefined {
+  return typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    typeof error.code === 'string'
+    ? error.code
+    : undefined;
 }

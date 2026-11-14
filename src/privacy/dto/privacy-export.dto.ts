@@ -5,6 +5,8 @@ import {
   Injectable,
   PipeTransform,
 } from '@nestjs/common';
+import { Type } from 'class-transformer';
+import { IsInt, IsString, Matches, Max, Min } from 'class-validator';
 import type { Request } from 'express';
 import { PRIVACY_EXPORT_IDEMPOTENCY_KEY_PATTERN } from '../privacy-export.constants';
 
@@ -56,4 +58,19 @@ export class EmptyBodyPipe implements PipeTransform<unknown, void> {
       throw new BadRequestException('This endpoint does not accept a body');
     }
   }
+}
+
+/** Query of a signed archive download link. */
+export class DownloadArchiveQueryDto {
+  /** Link expiry in seconds since the Unix epoch. */
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  @Max(99_999_999_999)
+  expires!: number;
+
+  /** Base64url HMAC-SHA256 signature (43 characters). */
+  @IsString()
+  @Matches(/^[A-Za-z0-9_-]{43}$/)
+  signature!: string;
 }
