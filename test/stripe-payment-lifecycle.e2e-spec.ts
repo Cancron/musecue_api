@@ -1039,6 +1039,227 @@ describeWithDatabase('Stripe payment lifecycle (PostgreSQL)', () => {
       });
     });
   });
+
+  /**
+   * A user on the free trial buys Pro. The existing subscription rules still
+   * apply: the trial history is never changed, paid Pro wins while both run,
+   * the trial can never be restarted, and a refund ends only the paid term
+   * (the trial keeps its own window).
+   */
+  describe('a free-trial user buying Pro', () => {
+    const justBefore = (iso: string) => plus(iso, -1);
+
+    afterEach(async () => {
+      await assertDatabaseInvariants();
+    });
+
+    const trialOf = async (authId: string) => {
+      const record = await client().userSubscription.findUniqueOrThrow({
+        where: { authId },
+        include: {
+          events: { orderBy: [{ occurredAt: 'asc' }, { type: 'asc' }] },
+        },
+      });
+      return {
+        fields: {
+          trialUsed: record.trialUsed,
+          trialStartedAt: iso(record.trialStartedAt),
+          trialExpiresAt: iso(record.trialExpiresAt),
+        },
+        events: record.events.map((event) => event.type),
+      };
+    };
+    async function startTrial() {
+      const authId = await createUser(client());
+      await http()
+        .post('/v1/subscription/trial')
+        .set('Authorization', harness.bearer(authId))
+        .expect(201);
+      return { authId, trial: await trialOf(authId) };
+    }
+    /** Checkout through the API, then paid on Stripe and confirmed. */
+    async function buyPro(authId: string, interval: string, paidAt: string) {
+      const response = await checkoutOf(authId, interval).expect(201);
+      const row = await client().checkoutSession.findUniqueOrThrow({
+        where: { id: dataOf(response).checkoutSessionId },
+      });
+      const sessionId = row.providerSessionId as string;
+      travel(paidAt);
+      api.completeSession(sessionId);
+      await deliverParallel(
+        [
+          api.signedEvent('checkout.session.completed', sessionId),
+          api.signedInvoiceEvent('invoice.paid', sessionInvoice(sessionId)),
+        ],
+        2,
+      );
+      return {
+        subscriptionId: sessionSubscription(sessionId),
+        invoiceId: sessionInvoice(sessionId),
+      };
+    }
+
+    it('keeps the trial history through purchase, renewal, cancellation and expiration (monthly)', async () => {
+      travel('2031-06-10T09:00:00.000Z');
+      const { authId, trial } = await startTrial();
+      expect(trial.fields).toEqual({
+        trialUsed: true,
+        trialStartedAt: '2031-06-10T09:00:00.000Z',
+        trialExpiresAt: expect.any(String) as string,
+      });
+      const trialEnd = trial.fields.trialExpiresAt as string;
+      await expect(statusOf(authId)).resolves.toMatchObject({
+        status: 'TRIAL',
+        hasProAccess: true,
+        accessSource: 'TRIAL',
+        accessExpiresAt: trialEnd,
+      });
+
+      // Bought during the trial.
+      const b0 = '2031-06-12T09:00:00.000Z';
+      const b1 = '2031-07-12T09:00:00.000Z';
+      const b2 = '2031-08-12T09:00:00.000Z';
+      travel(plus(b0, -5 * 60_000));
+      const { subscriptionId } = await buyPro(authId, 'MONTHLY', b0);
+      let now = await trialOf(authId);
+      expect(now).toEqual({
+        fields: trial.fields,
+        events: [...trial.events, 'CREATED'],
+      });
+      await expect(statusOf(authId)).resolves.toMatchObject({
+        status: 'PRO',
+        hasProAccess: true,
+        accessSource: 'PRO',
+        accessExpiresAt: b1,
+        trial: {
+          eligible: false,
+          ineligibleReason: 'TRIAL_ALREADY_USED',
+          used: true,
+          active: true,
+          startedAt: trial.fields.trialStartedAt,
+          expiresAt: trialEnd,
+        },
+        pro: { active: true, startedAt: b0, expiresAt: b1, canceledAt: null },
+      });
+
+      // Renewal.
+      travel(b1);
+      const renewal = api.renewSubscription(subscriptionId).id as string;
+      await deliverParallel(
+        [api.signedInvoiceEvent('invoice.paid', renewal)],
+        2,
+      );
+      now = await trialOf(authId);
+      expect(now).toEqual({
+        fields: trial.fields,
+        events: [...trial.events, 'CREATED', 'RENEWED'],
+      });
+      await expect(
+        accessAt(authId, { renewed: b1, lastInstant: justBefore(b2) }),
+      ).resolves.toEqual({ renewed: true, lastInstant: true });
+
+      // Cancellation at period end.
+      const canceledAt = plus(b1, 3 * DAY);
+      travel(canceledAt);
+      await http()
+        .post('/v1/subscription/cancel')
+        .set('Authorization', harness.bearer(authId))
+        .expect(200);
+      expect((await trialOf(authId)).fields).toEqual(trial.fields);
+      await expect(statusOf(authId)).resolves.toMatchObject({
+        hasProAccess: true,
+        accessSource: 'PRO',
+        pro: { active: true, expiresAt: b2, canceledAt },
+      });
+
+      // Expiration: no access, and the trial can never be restarted.
+      travel(b2);
+      api.cancelSubscription(subscriptionId);
+      await deliverParallel([
+        api.signedSubscriptionEvent(
+          'customer.subscription.deleted',
+          subscriptionId,
+        ),
+      ]);
+      await expect(statusOf(authId)).resolves.toMatchObject({
+        status: 'EXPIRED',
+        hasProAccess: false,
+        accessSource: null,
+        trial: { eligible: false, ineligibleReason: 'TRIAL_ALREADY_USED' },
+        pro: { active: false, expiresAt: b2, canceledAt },
+      });
+      await http()
+        .post('/v1/subscription/trial')
+        .set('Authorization', harness.bearer(authId))
+        .expect(409);
+      await expect(trialOf(authId)).resolves.toEqual({
+        fields: trial.fields,
+        events: [...trial.events, 'CREATED', 'RENEWED', 'CANCELED'],
+      });
+      await expect(
+        accessAt(authId, {
+          duringTrial: plus(trial.fields.trialStartedAt as string, HOUR),
+          lastInstant: justBefore(b2),
+          expiry: b2,
+        }),
+      ).resolves.toEqual({
+        duringTrial: true,
+        lastInstant: true,
+        expiry: false,
+      });
+    });
+
+    it('a full refund during the trial ends paid Pro at once; the trial keeps its own window (yearly)', async () => {
+      travel('2032-03-01T08:00:00.000Z');
+      const { authId, trial } = await startTrial();
+      const trialEnd = trial.fields.trialExpiresAt as string;
+      const b0 = '2032-03-02T08:00:00.000Z';
+      travel(plus(b0, -5 * 60_000));
+      const { invoiceId } = await buyPro(authId, 'YEARLY', b0);
+      await expect(statusOf(authId)).resolves.toMatchObject({
+        accessSource: 'PRO',
+        accessExpiresAt: '2033-03-02T08:00:00.000Z',
+      });
+
+      const refundedAt = plus(b0, DAY);
+      expect(at(refundedAt).getTime()).toBeLessThan(at(trialEnd).getTime());
+      travel(refundedAt);
+      api.refundInvoice(invoiceId, { reason: 'requested_by_customer' });
+      await deliverParallel(
+        [api.signedChargeEvent('charge.refunded', api.chargeOf(invoiceId))],
+        2,
+      );
+
+      const state = await storedState(authId);
+      expect(state?.payments).toMatchObject([
+        { status: 'REFUNDED', amountCents: 19000, refundedAmountCents: 19000 },
+      ]);
+      expect(state?.subscription).toMatchObject({ proExpiresAt: refundedAt });
+      await expect(trialOf(authId)).resolves.toEqual({
+        fields: trial.fields,
+        events: [...trial.events, 'CREATED', 'PAYMENT_REFUNDED'],
+      });
+      // Access continues from the trial only, until the trial's own expiry.
+      await expect(statusOf(authId)).resolves.toMatchObject({
+        status: 'TRIAL',
+        hasProAccess: true,
+        accessSource: 'TRIAL',
+        accessExpiresAt: trialEnd,
+        pro: { active: false },
+      });
+      await expect(
+        accessAt(authId, {
+          trialLastInstant: plus(trialEnd, -1),
+          trialEnd,
+          paidYearLeft: plus(trialEnd, 30 * DAY),
+        }),
+      ).resolves.toEqual({
+        trialLastInstant: true,
+        trialEnd: false,
+        paidYearLeft: false,
+      });
+    });
+  });
 });
 
 /** A deterministic shuffle (mulberry32), so failures are reproducible. */

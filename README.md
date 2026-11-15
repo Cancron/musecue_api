@@ -583,6 +583,7 @@ Review notes (November 2026):
   - the whole lifecycle for monthly and yearly plans, through the HTTP API and signed webhooks, with test users and a frozen clock at month-end and leap-day anchors: checkout, redirect only, confirmed payment, activation, renewal, failed payment, recovery, cancellation, restart, expiration, full and partial refund, and no payment;
   - checks on status, Pro access at exact instants, amounts, period lengths, Stripe references and the stored event history;
   - concurrent checkouts, webhooks and cancellations; duplicated events; an application restart;
+  - a free-trial user buying Pro: the trial history never changes through purchase, renewal, cancellation and expiration; a refund during the trial ends only the paid term;
   - the same lifecycle delivered reversed and in three shuffled orders, duplicated and concurrent, compared with the in-order stored state;
   - after every test, SQL checks of database invariants: each access change has a collected payment; terms are covered by payments; refund totals match; no duplicate payments or events; every webhook logged as processed.
 - **Problems found and fixed:**

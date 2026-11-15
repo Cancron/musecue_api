@@ -52,8 +52,8 @@ model UserSubscription {
   proCanceledAt   DateTime?
 
   // Link to the payment provider's recurring subscription (set by checkout).
-  paymentProvider        String? @db.VarChar(50)
-  providerSubscriptionId String? @db.VarChar(255)
+  paymentProvider        String?   @db.VarChar(50)
+  providerSubscriptionId String?   @db.VarChar(255)
   // Set when a renewal of the linked provider subscription failed and is
   // still being retried; cleared once a payment is collected or the provider
   // subscription ends. Never changes the paid term.
