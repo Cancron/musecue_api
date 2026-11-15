@@ -84,7 +84,14 @@ export class PrivacyExportProcessor extends WorkerHost {
     const claim = await this.prisma.dataExport.updateMany({
       // The owner in the job must match the row; a forged or stale job for
       // another user's export cannot claim it.
-      where: { id: exportId, authId, status: { in: ['QUEUED', 'PROCESSING'] } },
+      // Only while the account is active: once a deletion was approved, no
+      // export can start writing files (running ones are cancelled).
+      where: {
+        id: exportId,
+        authId,
+        status: { in: ['QUEUED', 'PROCESSING'] },
+        authUser: { is: { status: 'ACTIVE' } },
+      },
       data: {
         status: 'PROCESSING',
         progress: PROGRESS_STEP,

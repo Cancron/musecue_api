@@ -134,6 +134,8 @@ describe('Privacy export endpoints (HTTP)', () => {
     // AuthGuard: the token version cached for every user is 1.
     redis.get.mockResolvedValue(1 as never);
     table.attach(prisma);
+    // Owners are active unless a test says otherwise.
+    prisma.authUser.findUnique.mockResolvedValue({ status: 'ACTIVE' } as never);
     queue.enqueue.mockResolvedValue();
     storage.deleteExportScope.mockResolvedValue();
   });
@@ -310,6 +312,17 @@ describe('Privacy export endpoints (HTTP)', () => {
       const mine = await requestExport(USER_A).expect(202);
 
       expect(dataOf(mine).id).not.toBe(dataOf(other).id);
+    });
+
+    it('refuses to start an export for an account that is no longer active (e.g. pending deletion)', async () => {
+      prisma.authUser.findUnique.mockResolvedValue({
+        status: 'PENDING_DELETION',
+      } as never);
+
+      await requestExport(USER_A).expect(401);
+
+      expect(table.rows).toHaveLength(0);
+      expect(queue.enqueue.mock.calls).toHaveLength(0);
     });
 
     it('returns 503 and records a failed export when the queue is unavailable', async () => {

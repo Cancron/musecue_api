@@ -15,6 +15,8 @@ type Data = Record<string, unknown>;
  */
 export class DataExportTable {
   rows: DataExport[] = [];
+  /** Owners whose account is not ACTIVE (e.g. pending deletion). */
+  inactiveOwners = new Set<string>();
 
   private uniqueViolation(): Error {
     return Object.assign(new Error('Unique constraint failed'), {
@@ -46,6 +48,14 @@ export class DataExportTable {
 
   private matches(row: DataExport, where: Where = {}): boolean {
     return Object.entries(where).every(([field, expected]) => {
+      if (field === 'authUser') {
+        // The only relation filter used: the owner's account status.
+        const wanted = (expected as { is: { status: string } }).is.status;
+        const status = this.inactiveOwners.has(row.authId)
+          ? 'PENDING_DELETION'
+          : 'ACTIVE';
+        return status === wanted;
+      }
       const value = row[field as keyof DataExport];
       if (
         expected !== null &&

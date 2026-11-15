@@ -363,6 +363,18 @@ describe('Export worker coordination (privacy)', () => {
       expect(row.workerLeaseUntil).toBeNull();
     });
 
+    it('never claims an export of an account whose deletion was approved', async () => {
+      const row = await queuedExport();
+      table.inactiveOwners.add(OWNER_ID);
+      const build = jest.spyOn(PrivacyExportArchiveService.prototype, 'build');
+
+      await deliver(row.id);
+
+      expect(build.mock.calls).toHaveLength(0);
+      expect(row).toMatchObject({ status: 'QUEUED', workerLeaseUntil: null });
+      expect(await filesOf(row.id)).toEqual([]);
+    });
+
     it('releases its lease after a successful export', async () => {
       const row = await queuedExport();
 

@@ -993,6 +993,29 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
       ).resolves.toBe(0);
     });
 
+    it('never lets a worker start an export of an account whose deletion was approved', async () => {
+      const victim = await seedAccount();
+      const pending = await client.dataExport.findFirstOrThrow({
+        where: { authId: victim.id, status: 'PROCESSING' },
+      });
+      const filesBefore = await filesUnder('exports', victim.id);
+      await acceptDeletion(victim.id);
+
+      // A delayed job for the export is delivered after the approval.
+      await runExport(pending.id, victim.id);
+
+      await expect(
+        client.dataExport.findUniqueOrThrow({ where: { id: pending.id } }),
+      ).resolves.toMatchObject({
+        startedAt: pending.startedAt,
+        attempts: pending.attempts,
+        workerLeaseUntil: null,
+      });
+      expect(await filesUnder('exports', victim.id)).toEqual(filesBefore);
+      await recovery.resume();
+      expect(await filesUnder('exports', victim.id)).toEqual([]);
+    });
+
     it('serializes archive file creation with the cancellation (real row locks): before it, or refused after it', async () => {
       const authId = (await seedAccount()).id;
       // The account's running export (one active export per user).

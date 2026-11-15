@@ -90,6 +90,8 @@ describe('PrivacyExportProcessor (privacy export worker)', () => {
         id: EXPORT_ID,
         authId: OWNER,
         status: { in: ['QUEUED', 'PROCESSING'] },
+        // Never for an account whose deletion was approved.
+        authUser: { is: { status: 'ACTIVE' } },
       },
       data: {
         status: 'PROCESSING',

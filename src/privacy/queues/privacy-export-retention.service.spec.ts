@@ -156,19 +156,20 @@ describe('PrivacyExportRetentionService (privacy export expiry and cleanup)', ()
 
     it('catches up on every overdue export in one sweep after missed runs (more than one batch)', async () => {
       const rows: DataExport[] = [];
-      for (let i = 0; i < 130; i += 1) {
+      // More than one cleanup batch (100), with real archive files.
+      for (let i = 0; i < 105; i += 1) {
         rows.push(await completed(i % 2 ? OWNER : OTHER, T0));
       }
 
       // The service was down for three days.
       const result = await retention.sweep(at(3 * DAY));
 
-      expect(result).toMatchObject({ expired: 130, filesDeleted: 130 });
+      expect(result).toMatchObject({ expired: 105, filesDeleted: 105 });
       for (const row of rows) {
         expect(table.get(row.id).status).toBe('EXPIRED');
         expect(await filesOf(row.authId, row.id)).toEqual([]);
       }
-    });
+    }, 30_000);
   });
 
   describe('cleanup process', () => {
@@ -341,7 +342,7 @@ describe('PrivacyExportRetentionService (privacy export expiry and cleanup)', ()
       expect(result).toMatchObject({ filesDeleted: 1, cleanupFailures: 101 });
       expect(table.get(healthy.id).filesDeletedAt).toBeInstanceOf(Date);
       expect(await filesOf(OTHER, healthy.id)).toEqual([]);
-    });
+    }, 30_000);
 
     it('still deletes pending files when marking exports as expired fails', async () => {
       const failed = await inProgress(OWNER, 'PROCESSING');

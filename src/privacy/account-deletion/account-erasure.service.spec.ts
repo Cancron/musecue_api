@@ -621,7 +621,7 @@ describe('AccountErasureService private file cleanup (scripted storage)', () => 
       },
     );
 
-    it('does not touch storage again once every file is resolved, even if a later step fails', async () => {
+    it('never deletes a resolved file again, even if a later step fails: later passes only re-check storage', async () => {
       prisma.authUser.deleteMany.mockRejectedValueOnce(
         new Error('connection lost'),
       );
@@ -629,11 +629,21 @@ describe('AccountErasureService private file cleanup (scripted storage)', () => 
       await expect(run()).resolves.toBe('PENDING');
       expect(request.filesDeletedAt).not.toBeNull();
       expect(request.dataErasedAt).toBeNull();
-      const operations = allOperations().length;
+      const deletesBefore = [
+        ...images.deletedKeys(),
+        ...exportsStorage.deletedKeys(),
+      ];
+      const operationsBefore = allOperations().length;
 
       await expect(run()).resolves.toBe('COMPLETED');
 
-      expect(allOperations()).toHaveLength(operations);
+      const newOperations = allOperations().slice(operationsBefore);
+      // Only the read-only final storage check (one listing per storage).
+      expect(newOperations.map((call) => call[0])).toEqual(['list', 'list']);
+      expect([
+        ...images.deletedKeys(),
+        ...exportsStorage.deletedKeys(),
+      ]).toEqual(deletesBefore);
     });
   });
 
@@ -717,6 +727,46 @@ describe('AccountErasureService private file cleanup (scripted storage)', () => 
     });
   });
 
+  describe('requests already running when the deletion was approved', () => {
+    const UPLOAD = `${OWNER}/${SESSION}/12121212-1212-4212-8212-121212121212.jpg`;
+    /** An upload that was in flight saves its file while the rows are deleted. */
+    const uploadDuringHardDelete = () => {
+      prisma.authUser.deleteMany.mockImplementation((() => {
+        images.files.add(UPLOAD);
+        return Promise.resolve({ count: 1 });
+      }) as never);
+    };
+
+    it('finds, records and deletes a file written during the hard delete before completing', async () => {
+      uploadDuringHardDelete();
+
+      await expect(run()).resolves.toBe('COMPLETED');
+
+      expect(images.deletedKeys()).toContain(UPLOAD);
+      expect(images.files.has(UPLOAD)).toBe(false);
+      expect(fileRows.find((file) => file.storageKey === UPLOAD)).toMatchObject(
+        { kind: 'PRIVATE_IMAGE', status: 'DELETED' },
+      );
+    });
+
+    it('does not complete while that file cannot be deleted', async () => {
+      uploadDuringHardDelete();
+      images.failDelete(UPLOAD, storageError('EIO'));
+
+      await expect(run()).resolves.toBe('PENDING');
+
+      expect(request.status).toBe('PROCESSING');
+      expect(request.completedAt).toBeNull();
+      expect(images.files.has(UPLOAD)).toBe(true);
+      expect(fileRows.find((file) => file.storageKey === UPLOAD)?.status).toBe(
+        'PENDING',
+      );
+
+      await expect(run()).resolves.toBe('COMPLETED');
+      expect(images.files.has(UPLOAD)).toBe(false);
+    });
+  });
+
   describe('interrupted and concurrent processing', () => {
     it('resumes without losing a reference when recording a deletion fails (database interruption)', async () => {
       const realUpdate =
@@ -737,7 +787,11 @@ describe('AccountErasureService private file cleanup (scripted storage)', () => 
       // One file was deleted from storage, but its outcome was not recorded:
       // the reference is still pending, and the account is not deleted.
       expect(accountDeleted()).toBe(false);
-      const firstDeleted = images.deletedKeys()[0];
+      // The first deletion on either storage (processing order follows the
+      // references' random IDs).
+      const firstDeleted = allOperations().find(
+        (call) => call[0] === 'delete',
+      )![2];
       expect(
         fileRows.find((file) => file.storageKey === firstDeleted)?.status,
       ).toBe('PENDING');

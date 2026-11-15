@@ -149,6 +149,17 @@ export class AccountErasureService {
       if (!request.sessionsRevokedAt) {
         request = await this.revokeSessions(request, lease, problems);
       }
+      // Final storage check, after the account's rows are gone: a request
+      // that was already running when the deletion was approved (for example
+      // a photo upload) may have written a file in the meantime. From now on
+      // no writer can succeed (its database write fails and it removes its
+      // own file), so a clean check here is final.
+      if (request.dataErasedAt) {
+        const leftover = await this.deleteFiles(request, lease, problems, now);
+        if (leftover > 0 && problems.length === 0) {
+          problems.push('Files remain in storage; cleanup will be retried');
+        }
+      }
     } catch (error) {
       if (error instanceof ErasureLeaseLostError) {
         this.logger.warn('Account deletion lease taken over; stopping', {

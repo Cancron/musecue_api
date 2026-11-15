@@ -35,6 +35,15 @@ export class PrivacyExportService {
   ): Promise<DataExportView> {
     const existing = await this.findReusable(authId, idempotencyKey);
     if (existing) return this.toView(existing);
+    // The token may be valid for a moment longer than the account (e.g. a
+    // deletion was just approved): never start an export for it.
+    const owner = await this.prisma.authUser.findUnique({
+      where: { id: authId },
+      select: { status: true },
+    });
+    if (owner?.status !== 'ACTIVE') {
+      throw AppError.unauthorized('User account is not active');
+    }
 
     let created: DataExport;
     try {
