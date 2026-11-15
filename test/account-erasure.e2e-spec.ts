@@ -11,13 +11,26 @@ import type { Logger } from 'winston';
 import { AuthService } from '../src/auth/auth.service';
 import { AuthUtilsService } from '../src/auth/services/auth-utils.service';
 import type { EmailQueueService } from '../src/common/queues/email/email.queue';
-import type { ActivityLogService } from '../src/common/services/activity-log.service';
 import type { CustomLoggerService } from '../src/common/services/custom-logger.service';
 import type { PrismaService } from '../src/common/services/prisma.service';
 import { AccountDeletionCodeService } from '../src/privacy/account-deletion/account-deletion-code.service';
 import { AccountDeletionRecoveryService } from '../src/privacy/account-deletion/account-deletion-recovery.service';
 import { AccountDeletionService } from '../src/privacy/account-deletion/account-deletion.service';
-import { AccountErasureService } from '../src/privacy/account-deletion/account-erasure.service';
+import {
+  AccountErasureService,
+  ERASURE_LEASE_MS,
+} from '../src/privacy/account-deletion/account-erasure.service';
+import { PrivacyExportArchiveService } from '../src/privacy/export/privacy-export-archive.service';
+import { PrivacyExportCollectorService } from '../src/privacy/export/privacy-export-collector.service';
+import { PrivacyExportSupersededError } from '../src/privacy/export/privacy-export.errors';
+import type { PrivacyExportJob } from '../src/privacy/interfaces/privacy-export.interface';
+import { ExportAttempt } from '../src/privacy/queues/privacy-export-attempt';
+import { PrivacyExportLifecycleService } from '../src/privacy/queues/privacy-export-lifecycle.service';
+import { PrivacyExportProcessor } from '../src/privacy/queues/privacy-export.processor';
+import { ActivityLogService } from '../src/common/services/activity-log.service';
+import { SubscriptionAccessService } from '../src/subscription/subscription-access.service';
+import { SubscriptionPlanService } from '../src/subscription/subscription-plan.service';
+import type { Job } from 'bullmq';
 import { PrivateImageStorageService } from '../src/storage/private-image-storage.service';
 import { PrivacyExportStorageService } from '../src/storage/privacy-export-storage.service';
 import { FakeRedis } from './support/account-deletion-fakes';
@@ -68,6 +81,11 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
   let erasure: AccountErasureService;
   let recovery: AccountDeletionRecoveryService;
   let images: PrivateImageStorageService;
+  let auth: AuthService;
+  let codes: AccountDeletionCodeService;
+  let exportsStorage: PrivacyExportStorageService;
+  let exportProcessor: PrivacyExportProcessor;
+  let workerImages: PrivateImageStorageService;
   let passwordHash: string;
   const emailQueue = mock<EmailQueueService>();
   const env = {
@@ -91,7 +109,7 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
 
     const redis = new FakeRedis().asService();
     const utils = new AuthUtilsService(redis);
-    const auth = new AuthService(
+    auth = new AuthService(
       utils,
       prisma,
       mock<ActivityLogService>(),
@@ -100,7 +118,7 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
       mock<CustomLoggerService>(),
     );
     emailQueue.sendAccountDeletionCode.mockResolvedValue();
-    const codes = new AccountDeletionCodeService(redis, utils, emailQueue);
+    codes = new AccountDeletionCodeService(redis, utils, emailQueue);
     deletions = new AccountDeletionService(
       prisma,
       auth,
@@ -109,13 +127,42 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
       mock<Logger>(),
     );
     images = new PrivateImageStorageService();
+    exportsStorage = new PrivacyExportStorageService();
     erasure = new AccountErasureService(
       prisma,
       auth,
       codes,
       images,
-      new PrivacyExportStorageService(),
+      exportsStorage,
       mock<Logger>(),
+    );
+    // A real export worker (with its own storage instances, so tests can
+    // pause it while it reads a photo).
+    workerImages = new PrivateImageStorageService();
+    const workerLogger = mock<Logger>();
+    exportProcessor = new PrivacyExportProcessor(
+      prisma,
+      new PrivacyExportArchiveService(
+        new PrivacyExportCollectorService(
+          prisma,
+          new SubscriptionAccessService(
+            prisma,
+            new SubscriptionPlanService(
+              prisma,
+              new ActivityLogService(prisma, mock<CustomLoggerService>()),
+            ),
+          ),
+        ),
+        workerImages,
+        exportsStorage,
+      ),
+      exportsStorage,
+      new PrivacyExportLifecycleService(prisma, exportsStorage, workerLogger),
+      workerLogger,
+      new ConfigService({
+        PRIVACY_EXPORT_WORKER_LEASE_MS: '5000',
+        PRIVACY_EXPORT_WORKER_HEARTBEAT_MS: '20',
+      }),
     );
     recovery = new AccountDeletionRecoveryService(
       prisma,
@@ -170,8 +217,6 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
     email: string;
     subscriptionId: string;
     paymentId: string;
-    sessionId: string;
-    photoKey: string;
   }
 
   /** An account with data in every table, private files and a payment. */
@@ -294,15 +339,34 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
       },
     });
 
-    const exportRow = await client.dataExport.create({
-      data: { authId: user.id, idempotencyKey: `e-${tag}` },
+    const running = await client.dataExport.create({
+      data: {
+        authId: user.id,
+        idempotencyKey: `e-${tag}`,
+        status: 'PROCESSING',
+        startedAt: new Date(),
+      },
     });
-    await putFile('exports', `${user.id}/${exportRow.id}/${randomUUID()}.zip`);
-    // A temporary file of an interrupted export attempt.
     await putFile(
       'exports',
-      `${user.id}/${exportRow.id}/${randomUUID()}.zip.partial`,
+      `${user.id}/${running.id}/${randomUUID()}.zip.partial`,
     );
+    const completedAt = new Date();
+    const archiveKey = `${user.id}/${randomUUID()}/${randomUUID()}.zip`;
+    await putFile('exports', archiveKey);
+    await client.dataExport.create({
+      data: {
+        authId: user.id,
+        idempotencyKey: `c-${tag}`,
+        status: 'COMPLETED',
+        progress: 100,
+        storageKey: archiveKey,
+        sizeBytes: BigInt(10),
+        sha256: 'a'.repeat(64),
+        completedAt,
+        expiresAt: new Date(completedAt.getTime() + 86_400_000),
+      },
+    });
 
     const subscription = await client.userSubscription.create({
       data: { authId: user.id },
@@ -340,8 +404,6 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
       email,
       subscriptionId: subscription.id,
       paymentId: payment.id,
-      sessionId: session.id,
-      photoKey,
     };
   }
 
@@ -408,24 +470,6 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
         details: {
           create: { fieldName: 'trialDays', oldValue: '7', newValue: '14' },
         },
-      },
-    });
-    // A file in the victim's folder that the bystander's record also uses.
-    const sharedKey = `${victim.id}/${victim.sessionId}/${randomUUID()}.jpg`;
-    await putFile('images', sharedKey);
-    const bystanderSession = await client.makeupSession.findFirstOrThrow({
-      where: { authId: bystander.id },
-    });
-    await client.imageAsset.create({
-      data: {
-        sessionId: bystanderSession.id,
-        purpose: 'COMPLETION',
-        source: 'PRIVATE_UPLOAD',
-        storageKey: sharedKey,
-        mimeType: 'image/jpeg',
-        width: 1,
-        height: 1,
-        sizeBytes: 1,
       },
     });
     const paymentBefore = await client.paymentTransaction.findUniqueOrThrow({
@@ -530,11 +574,8 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
       bystanderFiles.exports,
     );
 
-    // 5. Every private file of the account is gone, referenced or not,
-    //    including temporary export files; only the shared file is kept.
-    expect(await filesUnder('images', victim.id)).toEqual([
-      join(root, 'images', sharedKey),
-    ]);
+    // 5. Every private file of the account is gone, referenced or not.
+    expect(await filesUnder('images', victim.id)).toEqual([]);
     expect(await filesUnder('exports', victim.id)).toEqual([]);
 
     // 6. The request records every step, and every storage reference.
@@ -553,25 +594,29 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
       'accountBlockedAt',
       'sessionsRevokedAt',
       'processingStartedAt',
-      'dataErasedAt',
+      'filesRecordedAt',
       'filesDeletedAt',
+      'dataErasedAt',
       'completedAt',
     ] as const) {
       expect(request[step]).toBeInstanceOf(Date);
     }
-    const byOutcome = (outcome: string) =>
-      request.files
-        .filter((file) => file.outcome === outcome)
-        .map((file) => file.storageKey)
-        .sort();
-    expect(byOutcome('RETAINED_SHARED')).toEqual([sharedKey]);
-    // Photos, avatar and unreferenced photo; archive and temporary file.
-    expect(byOutcome('DELETED')).toHaveLength(5);
+    // Files were deleted before the account.
+    expect(request.filesDeletedAt!.getTime()).toBeLessThanOrEqual(
+      request.dataErasedAt!.getTime(),
+    );
     expect(
-      request.files.every(
-        (file) => file.resolvedAt && file.kind !== 'IMAGE_OWNER_DIRECTORY',
-      ),
-    ).toBe(true);
+      request.files.map((file) => [file.kind, file.status]).sort(),
+    ).toEqual(
+      [
+        ['EXPORT_ARCHIVE', 'DELETED'],
+        ['EXPORT_OWNER_DIRECTORY', 'DELETED'],
+        ['IMAGE_OWNER_DIRECTORY', 'DELETED'],
+        ['PRIVATE_IMAGE', 'DELETED'],
+        ['PRIVATE_IMAGE', 'DELETED'],
+      ].sort(),
+    );
+    expect(request.files.every((file) => file.resolvedAt)).toBe(true);
   });
 
   it('keeps payment records immutable after they were detached', async () => {
@@ -673,11 +718,11 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
     }
   });
 
-  it('leaves nothing half-done when the database fails during erasure, and resumes on the next sweep', async () => {
+  it('keeps the account closed (not deleted) when the database fails after the files were deleted, and resumes', async () => {
     const victim = await seedAccount();
     const requestId = await acceptDeletion(victim.id);
     const before = await userRowCounts(victim.id, victim.subscriptionId);
-    // Simulate a database failure in the middle of the cascade.
+    // Simulate a database failure in the middle of the hard delete.
     const pg = await connectToSchema(schema);
     await pg.query(`
       CREATE FUNCTION "fail_login_history_delete"() RETURNS trigger
@@ -692,24 +737,17 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
       where: { id: requestId },
       include: { files: true },
     });
-    // The files were already removed (that step completed), but the data
-    // erasure rolled back as a whole: the account still exists, closed, with
-    // all its rows, and the request resumes at the data step.
-    expect(stuck).toMatchObject({
-      status: 'PROCESSING',
-      dataErasedAt: null,
-      lockedUntil: null,
-    });
+    // The files are deleted, but the data transaction rolled back as a
+    // whole: the account still exists, closed, with all its data.
+    expect(stuck).toMatchObject({ status: 'PROCESSING', dataErasedAt: null });
     expect(stuck.filesDeletedAt).toBeInstanceOf(Date);
-    expect(stuck.files.every((file) => file.resolvedAt)).toBe(true);
-    expect(stuck.lastError).toEqual(expect.any(String));
+    expect(await filesUnder('images', victim.id)).toEqual([]);
     expect(await userRowCounts(victim.id, victim.subscriptionId)).toEqual(
       before,
     );
     await expect(
       client.authUser.findUniqueOrThrow({ where: { id: victim.id } }),
     ).resolves.toMatchObject({ status: 'PENDING_DELETION' });
-    expect(await filesUnder('images', victim.id)).toEqual([]);
 
     await pg.query(
       `DROP TRIGGER "fail_login_history_delete" ON "loginHistory";`,
@@ -719,47 +757,35 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
 
     expect(resumed.completed).toBe(1);
     await expect(
-      client.accountDeletionRequest.findUniqueOrThrow({
-        where: { id: requestId },
-      }),
-    ).resolves.toMatchObject({ status: 'COMPLETED', attempts: 2 });
-    await expect(
       client.authUser.count({ where: { id: victim.id } }),
     ).resolves.toBe(0);
   });
 
-  it('keeps the account closed and undeleted while a file cannot be removed, and retries from the saved reference', async () => {
+  it('keeps the account closed and its storage references while file deletion fails, and completes once storage recovers', async () => {
     const victim = await seedAccount();
     const requestId = await acceptDeletion(victim.id);
     const before = await userRowCounts(victim.id, victim.subscriptionId);
-    // A second adapter over the same root performs the real removals.
-    const realStore = new PrivateImageStorageService();
-    const removals: string[] = [];
-    const remove = jest
-      .spyOn(images, 'remove')
-      .mockImplementation((key: string) => {
-        removals.push(key);
-        if (key === victim.photoKey) {
-          return Promise.reject(
-            Object.assign(new Error('EIO'), { code: 'EIO' }),
-          );
-        }
-        return realStore.remove(key);
-      });
+    // A referenced photo (not the unreferenced leftover in the same folder).
+    const { storageKey: photoKey } = await client.imageAsset.findFirstOrThrow({
+      where: { session: { authId: victim.id } },
+      select: { storageKey: true },
+    });
+    // Real storage, with one file that cannot be deleted for now.
+    const realDelete = images.deleteOwnerFile.bind(images) as (
+      authId: string,
+      key: string,
+    ) => Promise<boolean>;
+    const failing = jest
+      .spyOn(images, 'deleteOwnerFile')
+      .mockImplementation((authId: string, key: string) =>
+        key === photoKey
+          ? Promise.reject(Object.assign(new Error('EIO'), { code: 'EIO' }))
+          : realDelete(authId, key),
+      );
 
     await recovery.resume();
+    await recovery.resume();
 
-    // Storage: the failing photo is still there; the others were removed.
-    const remaining = await filesUnder('images', victim.id);
-    expect(remaining).toEqual([join(root, 'images', victim.photoKey)]);
-    expect(await filesUnder('exports', victim.id)).toEqual([]);
-    // The account is not deleted: it stays closed with all of its data.
-    await expect(
-      client.authUser.findUniqueOrThrow({ where: { id: victim.id } }),
-    ).resolves.toMatchObject({ status: 'PENDING_DELETION' });
-    expect(await userRowCounts(victim.id, victim.subscriptionId)).toEqual(
-      before,
-    );
     const pending = await client.accountDeletionRequest.findUniqueOrThrow({
       where: { id: requestId },
       include: { files: true },
@@ -768,35 +794,417 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
       status: 'PROCESSING',
       filesDeletedAt: null,
       dataErasedAt: null,
+      completedAt: null,
     });
-    expect(pending.referencesRecordedAt).toBeInstanceOf(Date);
-    // The reference to the failing file is kept for the retry.
-    expect(pending.files.filter((file) => file.resolvedAt === null)).toEqual([
-      expect.objectContaining({
-        kind: 'PRIVATE_IMAGE',
-        storageKey: victim.photoKey,
-        attempts: 1,
-        lastError: 'Error (EIO)',
-      }),
-    ]);
+    expect(pending.lastError).toMatch(/File deletion failed/);
+    // Not deleted: the account and all its data still exist, closed.
+    await expect(
+      client.authUser.findUniqueOrThrow({ where: { id: victim.id } }),
+    ).resolves.toMatchObject({ status: 'PENDING_DELETION' });
+    expect(await userRowCounts(victim.id, victim.subscriptionId)).toEqual(
+      before,
+    );
+    // The failing file is still on disk and still referenced; the other
+    // files were deleted.
+    const left = (await filesUnder('images', victim.id)).map((path) =>
+      path.slice(join(root, 'images').length + 1),
+    );
+    expect(left).toEqual([photoKey]);
+    expect(pending.files.filter((file) => file.status === 'PENDING')).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'PRIVATE_IMAGE',
+          storageKey: photoKey,
+          lastError: 'Error (EIO)',
+        }),
+      ]),
+    );
 
-    // Storage recovers: only the failed file is removed on the retry.
-    remove.mockRestore();
-    const retried = jest.spyOn(images, 'remove');
+    failing.mockRestore();
     await recovery.resume();
 
-    expect(retried.mock.calls.map(([key]) => key)).toEqual([victim.photoKey]);
     expect(await filesUnder('images', victim.id)).toEqual([]);
-    await expect(
-      client.authUser.count({ where: { id: victim.id } }),
-    ).resolves.toBe(0);
     await expect(
       client.accountDeletionRequest.findUniqueOrThrow({
         where: { id: requestId },
       }),
     ).resolves.toMatchObject({ status: 'COMPLETED' });
-    retried.mockRestore();
-    expect(removals).toContain(victim.photoKey);
+    await expect(
+      client.authUser.count({ where: { id: victim.id } }),
+    ).resolves.toBe(0);
+  });
+
+  it('keeps a file another account references, and completes with the rest deleted', async () => {
+    const victim = await seedAccount();
+    const bystander = await seedAccount();
+    // Another account's row points at one of the victim's photos.
+    const sharedKey = (
+      await client.imageAsset.findFirstOrThrow({
+        where: { session: { authId: victim.id } },
+        select: { storageKey: true },
+      })
+    ).storageKey;
+    const bystanderSession = await client.makeupSession.findFirstOrThrow({
+      where: { authId: bystander.id },
+    });
+    await client.imageAsset.create({
+      data: {
+        sessionId: bystanderSession.id,
+        purpose: 'COMPLETION',
+        source: 'PRIVATE_UPLOAD',
+        storageKey: sharedKey,
+        mimeType: 'image/jpeg',
+        width: 1,
+        height: 1,
+        sizeBytes: 1,
+      },
+    });
+    const requestId = await acceptDeletion(victim.id);
+
+    await expect(recovery.resume()).resolves.toMatchObject({ completed: 1 });
+
+    const left = (await filesUnder('images', victim.id)).map((path) =>
+      path.slice(join(root, 'images').length + 1),
+    );
+    expect(left).toEqual([sharedKey]);
+    const files = await client.accountDeletionFile.findMany({
+      where: { requestId },
+    });
+    expect(files.find((file) => file.storageKey === sharedKey)).toMatchObject({
+      status: 'RETAINED',
+      note: 'Referenced by another account',
+    });
+  });
+
+  it('completes when files are already missing from storage', async () => {
+    const victim = await seedAccount();
+    await rm(join(root, 'images', victim.id), { recursive: true, force: true });
+    await rm(join(root, 'exports', victim.id), {
+      recursive: true,
+      force: true,
+    });
+    const requestId = await acceptDeletion(victim.id);
+
+    await expect(recovery.resume()).resolves.toMatchObject({ completed: 1 });
+
+    const files = await client.accountDeletionFile.findMany({
+      where: { requestId },
+    });
+    expect(files.map((file) => file.status)).toEqual(
+      files.map(() => 'MISSING'),
+    );
+  });
+
+  describe('coordination with export workers and concurrent processing', () => {
+    const waitFor = async (condition: () => boolean, timeoutMs = 5_000) => {
+      const deadline = Date.now() + timeoutMs;
+      while (!condition()) {
+        if (Date.now() > deadline) throw new Error('Timed out waiting');
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    };
+    const runExport = (exportId: string, authId: string) =>
+      exportProcessor.process({
+        data: { exportId, authId },
+        opts: { attempts: 3 },
+        attemptsMade: 0,
+        discard: jest.fn(),
+      } as unknown as Job<PrivacyExportJob>);
+
+    it('waits for a running export worker, which stops and removes its partial archive, before deleting anything', async () => {
+      const victim = await seedAccount();
+      // The account's running export (one active export per user).
+      const live = await client.dataExport.findFirstOrThrow({
+        where: { authId: victim.id, status: 'PROCESSING' },
+      });
+      // Pause the worker while it copies a photo into the archive.
+      let resume!: () => void;
+      const gate = new Promise<void>((resolve) => (resume = resolve));
+      let paused = false;
+      const read = workerImages.read.bind(workerImages) as (
+        key: string,
+      ) => Promise<Buffer>;
+      const readSpy = jest
+        .spyOn(workerImages, 'read')
+        .mockImplementation(async (key: string) => {
+          paused = true;
+          await gate;
+          return read(key);
+        });
+      const partials = () =>
+        filesUnder('exports', victim.id).then((files) =>
+          files.filter((file) => file.includes(live.id)),
+        );
+      // A partial archive left by an earlier, crashed attempt of this export
+      // (seeded); the live worker writes its own next to it.
+      const stale = await partials();
+      const worker = runExport(live.id, victim.id);
+      await waitFor(() => paused);
+      const own = (await partials()).filter((file) => !stale.includes(file));
+      expect(own).toHaveLength(1);
+      expect(own[0]).toMatch(/\.zip\.partial$/);
+
+      const requestId = await acceptDeletion(victim.id);
+      const first = await recovery.resume();
+
+      // Coordinated: the export was cancelled, but nothing was deleted while
+      // the worker can still write; the account stays closed.
+      expect(first).toMatchObject({ completed: 0, pending: 1 });
+      const waiting = await client.accountDeletionRequest.findUniqueOrThrow({
+        where: { id: requestId },
+      });
+      expect(waiting).toMatchObject({
+        status: 'PROCESSING',
+        filesDeletedAt: null,
+        dataErasedAt: null,
+        lastError: 'Waiting for 1 export worker(s) of the account to stop',
+      });
+      expect(waiting.filesRecordedAt).toBeInstanceOf(Date);
+      await expect(
+        client.dataExport.findUniqueOrThrow({ where: { id: live.id } }),
+      ).resolves.toMatchObject({
+        status: 'FAILED',
+        errorCode: 'ACCOUNT_UNAVAILABLE',
+      });
+      await expect(
+        client.authUser.findUniqueOrThrow({ where: { id: victim.id } }),
+      ).resolves.toMatchObject({ status: 'PENDING_DELETION' });
+      expect(await filesUnder('images', victim.id)).not.toEqual([]);
+
+      // The worker notices the cancellation, removes its partial archive and
+      // releases its lease.
+      resume();
+      await expect(worker).resolves.toBeUndefined();
+      readSpy.mockRestore();
+      // The worker removed its own partial archive; the stale one is left
+      // for the erasure, which is allowed to proceed now.
+      expect(await partials()).toEqual(stale);
+      await expect(
+        client.dataExport.findUniqueOrThrow({ where: { id: live.id } }),
+      ).resolves.toMatchObject({ workerLeaseUntil: null });
+
+      const second = await recovery.resume();
+
+      expect(second.completed).toBe(1);
+      expect(await filesUnder('exports', victim.id)).toEqual([]);
+      expect(await filesUnder('images', victim.id)).toEqual([]);
+      await expect(
+        client.authUser.count({ where: { id: victim.id } }),
+      ).resolves.toBe(0);
+    });
+
+    it('serializes archive file creation with the cancellation (real row locks): before it, or refused after it', async () => {
+      const authId = (await seedAccount()).id;
+      // The account's running export (one active export per user).
+      const row = await client.dataExport.findFirstOrThrow({
+        where: { authId, status: 'PROCESSING' },
+      });
+      const startedAt = row.startedAt!;
+      const attempt = new ExportAttempt(prisma, row.id, startedAt);
+      const order: string[] = [];
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => (release = resolve));
+
+      const creating = attempt.fenced(async () => {
+        order.push('file created');
+        await held;
+      });
+      await waitFor(() => order.length === 1);
+      // Account erasure cancels the account's exports meanwhile.
+      const cancelling = client.dataExport
+        .updateMany({
+          where: { authId, status: { in: ['QUEUED', 'PROCESSING'] } },
+          data: {
+            status: 'FAILED',
+            error: 'unavailable',
+            errorCode: 'ACCOUNT_UNAVAILABLE',
+            completedAt: new Date(),
+          },
+        })
+        .then(() => order.push('cancelled'));
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      // The cancellation waits for the file operation holding the row lock.
+      expect(order).toEqual(['file created']);
+
+      release();
+      await Promise.all([creating, cancelling]);
+      expect(order).toEqual(['file created', 'cancelled']);
+
+      const afterwards = jest.fn(() => Promise.resolve());
+      await expect(attempt.fenced(afterwards)).rejects.toBeInstanceOf(
+        PrivacyExportSupersededError,
+      );
+      expect(afterwards.mock.calls).toHaveLength(0);
+    });
+
+    it('keeps every cleanup reference when the database fails while recording file outcomes, and resumes', async () => {
+      const victim = await seedAccount();
+      const requestId = await acceptDeletion(victim.id);
+      const pg = await connectToSchema(schema);
+      await pg.query(`
+        CREATE FUNCTION "fail_file_update"() RETURNS trigger
+        LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'simulated failure'; END; $$;
+        CREATE TRIGGER "fail_file_update" BEFORE UPDATE ON "AccountDeletionFile"
+          FOR EACH ROW EXECUTE FUNCTION "fail_file_update"();`);
+
+      const interrupted = await recovery.resume();
+
+      expect(interrupted).toMatchObject({ completed: 0, pending: 1 });
+      const recorded = await client.accountDeletionFile.findMany({
+        where: { requestId },
+      });
+      // The references survived the interruption, all still pending.
+      expect(recorded.length).toBeGreaterThanOrEqual(5);
+      expect(recorded.every((file) => file.status === 'PENDING')).toBe(true);
+      await expect(
+        client.authUser.findUniqueOrThrow({ where: { id: victim.id } }),
+      ).resolves.toMatchObject({ status: 'PENDING_DELETION' });
+
+      await pg.query(
+        `DROP TRIGGER "fail_file_update" ON "AccountDeletionFile";`,
+      );
+      await pg.end();
+      const resumed = await recovery.resume();
+
+      expect(resumed.completed).toBe(1);
+      const resolved = await client.accountDeletionFile.findMany({
+        where: { requestId },
+      });
+      expect(resolved.map((file) => file.id).sort()).toEqual(
+        recorded.map((file) => file.id).sort(),
+      );
+      expect(resolved.every((file) => file.status !== 'PENDING')).toBe(true);
+      expect(await filesUnder('images', victim.id)).toEqual([]);
+      expect(await filesUnder('exports', victim.id)).toEqual([]);
+    });
+
+    it('stops a worker whose lease expired and was taken over, without duplicating or undoing the new worker’s work', async () => {
+      const victim = await seedAccount();
+      const bystander = await seedAccount();
+      const bystanderFiles = await filesUnder('images', bystander.id);
+      const requestId = await acceptDeletion(victim.id);
+      // Worker A gets stuck inside its first storage operation.
+      const slowImages = new PrivateImageStorageService();
+      const deleteFile = slowImages.deleteOwnerFile.bind(slowImages) as (
+        authId: string,
+        key: string,
+      ) => Promise<boolean>;
+      let resume!: () => void;
+      const gate = new Promise<void>((resolve) => (resume = resolve));
+      let stuck = false;
+      jest
+        .spyOn(slowImages, 'deleteOwnerFile')
+        .mockImplementationOnce(async (authId: string, key: string) => {
+          stuck = true;
+          await gate;
+          return deleteFile(authId, key);
+        });
+      const workerA = new AccountErasureService(
+        prisma,
+        auth,
+        codes,
+        slowImages,
+        exportsStorage,
+        mock<Logger>(),
+      );
+
+      const a = workerA.process(requestId);
+      await waitFor(() => stuck);
+      // A's lease expires; worker B claims the request and completes it.
+      const b = await erasure.process(
+        requestId,
+        new Date(Date.now() + ERASURE_LEASE_MS + 60_000),
+      );
+      expect(b).toBe('COMPLETED');
+      const completed = await client.accountDeletionRequest.findUniqueOrThrow({
+        where: { id: requestId },
+        include: { files: true },
+      });
+
+      resume();
+      await expect(a).resolves.toBe('SKIPPED');
+
+      // A changed nothing after losing its lease.
+      await expect(
+        client.accountDeletionRequest.findUniqueOrThrow({
+          where: { id: requestId },
+          include: { files: true },
+        }),
+      ).resolves.toEqual(completed);
+      expect(completed).toMatchObject({ status: 'COMPLETED', attempts: 2 });
+      expect(await filesUnder('images', victim.id)).toEqual([]);
+      expect(await filesUnder('images', bystander.id)).toEqual(bystanderFiles);
+    });
+
+    it('turns concurrent deletion requests and concurrent sweeps on several instances into one deletion, deleting each file once', async () => {
+      const victim = await seedAccount();
+      const bystander = await seedAccount();
+      const bystanderFiles = await filesUnder('images', bystander.id);
+      // Several requests at once (identity verified for each).
+      const verify = jest.spyOn(codes, 'verify').mockResolvedValue(true);
+      const views = await Promise.all(
+        Array.from({ length: 4 }, () =>
+          deletions.requestDeletion(
+            victim.id,
+            { password: PASSWORD, code: 'ABC123' },
+            META,
+          ),
+        ),
+      );
+      verify.mockRestore();
+      expect(new Set(views.map((view) => view.id)).size).toBe(1);
+
+      // Several instances sweep at the same time; count real deletions.
+      const deleted: string[] = [];
+      const instances = Array.from({ length: 3 }, () => {
+        const instanceImages = new PrivateImageStorageService();
+        const realDelete = instanceImages.deleteOwnerFile.bind(
+          instanceImages,
+        ) as (authId: string, key: string) => Promise<boolean>;
+        jest
+          .spyOn(instanceImages, 'deleteOwnerFile')
+          .mockImplementation(async (authId: string, key: string) => {
+            const removed = await realDelete(authId, key);
+            if (removed) deleted.push(key);
+            return removed;
+          });
+        const instanceErasure = new AccountErasureService(
+          prisma,
+          auth,
+          codes,
+          instanceImages,
+          exportsStorage,
+          mock<Logger>(),
+        );
+        return new AccountDeletionRecoveryService(
+          prisma,
+          deletions,
+          instanceErasure,
+          new ConfigService({ NODE_ENV: 'test' }),
+          mock<Logger>(),
+        );
+      });
+
+      const results = await Promise.all(
+        instances.map((instance) => instance.resume()),
+      );
+
+      expect(results.reduce((sum, result) => sum + result.completed, 0)).toBe(
+        1,
+      );
+      expect(new Set(deleted).size).toBe(deleted.length);
+      expect(deleted.length).toBeGreaterThan(0);
+      await expect(
+        client.accountDeletionRequest.count({ where: { authId: victim.id } }),
+      ).resolves.toBe(1);
+      await expect(
+        client.accountDeletionRequest.findFirstOrThrow({
+          where: { authId: victim.id },
+        }),
+      ).resolves.toMatchObject({ status: 'COMPLETED', attempts: 1 });
+      expect(await filesUnder('images', victim.id)).toEqual([]);
+      expect(await filesUnder('images', bystander.id)).toEqual(bystanderFiles);
+    });
   });
 
   it('performs the deletion once, however often or concurrently it is processed', async () => {

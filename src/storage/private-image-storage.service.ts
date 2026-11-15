@@ -1,15 +1,16 @@
 import { Injectable } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import {
-  type FileRemoval,
+  isMissingFileError,
+  resolvePrivateStorageKey,
+} from './private-storage-key';
+import {
+  deleteOwnedFile,
   listOwnerFiles,
-  type PrivateFileStore,
-  removeEmptyOwnerDirectories,
-  removeStoredFile,
-} from './private-file-store';
-import { resolvePrivateStorageKey } from './private-storage-key';
+  pruneOwnerDirectories,
+} from './private-storage-owner-files';
 
 const EXTENSIONS_BY_MIME = {
   'image/jpeg': '.jpg',
@@ -20,7 +21,7 @@ const EXTENSIONS_BY_MIME = {
 type SupportedImageMime = keyof typeof EXTENSIONS_BY_MIME;
 
 @Injectable()
-export class PrivateImageStorageService implements PrivateFileStore {
+export class PrivateImageStorageService {
   private readonly root = resolve(
     process.env.PRIVATE_UPLOAD_DIR ??
       join(process.cwd(), '.data', 'private-images'),
@@ -48,26 +49,30 @@ export class PrivateImageStorageService implements PrivateFileStore {
 
   async delete(storageKey: string): Promise<void> {
     if (storageKey.includes('://')) return;
-    this.resolveKey(storageKey);
-    await this.remove(storageKey);
+
+    try {
+      await unlink(this.resolveKey(storageKey));
+    } catch (error) {
+      if (!isMissingFileError(error)) throw error;
+    }
   }
 
-  /** Removes one stored file (any name), reporting one already gone. */
-  remove(storageKey: string): Promise<FileRemoval> {
-    return removeStoredFile(
-      this.root,
-      storageKey,
-      'Invalid private image storage key',
-    );
+  /** Storage keys of every file of one owner (`<authId>/...`). */
+  listOwnerFiles(authId: string): Promise<string[]> {
+    return listOwnerFiles(this.root, authId);
   }
 
-  /** Every private image file of one owner, including unreferenced ones. */
-  listOwnerFiles(ownerId: string): Promise<string[]> {
-    return listOwnerFiles(this.root, ownerId);
+  /**
+   * Deletes one file of `authId`; resolves false when it was already
+   * missing. Keys outside `<authId>/` are refused (OwnerScopeViolationError).
+   */
+  deleteOwnerFile(authId: string, storageKey: string): Promise<boolean> {
+    return deleteOwnedFile(this.root, authId, storageKey);
   }
 
-  removeEmptyOwnerDirectories(ownerId: string): Promise<void> {
-    return removeEmptyOwnerDirectories(this.root, ownerId);
+  /** Removes the owner's empty directories; never removes a file. */
+  pruneOwnerDirectories(authId: string): Promise<void> {
+    return pruneOwnerDirectories(this.root, authId);
   }
 
   read(storageKey: string): Promise<Buffer> {

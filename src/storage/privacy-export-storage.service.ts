@@ -19,16 +19,14 @@ import {
 import { once } from 'node:events';
 import { dirname, join, resolve } from 'node:path';
 import {
-  type FileRemoval,
-  listOwnerFiles,
-  type PrivateFileStore,
-  removeEmptyOwnerDirectories,
-  removeStoredFile,
-} from './private-file-store';
-import {
   isMissingFileError,
   resolvePrivateStorageKey,
 } from './private-storage-key';
+import {
+  deleteOwnedFile,
+  listOwnerFiles,
+  pruneOwnerDirectories,
+} from './private-storage-owner-files';
 
 const SAFE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
@@ -81,7 +79,7 @@ export interface DeleteExportScopeOptions {
  * only resolved filesystem paths use the platform separator.
  */
 @Injectable()
-export class PrivacyExportStorageService implements PrivateFileStore {
+export class PrivacyExportStorageService {
   private readonly root = resolve(
     process.env.PRIVATE_EXPORT_DIR ??
       join(process.cwd(), '.data', 'private-exports'),
@@ -221,25 +219,22 @@ export class PrivacyExportStorageService implements PrivateFileStore {
     return scopes;
   }
 
+  /** Storage keys of every file of one owner (`<authId>/...`). */
+  listOwnerFiles(authId: string): Promise<string[]> {
+    return listOwnerFiles(this.root, authId);
+  }
+
   /**
-   * Every export file of one owner: finished archives and temporary
-   * `.partial` files of interrupted or running attempts.
+   * Deletes one file of `authId`; resolves false when it was already
+   * missing. Keys outside `<authId>/` are refused (OwnerScopeViolationError).
    */
-  listOwnerFiles(ownerId: string): Promise<string[]> {
-    return listOwnerFiles(this.root, ownerId);
+  deleteOwnerFile(authId: string, storageKey: string): Promise<boolean> {
+    return deleteOwnedFile(this.root, authId, storageKey);
   }
 
-  /** Removes one stored file (archive or temporary), reporting one already gone. */
-  remove(storageKey: string): Promise<FileRemoval> {
-    return removeStoredFile(
-      this.root,
-      storageKey,
-      'Invalid private export storage key',
-    );
-  }
-
-  removeEmptyOwnerDirectories(ownerId: string): Promise<void> {
-    return removeEmptyOwnerDirectories(this.root, ownerId);
+  /** Removes the owner's empty directories; never removes a file. */
+  pruneOwnerDirectories(authId: string): Promise<void> {
+    return pruneOwnerDirectories(this.root, authId);
   }
 
   /** Removes an owner's export directory if it is empty. */

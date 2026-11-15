@@ -212,23 +212,26 @@ enum AccountDeletionVerification {
 }
 
 enum AccountDeletionFileKind {
-  // One private image file (session photo, avatar or unreferenced file).
+  // One private image (session photo or avatar): an image storage key.
   PRIVATE_IMAGE
-  // One export file: a generated archive or a temporary `.partial` file.
-  EXPORT_FILE
-  // Legacy (requests started before per-file cleanup): the owner's image
-  // or export directory, resolved once the owner's files are all handled.
+  // Every remaining file in the owner's image directory (`<authId>`),
+  // including files no database row references any more.
   IMAGE_OWNER_DIRECTORY
+  // Every remaining file in the owner's export directory (`<authId>`),
+  // including partial (temporary) archives.
   EXPORT_OWNER_DIRECTORY
+  // One generated export archive: an export storage key.
+  EXPORT_ARCHIVE
 }
 
-enum AccountDeletionFileOutcome {
-  // Removed from private storage by the cleanup.
+enum AccountDeletionFileStatus {
+  // Not yet deleted (or the last attempt failed; retried).
+  PENDING
+  // Deleted from storage.
   DELETED
-  // Already gone when the cleanup reached it.
-  ALREADY_MISSING
-  // Kept: another user's record references the same file.
-  RETAINED_SHARED
-  // Kept: the reference points outside the account's own storage scope.
-  RETAINED_NOT_OWNED
+  // Already absent from storage: nothing to delete.
+  MISSING
+  // Deliberately kept: another account references it, or it lies outside
+  // the account's storage scope.
+  RETAINED
 }

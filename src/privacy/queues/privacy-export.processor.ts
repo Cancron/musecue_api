@@ -1,5 +1,6 @@
 import { Processor, WorkerHost } from '@nestjs/bullmq';
 import { Inject } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import type { DataExportErrorCode } from '@prisma/client';
 import type { Job } from 'bullmq';
 import { WINSTON_MODULE_PROVIDER } from 'nest-winston';
@@ -16,6 +17,11 @@ import {
   PRIVACY_EXPORT_QUEUE,
   PRIVACY_EXPORT_RETENTION_MS,
 } from '../privacy-export.constants';
+import {
+  DEFAULT_EXPORT_ATTEMPT_TIMING,
+  ExportAttempt,
+  type ExportAttemptTiming,
+} from './privacy-export-attempt';
 import {
   errorCode,
   PrivacyExportLifecycleService,
@@ -43,13 +49,38 @@ export class PrivacyExportProcessor extends WorkerHost {
     private readonly storage: PrivacyExportStorageService,
     private readonly lifecycle: PrivacyExportLifecycleService,
     @Inject(WINSTON_MODULE_PROVIDER) private readonly logger: Logger,
+    private readonly config?: ConfigService,
   ) {
     super();
+  }
+
+  /** Worker lease and heartbeat (configurable mainly for tests). */
+  private timing(): ExportAttemptTiming {
+    const read = (key: string, fallback: number) => {
+      const value = Number(this.config?.get<string>(key));
+      return Number.isInteger(value) && value > 0 ? value : fallback;
+    };
+    return {
+      leaseMs: read(
+        'PRIVACY_EXPORT_WORKER_LEASE_MS',
+        DEFAULT_EXPORT_ATTEMPT_TIMING.leaseMs,
+      ),
+      heartbeatMs: read(
+        'PRIVACY_EXPORT_WORKER_HEARTBEAT_MS',
+        DEFAULT_EXPORT_ATTEMPT_TIMING.heartbeatMs,
+      ),
+    };
   }
 
   async process(job: Job<PrivacyExportJob>): Promise<void> {
     const { exportId, authId } = job.data;
     const startedAt = new Date();
+    const attempt = new ExportAttempt(
+      this.prisma,
+      exportId,
+      startedAt,
+      this.timing(),
+    );
     const claim = await this.prisma.dataExport.updateMany({
       // The owner in the job must match the row; a forged or stale job for
       // another user's export cannot claim it.
@@ -60,16 +91,23 @@ export class PrivacyExportProcessor extends WorkerHost {
         startedAt,
         error: null,
         attempts: { increment: 1 },
+        workerLeaseUntil: attempt.leaseUntil(startedAt),
       },
     });
     if (!claim.count) return;
 
+    attempt.start();
     let storageKey: string | undefined;
+    let failure: unknown = null;
     try {
       const result = await this.archive.build(
         authId,
         exportId,
         this.progressReporter(exportId, startedAt),
+        {
+          fence: (operation) => attempt.fenced(operation),
+          signal: attempt.signal,
+        },
       );
       storageKey = result.storageKey;
       const completedAt = new Date();
@@ -109,19 +147,26 @@ export class PrivacyExportProcessor extends WorkerHost {
     } catch (error) {
       if (storageKey) {
         // The archive was built but could not be published: remove it. If
-        // that fails as well, the final-failure cleanup removes the whole
-        // export directory.
+        // that fails as well, cleanup (failure handling, or account erasure,
+        // which re-checks storage) removes it.
         await this.storage.delete(storageKey).catch(() => undefined);
       }
-      if (error instanceof PrivacyExportSupersededError) {
-        this.logger.warn('Superseded personal data export attempt stopped', {
-          context: 'PrivacyExportProcessor',
-          exportId,
-        });
-        return;
-      }
-      throw await this.handleFailure(job, error, startedAt);
+      failure = error;
+    } finally {
+      // Released only after the attempt's last storage operation, so account
+      // erasure never cleans up while this worker can still write.
+      await attempt.stop();
     }
+
+    if (failure === null) return;
+    if (failure instanceof PrivacyExportSupersededError) {
+      this.logger.warn('Superseded personal data export attempt stopped', {
+        context: 'PrivacyExportProcessor',
+        exportId,
+      });
+      return;
+    }
+    throw await this.handleFailure(job, failure, startedAt);
   }
 
   private progressReporter(exportId: string, startedAt: Date) {

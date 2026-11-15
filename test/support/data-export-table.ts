@@ -180,6 +180,7 @@ export class DataExportTable {
       missingPhotoCount: null,
       error: null,
       errorCode: null,
+      workerLeaseUntil: null,
       startedAt: null,
       completedAt: null,
       expiresAt: null,
@@ -214,8 +215,38 @@ export class DataExportTable {
     return row;
   }
 
+  private locks: Promise<void> = Promise.resolve();
+
   /** Routes the Prisma mock's dataExport delegate to this table. */
   attach(prisma: DeepMockProxy<PrismaService>): this {
+    // Export file fences: transactions run one at a time (like row locks),
+    // and the fence's SELECT ... FOR UPDATE reads the export row.
+    prisma.$transaction.mockImplementation((async (
+      callback: (tx: PrismaService) => Promise<unknown>,
+    ) => {
+      const previous = this.locks;
+      let release!: () => void;
+      this.locks = new Promise((resolve) => (release = resolve));
+      await previous;
+      try {
+        return await callback(prisma);
+      } finally {
+        release();
+      }
+    }) as never);
+    prisma.$queryRaw.mockImplementation(((
+      _sql: TemplateStringsArray,
+      id: string,
+    ) => {
+      const row = this.rows.find((item) => item.id === id);
+      return Promise.resolve(
+        row ? [{ status: row.status, startedAt: row.startedAt }] : [],
+      );
+    }) as never);
+    prisma.dataExport.count.mockImplementation(((args: { where: Where }) =>
+      Promise.resolve(
+        this.rows.filter((row) => this.matches(row, args.where)).length,
+      )) as never);
     prisma.dataExport.findUnique.mockImplementation(this.findUnique as never);
     prisma.dataExport.findFirst.mockImplementation(this.findFirst as never);
     prisma.dataExport.findMany.mockImplementation(this.findMany as never);

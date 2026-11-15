@@ -17,7 +17,21 @@ import {
   renderManifest,
   renderReadme,
 } from './privacy-export-documents';
+import { PrivacyExportSupersededError } from './privacy-export.errors';
 import { PrivacyZipWriter } from './privacy-zip-writer';
+
+/** How a worker attempt controls the build (see ExportAttempt). */
+export interface ArchiveBuildControl {
+  /**
+   * Runs a file operation only while the attempt is still current; used for
+   * creating and publishing the archive file.
+   */
+  fence: <T>(operation: () => Promise<T>) => Promise<T>;
+  /** Aborted when the attempt was cancelled: the build stops at once. */
+  signal?: AbortSignal;
+}
+
+const UNFENCED: ArchiveBuildControl = { fence: (operation) => operation() };
 
 /** Progress checkpoints reported while an archive is built. */
 export const ARCHIVE_PROGRESS = {
@@ -43,15 +57,23 @@ export class PrivacyExportArchiveService {
     authId: string,
     exportId: string,
     onProgress: PrivacyExportProgress,
+    control: ArchiveBuildControl = UNFENCED,
   ): Promise<PrivacyExportArchiveResult> {
+    const stopIfCancelled = () => {
+      if (control.signal?.aborted) throw new PrivacyExportSupersededError();
+    };
     const snapshot = await this.collector.collect(authId, exportId);
     await onProgress(ARCHIVE_PROGRESS.COLLECTED);
+    stopIfCancelled();
 
-    const target = await this.exports.createArchive(authId, exportId);
+    const target = await control.fence(() =>
+      this.exports.createArchive(authId, exportId),
+    );
     const zip = new PrivacyZipWriter(target.stream);
     const mtime = snapshot.generatedAt;
     const entries: ManifestEntry[] = [];
     const add = async (path: string, bytes: Buffer, compress: boolean) => {
+      stopIfCancelled();
       await zip.add(path, bytes, { compress, mtime });
       entries.push({
         path,
@@ -65,6 +87,7 @@ export class PrivacyExportArchiveService {
       const unavailable: UnavailablePhoto[] = [...snapshot.unavailablePhotos];
       const total = snapshot.photos.length;
       for (const [index, photo] of snapshot.photos.entries()) {
+        stopIfCancelled();
         let bytes: Buffer;
         try {
           bytes = await this.images.read(photo.storageKey);
@@ -102,8 +125,9 @@ export class PrivacyExportArchiveService {
         { compress: true, mtime },
       );
       const summary = await zip.finish();
-      // Only a fully written archive gets its final (non-.partial) name.
-      await this.exports.commitArchive(target.storageKey);
+      // Only a fully written archive gets its final (non-.partial) name, and
+      // only while the attempt is still current.
+      await control.fence(() => this.exports.commitArchive(target.storageKey));
       return {
         storageKey: target.storageKey,
         sizeBytes: summary.sizeBytes,

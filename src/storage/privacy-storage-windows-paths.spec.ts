@@ -49,11 +49,18 @@ jest.mock('node:fs/promises', () => {
       mockFiles.set(to, data);
       return Promise.resolve();
     },
-    readdir: (directory: string) => {
+    readdir: (directory: string, options?: { withFileTypes?: boolean }) => {
       const names = [...new Set(children(directory))];
-      return names.length || mockDirectories.has(directory)
-        ? Promise.resolve(names)
-        : Promise.reject(missing(directory));
+      if (!names.length && !mockDirectories.has(directory)) {
+        return Promise.reject(missing(directory));
+      }
+      if (!options?.withFileTypes) return Promise.resolve(names);
+      return Promise.resolve(
+        names.map((name) => ({
+          name,
+          isDirectory: () => !mockFiles.has(`${directory}\\${name}`),
+        })),
+      );
     },
     rm: (target: string) => {
       for (const file of [...mockFiles.keys()]) {
@@ -201,6 +208,43 @@ describe('Private storage on Windows (privacy export prerequisites)', () => {
         ).rejects.toThrow('Invalid private image storage key');
         expect(isOwnedPrivateImageKey(key, OWNER, SESSION)).toBe(false);
       }
+    });
+
+    it('lists and deletes an owner’s files with "/" keys, and refuses other owners', async () => {
+      const storage = new PrivateImageStorageService();
+      const mine = await storage.save(
+        OWNER,
+        SESSION,
+        'image/jpeg',
+        Buffer.from('a'),
+      );
+      const avatar = await storage.save(
+        OWNER,
+        'profile',
+        'image/png',
+        Buffer.from('b'),
+      );
+      const theirs = await storage.save(
+        OTHER,
+        SESSION,
+        'image/jpeg',
+        Buffer.from('c'),
+      );
+
+      const keys = await storage.listOwnerFiles(OWNER);
+
+      expect(keys.sort()).toEqual([avatar, mine].sort());
+      expect(keys.every((key) => !key.includes('\\'))).toBe(true);
+      await expect(storage.deleteOwnerFile(OWNER, theirs)).rejects.toThrow(
+        "outside the owner's scope",
+      );
+      for (const key of keys) {
+        await expect(storage.deleteOwnerFile(OWNER, key)).resolves.toBe(true);
+      }
+      await expect(storage.deleteOwnerFile(OWNER, mine)).resolves.toBe(false);
+      expect([...mockFiles.keys()]).toEqual([
+        `${IMAGE_ROOT}\\${OTHER}\\${SESSION}\\${theirs.split('/')[2]}`,
+      ]);
     });
 
     it('resolves keys to drive-letter paths inside the root', () => {

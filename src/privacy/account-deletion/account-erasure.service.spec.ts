@@ -1,80 +1,281 @@
 import type {
   AccountDeletionFile,
-  AccountDeletionFileKind,
   AccountDeletionRequest,
+  Prisma,
 } from '@prisma/client';
 import { mock, mockDeep } from 'jest-mock-extended';
 import { randomUUID } from 'node:crypto';
 import type { Logger } from 'winston';
-import {
-  ControlledFileStore,
-  type StorageOperation,
-} from '../../../test/support/controlled-file-store';
 import type { AuthService } from '../../auth/auth.service';
 import type { PrismaService } from '../../common/services/prisma.service';
+import type { PrivateImageStorageService } from '../../storage/private-image-storage.service';
+import type { PrivacyExportStorageService } from '../../storage/privacy-export-storage.service';
 import type { AccountDeletionCodeService } from './account-deletion-code.service';
 import {
   AccountErasureService,
   ERASURE_LEASE_MS,
+  FILE_NOTES,
 } from './account-erasure.service';
 
 const OWNER = '0a0a0a0a-0000-4000-8000-00000000000a';
 const OTHER = '0b0b0b0b-0000-4000-8000-00000000000b';
 const SESSION = 'c4c4c4c4-0000-4000-8000-000000000004';
-const OTHER_SESSION = 'd5d5d5d5-0000-4000-8000-000000000005';
 const EXPORT_ID = 'e3e3e3e3-0000-4000-8000-000000000003';
-const uuid = (n: number) =>
-  `${String(n).repeat(8)}-1111-4111-8111-111111111111`;
-
-// The owner's private files.
-const PHOTO = `${OWNER}/${SESSION}/${uuid(1)}.jpg`;
-const SNAPSHOT = `${OWNER}/${SESSION}/${uuid(2)}.png`;
-const AVATAR = `${OWNER}/profile/${uuid(3)}.webp`;
-const ORPHAN = `${OWNER}/${SESSION}/${uuid(4)}.jpg`; // no row references it
-const ARCHIVE = `${OWNER}/${EXPORT_ID}/${uuid(5)}.zip`;
-const TEMPORARY = `${OWNER}/${EXPORT_ID}/${uuid(6)}.zip.partial`;
-// Another user's files.
-const OTHER_PHOTO = `${OTHER}/${OTHER_SESSION}/${uuid(7)}.jpg`;
-const OTHER_ARCHIVE = `${OTHER}/${uuid(8)}/${uuid(9)}.zip`;
 const T0 = new Date('2026-09-01T12:00:00.000Z');
 
-/**
- * The erasure's database (request, file references, account rows and other
- * users' references) in memory, with rollback, plus the two controlled
- * storage adapters. `events` interleaves storage operations with the
- * account's hard deletion, so their order can be asserted.
- */
-class ErasureWorld {
-  readonly events: Array<StorageOperation | { op: 'erase-account' }> = [];
-  readonly images = new ControlledFileStore(this.events as StorageOperation[]);
-  readonly exports = new ControlledFileStore(this.events as StorageOperation[]);
-  readonly prisma = mockDeep<PrismaService>();
-  readonly auth = mock<AuthService>();
-  request: AccountDeletionRequest;
-  files: AccountDeletionFile[] = [];
-  user: { status: string; email: string; tokenVersion: number } | null = {
-    status: 'PENDING_DELETION',
-    email: 'owner@example.com',
-    tokenVersion: 2,
-  };
-  /** Image rows of the owner (storage key, session, source). */
-  ownerImages = [
-    { sessionId: SESSION, storageKey: PHOTO, source: 'PRIVATE_UPLOAD' },
-    { sessionId: SESSION, storageKey: SNAPSHOT, source: 'PRIVATE_UPLOAD' },
-    {
-      sessionId: SESSION,
-      storageKey: 'mock://capture',
-      source: 'MOCK_CAPTURE',
-    },
-  ];
-  ownerAvatar: string | null = AVATAR;
-  ownerExports = [{ storageKey: ARCHIVE as string | null }];
-  /** Keys referenced by OTHER users' rows (images/avatars, exports). */
-  sharedImageKeys = new Set<string>();
-  sharedExportKeys = new Set<string>();
+const PHOTO = `${OWNER}/${SESSION}/11111111-1111-4111-8111-111111111111.jpg`;
+const SNAPSHOT = `${OWNER}/${SESSION}/44444444-4444-4444-8444-444444444444.png`;
+const AVATAR = `${OWNER}/profile/22222222-2222-4222-8222-222222222222.png`;
+const ORPHAN = `${OWNER}/${SESSION}/orphan-without-row.jpg`;
+/** In the owner's scope, but another account's row references it too. */
+const SHARED = `${OWNER}/${SESSION}/55555555-5555-4555-8555-555555555555.jpg`;
+const OTHER_PHOTO = `${OTHER}/d5d5d5d5-0000-4000-8000-000000000005/33333333-3333-4333-8333-333333333333.jpg`;
+const ARCHIVE = `${OWNER}/${EXPORT_ID}/66666666-6666-4666-8666-666666666666.zip`;
+const PARTIAL = `${OWNER}/${EXPORT_ID}/77777777-7777-4777-8777-777777777777.zip.partial`;
+const OTHER_ARCHIVE = `${OTHER}/f0f0f0f0-0000-4000-8000-00000000000f/88888888-8888-4888-8888-888888888888.zip`;
 
-  constructor() {
-    this.request = {
+const storageError = (code: string) =>
+  Object.assign(new Error(`${code}: /srv/private/${OWNER}/secret`), { code });
+
+/**
+ * A private storage adapter whose responses the test controls. It holds a
+ * set of keys and records every operation; scripted failures are consumed
+ * per key (or per owner for listing and pruning) in order.
+ */
+class ScriptedStorage {
+  readonly files: Set<string>;
+  readonly deleteFailures = new Map<string, Error[]>();
+  readonly listFailures: Error[] = [];
+  readonly pruneFailures: Error[] = [];
+  /** Keys whose deletion reports "missing" even if listed (raced away). */
+  readonly reportMissing = new Set<string>();
+  readonly calls: Array<[string, ...string[]]> = [];
+  /** Runs before each operation (to simulate concurrent writers/workers). */
+  beforeOperation: (operation: string, key?: string) => void = () => {};
+
+  constructor(keys: string[]) {
+    this.files = new Set(keys);
+  }
+
+  readonly listOwnerFiles = jest.fn((authId: string) => {
+    this.beforeOperation('list');
+    this.calls.push(['list', authId]);
+    const failure = this.listFailures.shift();
+    if (failure) return Promise.reject(failure);
+    return Promise.resolve(
+      [...this.files].filter((key) => key.startsWith(`${authId}/`)).sort(),
+    );
+  });
+
+  readonly deleteOwnerFile = jest.fn((authId: string, key: string) => {
+    this.beforeOperation('delete', key);
+    this.calls.push(['delete', authId, key]);
+    const failure = this.deleteFailures.get(key)?.shift();
+    if (failure) return Promise.reject(failure);
+    if (this.reportMissing.has(key)) {
+      this.files.delete(key);
+      return Promise.reject(storageError('ENOENT'));
+    }
+    return Promise.resolve(this.files.delete(key));
+  });
+
+  readonly pruneOwnerDirectories = jest.fn((authId: string) => {
+    this.beforeOperation('prune');
+    this.calls.push(['prune', authId]);
+    const failure = this.pruneFailures.shift();
+    return failure ? Promise.reject(failure) : Promise.resolve();
+  });
+
+  failDelete(key: string, ...errors: Error[]): void {
+    this.deleteFailures.set(key, errors);
+  }
+
+  deletedKeys(): string[] {
+    return this.calls
+      .filter(([operation]) => operation === 'delete')
+      .map((call) => call[2]);
+  }
+}
+
+describe('AccountErasureService private file cleanup (scripted storage)', () => {
+  let prisma: ReturnType<typeof mockDeep<PrismaService>>;
+  let images: ScriptedStorage;
+  let exportsStorage: ScriptedStorage;
+  let service: AccountErasureService;
+  let request: AccountDeletionRequest;
+  let fileRows: AccountDeletionFile[];
+  let userStatus: 'PENDING_DELETION' | 'ACTIVE' | null;
+  let sharedKeys: Set<string>;
+  let ownImages: Array<{
+    sessionId: string;
+    storageKey: string;
+    source: string;
+  }>;
+  let activeExportWorkers: number;
+
+  function wirePrisma() {
+    prisma = mockDeep<PrismaService>();
+    const apply = (
+      target: Record<string, unknown>,
+      data: Record<string, unknown>,
+    ) => {
+      for (const [key, value] of Object.entries(data)) {
+        target[key] =
+          value && typeof value === 'object' && 'increment' in value
+            ? (target[key] as number) + (value.increment as number)
+            : value;
+      }
+    };
+    prisma.accountDeletionRequest.updateMany.mockImplementation(((args: {
+      where: Prisma.AccountDeletionRequestWhereInput;
+      data: Record<string, unknown>;
+    }) => {
+      if (args.where.OR) {
+        const now = (
+          args.where.OR as Array<{ lockedUntil: { lt: Date } }>
+        )[1].lockedUntil.lt.getTime();
+        const free =
+          ['PENDING', 'PROCESSING'].includes(request.status) &&
+          (request.lockedUntil === null || request.lockedUntil.getTime() < now);
+        if (!free) return Promise.resolve({ count: 0 });
+      }
+      if (
+        'processingStartedAt' in args.where &&
+        request.processingStartedAt !== null
+      ) {
+        return Promise.resolve({ count: 0 });
+      }
+      // Lease-guarded writes: only the holder of the latest claim.
+      if (
+        typeof args.where.attempts === 'number' &&
+        args.where.attempts !== request.attempts
+      ) {
+        return Promise.resolve({ count: 0 });
+      }
+      apply(request as unknown as Record<string, unknown>, args.data);
+      return Promise.resolve({ count: 1 });
+    }) as never);
+    prisma.accountDeletionRequest.findUniqueOrThrow.mockImplementation((() =>
+      Promise.resolve({ ...request })) as never);
+    prisma.accountDeletionRequest.update.mockImplementation(((args: {
+      data: Record<string, unknown>;
+    }) => {
+      apply(request as unknown as Record<string, unknown>, args.data);
+      return Promise.resolve({ ...request });
+    }) as never);
+    prisma.accountDeletionFile.createMany.mockImplementation(((args: {
+      data: Array<
+        Pick<AccountDeletionFile, 'requestId' | 'kind' | 'storageKey'>
+      >;
+    }) => {
+      for (const file of args.data) {
+        fileRows.push({
+          id: randomUUID(),
+          status: 'PENDING',
+          attempts: 0,
+          lastError: null,
+          note: null,
+          resolvedAt: null,
+          createdAt: T0,
+          ...file,
+        });
+      }
+      return Promise.resolve({ count: args.data.length });
+    }) as never);
+    prisma.accountDeletionFile.findMany.mockImplementation(((args: {
+      where: { status: string };
+    }) =>
+      Promise.resolve(
+        fileRows
+          .filter((file) => file.status === args.where.status)
+          .map((file) => ({ ...file })),
+      )) as never);
+    prisma.accountDeletionFile.updateMany.mockImplementation(((args: {
+      where: {
+        id?: string;
+        status?: string | { in: string[] };
+        kind?: string;
+        storageKey?: string;
+        request?: { is: { attempts: number } };
+      };
+      data: Record<string, unknown>;
+    }) => {
+      if (
+        args.where.request &&
+        args.where.request.is.attempts !== request.attempts
+      ) {
+        return Promise.resolve({ count: 0 });
+      }
+      const targets = fileRows.filter(
+        (file) =>
+          (args.where.id === undefined || file.id === args.where.id) &&
+          (args.where.kind === undefined || file.kind === args.where.kind) &&
+          (args.where.storageKey === undefined ||
+            file.storageKey === args.where.storageKey) &&
+          (args.where.status === undefined ||
+            (typeof args.where.status === 'string'
+              ? file.status === args.where.status
+              : args.where.status.in.includes(file.status))),
+      );
+      for (const file of targets) {
+        apply(file as unknown as Record<string, unknown>, args.data);
+      }
+      return Promise.resolve({ count: targets.length });
+    }) as never);
+    prisma.dataExport.count.mockImplementation((() =>
+      Promise.resolve(activeExportWorkers)) as never);
+    prisma.accountDeletionFile.update.mockImplementation(((args: {
+      where: { id: string };
+      data: Record<string, unknown>;
+    }) => {
+      const file = fileRows.find((item) => item.id === args.where.id)!;
+      apply(file as unknown as Record<string, unknown>, args.data);
+      return Promise.resolve({ ...file });
+    }) as never);
+    prisma.$transaction.mockImplementation((async (
+      callback: (tx: PrismaService) => Promise<unknown>,
+    ) => {
+      const before = {
+        request: { ...request },
+        files: fileRows.map((file) => ({ ...file })),
+      };
+      try {
+        return await callback(prisma);
+      } catch (error) {
+        request = before.request;
+        fileRows = before.files;
+        throw error;
+      }
+    }) as never);
+    prisma.authUser.findUnique.mockImplementation((() =>
+      Promise.resolve(
+        userStatus ? { status: userStatus, email: 'owner@example.com' } : null,
+      )) as never);
+    prisma.authUser.deleteMany.mockResolvedValue({ count: 1 });
+    prisma.imageAsset.findMany.mockImplementation((() =>
+      Promise.resolve(ownImages)) as never);
+    prisma.userProfile.findUnique.mockResolvedValue({
+      avatarUrl: AVATAR,
+    } as never);
+    prisma.dataExport.findMany.mockResolvedValue([
+      { storageKey: ARCHIVE },
+      // A corrupted archive reference pointing at another user's archive.
+      { storageKey: OTHER_ARCHIVE },
+    ] as never);
+    prisma.dataExport.updateMany.mockResolvedValue({ count: 1 });
+    // Sharing: another account's image row or avatar references the key.
+    prisma.imageAsset.count.mockImplementation(((args: {
+      where: { storageKey: string };
+    }) =>
+      Promise.resolve(sharedKeys.has(args.where.storageKey) ? 1 : 0)) as never);
+    prisma.userProfile.count.mockResolvedValue(0);
+    prisma.userSubscription.findUnique.mockResolvedValue(null);
+    prisma.activityLogEvent.deleteMany.mockResolvedValue({ count: 0 });
+    prisma.activityLogEvent.updateMany.mockResolvedValue({ count: 0 });
+  }
+
+  beforeEach(() => {
+    request = {
       id: randomUUID(),
       authId: OWNER,
       status: 'PENDING',
@@ -83,631 +284,549 @@ class ErasureWorld {
       accountBlockedAt: T0,
       sessionsRevokedAt: T0,
       processingStartedAt: null,
-      referencesRecordedAt: null,
-      filesDeletedAt: null,
+      filesRecordedAt: null,
       dataErasedAt: null,
+      filesDeletedAt: null,
       completedAt: null,
       lockedUntil: null,
       attempts: 0,
       lastError: null,
       updatedAt: T0,
     };
-    this.images.add(PHOTO, SNAPSHOT, AVATAR, ORPHAN, OTHER_PHOTO);
-    this.exports.add(ARCHIVE, TEMPORARY, OTHER_ARCHIVE);
-    this.auth.revokeAllSessions.mockResolvedValue();
-    this.auth.forgetDeletedAccount.mockResolvedValue();
-    this.wire();
-  }
-
-  service() {
+    fileRows = [];
+    userStatus = 'PENDING_DELETION';
+    sharedKeys = new Set();
+    activeExportWorkers = 0;
+    ownImages = [
+      { sessionId: SESSION, storageKey: PHOTO, source: 'PRIVATE_UPLOAD' },
+      { sessionId: SESSION, storageKey: SNAPSHOT, source: 'PRIVATE_UPLOAD' },
+      // Shared, non-private assets are never storage operations.
+      {
+        sessionId: SESSION,
+        storageKey: 'mock://capture/1',
+        source: 'MOCK_CAPTURE',
+      },
+      {
+        sessionId: SESSION,
+        storageKey: 'https://cdn.example.com/look.jpg',
+        source: 'PRIVATE_UPLOAD',
+      },
+      // Corrupted references pointing at another user's file.
+      { sessionId: SESSION, storageKey: OTHER_PHOTO, source: 'PRIVATE_UPLOAD' },
+      {
+        sessionId: SESSION,
+        storageKey: `${OWNER}/..\\${OTHER}\\x.jpg`,
+        source: 'PRIVATE_UPLOAD',
+      },
+    ];
+    images = new ScriptedStorage([
+      PHOTO,
+      SNAPSHOT,
+      AVATAR,
+      ORPHAN,
+      OTHER_PHOTO,
+    ]);
+    exportsStorage = new ScriptedStorage([ARCHIVE, PARTIAL, OTHER_ARCHIVE]);
+    wirePrisma();
+    const auth = mock<AuthService>();
+    auth.revokeAllSessions.mockResolvedValue();
+    auth.forgetDeletedAccount.mockResolvedValue();
     const codes = mock<AccountDeletionCodeService>();
     codes.forget.mockResolvedValue();
-    return new AccountErasureService(
-      this.prisma,
-      this.auth,
+    service = new AccountErasureService(
+      prisma,
+      auth,
       codes,
-      this.images,
-      this.exports,
+      images as unknown as PrivateImageStorageService,
+      exportsStorage as unknown as PrivacyExportStorageService,
       mock<Logger>(),
     );
-  }
-
-  file(kind: AccountDeletionFileKind, key: string) {
-    return this.files.find(
-      (item) => item.kind === kind && item.storageKey === key,
-    );
-  }
-
-  private apply(
-    target: Record<string, unknown>,
-    data: Record<string, unknown>,
-  ) {
-    for (const [key, value] of Object.entries(data)) {
-      target[key] =
-        value && typeof value === 'object' && 'increment' in value
-          ? (target[key] as number) + (value.increment as number)
-          : value;
-    }
-  }
-
-  private wire() {
-    const prisma = this.prisma;
-    prisma.$transaction.mockImplementation((async (
-      callback: (tx: PrismaService) => Promise<unknown>,
-    ) => {
-      const before = {
-        request: { ...this.request },
-        files: this.files.map((file) => ({ ...file })),
-        user: this.user && { ...this.user },
-      };
-      try {
-        return await callback(prisma);
-      } catch (error) {
-        this.request = before.request;
-        this.files = before.files;
-        this.user = before.user;
-        throw error;
-      }
-    }) as never);
-
-    // Request: claim with lease, updates.
-    prisma.accountDeletionRequest.updateMany.mockImplementation(((args: {
-      where: {
-        OR?: Array<{ lockedUntil?: { lt: Date } | null }>;
-        processingStartedAt?: null;
-      };
-      data: Record<string, unknown>;
-    }) => {
-      const request = this.request;
-      if (args.where.OR) {
-        const now = args.where.OR[1]?.lockedUntil?.lt ?? new Date();
-        const free =
-          ['PENDING', 'PROCESSING'].includes(request.status) &&
-          (request.lockedUntil === null ||
-            request.lockedUntil.getTime() < now.getTime());
-        if (!free) return Promise.resolve({ count: 0 });
-      }
-      if ('processingStartedAt' in args.where && request.processingStartedAt) {
-        return Promise.resolve({ count: 0 });
-      }
-      this.apply(request as never, args.data);
-      return Promise.resolve({ count: 1 });
-    }) as never);
-    prisma.accountDeletionRequest.findUniqueOrThrow.mockImplementation((() =>
-      Promise.resolve({ ...this.request })) as never);
-    prisma.accountDeletionRequest.update.mockImplementation(((args: {
-      data: Record<string, unknown>;
-    }) => {
-      this.apply(this.request as never, args.data);
-      return Promise.resolve({ ...this.request });
-    }) as never);
-
-    // File references.
-    prisma.accountDeletionFile.createMany.mockImplementation(((args: {
-      data: Array<{
-        requestId: string;
-        kind: AccountDeletionFileKind;
-        storageKey: string;
-      }>;
-    }) => {
-      let count = 0;
-      for (const item of args.data) {
-        if (!this.file(item.kind, item.storageKey)) {
-          this.files.push({
-            id: randomUUID(),
-            resolvedAt: null,
-            outcome: null,
-            attempts: 0,
-            lastError: null,
-            createdAt: T0,
-            ...item,
-          });
-          count += 1;
-        }
-      }
-      return Promise.resolve({ count });
-    }) as never);
-    prisma.accountDeletionFile.findMany.mockImplementation(((args: {
-      where: { resolvedAt: null; kind: { in: string[] } };
-    }) =>
-      Promise.resolve(
-        this.files
-          .filter((file) => file.resolvedAt === null)
-          .filter((file) => args.where.kind.in.includes(file.kind))
-          .sort((a, b) => a.storageKey.localeCompare(b.storageKey))
-          .map((file) => ({ ...file })),
-      )) as never);
-    prisma.accountDeletionFile.update.mockImplementation(((args: {
-      where: { id: string };
-      data: Record<string, unknown>;
-    }) => {
-      const file = this.files.find((item) => item.id === args.where.id)!;
-      this.apply(file as never, args.data);
-      return Promise.resolve({ ...file });
-    }) as never);
-    prisma.accountDeletionFile.updateMany.mockImplementation(((args: {
-      where: {
-        kind: AccountDeletionFileKind | { in: AccountDeletionFileKind[] };
-        storageKey?: { in: string[] };
-        outcome?: { in: string[] };
-        resolvedAt?: null;
-      };
-      data: Record<string, unknown>;
-    }) => {
-      const kinds =
-        typeof args.where.kind === 'string'
-          ? [args.where.kind]
-          : args.where.kind.in;
-      const targets = this.files.filter(
-        (file) =>
-          kinds.includes(file.kind) &&
-          (!args.where.storageKey ||
-            args.where.storageKey.in.includes(file.storageKey)) &&
-          (!args.where.outcome ||
-            (file.outcome !== null &&
-              args.where.outcome.in.includes(file.outcome))) &&
-          (!('resolvedAt' in args.where) || file.resolvedAt === null),
-      );
-      for (const file of targets) this.apply(file as never, args.data);
-      return Promise.resolve({ count: targets.length });
-    }) as never);
-
-    // The account and its rows.
-    prisma.authUser.findUnique.mockImplementation((() =>
-      Promise.resolve(this.user && { ...this.user })) as never);
-    prisma.authUser.deleteMany.mockImplementation((() => {
-      this.events.push({ op: 'erase-account' });
-      this.user = null;
-      return Promise.resolve({ count: 1 });
-    }) as never);
-    prisma.imageAsset.findMany.mockImplementation((() =>
-      Promise.resolve(this.ownerImages)) as never);
-    prisma.userProfile.findUnique.mockImplementation((() =>
-      Promise.resolve(
-        this.ownerAvatar ? { avatarUrl: this.ownerAvatar } : null,
-      )) as never);
-    prisma.dataExport.findMany.mockImplementation((() =>
-      Promise.resolve(this.ownerExports)) as never);
-    prisma.dataExport.updateMany.mockResolvedValue({ count: 1 });
-    prisma.userSubscription.findUnique.mockResolvedValue(null);
-    prisma.activityLogEvent.deleteMany.mockResolvedValue({ count: 0 });
-    prisma.activityLogEvent.updateMany.mockResolvedValue({ count: 0 });
-
-    // Other users' references (shared files).
-    prisma.imageAsset.count.mockImplementation(((args: {
-      where: { storageKey: string };
-    }) =>
-      Promise.resolve(
-        this.sharedImageKeys.has(args.where.storageKey) ? 1 : 0,
-      )) as never);
-    prisma.userProfile.count.mockResolvedValue(0);
-    prisma.dataExport.count.mockImplementation(((args: {
-      where: { storageKey: string };
-    }) =>
-      Promise.resolve(
-        this.sharedExportKeys.has(args.where.storageKey) ? 1 : 0,
-      )) as never);
-  }
-}
-
-const storageError = (code: string) =>
-  Object.assign(new Error(`${code}: /srv/private/${OWNER}`), { code });
-
-describe('Account file cleanup (privacy account deletion, controlled storage)', () => {
-  let world: ErasureWorld;
-
-  beforeEach(() => {
-    world = new ErasureWorld();
   });
 
-  describe('file deletion', () => {
-    it('removes every photo, the avatar, unreferenced photos, export archives and temporary files through the adapters', async () => {
-      await expect(world.service().process(world.request.id, T0)).resolves.toBe(
-        'COMPLETED',
-      );
+  const run = (at: Date = T0) => service.process(request.id, at);
+  const accountDeleted = () => prisma.authUser.deleteMany.mock.calls.length > 0;
+  const allOperations = () => [...images.calls, ...exportsStorage.calls];
 
-      expect(world.images.removed().sort()).toEqual(
+  describe('file deletion', () => {
+    it('deletes every photo, avatar, export archive and temporary file of the account through the adapters', async () => {
+      await expect(run()).resolves.toBe('COMPLETED');
+
+      // Referenced photos and avatar, then the directory sweep's leftovers.
+      expect(images.deletedKeys().sort()).toEqual(
         [PHOTO, SNAPSHOT, AVATAR, ORPHAN].sort(),
       );
-      expect(world.exports.removed().sort()).toEqual(
-        [ARCHIVE, TEMPORARY].sort(),
+      // The published archive, then the partial (temporary) archive.
+      expect(exportsStorage.deletedKeys().sort()).toEqual(
+        [ARCHIVE, PARTIAL].sort(),
       );
-      // Each file was removed exactly once.
-      expect(world.images.removalAttempts()).toHaveLength(4);
-      expect(world.exports.removalAttempts()).toHaveLength(2);
-      // Empty owner directories are pruned afterwards.
-      for (const store of [world.images, world.exports]) {
-        expect(store.operations.filter((op) => op.op === 'prune')).toEqual([
-          { op: 'prune', target: OWNER, result: 'OK' },
-        ]);
-      }
+      // Every operation is scoped to the account's own directory.
+      for (const call of allOperations()) expect(call[1]).toBe(OWNER);
+      expect(images.pruneOwnerDirectories.mock.calls).toEqual([[OWNER]]);
+      expect(exportsStorage.pruneOwnerDirectories.mock.calls).toEqual([
+        [OWNER],
+      ]);
+      expect([...images.files]).toEqual([OTHER_PHOTO]);
+      expect([...exportsStorage.files]).toEqual([OTHER_ARCHIVE]);
     });
 
-    it('does not delete the account before every file is removed', async () => {
-      await world.service().process(world.request.id, T0);
+    it('deletes each file once: a file deleted individually is not deleted again by the sweep', async () => {
+      await run();
 
-      const eraseAt = world.events.findIndex(
-        (event) => event.op === 'erase-account',
-      );
-      const lastRemoval = world.events
-        .map((event) => event.op)
-        .lastIndexOf('remove');
-      expect(eraseAt).toBeGreaterThan(lastRemoval);
-      expect(eraseAt).toBeGreaterThan(
-        world.events.map((event) => event.op).lastIndexOf('prune'),
-      );
+      const deletions = [
+        ...images.deletedKeys(),
+        ...exportsStorage.deletedKeys(),
+      ];
+      expect(new Set(deletions).size).toBe(deletions.length);
     });
 
-    it('stops the account’s running exports before it touches any file', async () => {
-      await world.service().process(world.request.id, T0);
+    it('deletes the files before the account: no storage operation happens after the hard delete', async () => {
+      await run();
 
-      expect(world.prisma.dataExport.updateMany.mock.calls[0][0]).toMatchObject(
-        {
-          where: { authId: OWNER, status: { in: ['QUEUED', 'PROCESSING'] } },
-          data: { status: 'FAILED', errorCode: 'ACCOUNT_UNAVAILABLE' },
-        },
-      );
-    });
-
-    it('finds and removes a temporary file written while the cleanup runs', async () => {
-      const late = `${OWNER}/${EXPORT_ID}/${uuid(9)}.zip.partial`;
-      world.images.onRemove = (key) => {
-        // An export attempt that was just stopped writes a last file.
-        if (key === PHOTO) world.exports.add(late);
-      };
-
-      await world.service().process(world.request.id, T0);
-
-      expect(world.exports.removed()).toContain(late);
-      expect(world.exports.files.has(late)).toBe(false);
-      const eraseAt = world.events.findIndex(
-        (event) => event.op === 'erase-account',
-      );
-      const lateRemoval = world.events.findIndex(
-        (event) =>
-          event.op === 'remove' && 'target' in event && event.target === late,
-      );
-      expect(lateRemoval).toBeLessThan(eraseAt);
-    });
-
-    it('removes a file again if it reappears after being removed', async () => {
-      let rewritten = false;
-      world.exports.onRemove = (key) => {
-        if (key === ARCHIVE && !rewritten) {
-          rewritten = true;
-          world.exports.add(ARCHIVE);
-        }
-      };
-
-      await world.service().process(world.request.id, T0);
-
+      const deleteOrder =
+        prisma.authUser.deleteMany.mock.invocationCallOrder[0];
+      const storageOrders = [
+        ...images.deleteOwnerFile.mock.invocationCallOrder,
+        ...images.pruneOwnerDirectories.mock.invocationCallOrder,
+        ...exportsStorage.deleteOwnerFile.mock.invocationCallOrder,
+        ...exportsStorage.pruneOwnerDirectories.mock.invocationCallOrder,
+      ];
+      expect(Math.max(...storageOrders)).toBeLessThan(deleteOrder);
+      // ...and running exports were stopped before any file was recorded.
       expect(
-        world.exports.removalAttempts().filter((key) => key === ARCHIVE),
-      ).toHaveLength(2);
-      expect(world.exports.files.has(ARCHIVE)).toBe(false);
+        prisma.dataExport.updateMany.mock.invocationCallOrder[0],
+      ).toBeLessThan(Math.min(...storageOrders));
+      expect(prisma.dataExport.updateMany.mock.calls[0][0]).toMatchObject({
+        where: { authId: OWNER, status: { in: ['QUEUED', 'PROCESSING'] } },
+        data: { status: 'FAILED', errorCode: 'ACCOUNT_UNAVAILABLE' },
+      });
     });
   });
 
   describe('file ownership', () => {
-    it('never lists, removes or prunes another user’s storage', async () => {
-      await world.service().process(world.request.id, T0);
+    it('never issues a storage operation for another account’s file, even from corrupted references', async () => {
+      await run();
 
-      for (const store of [world.images, world.exports]) {
-        expect(
-          store.operations.every((op) => op.target.startsWith(OWNER)),
-        ).toBe(true);
+      const touched = allOperations().flatMap((call) => call.slice(1));
+      for (const foreign of [OTHER_PHOTO, OTHER_ARCHIVE, OTHER]) {
+        expect(touched).not.toContain(foreign);
       }
-      expect(world.images.files).toEqual(new Set([OTHER_PHOTO]));
-      expect(world.exports.files).toEqual(new Set([OTHER_ARCHIVE]));
+      expect(touched.some((value) => value.includes('\\'))).toBe(false);
+      expect(touched.some((value) => value.includes('://'))).toBe(false);
     });
 
-    it('never touches a file the account’s rows reference outside its own scope', async () => {
-      world.ownerImages.push(
-        {
-          sessionId: SESSION,
-          storageKey: OTHER_PHOTO,
-          source: 'PRIVATE_UPLOAD',
-        },
-        {
-          sessionId: SESSION,
-          storageKey: `${OWNER}/..\\${OTHER}\\${OTHER_SESSION}\\${uuid(7)}.jpg`,
-          source: 'PRIVATE_UPLOAD',
-        },
-      );
-      world.ownerExports.push({ storageKey: OTHER_ARCHIVE });
-      world.ownerAvatar = 'https://lh3.googleusercontent.com/a/photo';
+    it('records no reference to another account’s file (collection check)', async () => {
+      await run();
 
-      await world.service().process(world.request.id, T0);
-
-      const attempted = [
-        ...world.images.removalAttempts(),
-        ...world.exports.removalAttempts(),
-      ];
-      expect(attempted).not.toContain(OTHER_PHOTO);
-      expect(attempted).not.toContain(OTHER_ARCHIVE);
+      const recorded = fileRows.map((file) => file.storageKey);
+      expect(recorded).not.toContain(OTHER_PHOTO);
+      expect(recorded).not.toContain(OTHER_ARCHIVE);
       expect(
-        attempted.some((key) => key.includes('\\') || key.includes('://')),
-      ).toBe(false);
-      expect(world.images.files.has(OTHER_PHOTO)).toBe(true);
-      expect(world.exports.files.has(OTHER_ARCHIVE)).toBe(true);
-      // Such keys are not even recorded as files of the account.
-      expect(world.file('PRIVATE_IMAGE', OTHER_PHOTO)).toBeUndefined();
-      expect(world.file('EXPORT_FILE', OTHER_ARCHIVE)).toBeUndefined();
+        recorded.every((key) => key === OWNER || key.startsWith(`${OWNER}/`)),
+      ).toBe(true);
     });
 
-    it('keeps, never removes, a saved reference that points outside the account’s scope', async () => {
-      // For example a reference saved by an older version, or corrupted.
-      world.files.push({
-        id: randomUUID(),
-        requestId: world.request.id,
-        kind: 'PRIVATE_IMAGE',
-        storageKey: OTHER_PHOTO,
-        resolvedAt: null,
-        outcome: null,
-        attempts: 0,
-        lastError: null,
-        createdAt: T0,
+    it('retains a tampered reference outside the account’s scope without any storage operation (deletion check)', async () => {
+      // References already recorded, one of them tampered with.
+      request.filesRecordedAt = T0;
+      fileRows.push(
+        ...[
+          { kind: 'PRIVATE_IMAGE' as const, storageKey: OTHER_PHOTO },
+          { kind: 'EXPORT_ARCHIVE' as const, storageKey: OTHER_ARCHIVE },
+        ].map((file) => ({
+          id: randomUUID(),
+          requestId: request.id,
+          status: 'PENDING' as const,
+          attempts: 0,
+          lastError: null,
+          note: null,
+          resolvedAt: null,
+          createdAt: T0,
+          ...file,
+        })),
+      );
+
+      await run();
+
+      for (const key of [OTHER_PHOTO, OTHER_ARCHIVE]) {
+        expect(fileRows.find((file) => file.storageKey === key)).toMatchObject({
+          status: 'RETAINED',
+          note: FILE_NOTES.OUT_OF_SCOPE,
+        });
+      }
+      // No operation ever targets the foreign keys (the verification pass
+      // still cleans the account's own files, in its own scope).
+      const touched = allOperations().flatMap((call) => call.slice(1));
+      expect(touched).not.toContain(OTHER_PHOTO);
+      expect(touched).not.toContain(OTHER_ARCHIVE);
+      for (const call of allOperations()) expect(call[1]).toBe(OWNER);
+      expect(images.files.has(OTHER_PHOTO)).toBe(true);
+      expect(exportsStorage.files.has(OTHER_ARCHIVE)).toBe(true);
+    });
+
+    it('keeps a file that another account references, and still deletes the rest', async () => {
+      images.files.add(SHARED);
+      ownImages.push({
+        sessionId: SESSION,
+        storageKey: SHARED,
+        source: 'PRIVATE_UPLOAD',
       });
+      sharedKeys.add(SHARED);
 
-      await expect(world.service().process(world.request.id, T0)).resolves.toBe(
-        'COMPLETED',
-      );
+      await expect(run()).resolves.toBe('COMPLETED');
 
-      expect(world.images.removalAttempts()).not.toContain(OTHER_PHOTO);
-      expect(world.images.files.has(OTHER_PHOTO)).toBe(true);
-      expect(world.file('PRIVATE_IMAGE', OTHER_PHOTO)?.outcome).toBe(
-        'RETAINED_NOT_OWNED',
+      expect(images.deletedKeys()).not.toContain(SHARED);
+      expect(images.files.has(SHARED)).toBe(true);
+      expect(images.deletedKeys()).toEqual(
+        expect.arrayContaining([PHOTO, SNAPSHOT, AVATAR, ORPHAN]),
       );
+      expect(fileRows.find((file) => file.storageKey === SHARED)).toMatchObject(
+        {
+          kind: 'PRIVATE_IMAGE',
+          status: 'RETAINED',
+          note: FILE_NOTES.SHARED,
+        },
+      );
+      // The sweep also leaves it alone and says so.
+      expect(
+        fileRows.find((file) => file.kind === 'IMAGE_OWNER_DIRECTORY'),
+      ).toMatchObject({ status: 'RETAINED' });
     });
 
-    it('keeps a file in the account’s folder that another user’s record also uses', async () => {
-      world.sharedImageKeys.add(ORPHAN);
-      world.sharedExportKeys.add(TEMPORARY);
+    it('keeps a file that another account references even when only the sweep finds it', async () => {
+      images.files.add(SHARED);
+      sharedKeys.add(SHARED);
 
-      await expect(world.service().process(world.request.id, T0)).resolves.toBe(
-        'COMPLETED',
-      );
+      await run();
 
-      expect(world.images.removalAttempts()).not.toContain(ORPHAN);
-      expect(world.exports.removalAttempts()).not.toContain(TEMPORARY);
-      expect(world.images.files.has(ORPHAN)).toBe(true);
-      expect(world.exports.files.has(TEMPORARY)).toBe(true);
-      expect(world.file('PRIVATE_IMAGE', ORPHAN)?.outcome).toBe(
-        'RETAINED_SHARED',
-      );
-      expect(world.file('EXPORT_FILE', TEMPORARY)?.outcome).toBe(
-        'RETAINED_SHARED',
-      );
-      // Everything else of the owner is removed.
-      expect(world.images.removed().sort()).toEqual(
-        [PHOTO, SNAPSHOT, AVATAR].sort(),
-      );
-    });
-
-    it('does not touch storage for an account that is no longer pending deletion', async () => {
-      world.user = {
-        status: 'ACTIVE',
-        email: 'owner@example.com',
-        tokenVersion: 2,
-      };
-
-      await expect(world.service().process(world.request.id, T0)).resolves.toBe(
-        'PENDING',
-      );
-
-      expect(world.images.operations).toEqual([]);
-      expect(world.exports.operations).toEqual([]);
+      expect(images.deletedKeys()).not.toContain(SHARED);
+      expect(images.files.has(SHARED)).toBe(true);
     });
   });
 
   describe('missing files', () => {
-    it('treats a referenced file that is already gone as handled, and continues', async () => {
-      world.images.files.delete(SNAPSHOT);
-      world.images.respond(AVATAR, 'MISSING');
+    it('treats files already missing from storage as cleaned up (reported or thrown as ENOENT)', async () => {
+      images.files.delete(PHOTO); // adapter reports "missing" (false)
+      images.reportMissing.add(AVATAR); // adapter throws ENOENT
 
-      await expect(world.service().process(world.request.id, T0)).resolves.toBe(
-        'COMPLETED',
-      );
+      await expect(run()).resolves.toBe('COMPLETED');
 
-      // Removal was attempted once for each missing file; no retry needed.
-      expect(
-        world.images.removalAttempts().filter((key) => key === SNAPSHOT),
-      ).toEqual([SNAPSHOT]);
-      expect(
-        world.images.removalAttempts().filter((key) => key === AVATAR),
-      ).toEqual([AVATAR]);
-      expect(world.file('PRIVATE_IMAGE', SNAPSHOT)?.outcome).toBe(
-        'ALREADY_MISSING',
+      expect(fileRows.find((file) => file.storageKey === PHOTO)?.status).toBe(
+        'MISSING',
       );
-      expect(world.file('PRIVATE_IMAGE', AVATAR)?.outcome).toBe(
-        'ALREADY_MISSING',
+      expect(fileRows.find((file) => file.storageKey === AVATAR)?.status).toBe(
+        'MISSING',
       );
-      expect(world.images.removed().sort()).toEqual([PHOTO, ORPHAN].sort());
-      expect(world.events.some((event) => event.op === 'erase-account')).toBe(
-        true,
-      );
+      expect(accountDeleted()).toBe(true);
     });
 
-    it('handles an account with no files at all', async () => {
-      world.images.files.clear();
-      world.exports.files.clear();
-      world.ownerImages = [];
-      world.ownerAvatar = null;
-      world.ownerExports = [];
+    it('treats an owner directory with nothing left as cleaned up', async () => {
+      images.files.clear();
+      exportsStorage.files.clear();
 
-      await expect(world.service().process(world.request.id, T0)).resolves.toBe(
-        'COMPLETED',
-      );
+      await expect(run()).resolves.toBe('COMPLETED');
 
-      expect(world.images.removalAttempts()).toEqual([]);
-      expect(world.exports.removalAttempts()).toEqual([]);
+      expect(
+        fileRows
+          .filter((file) => file.kind.endsWith('OWNER_DIRECTORY'))
+          .map((file) => file.status),
+      ).toEqual(['MISSING', 'MISSING']);
     });
   });
 
   describe('storage errors', () => {
-    it('keeps the account closed and the reference pending when a removal fails, then retries only that file', async () => {
-      world.images.respond(SNAPSHOT, storageError('EIO'));
+    it('keeps the account closed and undeleted while a file cannot be deleted, and retries only what is left', async () => {
+      images.failDelete(PHOTO, storageError('EIO'), storageError('EIO'));
 
-      await expect(world.service().process(world.request.id, T0)).resolves.toBe(
-        'PENDING',
-      );
+      await expect(run()).resolves.toBe('PENDING');
 
-      // Storage: every other file removed; the failing one is still there.
-      expect(world.images.files.has(SNAPSHOT)).toBe(true);
-      expect(world.images.removed().sort()).toEqual(
-        [AVATAR, ORPHAN, PHOTO].sort(),
-      );
-      // The account is not deleted, and the reference is kept for the retry.
-      expect(world.events.some((event) => event.op === 'erase-account')).toBe(
-        false,
-      );
-      expect(world.user?.status).toBe('PENDING_DELETION');
-      expect(world.file('PRIVATE_IMAGE', SNAPSHOT)).toMatchObject({
-        resolvedAt: null,
-        outcome: null,
-        attempts: 1,
-        lastError: 'Error (EIO)',
-      });
-      expect(world.request).toMatchObject({
+      // Not deleted: no hard delete, the deletion is incomplete.
+      expect(accountDeleted()).toBe(false);
+      expect(request).toMatchObject({
         status: 'PROCESSING',
         filesDeletedAt: null,
         dataErasedAt: null,
+        completedAt: null,
         lockedUntil: null,
+        lastError: 'File deletion failed: Error (EIO)',
       });
-      expect(world.request.lastError).not.toContain('/srv/');
-
-      world.images.operations.length = 0;
-      await expect(world.service().process(world.request.id, T0)).resolves.toBe(
-        'COMPLETED',
-      );
-
-      // Only the failed file is removed on the retry.
-      expect(world.images.removalAttempts()).toEqual([SNAPSHOT]);
-      expect(world.images.files.has(SNAPSHOT)).toBe(false);
+      // The reference is kept, pending, with the (path-free) error.
+      expect(fileRows.find((file) => file.storageKey === PHOTO)).toMatchObject({
+        status: 'PENDING',
+        attempts: 1,
+        lastError: 'Error (EIO)',
+      });
+      expect(JSON.stringify(fileRows)).not.toContain('/srv/');
+      // The directory sweep hit the same error and stays pending too, but it
+      // still deleted every other file it could.
       expect(
-        world.events.filter((event) => event.op === 'erase-account'),
-      ).toHaveLength(1);
+        fileRows.find((file) => file.kind === 'IMAGE_OWNER_DIRECTORY')?.status,
+      ).toBe('PENDING');
+      expect(images.files.has(ORPHAN)).toBe(false);
+
+      // Storage recovers: only the unresolved references are retried.
+      images.calls.length = 0;
+      exportsStorage.calls.length = 0;
+      await expect(run()).resolves.toBe('COMPLETED');
+
+      expect(images.deletedKeys()).toEqual([PHOTO]);
+      expect(exportsStorage.deletedKeys()).toEqual([]);
+      expect(accountDeleted()).toBe(true);
     });
 
-    it('retries a persistently failing file on every run without ever deleting the account', async () => {
-      world.exports.respond(
-        ARCHIVE,
-        storageError('EACCES'),
-        storageError('EACCES'),
-        storageError('EACCES'),
+    it('never deletes the account while deletion keeps failing', async () => {
+      images.failDelete(
+        PHOTO,
+        ...Array.from({ length: 10 }, () => storageError('EACCES')),
       );
-      const service = world.service();
 
-      for (let run = 1; run <= 3; run += 1) {
-        await expect(service.process(world.request.id, T0)).resolves.toBe(
-          'PENDING',
-        );
-        expect(world.file('EXPORT_FILE', ARCHIVE)?.attempts).toBe(run);
+      for (let attempt = 1; attempt <= 4; attempt += 1) {
+        await expect(run()).resolves.toBe('PENDING');
       }
+
+      expect(accountDeleted()).toBe(false);
+      expect(request.status).toBe('PROCESSING');
+      expect(fileRows.find((file) => file.storageKey === PHOTO)).toMatchObject({
+        status: 'PENDING',
+        attempts: 4,
+      });
+      // The photo was attempted on every run, never silently dropped.
       expect(
-        world.exports.removalAttempts().filter((key) => key === ARCHIVE),
-      ).toHaveLength(3);
-      expect(world.events.some((event) => event.op === 'erase-account')).toBe(
-        false,
-      );
-      expect(world.user?.status).toBe('PENDING_DELETION');
-
-      await expect(service.process(world.request.id, T0)).resolves.toBe(
-        'COMPLETED',
-      );
-      expect(world.exports.files.has(ARCHIVE)).toBe(false);
+        images.deletedKeys().filter((key) => key === PHOTO).length,
+      ).toBeGreaterThanOrEqual(4);
     });
 
-    it('removes nothing and deletes nothing when the storage cannot be listed', async () => {
-      world.images.failListing(storageError('EIO'));
+    it.each([
+      [
+        'listing the directory',
+        (s: ScriptedStorage) => s.listFailures.push(storageError('EACCES')),
+      ],
+      [
+        'removing empty directories',
+        (s: ScriptedStorage) => s.pruneFailures.push(storageError('EBUSY')),
+      ],
+    ])(
+      'keeps the deletion incomplete when %s fails, then completes',
+      async (_label, script) => {
+        script(exportsStorage);
 
-      await expect(world.service().process(world.request.id, T0)).resolves.toBe(
-        'PENDING',
+        await expect(run()).resolves.toBe('PENDING');
+        expect(accountDeleted()).toBe(false);
+        expect(
+          fileRows.find((file) => file.kind === 'EXPORT_OWNER_DIRECTORY')
+            ?.status,
+        ).toBe('PENDING');
+
+        await expect(run()).resolves.toBe('COMPLETED');
+        expect(accountDeleted()).toBe(true);
+      },
+    );
+
+    it('does not touch storage again once every file is resolved, even if a later step fails', async () => {
+      prisma.authUser.deleteMany.mockRejectedValueOnce(
+        new Error('connection lost'),
       );
 
-      expect(world.images.removalAttempts()).toEqual([]);
-      expect(world.exports.removalAttempts()).toEqual([]);
-      expect(world.events.some((event) => event.op === 'erase-account')).toBe(
-        false,
-      );
-      // The references recorded before the listing are kept for the retry.
-      expect(world.file('PRIVATE_IMAGE', PHOTO)?.resolvedAt).toBeNull();
+      await expect(run()).resolves.toBe('PENDING');
+      expect(request.filesDeletedAt).not.toBeNull();
+      expect(request.dataErasedAt).toBeNull();
+      const operations = allOperations().length;
 
-      await expect(world.service().process(world.request.id, T0)).resolves.toBe(
-        'COMPLETED',
+      await expect(run()).resolves.toBe('COMPLETED');
+
+      expect(allOperations()).toHaveLength(operations);
+    });
+  });
+
+  describe('active export workers', () => {
+    it('does not touch storage or complete while an export worker of the account may still write', async () => {
+      activeExportWorkers = 1;
+
+      await expect(run()).resolves.toBe('PENDING');
+
+      expect(allOperations()).toEqual([]);
+      expect(accountDeleted()).toBe(false);
+      expect(request).toMatchObject({
+        status: 'PROCESSING',
+        filesDeletedAt: null,
+        lastError: 'Waiting for 1 export worker(s) of the account to stop',
+      });
+      // Running exports were cancelled first, so the worker will stop.
+      expect(prisma.dataExport.updateMany.mock.calls[0][0]).toMatchObject({
+        data: { status: 'FAILED' },
+      });
+      // The check uses worker leases that are still live.
+      expect(prisma.dataExport.count.mock.calls[0][0]).toEqual({
+        where: { authId: OWNER, workerLeaseUntil: { gt: T0 } },
+      });
+
+      activeExportWorkers = 0;
+      await expect(run()).resolves.toBe('COMPLETED');
+      expect(exportsStorage.deletedKeys().sort()).toEqual(
+        [ARCHIVE, PARTIAL].sort(),
       );
     });
 
-    it('does not finish while the owner’s directories cannot be cleaned up', async () => {
-      world.exports.failPruning(storageError('EBUSY'));
+    it('records and deletes a file that a worker left while cleanup was running, before completing', async () => {
+      const LATE = `${OWNER}/${EXPORT_ID}/99999999-9999-4999-8999-999999999999.zip.partial`;
+      let written = false;
+      // The worker finishes writing its partial archive right after the
+      // export directory sweep.
+      exportsStorage.beforeOperation = (operation) => {
+        if (operation === 'prune' && !written) {
+          written = true;
+          exportsStorage.files.add(LATE);
+        }
+      };
 
-      await expect(world.service().process(world.request.id, T0)).resolves.toBe(
-        'PENDING',
-      );
-      expect(world.request.filesDeletedAt).toBeNull();
-      expect(world.events.some((event) => event.op === 'erase-account')).toBe(
-        false,
-      );
+      await expect(run()).resolves.toBe('COMPLETED');
 
-      await expect(world.service().process(world.request.id, T0)).resolves.toBe(
-        'COMPLETED',
+      expect(exportsStorage.deletedKeys()).toContain(LATE);
+      expect(exportsStorage.files.size).toBe(1); // only the other user's archive
+      const late = fileRows.find((file) => file.storageKey === LATE);
+      expect(late).toMatchObject({ kind: 'EXPORT_ARCHIVE', status: 'DELETED' });
+      // Recorded as a reference before it was deleted.
+      const recordedAt = Math.max(
+        ...prisma.accountDeletionFile.createMany.mock.invocationCallOrder,
+      );
+      const deleteCalls = exportsStorage.deleteOwnerFile.mock.calls;
+      const deletedAt =
+        exportsStorage.deleteOwnerFile.mock.invocationCallOrder[
+          deleteCalls.findIndex(([, key]) => key === LATE)
+        ];
+      expect(deletedAt).toBeGreaterThan(recordedAt);
+    });
+
+    it('never completes while files keep appearing in storage', async () => {
+      let counter = 0;
+      exportsStorage.beforeOperation = (operation) => {
+        if (operation === 'list') {
+          counter += 1;
+          exportsStorage.files.add(
+            `${OWNER}/${EXPORT_ID}/late-${counter}.zip.partial`,
+          );
+        }
+      };
+
+      await expect(run()).resolves.toBe('PENDING');
+
+      expect(accountDeleted()).toBe(false);
+      expect(request.filesDeletedAt).toBeNull();
+      expect(request.lastError).toBe(
+        'Files keep appearing in storage; cleanup will be retried',
       );
     });
   });
 
-  describe('resumption', () => {
-    it('finishes the files of a request that erased its data first (before per-file cleanup)', async () => {
-      world.request.dataErasedAt = T0;
-      world.user = null;
-      world.files.push({
-        id: randomUUID(),
-        requestId: world.request.id,
-        kind: 'IMAGE_OWNER_DIRECTORY',
-        storageKey: OWNER,
-        resolvedAt: null,
-        outcome: null,
-        attempts: 0,
-        lastError: null,
-        createdAt: T0,
-      });
+  describe('interrupted and concurrent processing', () => {
+    it('resumes without losing a reference when recording a deletion fails (database interruption)', async () => {
+      const realUpdate =
+        prisma.accountDeletionFile.updateMany.getMockImplementation()!;
+      let failed = false;
+      prisma.accountDeletionFile.updateMany.mockImplementation(((
+        args: never,
+      ) => {
+        if (!failed) {
+          failed = true;
+          return Promise.reject(new Error('connection reset'));
+        }
+        return realUpdate(args);
+      }) as never);
 
-      await expect(world.service().process(world.request.id, T0)).resolves.toBe(
-        'COMPLETED',
-      );
+      await expect(run()).resolves.toBe('PENDING');
 
-      expect(world.images.removed().sort()).toEqual(
-        [PHOTO, SNAPSHOT, AVATAR, ORPHAN].sort(),
-      );
+      // One file was deleted from storage, but its outcome was not recorded:
+      // the reference is still pending, and the account is not deleted.
+      expect(accountDeleted()).toBe(false);
+      const firstDeleted = images.deletedKeys()[0];
       expect(
-        world.file('IMAGE_OWNER_DIRECTORY', OWNER)?.resolvedAt,
-      ).toBeInstanceOf(Date);
+        fileRows.find((file) => file.storageKey === firstDeleted)?.status,
+      ).toBe('PENDING');
+
+      await expect(run()).resolves.toBe('COMPLETED');
+      expect(
+        fileRows.find((file) => file.storageKey === firstDeleted)?.status,
+      ).toBe('MISSING');
     });
 
-    it('lets only one worker hold a request, until its lease expires', async () => {
-      world.request.status = 'PROCESSING';
-      world.request.lockedUntil = new Date(T0.getTime() + ERASURE_LEASE_MS);
+    it('stops a worker whose lease was taken over before its next storage operation', async () => {
+      let operationsAtTakeover = -1;
+      let inFlightKey = '';
+      images.beforeOperation = (operation, key) => {
+        if (operation === 'delete' && operationsAtTakeover < 0) {
+          operationsAtTakeover = allOperations().length;
+          inFlightKey = key!;
+          // Meanwhile the lease expired and another worker claimed it.
+          request.attempts += 1;
+        }
+      };
 
-      await expect(world.service().process(world.request.id, T0)).resolves.toBe(
-        'SKIPPED',
-      );
-      expect(world.images.operations).toEqual([]);
+      await expect(run()).resolves.toBe('SKIPPED');
 
-      const later = new Date(T0.getTime() + ERASURE_LEASE_MS + 1);
+      // Only the operation already in flight; nothing after the takeover.
+      expect(allOperations()).toHaveLength(operationsAtTakeover + 1);
+      expect(accountDeleted()).toBe(false);
+      // Its outcome was not recorded by the stale worker: the reference stays
+      // pending, so the new lease holder resolves it (as MISSING).
+      expect(
+        fileRows.find((file) => file.storageKey === inFlightKey)?.status,
+      ).toBe('PENDING');
+      expect(request.lastError).toBeNull();
+    });
+
+    it('records nothing when its lease is taken over during the final storage check', async () => {
+      const LATE = `${OWNER}/${SESSION}/late-file.jpg`;
+      let lists = 0;
+      images.beforeOperation = (operation) => {
+        if (operation !== 'list') return;
+        lists += 1;
+        // The second listing is the final check: meanwhile a file appears
+        // and another worker takes over the request.
+        if (lists === 2) {
+          images.files.add(LATE);
+          request.attempts += 1;
+        }
+      };
+
+      await expect(run()).resolves.toBe('SKIPPED');
+
+      expect(fileRows.map((file) => file.storageKey)).not.toContain(LATE);
+      expect(images.deletedKeys()).not.toContain(LATE);
+      expect(accountDeleted()).toBe(false);
+    });
+
+    it('lets concurrent workers delete each file exactly once', async () => {
+      const outcomes = await Promise.all([run(), run(), run()]);
+
+      expect(outcomes.sort()).toEqual(['COMPLETED', 'SKIPPED', 'SKIPPED']);
+      const deletions = [
+        ...images.deletedKeys(),
+        ...exportsStorage.deletedKeys(),
+      ];
+      expect(new Set(deletions).size).toBe(deletions.length);
+      expect(prisma.authUser.deleteMany.mock.calls).toHaveLength(1);
+    });
+  });
+
+  describe('guards', () => {
+    it('does not touch storage for an account that is not pending deletion', async () => {
+      userStatus = 'ACTIVE';
+
+      await expect(run()).resolves.toBe('PENDING');
+
+      expect(allOperations()).toEqual([]);
+      expect(fileRows).toEqual([]);
+    });
+
+    it('lets only one worker delete files at a time, until its lease expires', async () => {
+      request.status = 'PROCESSING';
+      request.lockedUntil = new Date(T0.getTime() + ERASURE_LEASE_MS);
+
+      await expect(run()).resolves.toBe('SKIPPED');
+      expect(allOperations()).toEqual([]);
+
       await expect(
-        world.service().process(world.request.id, later),
+        run(new Date(T0.getTime() + ERASURE_LEASE_MS + 1)),
       ).resolves.toBe('COMPLETED');
-    });
-
-    it('does nothing once completed', async () => {
-      const service = world.service();
-      await service.process(world.request.id, T0);
-      const operations = world.events.length;
-
-      await expect(service.process(world.request.id, T0)).resolves.toBe(
-        'SKIPPED',
-      );
-
-      expect(world.events).toHaveLength(operations);
     });
   });
 });

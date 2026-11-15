@@ -37,6 +37,10 @@ model DataExport {
   completedAt       DateTime?
   expiresAt         DateTime?
   filesDeletedAt    DateTime?
+  // Set while a worker is building this export (renewed by its heartbeat,
+  // cleared after its last storage operation). Account erasure waits until
+  // no export of the account has a live worker lease.
+  workerLeaseUntil  DateTime?
   createdAt         DateTime             @default(now())
   updatedAt         DateTime             @updatedAt
 
@@ -46,6 +50,7 @@ model DataExport {
   @@index([authId, createdAt])
   @@index([status, expiresAt])
   @@index([status, filesDeletedAt])
+  @@index([authId, workerLeaseUntil])
 }
 
 // ================================
@@ -56,17 +61,16 @@ model DataExport {
 // its processing so an interrupted deletion is always resumed.
 //
 // Steps (each recorded when done, in this order):
-//   accountBlockedAt     - accepted: account PENDING_DELETION (closed), tokens
-//                          invalidated
-//   sessionsRevokedAt    - every refresh session removed
-//   referencesRecordedAt - the account's storage references were saved
-//                          (AccountDeletionFile) and its running exports
-//                          stopped, in one transaction
-//   filesDeletedAt       - every private file of the account (photos,
-//                          export archives, temporary files) was removed;
-//                          until then the account stays closed, not deleted
-//   dataErasedAt         - the account and all its data were hard-deleted
-//   completedAt          - status COMPLETED
+//   accountBlockedAt  - accepted: account PENDING_DELETION, tokens invalidated
+//   sessionsRevokedAt - every refresh session removed
+//   filesRecordedAt   - every private file of the account recorded as an
+//                       AccountDeletionFile reference (running exports stopped)
+//   filesDeletedAt    - every reference resolved: the files are deleted from
+//                       private storage (or missing, or retained because
+//                       another account uses them). Until then the account
+//                       stays closed and is NOT deleted.
+//   dataErasedAt      - one transaction hard-deleted the account and its data
+//   completedAt       - status COMPLETED
 // `lockedUntil` is a short processing lease so only one worker processes a
 // request at a time; an expired lease is picked up again.
 //
@@ -75,22 +79,22 @@ model DataExport {
 // personal data. At most one request per account is open (not COMPLETED) at a
 // time (partial unique index in the migration).
 model AccountDeletionRequest {
-  id                   String                      @id @default(uuid())
-  authId               String
-  status               AccountDeletionStatus       @default(PENDING)
-  verificationMethod   AccountDeletionVerification
-  requestedAt          DateTime                    @default(now())
-  accountBlockedAt     DateTime
-  sessionsRevokedAt    DateTime?
-  processingStartedAt  DateTime?
-  referencesRecordedAt DateTime?
-  filesDeletedAt       DateTime?
-  dataErasedAt         DateTime?
-  completedAt          DateTime?
-  lockedUntil          DateTime?
-  attempts             Int                         @default(0)
-  lastError            String?                     @db.VarChar(500)
-  updatedAt            DateTime                    @updatedAt
+  id                  String                      @id @default(uuid())
+  authId              String
+  status              AccountDeletionStatus       @default(PENDING)
+  verificationMethod  AccountDeletionVerification
+  requestedAt         DateTime                    @default(now())
+  accountBlockedAt    DateTime
+  sessionsRevokedAt   DateTime?
+  processingStartedAt DateTime?
+  filesRecordedAt     DateTime?
+  dataErasedAt        DateTime?
+  filesDeletedAt      DateTime?
+  completedAt         DateTime?
+  lockedUntil         DateTime?
+  attempts            Int                         @default(0)
+  lastError           String?                     @db.VarChar(500)
+  updatedAt           DateTime                    @updatedAt
 
   files AccountDeletionFile[]
 
@@ -99,23 +103,23 @@ model AccountDeletionRequest {
   @@index([status, lockedUntil])
 }
 
-// A private file of an account being deleted. References are kept until the
-// file is handled, so a failed removal is retried from them. `resolvedAt` and
-// `outcome` are set together: DELETED, ALREADY_MISSING, or RETAINED_SHARED
-// (another user's record uses the same file, so it is never removed).
+// A file (or an owner directory) of an account being deleted that must be
+// removed from private storage. References are kept until they are resolved
+// (and afterwards, as the record), so failed deletions are retried from them.
 model AccountDeletionFile {
-  id         String                      @id @default(uuid())
+  id         String                    @id @default(uuid())
   requestId  String
   kind       AccountDeletionFileKind
-  storageKey String                      @db.VarChar(512)
+  storageKey String                    @db.VarChar(512)
+  status     AccountDeletionFileStatus @default(PENDING)
+  attempts   Int                       @default(0)
+  lastError  String?                   @db.VarChar(200)
+  note       String?                   @db.VarChar(200)
   resolvedAt DateTime?
-  outcome    AccountDeletionFileOutcome?
-  attempts   Int                         @default(0)
-  lastError  String?                     @db.VarChar(500)
-  createdAt  DateTime                    @default(now())
+  createdAt  DateTime                  @default(now())
 
   request AccountDeletionRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
 
   @@unique([requestId, kind, storageKey])
-  @@index([requestId, resolvedAt])
+  @@index([requestId, status])
 }

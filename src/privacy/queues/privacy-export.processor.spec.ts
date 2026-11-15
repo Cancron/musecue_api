@@ -97,12 +97,17 @@ describe('PrivacyExportProcessor (privacy export worker)', () => {
         startedAt: NOW,
         error: null,
         attempts: { increment: 1 },
+        workerLeaseUntil: new Date(NOW.getTime() + 60_000),
       },
     });
+    // The build runs with the attempt's file fence and cancellation signal.
+    const anyFunction: unknown = expect.any(Function);
+    const anyObject: unknown = expect.anything();
     expect(archive.build.mock.calls).toContainEqual([
       OWNER,
       EXPORT_ID,
-      expect.any(Function),
+      anyFunction,
+      { fence: anyFunction, signal: anyObject },
     ]);
     expect(publish).toEqual({
       where: {
