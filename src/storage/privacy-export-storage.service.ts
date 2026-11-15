@@ -19,6 +19,13 @@ import {
 import { once } from 'node:events';
 import { dirname, join, resolve } from 'node:path';
 import {
+  type FileRemoval,
+  listOwnerFiles,
+  type PrivateFileStore,
+  removeEmptyOwnerDirectories,
+  removeStoredFile,
+} from './private-file-store';
+import {
   isMissingFileError,
   resolvePrivateStorageKey,
 } from './private-storage-key';
@@ -74,7 +81,7 @@ export interface DeleteExportScopeOptions {
  * only resolved filesystem paths use the platform separator.
  */
 @Injectable()
-export class PrivacyExportStorageService {
+export class PrivacyExportStorageService implements PrivateFileStore {
   private readonly root = resolve(
     process.env.PRIVATE_EXPORT_DIR ??
       join(process.cwd(), '.data', 'private-exports'),
@@ -214,12 +221,25 @@ export class PrivacyExportStorageService {
     return scopes;
   }
 
-  /** Removes every export archive of one owner (`<authId>/`). */
-  async deleteOwnerDirectory(authId: string): Promise<void> {
-    if (!SAFE_SEGMENT.test(authId)) {
-      throw new Error('Invalid private export scope');
-    }
-    await rm(resolve(this.root, authId), { recursive: true, force: true });
+  /**
+   * Every export file of one owner: finished archives and temporary
+   * `.partial` files of interrupted or running attempts.
+   */
+  listOwnerFiles(ownerId: string): Promise<string[]> {
+    return listOwnerFiles(this.root, ownerId);
+  }
+
+  /** Removes one stored file (archive or temporary), reporting one already gone. */
+  remove(storageKey: string): Promise<FileRemoval> {
+    return removeStoredFile(
+      this.root,
+      storageKey,
+      'Invalid private export storage key',
+    );
+  }
+
+  removeEmptyOwnerDirectories(ownerId: string): Promise<void> {
+    return removeEmptyOwnerDirectories(this.root, ownerId);
   }
 
   /** Removes an owner's export directory if it is empty. */

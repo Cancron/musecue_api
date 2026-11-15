@@ -33,6 +33,7 @@ export function resolvePrivateStorageKey(
   root: string,
   storageKey: string,
   errorMessage = 'Invalid private storage key',
+  options: { requireExtension?: boolean } = {},
 ): string {
   if (!isStructurallySafeKey(storageKey)) throw new Error(errorMessage);
   const normalizedKey = storageKey.replaceAll('/', sep);
@@ -41,7 +42,8 @@ export function resolvePrivateStorageKey(
   if (
     relativePath.startsWith(`..${sep}`) ||
     relativePath === '..' ||
-    extname(absolutePath) === ''
+    relativePath === '' ||
+    ((options.requireExtension ?? true) && extname(absolutePath) === '')
   ) {
     throw new Error(errorMessage);
   }

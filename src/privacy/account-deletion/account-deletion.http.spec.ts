@@ -725,6 +725,7 @@ describe('Account deletion requests (HTTP)', () => {
         accountBlockedAt: T0,
         sessionsRevokedAt: null,
         processingStartedAt: null,
+        referencesRecordedAt: null,
         dataErasedAt: null,
         filesDeletedAt: null,
         completedAt: null,

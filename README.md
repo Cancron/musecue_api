@@ -504,18 +504,27 @@ Routes require a bearer token. The account is always the token's user. A request
 
 #### Erasure (hard deletion)
 
-`AccountDeletionRecoveryService` runs at startup and every 30 seconds. It finishes any pending session revocation and hands every open request whose processing lease (`lockedUntil`, 5 minutes) is free or expired to `AccountErasureService`. Each step is recorded on the request, so a crash or failure resumes from the last completed step:
+`AccountDeletionRecoveryService` runs at startup and every 30 seconds. It finishes any pending session revocation and hands every open request whose processing lease (`lockedUntil`, 5 minutes) is free or expired to `AccountErasureService`. Each step is recorded on the request, so a crash or failure resumes from the last completed step.
 
-1. **Data (one transaction).**
-   - Records the account's storage references as `AccountDeletionFile` rows: each private image inside the owner's own scope (session photos, avatar), plus the owner's whole image and export directories, which also catches files no row references any more.
+**The account stays closed (`PENDING_DELETION`, no token works) and is not deleted until every private file is gone:**
+
+1. **References (one transaction, `referencesRecordedAt`).** Stops the account's waiting or running exports (`FAILED` / `ACCOUNT_UNAVAILABLE`), so their workers stop and remove their own temporary files. Records every private file the account's rows reference as `AccountDeletionFile`: session photos, the avatar and export archives, each only if it lies in the account's own storage scope.
+2. **Files (`filesDeletedAt`).**
+   - **Discovery.** Lists the account's own directories through the private storage adapters (`PrivateImageStorageService`, `PrivacyExportStorageService`), so unreferenced photos and temporary `.partial` export files are found and recorded too.
+   - **Removal.** Each file is removed one by one, only if it is in the account's scope (`<authId>/...`, structurally safe key) and no other user's record (image, avatar or export) uses the same file. Otherwise it is kept: `RETAINED_NOT_OWNED` / `RETAINED_SHARED`. A file already gone counts as handled (`ALREADY_MISSING`).
+   - **Late files.** Discovery repeats until a pass finds nothing new, so files written meanwhile are handled before the account is deleted. Then the account's empty directories are removed; non-empty ones are never touched.
+   - **Storage errors.** A failed removal (or listing or pruning) leaves the file's reference pending with `attempts` and `lastError`. The run stays incomplete, the account is not deleted, and the next sweep retries only the unhandled files.
+   - Adapters never follow symbolic links and refuse file names they cannot address safely instead of skipping them.
+3. **Data (one transaction, `dataErasedAt`, only after step 2).**
    - Deletes activity-log entries about the account (its `authUser` and `UserSubscription` records).
-   - Anonymizes entries the account made about shared records (for example an administrator changing the plan): the actor, IP, user agent and device are cleared, and the change itself is kept.
+   - Anonymizes entries the account made about shared records (for example an administrator changing the plan): the actor, IP, user agent and device are cleared, and the change is kept.
    - Hard-deletes the `authUser` row, guarded by `status = PENDING_DELETION`. Foreign keys cascade to every row the account owns: profile, security, sign-in and email history, makeup sessions with images, preferences, analyses, recommendations, guides, steps, attempts and questions, AI runs, subscription and events, and data exports.
-   - Payments survive, detached. Either everything commits, references included, or nothing does (`dataErasedAt`).
-2. **Files.** Deletes each referenced file and directory and marks it `deletedAt`. A storage failure is retried from the saved references (`filesDeletedAt`).
-3. **Completion.** Once sessions are revoked, the data erased and the files deleted, the request becomes `COMPLETED`. Cached authentication data of the account (sessions, the token version, keys containing its email) and any outstanding code are removed.
+   - Payments survive, detached. A database failure rolls the whole step back and it is retried.
+4. **Completion.** Once sessions are revoked, the files handled and the data erased, the request becomes `COMPLETED`. Cached authentication data of the account (sessions, the token version, keys containing its email) and any outstanding code are removed.
 
-The database allows `COMPLETED` only after all three steps, and the request (no foreign key, no personal data) remains as the record that the deletion happened. The request, the deletion files table, the plan and payments are never reachable by a user's cascade. A foreign-key audit test enforces this: nothing `RESTRICT`s a user's deletion, and only `ActivityLogEvent.actionedBy` and `PaymentTransaction.subscriptionId` are set to `NULL`.
+The database enforces the order: references before files, files before data (`AccountDeletionRequest_data_after_files`), and `COMPLETED` only after every step. The request and its file references (no foreign key to the account, no personal data) remain as the record of what was deleted or kept. A foreign-key audit test checks that nothing `RESTRICT`s a user's deletion and that only `ActivityLogEvent.actionedBy` and `PaymentTransaction.subscriptionId` are set to `NULL`.
+
+Requests started before per-file cleanup (migration `20260930120000_account_file_cleanup`) had already erased their data. They finish their files the same way.
 
 ## Domain
 

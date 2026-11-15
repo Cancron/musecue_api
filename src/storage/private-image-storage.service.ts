@@ -1,11 +1,15 @@
 import { Injectable } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, rm, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import {
-  isMissingFileError,
-  resolvePrivateStorageKey,
-} from './private-storage-key';
+  type FileRemoval,
+  listOwnerFiles,
+  type PrivateFileStore,
+  removeEmptyOwnerDirectories,
+  removeStoredFile,
+} from './private-file-store';
+import { resolvePrivateStorageKey } from './private-storage-key';
 
 const EXTENSIONS_BY_MIME = {
   'image/jpeg': '.jpg',
@@ -15,10 +19,8 @@ const EXTENSIONS_BY_MIME = {
 
 type SupportedImageMime = keyof typeof EXTENSIONS_BY_MIME;
 
-const SAFE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
-
 @Injectable()
-export class PrivateImageStorageService {
+export class PrivateImageStorageService implements PrivateFileStore {
   private readonly root = resolve(
     process.env.PRIVATE_UPLOAD_DIR ??
       join(process.cwd(), '.data', 'private-images'),
@@ -46,23 +48,26 @@ export class PrivateImageStorageService {
 
   async delete(storageKey: string): Promise<void> {
     if (storageKey.includes('://')) return;
-
-    try {
-      await unlink(this.resolveKey(storageKey));
-    } catch (error) {
-      if (!isMissingFileError(error)) throw error;
-    }
+    this.resolveKey(storageKey);
+    await this.remove(storageKey);
   }
 
-  /**
-   * Removes every private image of one owner (`<authId>/`), including files
-   * no database row references any more. Used when an account is erased.
-   */
-  async deleteOwnerDirectory(authId: string): Promise<void> {
-    if (!SAFE_SEGMENT.test(authId)) {
-      throw new Error('Invalid private image storage owner');
-    }
-    await rm(resolve(this.root, authId), { recursive: true, force: true });
+  /** Removes one stored file (any name), reporting one already gone. */
+  remove(storageKey: string): Promise<FileRemoval> {
+    return removeStoredFile(
+      this.root,
+      storageKey,
+      'Invalid private image storage key',
+    );
+  }
+
+  /** Every private image file of one owner, including unreferenced ones. */
+  listOwnerFiles(ownerId: string): Promise<string[]> {
+    return listOwnerFiles(this.root, ownerId);
+  }
+
+  removeEmptyOwnerDirectories(ownerId: string): Promise<void> {
+    return removeEmptyOwnerDirectories(this.root, ownerId);
   }
 
   read(storageKey: string): Promise<Buffer> {

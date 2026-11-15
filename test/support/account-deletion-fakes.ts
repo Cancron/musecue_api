@@ -383,6 +383,7 @@ export class AccountStore {
         status: 'PENDING',
         sessionsRevokedAt: null,
         processingStartedAt: null,
+        referencesRecordedAt: null,
         dataErasedAt: null,
         filesDeletedAt: null,
         lockedUntil: null,
