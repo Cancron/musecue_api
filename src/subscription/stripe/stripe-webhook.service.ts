@@ -199,17 +199,20 @@ export class StripeWebhookService {
       return outcome;
     } catch (error) {
       const errorCode = errorCodeOf(error);
-      // Best effort: the database may be what failed.
-      await this.prisma.paymentWebhookEvent
-        .update({
-          where: { id: logged.id },
+      // Best effort: the database may be what failed. A concurrent delivery
+      // of the same event that already processed it is not overwritten.
+      try {
+        await this.prisma.paymentWebhookEvent.updateMany({
+          where: { id: logged.id, status: WebhookEventStatus.RECEIVED },
           data: {
             status: WebhookEventStatus.FAILED,
             processedAt: null,
             lastErrorCode: errorCode,
           },
-        })
-        .catch(() => undefined);
+        });
+      } catch {
+        // Logged below; the original error is what the caller gets.
+      }
       this.logger.logWithMetadata(
         'error',
         'Stripe webhook processing failed; Stripe will retry',
@@ -916,7 +919,12 @@ export class StripeWebhookService {
       },
       select: { id: true },
     });
-    if (!linked) return 'IGNORED';
+    if (!linked) {
+      // Ended before its first payment was recorded (a delayed checkout
+      // event): retry rather than lose the cancellation.
+      await this.retryIfFirstPaymentPending(ref);
+      return 'IGNORED';
+    }
     // The subscription state comes from the Stripe API, not the payload.
     const subscription = await this.stripe.retrieveSubscription(ref.id);
     if (
@@ -925,8 +933,11 @@ export class StripeWebhookService {
     ) {
       return 'IGNORED';
     }
-    const endedAt = subscription.ended_at ?? subscription.canceled_at;
-    const canceledAt = endedAt ? new Date(endedAt * 1000) : now;
+    // The cancellation time is when renewal was turned off (Stripe
+    // `canceled_at`), as for user and `customer.subscription.updated`
+    // cancellations; `ended_at` only when Stripe has no cancellation time.
+    const canceledSeconds = subscription.canceled_at ?? subscription.ended_at;
+    const canceledAt = canceledSeconds ? new Date(canceledSeconds * 1000) : now;
 
     return this.prisma.$transaction(async (tx) => {
       await this.lockSubscription(tx, linked.id);
@@ -1002,36 +1013,53 @@ export class StripeWebhookService {
   }
 
   /**
-   * A scheduled cancellation of a subscription whose first payment is not
-   * recorded yet (its checkout event is delayed). If Stripe confirms a paid,
-   * MuseCue-created subscription with the cancellation scheduled, ask Stripe
-   * to deliver the event again later instead of losing the cancellation;
-   * anything else (e.g. an abandoned checkout's subscription) is ignored.
+   * A cancellation of a subscription whose first payment is not recorded yet
+   * (its checkout event is delayed): retried rather than lost. Anything else
+   * (e.g. an abandoned checkout's subscription) is ignored.
    */
   private async cancellationBeforeFirstPayment(
     ref: Stripe.Subscription,
   ): Promise<WebhookOutcome> {
+    if (!ref.cancel_at_period_end) return 'IGNORED';
+    await this.retryIfFirstPaymentPending(ref);
+    return 'IGNORED';
+  }
+
+  /**
+   * Fails with a retryable 503 when `ref` is a MuseCue subscription whose
+   * first payment Stripe collected but MuseCue has not recorded yet (the
+   * checkout session, read from Stripe, is paid for this subscription). An
+   * event about it must then wait for the payment instead of being lost.
+   */
+  private async retryIfFirstPaymentPending(ref: Stripe.Subscription) {
     const checkoutId = ref.metadata?.[CHECKOUT_METADATA.CHECKOUT_ID];
-    if (!ref.cancel_at_period_end || !checkoutId) return 'IGNORED';
+    if (!checkoutId) return;
+    // Also matches a checkout linked to this subscription by a first payment
+    // recorded concurrently (after the caller found it unlinked).
     const origin = await this.prisma.checkoutSession.findFirst({
       where: {
         id: checkoutId,
         provider: STRIPE_PROVIDER,
-        providerSubscriptionId: null,
+        OR: [
+          { providerSubscriptionId: null },
+          { providerSubscriptionId: ref.id },
+        ],
       },
     });
-    if (!origin) return 'IGNORED';
-    const current = await this.stripe.retrieveSubscription(ref.id);
+    if (!origin?.providerSessionId) return;
+    const session = await this.stripe.retrieveCheckoutForVerification(
+      origin.providerSessionId,
+    );
     if (
-      !current.cancel_at_period_end ||
-      !['active', 'past_due'].includes(current.status) ||
-      current.metadata?.[CHECKOUT_METADATA.CHECKOUT_ID] !== origin.id
+      session.payment_status !== 'paid' ||
+      idOf(session.subscription) !== ref.id ||
+      session.metadata?.[CHECKOUT_METADATA.CHECKOUT_ID] !== origin.id
     ) {
-      return 'IGNORED';
+      return;
     }
     this.logger.logWithMetadata(
       'warn',
-      'Stripe cancellation before the first payment was recorded; retry later',
+      'Stripe subscription event before the first payment was recorded; retry later',
       { context: LOG_CONTEXT, providerSubscriptionId: ref.id },
     );
     throw AppError.serviceUnavailable(
@@ -1063,11 +1091,17 @@ export class StripeWebhookService {
         CHECKOUT_METADATA.CHECKOUT_ID
       ];
     if (!checkoutId) return null;
+    // A first payment recorded between the two queries links the checkout to
+    // this subscription; it must still be found (never "unknown"). A checkout
+    // linked to another subscription is not this subscription's origin.
     return this.prisma.checkoutSession.findFirst({
       where: {
         id: checkoutId,
         provider: STRIPE_PROVIDER,
-        providerSubscriptionId: null,
+        OR: [
+          { providerSubscriptionId: null },
+          { providerSubscriptionId: subscriptionId },
+        ],
       },
     });
   }

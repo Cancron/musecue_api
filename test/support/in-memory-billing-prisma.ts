@@ -28,6 +28,11 @@ const same = (a: unknown, b: unknown) =>
 
 function matches(row: Row, where: Where = {}): boolean {
   return Object.entries(where).every(([key, condition]) => {
+    if (key === 'OR' && Array.isArray(condition)) {
+      return condition.some((alternative) =>
+        matches(row, alternative as Where),
+      );
+    }
     if (isPlainObject(condition) && Array.isArray(condition.in)) {
       return condition.in.some((value) => same(row[key], value));
     }

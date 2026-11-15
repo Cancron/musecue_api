@@ -577,6 +577,21 @@ Review notes (November 2026):
   - An older renewal applied after a newer one after a gap cannot merge into the term (see above).
   - Cancellations requested through `POST /v1/subscription/cancel` are saved from Stripe's direct API response, not from a webhook, as required for that endpoint.
 
+#### Payment lifecycle integration tests
+
+- **What `test/stripe-payment-lifecycle.e2e-spec.ts` runs (PostgreSQL, simulated Stripe):**
+  - the whole lifecycle for monthly and yearly plans, through the HTTP API and signed webhooks, with test users and a frozen clock at month-end and leap-day anchors: checkout, redirect only, confirmed payment, activation, renewal, failed payment, recovery, cancellation, restart, expiration, full and partial refund, and no payment;
+  - checks on status, Pro access at exact instants, amounts, period lengths, Stripe references and the stored event history;
+  - concurrent checkouts, webhooks and cancellations; duplicated events; an application restart;
+  - the same lifecycle delivered reversed and in three shuffled orders, duplicated and concurrent, compared with the in-order stored state;
+  - after every test, SQL checks of database invariants: each access change has a collected payment; terms are covered by payments; refund totals match; no duplicate payments or events; every webhook logged as processed.
+- **Problems found and fixed:**
+  1. A renewal delivered while its first payment was being recorded could be answered `200` as "unknown subscription", so the paid renewal was lost. The same race could drop a subscription end.
+  2. The end of a subscription delivered before its first payment was recorded was lost.
+  3. An ended subscription stored its end time instead of Stripe's cancellation time (`canceled_at`).
+  4. A failed concurrent duplicate delivery could mark an already processed webhook as `FAILED`.
+- **Known limit:** when a renewal is recorded before an older renewal that bridges it to the current term, only the "Pro since" date (`proStartedAt`) differs from in-order delivery (see the limitation below). Payments, periods, events and current access are the same.
+
 Configuration (`.env.example`): `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_CHECKOUT_SUCCESS_URL`, `STRIPE_CHECKOUT_CANCEL_URL` (absolute http(s) URLs), optional `STRIPE_PRO_PRODUCT_ID`, and `STRIPE_CHECKOUT_EXPIRES_MINUTES` (31–1440, default 60). In the Stripe dashboard, create a webhook endpoint for `https://<api>/v1/webhooks/stripe` with the thirteen events above. For local development, forward events with the Stripe CLI and use the printed signing secret:
 
 ```bash
@@ -587,16 +602,22 @@ Migration `20261113120000_add_stripe_checkout` adds `PaymentCustomer` and `Check
 
 Not implemented yet: immediate cancellation (including canceling a past-due subscription to stop Stripe's retries), undoing a cancellation (a cancellation reversed in Stripe is not reflected), the customer portal (so users cannot update their card in-app; Stripe's own emails and hosted invoice page can be used), exposing the past-due state in `GET /v1/subscription`, requesting refunds from MuseCue, disputes (`charge.dispute.*`), canceling the Stripe subscription automatically when a payment is refunded, revoking an active free trial on refund (a trial is not a payment and keeps running), reactions to other `customer.subscription.updated` changes (e.g. `unpaid`), and automatic refunds or cancellation of duplicate payments and subscriptions. Renewal delays within Stripe's retry window (up to 3 days) are handled. If a renewal for an older period arrives after a newer one, the older period is recorded but cannot be merged into the term: the database allows one payment per term change.
 
-Database tests (`test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`, `test/stripe-checkout.e2e-spec.ts`, `test/stripe-renewal.e2e-spec.ts`, `test/stripe-payment-failure.e2e-spec.ts`, `test/stripe-cancellation.e2e-spec.ts`, `test/stripe-refund.e2e-spec.ts`, `test/subscription-billing.e2e-spec.ts`, `test/stripe-webhook-reliability.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
+Database tests (`test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`, `test/stripe-checkout.e2e-spec.ts`, `test/stripe-renewal.e2e-spec.ts`, `test/stripe-payment-failure.e2e-spec.ts`, `test/stripe-cancellation.e2e-spec.ts`, `test/stripe-refund.e2e-spec.ts`, `test/subscription-billing.e2e-spec.ts`, `test/stripe-webhook-reliability.e2e-spec.ts`, `test/stripe-payment-lifecycle.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
 
 ```bash
-TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json test/subscription-plan test/user-subscription test/subscription-trial test/subscription-status test/pro-access test/trial-lifecycle test/billing test/subscription-security test/stripe-checkout test/stripe-renewal test/stripe-payment-failure test/stripe-cancellation test/stripe-refund test/subscription-billing test/stripe-webhook-reliability
+TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json test/subscription-plan test/user-subscription test/subscription-trial test/subscription-status test/pro-access test/trial-lifecycle test/billing test/subscription-security test/stripe-checkout test/stripe-renewal test/stripe-payment-failure test/stripe-cancellation test/stripe-refund test/subscription-billing test/stripe-webhook-reliability test/stripe-payment-lifecycle
+```
+
+All payment database suites (each uses its own schema, so they can run in parallel workers):
+
+```bash
+TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npm run test:e2e:payments
 ```
 
 The Stripe unit tests do not need a database or a Stripe account; they run the real Stripe SDK against an in-memory emulation of the few Stripe endpoints used (`test/support/fake-stripe-api.ts`):
 
 ```bash
-npm test -- --runInBand stripe
+npm test -- --runInBand stripe   # or: npm run test:stripe
 npm test -- --runInBand subscription-billing
 ```
 

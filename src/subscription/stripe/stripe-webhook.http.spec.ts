@@ -114,11 +114,15 @@ describe('POST /v1/webhooks/stripe (HTTP)', () => {
     handleEvent.mockResolvedValue('ACTIVATED');
     prisma.paymentWebhookEvent.upsert.mockReset();
     prisma.paymentWebhookEvent.update.mockReset();
+    prisma.paymentWebhookEvent.updateMany.mockReset();
     prisma.paymentWebhookEvent.upsert.mockResolvedValue({
       id: 'log-1',
     } as never);
     prisma.paymentWebhookEvent.update.mockResolvedValue({
       id: 'log-1',
+    } as never);
+    prisma.paymentWebhookEvent.updateMany.mockResolvedValue({
+      count: 1,
     } as never);
   });
 
@@ -197,9 +201,12 @@ describe('POST /v1/webhooks/stripe (HTTP)', () => {
     expect(JSON.stringify(response.body)).not.toMatch(
       /PaymentTransaction|user 42|P2002/,
     );
-    // The failure is recorded (as an error class only) for redelivery.
-    expect(prisma.paymentWebhookEvent.update.mock.calls.at(-1)?.[0]).toEqual({
-      where: { id: 'log-1' },
+    // The failure is recorded (as an error class only) for redelivery,
+    // unless a concurrent delivery of the event has processed it meanwhile.
+    expect(
+      prisma.paymentWebhookEvent.updateMany.mock.calls.at(-1)?.[0],
+    ).toEqual({
+      where: { id: 'log-1', status: 'RECEIVED' },
       data: { status: 'FAILED', processedAt: null, lastErrorCode: 'db:P2002' },
     });
   });

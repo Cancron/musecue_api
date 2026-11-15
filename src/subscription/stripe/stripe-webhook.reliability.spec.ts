@@ -416,6 +416,133 @@ describe('Stripe webhooks: security and reliability', () => {
       await expect(access.hasProAccess(authId)).resolves.toBe(true);
     });
 
+    it('asks Stripe to retry the end of a subscription, and keeps Stripe’s cancellation date', async () => {
+      const { authId, subscriptionId, completed } = await paidCheckout(10);
+      // Renewal turned off two days ago; the subscription ended now.
+      const turnedOffAt = daysAgo(2);
+      const clock = jest
+        .spyOn(Date, 'now')
+        .mockReturnValue(turnedOffAt.getTime());
+      await api
+        .client()
+        .subscriptions.update(subscriptionId, { cancel_at_period_end: true });
+      clock.mockRestore();
+      api.cancelSubscription(subscriptionId);
+      const ended = api.signedSubscriptionEvent(
+        'customer.subscription.deleted',
+        subscriptionId,
+      );
+
+      await expect(send(ended)).rejects.toMatchObject({ status: 503 });
+
+      await send(completed);
+      await expect(send(ended)).resolves.toBe('SUBSCRIPTION_ENDED');
+      const record = db.userSubscription.rows.find((r) => r.authId === authId);
+      // Stripe `canceled_at`, not `ended_at`.
+      expect(record?.proCanceledAt).toEqual(turnedOffAt);
+      expect(
+        db.subscriptionEvent.rows.filter((row) => row.type === 'CANCELED'),
+      ).toEqual([expect.objectContaining({ occurredAt: turnedOffAt })]);
+    });
+
+    /**
+     * Records the first payment (as a concurrent delivery would) right after
+     * the `nth` lookup of `table` that matches `isLookup` found nothing.
+     */
+    function recordFirstPaymentAfterLookup(
+      table: { findFirst: (args?: { where?: object }) => Promise<unknown> },
+      isLookup: (where: Record<string, unknown>) => boolean,
+      nth: number,
+      completed: { payload: string; signature: string },
+    ) {
+      // The store's methods are arrow functions: no `this` to bind.
+      const findFirst = table.findFirst;
+      let misses = 0;
+      table.findFirst = async (args) => {
+        const result = await findFirst(args);
+        if (
+          result === null &&
+          misses < nth &&
+          isLookup((args?.where ?? {}) as Record<string, unknown>) &&
+          ++misses === nth
+        ) {
+          await send(completed);
+        }
+        return result;
+      };
+    }
+
+    it('never reports a renewal as unknown when the first payment is recorded during its lookup', async () => {
+      const { authId, subscriptionId, completed } = await paidCheckout(40);
+      const renewal = api.renewSubscription(subscriptionId).id as string;
+      const renewalEvent = api.signedInvoiceEvent('invoice.paid', renewal);
+      // The second "linked checkout" lookup misses; the payment is linked
+      // just before the fallback lookup by checkout id.
+      recordFirstPaymentAfterLookup(
+        db.checkoutSession,
+        (where) => where.providerSubscriptionId === subscriptionId,
+        2,
+        completed,
+      );
+
+      await expect(send(renewalEvent)).rejects.toMatchObject({ status: 503 });
+      expect(db.paymentTransaction.rows).toHaveLength(1);
+
+      await expect(send(renewalEvent)).resolves.toBe('RENEWED');
+      expect(db.paymentTransaction.rows).toHaveLength(2);
+      await expect(access.hasProAccess(authId)).resolves.toBe(true);
+    });
+
+    it('never drops the end of a subscription when the first payment is recorded during its lookup', async () => {
+      const { authId, subscriptionId, completed } = await paidCheckout(10);
+      api.cancelSubscription(subscriptionId);
+      const ended = api.signedSubscriptionEvent(
+        'customer.subscription.deleted',
+        subscriptionId,
+      );
+      recordFirstPaymentAfterLookup(
+        db.userSubscription,
+        (where) => where.providerSubscriptionId === subscriptionId,
+        1,
+        completed,
+      );
+
+      await expect(send(ended)).rejects.toMatchObject({ status: 503 });
+      await expect(send(ended)).resolves.toBe('SUBSCRIPTION_ENDED');
+      expect(
+        db.userSubscription.rows.find((r) => r.authId === authId)
+          ?.proCanceledAt,
+      ).toBeInstanceOf(Date);
+    });
+
+    it('keeps an event logged as processed when a concurrent duplicate delivery fails', async () => {
+      const { authId, subscriptionId, completed } = await paidCheckout(40);
+      const renewal = api.renewSubscription(subscriptionId).id as string;
+      const renewalEvent = api.signedInvoiceEvent('invoice.paid', renewal);
+      // While this delivery waits (no first payment yet), the first payment
+      // and another delivery of the same event are processed; this one then
+      // asks for a retry that Stripe will not make (it got a 200).
+      const findFirst = db.checkoutSession.findFirst;
+      let raced = false;
+      db.checkoutSession.findFirst = async (args) => {
+        const result = await findFirst(args);
+        if (!raced && result === null) {
+          raced = true;
+          await send(completed);
+          await expect(send(renewalEvent)).resolves.toBe('RENEWED');
+        }
+        return result;
+      };
+
+      await expect(send(renewalEvent)).rejects.toMatchObject({ status: 503 });
+      expect(logOf(renewalEvent.eventId)).toMatchObject({
+        status: 'PROCESSED',
+        outcome: 'RENEWED',
+        attempts: 2,
+      });
+      await expect(access.hasProAccess(authId)).resolves.toBe(true);
+    });
+
     it('does not retry a cancellation of a subscription that was never paid', async () => {
       const user = await db.authUser.create({ data: {} });
       const view = await checkout.createCheckout(user.id as string, MONTHLY);
