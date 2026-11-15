@@ -407,9 +407,14 @@ export class StripeWebhookService {
       );
       return 'REJECTED';
     }
-    return this.recordFirstPayment(
-      checkout,
-      verification.payment,
+    return this.applyEarlierRefunds(
+      verification.payment.providerPaymentId,
+      await this.recordFirstPayment(
+        checkout,
+        verification.payment,
+        metadata,
+        now,
+      ),
       metadata,
       now,
     );
@@ -601,12 +606,58 @@ export class StripeWebhookService {
       );
       return 'REJECTED';
     }
-    return this.recordRenewal(
-      origin.subscriptionId,
-      verification.payment,
+    return this.applyEarlierRefunds(
+      verification.payment.providerPaymentId,
+      await this.recordRenewal(
+        origin.subscriptionId,
+        verification.payment,
+        metadata,
+        now,
+      ),
       metadata,
       now,
     );
+  }
+
+  /**
+   * After a payment newly granted or extended access: a refund made in Stripe
+   * before the payment was recorded (its events were answered "retry later")
+   * is applied now, so access paid by a refunded payment ends at once rather
+   * than at Stripe's next retry. Best effort: the payment stays recorded, and
+   * if Stripe cannot be asked, the retried refund events still apply it.
+   */
+  private async applyEarlierRefunds(
+    invoiceId: string,
+    outcome: WebhookOutcome,
+    metadata: ActivityLogMetadata,
+    now: Date,
+  ): Promise<WebhookOutcome> {
+    if (outcome !== 'ACTIVATED' && outcome !== 'RENEWED') return outcome;
+    try {
+      const refunded = await this.refunds.syncInvoiceRefunds(
+        invoiceId,
+        metadata,
+        now,
+      );
+      if (refunded) {
+        this.logger.logWithMetadata(
+          'warn',
+          'Payment was refunded in Stripe before it was recorded; refund applied',
+          { context: LOG_CONTEXT, providerInvoiceId: invoiceId, refunded },
+        );
+      }
+    } catch (error) {
+      this.logger.logWithMetadata(
+        'warn',
+        'Could not check a newly recorded payment for refunds; the refund events will apply them',
+        {
+          context: LOG_CONTEXT,
+          providerInvoiceId: invoiceId,
+          errorCode: errorCodeOf(error),
+        },
+      );
+    }
+    return outcome;
   }
 
   private recordRenewal(
@@ -752,19 +803,24 @@ export class StripeWebhookService {
       return this.rejectInvoice(ref.id, verification);
     }
     const invoice = verification.invoice;
-    return this.recordFirstPayment(
-      origin,
-      {
-        providerSessionId: origin.providerSessionId,
-        providerPaymentId: invoice.providerInvoiceId,
-        providerSubscriptionId: invoice.providerSubscriptionId,
-        amountCents: invoice.amountCents,
-        currency: invoice.currency,
-        billingInterval: invoice.billingInterval,
-        periodStart: invoice.periodStart,
-        periodEnd: invoice.periodEnd,
-        paidAt: invoice.paidAt,
-      },
+    return this.applyEarlierRefunds(
+      invoice.providerInvoiceId,
+      await this.recordFirstPayment(
+        origin,
+        {
+          providerSessionId: origin.providerSessionId,
+          providerPaymentId: invoice.providerInvoiceId,
+          providerSubscriptionId: invoice.providerSubscriptionId,
+          amountCents: invoice.amountCents,
+          currency: invoice.currency,
+          billingInterval: invoice.billingInterval,
+          periodStart: invoice.periodStart,
+          periodEnd: invoice.periodEnd,
+          paidAt: invoice.paidAt,
+        },
+        metadata,
+        now,
+      ),
       metadata,
       now,
     );
@@ -1287,11 +1343,13 @@ export class StripeWebhookService {
 
     const checkoutId = ref.metadata?.[CHECKOUT_METADATA.CHECKOUT_ID];
     if (!checkoutId) return null;
+    // The session id may have been stored between the two queries; a
+    // checkout stored with another session is not this session's checkout.
     return this.prisma.checkoutSession.findFirst({
       where: {
         id: checkoutId,
         provider: STRIPE_PROVIDER,
-        providerSessionId: null,
+        OR: [{ providerSessionId: null }, { providerSessionId: ref.id }],
       },
     });
   }

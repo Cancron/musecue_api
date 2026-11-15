@@ -1306,7 +1306,7 @@ describe('StripeWebhookService', () => {
         ).resolves.toMatchObject({ status: 'OPEN' });
       });
 
-      it('allows checkout again once a recovered renewal has lapsed', async () => {
+      it('allows checkout again once a recovered renewal has lapsed and Stripe ended the subscription', async () => {
         // Bought ~70 days ago; the renewal failed, was recovered, and the
         // recovered period has also ended by now.
         const { authId, subscriptionId } = await subscribedDaysAgo(70);
@@ -1316,10 +1316,63 @@ describe('StripeWebhookService', () => {
         await expect(paid(invoiceId)).resolves.toBe('RENEWED');
         expect(recordOf(authId)?.pastDueSince).toBeNull();
         expect(accessOf(authId).hasProAccess).toBe(false);
+        const sessionsBefore = api.sessions.size;
 
+        // The Stripe subscription is still active (its next renewal may be
+        // collected any moment): a second subscription would charge twice.
+        await expect(
+          checkout.createCheckout(authId, MONTHLY),
+        ).rejects.toMatchObject({
+          status: 409,
+          message: expect.stringContaining('has not ended yet') as string,
+        });
+        expect(api.sessions.size).toBe(sessionsBefore);
+
+        api.cancelSubscription(subscriptionId);
+        await ended(subscriptionId);
         await expect(
           checkout.createCheckout(authId, MONTHLY),
         ).resolves.toMatchObject({ status: 'OPEN' });
+      });
+
+      it('refuses a new checkout while a lapsed term may still renew, so the user is never charged twice', async () => {
+        // The first month ended about five days ago and nothing failed: the
+        // Stripe subscription is active and its renewal can still arrive.
+        const { authId, subscriptionId } = await subscribedDaysAgo(35);
+        expect(accessOf(authId).hasProAccess).toBe(false);
+        expect(recordOf(authId)?.pastDueSince).toBeNull();
+        const sessionsBefore = api.sessions.size;
+        const checkoutsBefore = db.checkoutSession.rows.length;
+
+        await expect(
+          checkout.createCheckout(authId, MONTHLY),
+        ).rejects.toMatchObject({
+          status: 409,
+          message: expect.stringContaining('has not ended yet') as string,
+        });
+        expect(api.sessions.size).toBe(sessionsBefore);
+        expect(db.checkoutSession.rows).toHaveLength(checkoutsBefore);
+
+        // The renewal is collected: the one subscription continues.
+        const renewal = api.renewSubscription(subscriptionId).id as string;
+        await expect(paid(renewal)).resolves.toBe('RENEWED');
+        expect(accessOf(authId).hasProAccess).toBe(true);
+        expect(
+          new Set(
+            db.checkoutSession.rows.map((row) => row.providerSubscriptionId),
+          ),
+        ).toEqual(new Set([subscriptionId]));
+      });
+
+      it('creates nothing and answers 503 when Stripe cannot tell whether the previous subscription ended', async () => {
+        const { authId } = await subscribedDaysAgo(35);
+        const sessionsBefore = api.sessions.size;
+        api.failNext('GET /v1/subscriptions/:id', 'connection');
+
+        await expect(
+          checkout.createCheckout(authId, MONTHLY),
+        ).rejects.toMatchObject({ status: 503 });
+        expect(api.sessions.size).toBe(sessionsBefore);
       });
     });
   });

@@ -392,6 +392,25 @@ describe('StripeCheckoutService', () => {
       ).resolves.toMatchObject({ status: 'OPEN' });
     });
 
+    it('asks Stripe whether an expired term’s subscription ended, and allows a purchase when Stripe no longer knows it', async () => {
+      const userId = await createUser();
+      const now = new Date();
+      await givenPaidTerm(
+        userId,
+        new Date(now.getTime() - 40 * DAY),
+        new Date(now.getTime() - 9 * DAY),
+      );
+      await db.userSubscription.updateMany({
+        where: { authId: userId },
+        data: { paymentProvider: 'stripe', providerSubscriptionId: 'sub_gone' },
+      });
+
+      await expect(
+        service.createCheckout(userId, MONTHLY, now),
+      ).resolves.toMatchObject({ status: 'OPEN' });
+      expect(api.count('GET', '/v1/subscriptions/sub_gone')).toBe(1);
+    });
+
     it('lets a user on the free trial buy Pro', async () => {
       const userId = await createUser();
       const now = new Date();

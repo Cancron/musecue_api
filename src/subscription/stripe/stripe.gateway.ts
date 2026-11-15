@@ -250,6 +250,29 @@ export class StripeGateway {
     return typeof invoice === 'string' ? invoice : (invoice?.id ?? null);
   }
 
+  /**
+   * The charge that collected an invoice, or null when the invoice has no
+   * collected payment. Used to find refunds made before the payment itself
+   * was recorded.
+   */
+  async findChargeForInvoice(invoiceId: string): Promise<string | null> {
+    const client = this.requireClient();
+    const payments = await client.invoicePayments.list({
+      invoice: invoiceId,
+      limit: 10,
+    });
+    const paid = payments.data.find((payment) => payment.status === 'paid');
+    if (!paid) return null;
+    const direct = paid.payment.charge;
+    if (direct) return typeof direct === 'string' ? direct : direct.id;
+    const intent = paid.payment.payment_intent;
+    const intentId = typeof intent === 'string' ? intent : intent?.id;
+    if (!intentId) return null;
+    const charge = (await client.paymentIntents.retrieve(intentId))
+      .latest_charge;
+    return typeof charge === 'string' ? charge : (charge?.id ?? null);
+  }
+
   /** Stripe only expires `open` sessions; others reject the request. */
   async expireCheckoutSession(
     sessionId: string,

@@ -34,6 +34,9 @@ export const PENDING_CHECKOUT_STATUSES: CheckoutSessionStatus[] = [
 /** Claim/settle rounds before giving up on a checkout that keeps changing. */
 const MAX_ATTEMPTS = 3;
 
+/** Stripe subscription states that can never charge the customer again. */
+const ENDED_SUBSCRIPTION_STATUSES = new Set(['canceled', 'incomplete_expired']);
+
 const LOG_CONTEXT = 'StripeCheckoutService';
 
 export const CHECKOUT_ERRORS = {
@@ -46,6 +49,10 @@ export const CHECKOUT_ERRORS = {
   renewalPastDue: () =>
     AppError.conflict(
       'Your last Pro renewal payment failed and Stripe is still retrying it; a new checkout could charge you twice',
+    ),
+  previousSubscriptionActive: () =>
+    AppError.conflict(
+      'Your previous Pro subscription has not ended yet and may still renew; a new checkout could charge you twice',
     ),
   paymentProcessing: () =>
     AppError.conflict(
@@ -95,7 +102,9 @@ type SettleResult =
  * Rules:
  * - the user, price and currency come from the backend, never the client;
  * - users with an active paid term cannot start a checkout, nor can users
- *   whose last renewal failed while Stripe is still retrying it (past due);
+ *   whose last renewal failed while Stripe is still retrying it (past due),
+ *   nor users whose Stripe subscription has not ended yet (Stripe confirms),
+ *   so a user never has two subscriptions that can charge them;
  * - a user has at most one pending checkout. A repeated request for the same
  *   option reuses the open Stripe session (with its original price and
  *   expiry); a different option first expires the open Stripe session and
@@ -130,7 +139,12 @@ export class StripeCheckoutService {
     if (!this.stripe.checkoutConfigured) throw CHECKOUT_ERRORS.notConfigured();
 
     // Fail fast before creating anything at Stripe; repeated under the lock.
-    const { email } = await this.assertCanPurchase(this.prisma, authId, now);
+    const { email, record } = await this.assertCanPurchase(
+      this.prisma,
+      authId,
+      now,
+    );
+    await this.assertLinkedSubscriptionEnded(authId, record);
     const customerId = await this.ensureCustomer(authId, email);
 
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
@@ -198,6 +212,8 @@ export class StripeCheckoutService {
         proExpiresAt: true,
         proCanceledAt: true,
         pastDueSince: true,
+        paymentProvider: true,
+        providerSubscriptionId: true,
       },
     });
     if (isProActive(record, now)) throw CHECKOUT_ERRORS.alreadySubscribed();
@@ -205,6 +221,55 @@ export class StripeCheckoutService {
     // bought now could be charged on top of it.
     if (record?.pastDueSince) throw CHECKOUT_ERRORS.renewalPastDue();
     return { email: user.email, plan, record };
+  }
+
+  /**
+   * A paid term can lapse while its Stripe subscription can still charge:
+   * Stripe collects a renewal up to about an hour after the period ends (and
+   * its webhook can arrive later still), and a refund ends access but not the
+   * subscription. A checkout then would create a second subscription charged
+   * on top of the first. So a user whose record is linked to a Stripe
+   * subscription can buy again only once Stripe reports that subscription
+   * ended. The link only changes when a verified first payment is recorded,
+   * which a concurrent checkout cannot do (its payment would first block new
+   * checkouts as PROCESSING), so this check needs no lock.
+   */
+  private async assertLinkedSubscriptionEnded(
+    authId: string,
+    record: {
+      paymentProvider: string | null;
+      providerSubscriptionId: string | null;
+    } | null,
+  ) {
+    if (
+      record?.paymentProvider !== STRIPE_PROVIDER ||
+      !record.providerSubscriptionId
+    ) {
+      return;
+    }
+    const subscriptionId = record.providerSubscriptionId;
+    let status: string;
+    try {
+      status = (await this.stripe.retrieveSubscription(subscriptionId)).status;
+    } catch (error) {
+      if (error instanceof HttpException) throw error;
+      // A subscription that does not exist at Stripe can never charge.
+      if (
+        error instanceof Stripe.errors.StripeInvalidRequestError &&
+        error.code === 'resource_missing'
+      ) {
+        return;
+      }
+      this.logStripeError('subscriptions.retrieve', null, error);
+      throw CHECKOUT_ERRORS.providerUnavailable();
+    }
+    if (ENDED_SUBSCRIPTION_STATUSES.has(status)) return;
+    this.logger.logWithMetadata(
+      'warn',
+      'Checkout refused: the linked Stripe subscription has not ended',
+      { context: LOG_CONTEXT, authId, providerStatus: status },
+    );
+    throw CHECKOUT_ERRORS.previousSubscriptionActive();
   }
 
   /**

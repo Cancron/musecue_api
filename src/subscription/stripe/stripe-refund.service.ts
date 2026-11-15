@@ -131,6 +131,26 @@ export class StripeRefundService {
     return this.apply(payment.id, chargeId, refunds, metadata, now);
   }
 
+  /**
+   * Refunds of an invoice's charge, for a payment that was just recorded.
+   * A refund made in Stripe before its payment was recorded was answered
+   * "retry later" (the payment was unknown); applying it as soon as the
+   * payment is recorded ends the access it granted at once instead of at
+   * Stripe's next retry of the refund event. Returns null when the charge has
+   * no refunded money (the usual case: nothing to do).
+   */
+  async syncInvoiceRefunds(
+    invoiceId: string,
+    metadata: ActivityLogMetadata,
+    now: Date = new Date(),
+  ): Promise<RefundOutcome | null> {
+    const chargeId = await this.stripe.findChargeForInvoice(invoiceId);
+    if (!chargeId) return null;
+    const charge = await this.stripe.retrieveCharge(chargeId);
+    if (!(charge.amount_refunded > 0)) return null;
+    return this.syncCharge(chargeId, metadata, now);
+  }
+
   private apply(
     paymentId: string,
     chargeId: string,

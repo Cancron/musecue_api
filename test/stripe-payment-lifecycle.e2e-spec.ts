@@ -1040,6 +1040,138 @@ describeWithDatabase('Stripe payment lifecycle (PostgreSQL)', () => {
     });
   });
 
+  /** Boundaries where a lapsed term, a renewal or a refund are in flight. */
+  describe('payment safety at billing boundaries', () => {
+    afterEach(async () => {
+      await assertDatabaseInvariants();
+    });
+    const eventIdOf = (event: Signed) =>
+      (JSON.parse(event.payload) as { id: string }).id;
+
+    it('never starts a second subscription while a lapsed term’s renewal is still being collected', async () => {
+      const b0 = '2033-05-31T10:00:00.000Z';
+      const b1 = '2033-06-30T10:00:00.000Z';
+      const b2 = '2033-07-31T10:00:00.000Z';
+      travel(plus(b0, -5 * 60_000));
+      const user = await startCheckout('MONTHLY');
+      travel(b0);
+      api.completeSession(user.sessionId);
+      await deliverParallel([
+        api.signedEvent('checkout.session.completed', user.sessionId),
+      ]);
+      const subscriptionId = sessionSubscription(user.sessionId);
+
+      // Stripe collects a renewal up to about an hour after the period ends;
+      // until then the paid term has lapsed.
+      const lapsed = plus(b1, 30 * 60_000);
+      travel(lapsed);
+      await expect(accessAt(user.authId, { lapsed })).resolves.toEqual({
+        lapsed: false,
+      });
+      const sessionsBefore = api.sessions.size;
+      const responses = await Promise.all(
+        ['MONTHLY', 'YEARLY', 'MONTHLY', 'YEARLY'].map((option) =>
+          checkoutOf(user.authId, option),
+        ),
+      );
+      expect(responses.map((response) => response.status)).toEqual([
+        409, 409, 409, 409,
+      ]);
+      expect(api.sessions.size).toBe(sessionsBefore);
+
+      // The renewal arrives and extends the one subscription.
+      const renewal = api.renewSubscription(subscriptionId).id as string;
+      await deliverParallel(
+        [api.signedInvoiceEvent('invoice.paid', renewal)],
+        2,
+      );
+      const state = await storedState(user.authId);
+      expect(state?.subscription).toMatchObject({
+        status: 'PRO',
+        proStartedAt: b0,
+        proExpiresAt: b2,
+        providerSubscriptionId: subscriptionId,
+      });
+      expect(state?.payments.map((p) => [p.status, p.periodEnd])).toEqual([
+        ['SUCCEEDED', b1],
+        ['SUCCEEDED', b2],
+      ]);
+      expect(state?.checkouts).toEqual([
+        { status: 'COMPLETED', billingInterval: 'MONTHLY', amountCents: 1900 },
+      ]);
+      const customer = await client().paymentCustomer.findFirstOrThrow({
+        where: { authId: user.authId },
+      });
+      expect(
+        [...api.subscriptions.values()].filter(
+          (subscription) =>
+            subscription.customer === customer.providerCustomerId,
+        ),
+      ).toHaveLength(1);
+    });
+
+    it('applies a refund made before its payment was recorded as soon as the payment is recorded', async () => {
+      const b0 = '2033-09-15T08:00:00.000Z';
+      travel(plus(b0, -5 * 60_000));
+      const user = await startCheckout('YEARLY');
+      travel(b0);
+      api.completeSession(user.sessionId);
+      const invoice = sessionInvoice(user.sessionId);
+
+      // Refunded in Stripe before MuseCue recorded the payment.
+      const refundedAt = plus(b0, HOUR);
+      travel(refundedAt);
+      api.refundInvoice(invoice, { reason: 'requested_by_customer' });
+      const refundEvent = api.signedChargeEvent(
+        'charge.refunded',
+        api.chargeOf(invoice),
+      );
+      expect((await send(refundEvent)).status).toBe(503);
+      expectedRetries.add(eventIdOf(refundEvent));
+
+      // The payment events arrive (twice each, at once).
+      const recordedAt = plus(b0, 2 * HOUR);
+      travel(recordedAt);
+      await deliverParallel(
+        [
+          api.signedEvent('checkout.session.completed', user.sessionId),
+          api.signedInvoiceEvent('invoice.paid', invoice),
+        ],
+        2,
+      );
+      const state = await storedState(user.authId);
+      expect(state?.payments).toEqual([
+        paymentFromStripe(invoice, 'YEARLY', {
+          status: 'REFUNDED',
+          refundedAmountCents: 19000,
+          refunds: [
+            expect.objectContaining({
+              status: 'SUCCEEDED',
+              amountCents: 19000,
+            }),
+          ],
+        }),
+      ]);
+      expect(state?.subscription).toMatchObject({
+        status: 'EXPIRED',
+        proStartedAt: b0,
+        proExpiresAt: recordedAt,
+      });
+      expect(state?.events.map((e) => [e.type, e.occurredAt])).toEqual([
+        ['CREATED', b0],
+        ['PAYMENT_REFUNDED', refundedAt],
+      ]);
+      await expect(statusOf(user.authId)).resolves.toMatchObject({
+        hasProAccess: false,
+      });
+
+      // Stripe retries the refund event: nothing changes.
+      await deliverParallel([refundEvent], 2);
+      expectedRetries.delete(eventIdOf(refundEvent));
+      await expect(storedState(user.authId)).resolves.toEqual(state);
+    });
+  });
+
   /**
    * A user on the free trial buys Pro. The existing subscription rules still
    * apply: the trial history is never changed, paid Pro wins while both run,

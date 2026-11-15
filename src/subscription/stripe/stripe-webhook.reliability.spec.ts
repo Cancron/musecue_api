@@ -543,6 +543,42 @@ describe('Stripe webhooks: security and reliability', () => {
       await expect(access.hasProAccess(authId)).resolves.toBe(true);
     });
 
+    it('finds the checkout of a paid session whose id is stored during the webhook lookup', async () => {
+      const user = await db.authUser.create({ data: {} });
+      const authId = user.id as string;
+      // Stripe created the session but its response was lost: the checkout
+      // stays CREATING without a session id.
+      api.failNext('POST /v1/checkout/sessions', 'lost');
+      await expect(
+        checkout.createCheckout(authId, MONTHLY),
+      ).rejects.toMatchObject({ status: 503 });
+      const [row] = db.checkoutSession.rows;
+      expect(row.providerSessionId ?? null).toBeNull();
+      const [sessionId] = [...api.sessions.keys()];
+      api.completeSession(sessionId);
+
+      // A retried checkout request stores the session id right after the
+      // webhook's lookup by session id missed.
+      const findUnique = db.checkoutSession.findUnique;
+      let raced = false;
+      db.checkoutSession.findUnique = async (args) => {
+        const result = await findUnique(args);
+        if (!raced && result === null) {
+          raced = true;
+          await db.checkoutSession.updateMany({
+            where: { id: row.id },
+            data: { providerSessionId: sessionId },
+          });
+        }
+        return result;
+      };
+
+      await expect(
+        send(api.signedEvent('checkout.session.completed', sessionId)),
+      ).resolves.toBe('ACTIVATED');
+      await expect(access.hasProAccess(authId)).resolves.toBe(true);
+    });
+
     it('does not retry a cancellation of a subscription that was never paid', async () => {
       const user = await db.authUser.create({ data: {} });
       const view = await checkout.createCheckout(user.id as string, MONTHLY);

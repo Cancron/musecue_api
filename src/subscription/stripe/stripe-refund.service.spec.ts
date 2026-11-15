@@ -574,7 +574,7 @@ describe('StripeRefundService (refund webhooks)', () => {
       expect(recordOf(authId)).toEqual(before);
     });
 
-    it('asks Stripe to retry a refund of a payment that is not recorded yet', async () => {
+    it('asks Stripe to retry a refund of a payment that is not recorded yet, and applies it once the payment is recorded', async () => {
       const user = await db.authUser.create({ data: {} });
       const authId = user.id as string;
       const view = await checkout.createCheckout(authId, MONTHLY);
@@ -593,12 +593,104 @@ describe('StripeRefundService (refund webhooks)', () => {
       });
       expect(db.paymentRefund.rows).toHaveLength(0);
 
-      await handle(api.signedEvent('checkout.session.completed', sessionId));
+      // The payment event arrives: the refund Stripe already made is applied
+      // in the same delivery, so the refunded payment grants no access now.
       const now = new Date();
-      await expect(chargeRefunded(invoiceId, now)).resolves.toBe('REFUNDED');
+      await expect(
+        handle(api.signedEvent('checkout.session.completed', sessionId), now),
+      ).resolves.toBe('ACTIVATED');
+      expect(db.paymentTransaction.rows).toEqual([
+        expect.objectContaining({
+          status: 'REFUNDED',
+          refundedAmountCents: 1900,
+        }),
+      ]);
       expect(recordOf(authId)?.proExpiresAt).toEqual(now);
       expect(hasAccess(authId, now)).toBe(false);
+
+      // Stripe's retried refund event then changes nothing.
+      await expect(chargeRefunded(invoiceId, now)).resolves.toBe(
+        'ALREADY_PROCESSED',
+      );
+      expect(db.paymentRefund.rows).toHaveLength(1);
+      expect(db.subscriptionEvent.rows.map((row) => row.type).sort()).toEqual([
+        'CREATED',
+        'PAYMENT_REFUNDED',
+      ]);
     });
+
+    it('applies a partial refund of a renewal made before the renewal was recorded', async () => {
+      const { authId, subscriptionId } = await subscriber(35);
+      const renewal = api.renewSubscription(subscriptionId).id as string;
+      api.refundInvoice(renewal, { amount: 500 });
+      await expect(chargeRefunded(renewal)).rejects.toMatchObject({
+        status: 503,
+      });
+
+      const now = new Date();
+      await expect(
+        handle(api.signedInvoiceEvent('invoice.paid', renewal), now),
+      ).resolves.toBe('RENEWED');
+
+      expect(paymentOf(renewal)).toMatchObject({
+        status: 'PARTIALLY_REFUNDED',
+        refundedAmountCents: 500,
+      });
+      expect(recordOf(authId)?.proExpiresAt).toEqual(now);
+      expect(hasAccess(authId, now)).toBe(false);
+      expect(eventsOf(authId)).toEqual([
+        'CREATED',
+        'RENEWED',
+        'PAYMENT_REFUNDED',
+      ]);
+    });
+
+    it('keeps the payment recorded when Stripe cannot be asked about refunds; the retried refund event applies it', async () => {
+      const user = await db.authUser.create({ data: {} });
+      const authId = user.id as string;
+      const view = await checkout.createCheckout(authId, MONTHLY);
+      const sessionId = db.checkoutSession.rows.find(
+        (row) => row.id === view.checkoutSessionId,
+      )?.providerSessionId as string;
+      const invoiceId = api.completeSession(sessionId, {
+        periodStart: daysAgo(3),
+      }).invoice as string;
+      api.refundInvoice(invoiceId);
+      api.failNext('GET /v1/invoice_payments', 'connection');
+
+      await expect(
+        handle(api.signedEvent('checkout.session.completed', sessionId)),
+      ).resolves.toBe('ACTIVATED');
+      expect(paymentOf(invoiceId)?.status).toBe('SUCCEEDED');
+
+      const now = new Date();
+      await expect(chargeRefunded(invoiceId, now)).resolves.toBe('REFUNDED');
+      expect(paymentOf(invoiceId)?.status).toBe('REFUNDED');
+      expect(hasAccess(authId, now)).toBe(false);
+    });
+
+    it('makes no extra Stripe call for a payment without refunds beyond finding its charge', async () => {
+      const { invoiceId } = await subscriber(3);
+      expect(paymentOf(invoiceId)?.status).toBe('SUCCEEDED');
+      expect(db.paymentRefund.rows).toHaveLength(0);
+      expect(api.count('GET', /^\/v1\/refunds/)).toBe(0);
+    });
+  });
+
+  it('refuses a new checkout after a refund while the Stripe subscription can still renew', async () => {
+    const { authId, invoiceId, subscriptionId } = await subscriber(10);
+    api.refundInvoice(invoiceId);
+    await chargeRefunded(invoiceId);
+    expect(hasAccess(authId, new Date())).toBe(false);
+
+    await expect(
+      checkout.createCheckout(authId, MONTHLY),
+    ).rejects.toMatchObject({ status: 409 });
+
+    api.cancelSubscription(subscriptionId);
+    await expect(
+      checkout.createCheckout(authId, MONTHLY),
+    ).resolves.toMatchObject({ status: 'OPEN' });
   });
 
   it('keeps the trial history of a former trial user', async () => {
