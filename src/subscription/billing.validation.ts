@@ -153,7 +153,8 @@ export type PaidTermRejection =
   | 'UNPAID_GAP';
 
 export interface PaidTermPayment {
-  subscriptionId: string;
+  // NULL once the subscription was deleted (the payment is kept, detached).
+  subscriptionId: string | null;
   status: PaymentStatus;
   billingInterval: BillingInterval;
   periodStart: Date;

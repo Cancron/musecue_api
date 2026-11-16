@@ -143,6 +143,34 @@ describe('StripeRefundService (refund webhooks)', () => {
       now,
     );
 
+  it('records refunds of a detached payment without recreating deleted account data', async () => {
+    const { invoiceId } = await subscriber(10);
+    const payment = paymentOf(invoiceId)!;
+    const original = {
+      id: payment.id,
+      amountCents: payment.amountCents,
+      providerPaymentId: payment.providerPaymentId,
+    };
+    payment.subscriptionId = null;
+    db.userSubscription.rows.splice(0);
+    db.subscriptionEvent.rows.splice(0);
+    db.paymentCustomer.rows.splice(0);
+    api.refundInvoice(invoiceId);
+
+    await expect(chargeRefunded(invoiceId)).resolves.toBe('REFUNDED');
+    expect(paymentOf(invoiceId)).toMatchObject({
+      ...original,
+      subscriptionId: null,
+      status: 'REFUNDED',
+      refundedAmountCents: 1900,
+    });
+    expect(refundsOf(invoiceId)).toHaveLength(1);
+    expect(db.userSubscription.rows).toHaveLength(0);
+    expect(db.subscriptionEvent.rows).toHaveLength(0);
+    await expect(chargeRefunded(invoiceId)).resolves.toBe('ALREADY_PROCESSED');
+    expect(refundsOf(invoiceId)).toHaveLength(1);
+  });
+
   describe('a full refund', () => {
     it('records the refund, marks the payment REFUNDED and revokes access now', async () => {
       const { authId, invoiceId } = await subscriber(10);

@@ -21,6 +21,6 @@ import { AuthGuard } from '../common/guards/auth.guard';
     RedisService,
     AuthGuard,
   ],
-  exports: [AuthUtilsService, GoogleOAuthService],
+  exports: [AuthService, AuthUtilsService, GoogleOAuthService],
 })
 export class AuthModule {}

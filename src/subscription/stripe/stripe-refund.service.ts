@@ -163,8 +163,15 @@ export class StripeRefundService {
         where: { id: paymentId },
         select: { subscriptionId: true },
       });
+      if (subscriptionId !== null) {
+        await tx.$queryRaw`
+          SELECT "id" FROM "UserSubscription" WHERE "id" = ${subscriptionId} FOR UPDATE
+        `;
+      }
+      // Detached payments survive account deletion and still receive refund
+      // events. Serialize those events even when no subscription remains.
       await tx.$queryRaw`
-        SELECT "id" FROM "UserSubscription" WHERE "id" = ${subscriptionId} FOR UPDATE
+        SELECT "id" FROM "PaymentTransaction" WHERE "id" = ${paymentId} FOR UPDATE
       `;
       const payment = await tx.paymentTransaction.findUniqueOrThrow({
         where: { id: paymentId },
@@ -248,14 +255,16 @@ export class StripeRefundService {
           },
         });
       }
-      for (const row of newlySucceeded) {
-        await tx.subscriptionEvent.create({
-          data: {
-            subscriptionId: payment.subscriptionId,
-            type: SubscriptionEventType.PAYMENT_REFUNDED,
-            occurredAt: row.providerCreatedAt,
-          },
-        });
+      if (payment.subscriptionId !== null) {
+        for (const row of newlySucceeded) {
+          await tx.subscriptionEvent.create({
+            data: {
+              subscriptionId: payment.subscriptionId,
+              type: SubscriptionEventType.PAYMENT_REFUNDED,
+              occurredAt: row.providerCreatedAt,
+            },
+          });
+        }
       }
       await this.revokeAccess(tx, payment, metadata, now);
       this.logger.logWithMetadata('warn', 'Stripe refund recorded', {
@@ -281,6 +290,7 @@ export class StripeRefundService {
     metadata: ActivityLogMetadata,
     now: Date,
   ) {
+    if (payment.subscriptionId === null) return;
     const granted = await tx.subscriptionEvent.findFirst({
       where: {
         paymentId: payment.id,
@@ -354,6 +364,10 @@ export class StripeRefundService {
       return 'CURRENCY_MISMATCH';
     }
     if (charge.amount !== payment.amountCents) return 'AMOUNT_MISMATCH';
+    // syncCharge matched the Stripe-fetched charge to this immutable payment
+    // through its invoice. Account deletion removes the customer/subscription
+    // mapping, but must not prevent recording subsequent financial events.
+    if (payment.subscriptionId === null) return null;
     const record = await this.prisma.userSubscription.findUniqueOrThrow({
       where: { id: payment.subscriptionId },
       select: { authId: true },

@@ -89,6 +89,43 @@ describeWithDatabase('Stripe refunds (PostgreSQL, HTTP)', () => {
 
   const chargeRefunded = (invoiceId: string) =>
     send(api.signedChargeEvent('charge.refunded', api.chargeOf(invoiceId)));
+
+  it('records a refund after account deletion without restoring its subscription', async () => {
+    const { authId, invoiceId } = await subscriber();
+    const before = await client.paymentTransaction.findUniqueOrThrow({
+      where: {
+        provider_providerPaymentId: {
+          provider: 'stripe',
+          providerPaymentId: invoiceId,
+        },
+      },
+    });
+    await client.authUser.delete({ where: { id: authId } });
+    api.refundInvoice(invoiceId);
+
+    await chargeRefunded(invoiceId).expect(200);
+    const payment = await client.paymentTransaction.findUniqueOrThrow({
+      where: { id: before.id },
+    });
+    expect(payment).toMatchObject({
+      subscriptionId: null,
+      amountCents: before.amountCents,
+      providerPaymentId: before.providerPaymentId,
+      status: 'REFUNDED',
+      refundedAmountCents: before.amountCents,
+    });
+    expect(
+      await client.paymentRefund.count({ where: { paymentId: before.id } }),
+    ).toBe(1);
+    expect(
+      await client.authUser.findUnique({ where: { id: authId } }),
+    ).toBeNull();
+    expect(await client.userSubscription.count({ where: { authId } })).toBe(0);
+    await chargeRefunded(invoiceId).expect(200);
+    expect(
+      await client.paymentRefund.count({ where: { paymentId: before.id } }),
+    ).toBe(1);
+  });
   const paymentOf = (invoiceId: string) =>
     client.paymentTransaction.findUniqueOrThrow({
       where: {

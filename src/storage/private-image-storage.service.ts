@@ -1,7 +1,16 @@
 import { Injectable } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
-import { dirname, extname, join, relative, resolve, sep } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import {
+  isMissingFileError,
+  resolvePrivateStorageKey,
+} from './private-storage-key';
+import {
+  deleteOwnedFile,
+  listOwnerFiles,
+  pruneOwnerDirectories,
+} from './private-storage-owner-files';
 
 const EXTENSIONS_BY_MIME = {
   'image/jpeg': '.jpg',
@@ -24,15 +33,18 @@ export class PrivateImageStorageService {
     mimeType: SupportedImageMime,
     bytes: Buffer,
   ): Promise<string> {
-    const storageKey = join(
+    // Storage keys always use `/`, whatever the platform. Only the resolved
+    // filesystem path uses the platform separator (`\\` on Windows), so keys
+    // stay portable and pass the same validation on every OS.
+    const storageKey = [
       authId,
       scopeId,
       `${randomUUID()}${EXTENSIONS_BY_MIME[mimeType]}`,
-    );
+    ].join('/');
     const absolutePath = this.resolveKey(storageKey);
     await mkdir(dirname(absolutePath), { recursive: true });
     await writeFile(absolutePath, bytes, { flag: 'wx' });
-    return storageKey.replaceAll(sep, '/');
+    return storageKey;
   }
 
   async delete(storageKey: string): Promise<void> {
@@ -41,8 +53,26 @@ export class PrivateImageStorageService {
     try {
       await unlink(this.resolveKey(storageKey));
     } catch (error) {
-      if (!this.isMissingFile(error)) throw error;
+      if (!isMissingFileError(error)) throw error;
     }
+  }
+
+  /** Storage keys of every file of one owner (`<authId>/...`). */
+  listOwnerFiles(authId: string): Promise<string[]> {
+    return listOwnerFiles(this.root, authId);
+  }
+
+  /**
+   * Deletes one file of `authId`; resolves false when it was already
+   * missing. Keys outside `<authId>/` are refused (OwnerScopeViolationError).
+   */
+  deleteOwnerFile(authId: string, storageKey: string): Promise<boolean> {
+    return deleteOwnedFile(this.root, authId, storageKey);
+  }
+
+  /** Removes the owner's empty directories; never removes a file. */
+  pruneOwnerDirectories(authId: string): Promise<void> {
+    return pruneOwnerDirectories(this.root, authId);
   }
 
   read(storageKey: string): Promise<Buffer> {
@@ -50,25 +80,10 @@ export class PrivateImageStorageService {
   }
 
   private resolveKey(storageKey: string): string {
-    const normalizedKey = storageKey.replaceAll('/', sep);
-    const absolutePath = resolve(this.root, normalizedKey);
-    const relativePath = relative(this.root, absolutePath);
-    if (
-      relativePath.startsWith(`..${sep}`) ||
-      relativePath === '..' ||
-      extname(absolutePath) === ''
-    ) {
-      throw new Error('Invalid private image storage key');
-    }
-    return absolutePath;
-  }
-
-  private isMissingFile(error: unknown): boolean {
-    return (
-      typeof error === 'object' &&
-      error !== null &&
-      'code' in error &&
-      error.code === 'ENOENT'
+    return resolvePrivateStorageKey(
+      this.root,
+      storageKey,
+      'Invalid private image storage key',
     );
   }
 }

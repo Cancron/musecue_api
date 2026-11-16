@@ -10,6 +10,7 @@ import {
 import { map, Observable, tap } from 'rxjs';
 import { WINSTON_MODULE_PROVIDER } from 'nest-winston';
 import { Logger } from 'winston';
+import { redactUrl } from '../utils/redact-url';
 
 @Injectable()
 export class TransformInterceptor<T> implements NestInterceptor<T, any> {
@@ -38,7 +39,7 @@ export class TransformInterceptor<T> implements NestInterceptor<T, any> {
         this.logger.info('Request processed', {
           context: 'TransformInterceptor',
           method,
-          path,
+          path: redactUrl(String(path)),
           duration,
         });
       }),

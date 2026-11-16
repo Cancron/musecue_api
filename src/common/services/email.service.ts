@@ -118,6 +118,29 @@ export class EmailService {
   }
 
   /**
+   * Send the one-time code that confirms a permanent account deletion
+   */
+  async sendAccountDeletionCodeEmail(
+    email: string,
+    username: string,
+    code: string,
+    expiresInMinutes: number,
+  ): Promise<void> {
+    const html = this.getEmailTemplate('account-deletion-code.html', {
+      username,
+      code,
+      expiresInMinutes: String(expiresInMinutes),
+      year: new Date().getFullYear().toString(),
+    });
+
+    await this.sendEmail({
+      to: email,
+      subject: 'Confirm the deletion of your MuseCue account',
+      html,
+    });
+  }
+
+  /**
    * Send password reset email
    */
   async sendPasswordResetEmail(
