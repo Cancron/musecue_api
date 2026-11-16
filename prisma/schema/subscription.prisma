@@ -52,15 +52,20 @@ model UserSubscription {
   proCanceledAt   DateTime?
 
   // Link to the payment provider's recurring subscription (set by checkout).
-  paymentProvider        String? @db.VarChar(50)
-  providerSubscriptionId String? @db.VarChar(255)
+  paymentProvider        String?   @db.VarChar(50)
+  providerSubscriptionId String?   @db.VarChar(255)
+  // Set when a renewal of the linked provider subscription failed and is
+  // still being retried; cleared once a payment is collected or the provider
+  // subscription ends. Never changes the paid term.
+  pastDueSince           DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  authUser authUser             @relation(fields: [authId], references: [id], onDelete: Cascade)
-  payments PaymentTransaction[]
-  events   SubscriptionEvent[]
+  authUser         authUser             @relation(fields: [authId], references: [id], onDelete: Cascade)
+  payments         PaymentTransaction[]
+  events           SubscriptionEvent[]
+  checkoutSessions CheckoutSession[]
 
   @@unique([paymentProvider, providerSubscriptionId])
   @@index([status])
@@ -82,6 +87,9 @@ model PaymentTransaction {
   subscriptionId      String?
   provider            String          @db.VarChar(50)
   providerPaymentId   String          @db.VarChar(255)
+  // The provider invoice this attempt tried to collect (Stripe `in_...`).
+  // A failed attempt and the later successful one share it.
+  providerInvoiceId   String?         @db.VarChar(255)
   status              PaymentStatus   @default(PENDING)
   amountCents         Int
   currency            String          @default("USD") @db.Char(3)
@@ -98,16 +106,22 @@ model PaymentTransaction {
   updatedAt           DateTime        @updatedAt
 
   subscription UserSubscription?  @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
-  event        SubscriptionEvent?
+  event           SubscriptionEvent?
+  checkoutSession CheckoutSession?
+  refunds         PaymentRefund[]
 
   @@unique([provider, providerPaymentId])
   @@index([subscriptionId, createdAt])
   @@index([status])
+  @@index([provider, providerInvoiceId])
 }
 
 // Append-only lifecycle log of a subscription. CREATED and RENEWED events
 // reference the SUCCEEDED payment that paid for the period (one event per
 // payment); other events have no payment.
+// A cancellation is logged once: at most one CANCELED event per subscription
+// and cancellation time (partial unique index, migration
+// 20261116120000_subscription_cancellation).
 model SubscriptionEvent {
   id             String                @id @default(uuid())
   subscriptionId String
@@ -120,4 +134,116 @@ model SubscriptionEvent {
   payment      PaymentTransaction? @relation(fields: [paymentId], references: [id], onDelete: Restrict)
 
   @@index([subscriptionId, occurredAt])
+}
+
+// The user's customer record at a payment provider (e.g. Stripe `cus_...`).
+// Every user has their own customer: one per user and provider, and a
+// provider customer belongs to exactly one user.
+model PaymentCustomer {
+  id                 String   @id @default(uuid())
+  authId             String
+  provider           String   @db.VarChar(50)
+  providerCustomerId String   @db.VarChar(255)
+  createdAt          DateTime @default(now())
+
+  authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
+
+  @@unique([authId, provider])
+  @@unique([provider, providerCustomerId])
+}
+
+// One hosted checkout for the Pro plan. The price and interval are fixed when
+// the checkout is created from the backend plan configuration; the provider
+// session is created with an idempotency key derived from `id`, so retries
+// and concurrent requests resolve to the same provider session.
+//
+// A subscription has at most one pending checkout (CREATING, OPEN or
+// PROCESSING; partial unique index in the migration). A checkout never grants
+// access on its own: only a verified provider webhook records a SUCCEEDED
+// PaymentTransaction, links it here and moves the checkout to COMPLETED.
+// Status only moves forward and the price, interval, customer and provider
+// session never change (database trigger).
+model CheckoutSession {
+  id                     String                @id @default(uuid())
+  subscriptionId         String
+  provider               String                @db.VarChar(50)
+  providerSessionId      String?               @db.VarChar(255)
+  providerCustomerId     String                @db.VarChar(255)
+  providerSubscriptionId String?               @db.VarChar(255)
+  status                 CheckoutSessionStatus @default(CREATING)
+  billingInterval        BillingInterval
+  amountCents            Int
+  currency               String                @default("USD") @db.Char(3)
+  // Hosted payment page; only returned while the checkout is OPEN.
+  url                    String?
+  expiresAt              DateTime
+  completedAt            DateTime?
+  // Set when the checkout becomes EXPIRED or FAILED, with a short code
+  // explaining why (e.g. REPLACED, PROVIDER_EXPIRED, ASYNC_PAYMENT_FAILED).
+  closedAt               DateTime?
+  closedReason           String?               @db.VarChar(100)
+  paymentId              String?               @unique
+  createdAt              DateTime              @default(now())
+  updatedAt              DateTime              @updatedAt
+
+  subscription UserSubscription    @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  payment      PaymentTransaction? @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+
+  @@unique([provider, providerSessionId])
+  @@index([subscriptionId, createdAt])
+  @@index([status, expiresAt])
+}
+
+// One refund of a collected payment at the provider (Stripe `re_...`), full
+// or partial, as confirmed by the provider. Only SUCCEEDED refunds count
+// towards PaymentTransaction.refundedAmountCents. Refund facts never change,
+// the status only moves forward, succeeded refunds never exceed the payment
+// and rows are never deleted (database trigger).
+model PaymentRefund {
+  id                String       @id @default(uuid())
+  paymentId         String
+  provider          String       @db.VarChar(50)
+  providerRefundId  String       @db.VarChar(255)
+  providerChargeId  String       @db.VarChar(255)
+  status            RefundStatus
+  amountCents       Int
+  currency          String       @default("USD") @db.Char(3)
+  reason            String?      @db.VarChar(100)
+  // When the refund was created at the provider.
+  providerCreatedAt DateTime
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  payment PaymentTransaction @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+
+  @@unique([provider, providerRefundId])
+  @@index([paymentId])
+}
+
+// A provider webhook event whose signature was verified (e.g. Stripe
+// `evt_...`): written before processing, updated with the outcome, so a
+// verified event that could not be applied stays visible as FAILED until a
+// redelivery processes it. Stores no payload.
+model PaymentWebhookEvent {
+  id              String             @id @default(uuid())
+  provider        String             @db.VarChar(50)
+  providerEventId String             @db.VarChar(255)
+  type            String             @db.VarChar(100)
+  // The object the event is about (e.g. a checkout session or invoice id).
+  objectId        String?            @db.VarChar(255)
+  livemode        Boolean
+  eventCreatedAt  DateTime
+  status          WebhookEventStatus @default(RECEIVED)
+  // What processing did (e.g. ACTIVATED, ALREADY_PROCESSED, IGNORED).
+  outcome         String?            @db.VarChar(50)
+  // Deliveries received, including redeliveries of the same event.
+  attempts        Int                @default(1)
+  // Class or code of the last failure; never a message or payload.
+  lastErrorCode   String?            @db.VarChar(100)
+  receivedAt      DateTime           @default(now())
+  processedAt     DateTime?
+  updatedAt       DateTime           @updatedAt
+
+  @@unique([provider, providerEventId])
+  @@index([status, receivedAt])
 }

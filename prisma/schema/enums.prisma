@@ -173,6 +173,37 @@ enum SubscriptionEventType {
   RENEWED
   CANCELED
   EXPIRED
+  PAYMENT_FAILED
+  PAYMENT_REFUNDED
+}
+
+// Status of a provider refund. Only SUCCEEDED refunds count towards the
+// payment's refunded amount; the status only moves forward.
+enum RefundStatus {
+  PENDING
+  REQUIRES_ACTION
+  SUCCEEDED
+  FAILED
+  CANCELED
+}
+
+// One hosted checkout attempt with the payment provider. CREATING, OPEN and
+// PROCESSING are pending: a user has at most one pending checkout (partial
+// unique index). COMPLETED, EXPIRED and FAILED are terminal.
+enum CheckoutSessionStatus {
+  CREATING
+  OPEN
+  PROCESSING
+  COMPLETED
+  EXPIRED
+  FAILED
+}
+
+// Processing state of a verified provider webhook event.
+enum WebhookEventStatus {
+  RECEIVED
+  PROCESSED
+  FAILED
 }
 
 // ================================

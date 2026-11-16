@@ -16,7 +16,7 @@ The companion mobile application and detailed product specifications live in `..
 - BullMQ jobs for personalization, guide generation, visual checks, and guide questions
 - `AiRun` audit records containing operation, provider, model, prompt version, latency, progress, result/error, and status
 - a provider-neutral AI gateway with OpenRouter live mode, multimodal private-image input, strict structured output, runtime validation, bounded retries, and deterministic mock mode
-- a single Pro subscription plan: admin-configured monthly/yearly pricing and free trial, one-time trial activation, date-based Pro access through `ProAccessGuard`, and payment/lifecycle records protected by database rules (see "Subscriptions" under API); checkout, webhooks and billing endpoints are not implemented yet
+- a single Pro subscription plan: admin-configured monthly/yearly pricing and free trial, one-time trial activation, date-based Pro access through `ProAccessGuard`, payment/lifecycle records protected by database rules, and Stripe checkout for the monthly and yearly options with webhook-verified activation, automatic renewals, failed-payment handling and recovery, cancellation at period end, and refunds made in Stripe with immediate access revocation (see "Subscriptions" and "Stripe checkout" under API); requesting refunds from MuseCue and disputes are not implemented yet
 - personal data export: an authenticated user can request an asynchronous ZIP archive of their own account, profile, makeup history, subscription records and private photos, poll its status, and download it through a signed link valid for at most 15 minutes; archives expire 24 hours after export and are deleted by a scheduled retention sweep (see "Personal data export" under API)
 - account deletion: the owner confirms their identity (password and an emailed code, or the code alone for accounts without a password), the account is blocked and every token invalidated at once (`PENDING_DELETION`), and a background sweep hard-deletes the account and all its data and files, keeping payment records detached (see "Account deletion" under API)
 
@@ -327,16 +327,17 @@ Each user has at most one `UserSubscription` record (migration `20260914120000_a
 
 Subscription history is permanent at the database level (migration `20260916120000_protect_subscription_history`, a trigger that Prisma does not model). Once a trial has started, its dates never change and `trialUsed` stays `true`. A paid term can be renewed or replaced but never cleared, and the record cannot be deleted while its user exists; deleting the user still cascades. As a result, no code path can re-open trial eligibility or extend a trial.
 
-Billing records for the future payment integration (migration `20260918120000_add_payments_and_subscription_events`; no checkout, webhooks or billing endpoints yet):
+Billing records (migration `20260918120000_add_payments_and_subscription_events`; written by the Stripe checkout described below):
 
-- `PaymentTransaction` records one charge attempt for one billing period. It stores the amount in cents, currency, status (`PENDING`, `SUCCEEDED`, `FAILED`, `PARTIALLY_REFUNDED`, `REFUNDED`), `provider` + `providerPaymentId`, the period, timestamps, and failure and refund details.
+- `PaymentTransaction` records one charge attempt for one billing period. It stores the amount in cents, currency, status (`PENDING`, `SUCCEEDED`, `FAILED`, `PARTIALLY_REFUNDED`, `REFUNDED`), `provider` + `providerPaymentId`, `providerInvoiceId` (the provider invoice the attempt tried to collect, migration `20261115120000_stripe_payment_failures`), the period, timestamps, and failure and refund details.
   - `(provider, providerPaymentId)` is unique, and only one verified payment may cover a given period.
   - Payments are never deleted. Amount, currency, provider IDs and period never change, and status only moves forward.
   - When a user is hard-deleted, their subscription is deleted and their payments are kept, detached: `subscriptionId` becomes `NULL` (`ON DELETE SET NULL`, migration `20260929120000_account_erasure`). This is the only change the database allows to `subscriptionId`, and only once the subscription no longer exists. A payment is never moved, re-attached or deleted.
-- `SubscriptionEvent` is an append-only lifecycle log: `TRIAL_STARTED`, `CREATED`, `RENEWED`, `CANCELED`, `EXPIRED`. `CREATED` and `RENEWED` reference the `SUCCEEDED` payment for the period, and each payment backs at most one event.
+  - `PaymentRefund` (migration `20261117120000_stripe_refunds`) records each provider refund of a collected payment: Stripe refund and charge IDs, amount, currency, status (`PENDING`, `REQUIRES_ACTION`, `SUCCEEDED`, `FAILED`, `CANCELED`), reason and time. Refund facts never change, statuses only move forward, rows are never deleted, and succeeded refunds can never exceed the payment (database trigger).
+- `SubscriptionEvent` is an append-only lifecycle log: `TRIAL_STARTED`, `CREATED`, `RENEWED`, `CANCELED`, `EXPIRED`, `PAYMENT_FAILED`. `CREATED` and `RENEWED` reference the `SUCCEEDED` payment for the period, and each payment backs at most one event.
 - `UserSubscription` gains `paymentProvider` and `providerSubscriptionId` (unique together) to link the provider's recurring subscription.
 - A paid term (`proStartedAt`/`proExpiresAt`) can only be created or extended by a `SUCCEEDED` payment of the same subscription and interval that covers the newly granted range and ends exactly at `proExpiresAt`. A new term may not start before its paid period, and a renewal's period must start no later than the current expiry, so it cannot bridge an unpaid gap. Early renewals and monthly-to-yearly changes may overlap. Pending, failed and refunded payments never grant or renew Pro access. Cancelling keeps access until `proExpiresAt`.
-- A billing period ends exactly one calendar month or year after it starts, using PostgreSQL calendar arithmetic (migration `20260920120000_calendar_billing_periods_and_gap_free_terms`). Month-ends clamp: Jan 31 → Feb 28, or Feb 29 in a leap year. Feb 29 + 1 year → Feb 28. `src/subscription/billing.validation.ts` (`addBillingInterval`, `isValidBillingPeriod`, `getPaidTermRejection`, pricing and status-transition checks) applies the same rules for future checkout and webhook code.
+- A billing period is one calendar month or year as Stripe bills it (migration `20261114120000_stripe_anchored_billing_periods`, which replaces the exact rule of `20260920120000_calendar_billing_periods_and_gap_free_terms`). It either ends exactly one calendar interval after it starts (month-ends clamp: Jan 31 → Feb 28, or Feb 29 in a leap year; Feb 29 + 1 year → Feb 28), or it is anchored on a day the start month lacks. Stripe bills a subscription started on Jan 31 on Feb 28, then Mar 31, so Feb 28 → Mar 31 is valid. Such a period starts on its month's last day and ends later in the next month (next year for yearly) at the same time of day. Periods like Mar 1 → Mar 29 or Jan 31 → Mar 3 are still rejected. `src/subscription/billing.validation.ts` (`addBillingInterval`, `isValidBillingPeriod`, `getPaidTermRejection`, pricing and status-transition checks) applies the same rules in the application.
 
 `GET /v1/subscription` (bearer token) returns the caller's own subscription. The user comes only from the access token; query parameters cannot select another user. `status` is evaluated at request time from the stored dates, not the stored `status` column. Expiry therefore needs no background job, and reads never rewrite the record or its trial history.
 
@@ -373,7 +374,246 @@ handler(@Req() req: ProAccessRequest) { /* req.proAccess: status, accessSource, 
 
 The guard delegates to `SubscriptionAccessService`, the single Pro access decision. An active free trial and an active paid term unlock the same features, each within its own `[startedAt, expiresAt)` window. Without access, the guard returns `403` with `An active Pro subscription or free trial is required` and the handler does not run. Requests that did not pass `AuthGuard` are rejected with `401`, and lookup errors never grant access. No makeup endpoint uses the guard yet.
 
-Database tests (`test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`, `test/privacy-export.e2e-spec.ts`, `test/account-deletion.e2e-spec.ts`, `test/account-erasure.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
+### Stripe checkout
+
+| Method | Route                       | Auth                      | Purpose                                            |
+| ------ | --------------------------- | ------------------------- | -------------------------------------------------- |
+| `POST` | `/v1/subscription/checkout` | bearer token              | Start (or reuse) a hosted Stripe checkout for Pro  |
+| `POST` | `/v1/subscription/cancel`   | bearer token              | Cancel the caller's own subscription at period end |
+| `GET`  | `/v1/subscription/billing`  | bearer token              | The caller's billing information                   |
+| `GET`  | `/v1/subscription/payments` | bearer token              | The caller's payment history (paged)               |
+| `POST` | `/v1/webhooks/stripe`       | `Stripe-Signature` header | Stripe events; the only way paid Pro is granted    |
+
+`POST /v1/subscription/checkout` accepts exactly `{ "billingInterval": "MONTHLY" }` or `{ "billingInterval": "YEARLY" }`. Any other value, `null`, lowercase values and extra fields (a price, currency, user ID or "paid" flag) are rejected with `400`. The user comes from the access token, and the price from the plan configuration (`monthlyPriceUsdCents` / `yearlyPriceUsdCents`) at the moment the checkout is created. The response (`201`) is:
+
+```json
+{
+  "checkoutSessionId": "6f0c…",
+  "provider": "stripe",
+  "status": "OPEN",
+  "billingInterval": "MONTHLY",
+  "amountCents": 1900,
+  "currency": "USD",
+  "url": "https://checkout.stripe.com/c/pay/cs_…",
+  "expiresAt": "2026-11-13T13:00:00.000Z",
+  "reused": false
+}
+```
+
+The app opens `url`. Returning to the success URL does not activate anything: the app should poll `GET /v1/subscription` until `status` is `PRO`.
+
+Rules:
+
+- Every user has their own Stripe customer (`PaymentCustomer`), created on the first checkout and reused afterwards. It is unique per user, and a Stripe customer belongs to exactly one user.
+- Users with an active paid term, including a canceled term that has not expired, receive `409 You already have an active Pro subscription`. Trial users and users whose paid term expired can buy.
+- A user whose record is linked to a Stripe subscription can buy again only after Stripe reports that subscription ended (`canceled` or `incomplete_expired`; the API asks Stripe on each such checkout). Until then the response is `409 Your previous Pro subscription has not ended yet and may still renew; a new checkout could charge you twice`. This covers the renewal window after `proExpiresAt` (Stripe collects a renewal up to about an hour after the period ends, and its webhook can be later still) and a refund that ended access while the Stripe subscription continues. Without it, a second subscription could be charged on top of the first. If Stripe cannot be asked, the response is `503` and nothing is created.
+- A user has at most one pending checkout (a partial unique index on `CheckoutSession`). Repeating the request for the same option returns the same checkout with `reused: true`, as long as Stripe confirms it is still open, however little time it has left. It keeps the price it was created with: an admin price change applies only to checkouts created afterwards. Choosing the other option first expires the open Stripe session and creates the new one only after Stripe has confirmed the expiration. If the expiration cannot be confirmed, nothing new is created and the old checkout stays pending. This covers Stripe being unreachable, an error, a lost response and a result other than `expired`. The response is `503 The previous checkout could not be closed; please try again shortly`, or `409` when Stripe shows the old session was just paid or expired by a concurrent request. A later request replaces the old checkout once Stripe reports it expired. The old checkout is closed in the same transaction that creates its replacement.
+- Concurrent requests are serialized by the user's `UserSubscription` row lock, which is held only for short database work, never during Stripe calls. Stripe objects are created with idempotency keys derived from the user or the checkout, so concurrent or retried requests get the same Stripe customer and session. At most one payable session exists per user.
+- If the user paid but the webhook has not arrived yet, new checkouts receive `409 Your previous checkout payment is still being processed` and nothing is granted.
+- While a failed renewal is past due (Stripe may still collect it), new checkouts receive `409 Your last Pro renewal payment failed and Stripe is still retrying it; a new checkout could charge you twice`. This holds even after the paid term has lapsed. It ends when Stripe collects the invoice or ends the subscription.
+- Stripe failures return `503`. A checkout whose creation may have reached Stripe (timeout, network or server error) is kept and recovered through the same idempotency key on the next request. A definitive rejection marks it `FAILED`.
+
+Other responses: `403` for inactive, unverified or soft-deleted accounts and while the plan is disabled, and `503 Payments are not configured` until the Stripe settings below are present.
+
+Activation happens only in `POST /v1/webhooks/stripe`. The endpoint has no bearer token and is excluded from rate limiting. Each event is verified against the raw request body and the `Stripe-Signature` header, with Stripe's 5-minute replay tolerance; an invalid signature returns `400`. The API then re-reads the session, its subscription and its first invoice from the Stripe API, never trusting the event payload. It grants Pro only if all of these match the stored checkout:
+
+- the session is complete with `payment_status = paid`, for the user's own customer;
+- the subscription has exactly one item at the stored price and interval;
+- the first invoice (`subscription_create`) is paid in full in USD.
+
+One transaction then records the `SUCCEEDED` `PaymentTransaction` (provider `stripe`, invoice ID, amount, currency, interval, and the billing period exactly as Stripe reports it), sets the paid term and the Stripe subscription link on `UserSubscription`, appends a `CREATED` `SubscriptionEvent`, completes the checkout and writes an audit record. The existing database trigger independently checks that the payment covers the term. Replayed or concurrent deliveries record the payment once.
+
+A payment that fails verification is logged and acknowledged, and access is not granted. A payment that arrives while another paid term is active is recorded but never stacks a second term; it is logged as needing a refund.
+
+#### Automatic renewals
+
+Stripe charges the subscription at the end of each period. The API extends Pro only when it receives `invoice.paid` for a `subscription_cycle` invoice, re-reads the invoice and subscription from the Stripe API, and verifies all of the following:
+
+- the invoice belongs to the Stripe subscription bought through MuseCue and to the user's own customer;
+- it is `paid`, in full, in USD, at the price the subscription was bought for (admin price changes do not apply to existing subscriptions);
+- the subscription still has one item at that price and interval;
+- the invoice covers a valid billing period.
+
+One transaction under the user's row lock then records the `SUCCEEDED` `PaymentTransaction` (invoice ID and the period dates Stripe reports), extends `proExpiresAt` to the period end, appends a `RENEWED` `SubscriptionEvent` and writes an audit record. The trial fields and `proStartedAt` of a running term are never changed, and the database trigger again checks that the payment covers the extension.
+
+- Until the payment is confirmed nothing changes. A failed or open invoice grants nothing, and access ends at `proExpiresAt`. When a late payment arrives, the term is extended from its old expiry.
+- The invoice ID identifies the payment, so repeated, concurrent or delayed deliveries record it once. They never create a second renewal event or overwrite the subscription. A replay makes no Stripe API call.
+- A delayed event for an older period that the term already covers is recorded in the payment history, but never shortens or moves the term.
+- A renewal arriving after a gap (a period starting after `proExpiresAt`) starts a new term at the period Stripe reports.
+- `invoice.paid` for the first invoice (`subscription_create`) confirms the first payment, like the checkout events. It checks the invoice and subscription, including the checkout ID in the subscription metadata. Whichever event arrives first records the payment and its `CREATED` event; the others find it recorded.
+- A second charge for an already paid period is not recorded, and a renewal of a duplicate Stripe subscription never extends access. Both are logged at error level for a refund.
+
+#### Failed payments and recovery
+
+`invoice.payment_failed` reports one failed collection attempt, of the first invoice or of a renewal. The API re-reads the invoice and subscription from Stripe and checks them like a payment (customer, subscription, price, interval, period). It also asks Stripe for the attempt's decline reason; this is best effort, so a lookup failure still records the attempt as `payment_failed`. One transaction then records:
+
+- a `FAILED` `PaymentTransaction` for the attempt: invoice ID in `providerInvoiceId`, period, `failedAt`, `failureCode` (e.g. `insufficient_funds`) and `failureMessage`. Its `providerPaymentId` is `<invoice>:failed:<event>`, so every attempt keeps its own immutable record and a redelivered event is recorded once;
+- a `PAYMENT_FAILED` `SubscriptionEvent`;
+- for a still-unpaid renewal of the subscription that backs the paid term, `UserSubscription.pastDueSince`: the first failure, kept across retries.
+
+A failed attempt never grants, extends or shortens access. Users keep Pro until `proExpiresAt` of the period they paid for; access ends exactly then, and the payment state machine is unchanged (`FAILED` stays terminal). A failed first payment grants nothing, and the checkout stays open, so the customer can try another card.
+
+Recovery is Stripe collecting the invoice (a retry or a new card):
+
+- A renewal arrives as `invoice.paid` and is recorded like any renewal: one `SUCCEEDED` payment keyed by the invoice ID, one `RENEWED` event, and the term extended to Stripe's period end. The period starts at the old expiry, even if access had lapsed meanwhile. `pastDueSince` is cleared.
+- A first payment arrives as `checkout.session.completed`, `async_payment_succeeded` or `invoice.paid`, whichever comes first. It is recorded once with one `CREATED` event.
+- Repeated, concurrent or late deliveries never create a second payment, event or extension.
+- A failure event that arrives after the invoice was collected is kept as history only: it is not marked past due and the term is unchanged.
+
+`customer.subscription.deleted` for the linked subscription, confirmed as `canceled` through the Stripe API, means Stripe stopped retrying (or the subscription was canceled). It sets `proCanceledAt` (access continues until `proExpiresAt`), appends one `CANCELED` event and clears `pastDueSince`, so the user can check out again. Configure Stripe to cancel subscriptions after the final failed retry. With "mark as unpaid" or "leave past due", the user stays past due until the invoice is paid or the subscription is canceled.
+
+#### Billing information and payment history
+
+Both routes are read-only and require a bearer token (`401` without a valid one). They always describe the token user: user, customer or payment IDs are never accepted (unknown query parameters are rejected with `400`; a request body is ignored). They read only PostgreSQL, where only verified Stripe events write (checkout, invoices, failures, cancellation, refunds). They never call Stripe and keep nothing in memory, so the same data gives the same answer after a restart. No Stripe identifiers (customer, subscription, invoice, charge, refund), credentials or raw failure messages are returned.
+
+`GET /v1/subscription/billing`:
+
+```json
+{
+  "status": "PRO",
+  "hasProAccess": true,
+  "accessExpiresAt": "2026-12-01T10:00:00.000Z",
+  "subscriptionState": "ACTIVE",
+  "plan": { "code": "PRO", "billingInterval": "MONTHLY", "priceCents": 1900, "currency": "USD" },
+  "currentPeriod": { "start": "2026-11-01T10:00:00.000Z", "end": "2026-12-01T10:00:00.000Z" },
+  "autoRenew": true,
+  "nextRenewalAt": "2026-12-01T10:00:00.000Z",
+  "canceledAt": null,
+  "pastDueSince": null
+}
+```
+
+- `status`, `hasProAccess` and `accessExpiresAt` follow the same rules as `GET /v1/subscription`.
+- `subscriptionState` is one of:
+  - `NONE`: never paid (including trial-only users);
+  - `ACTIVE`: the paid term is running;
+  - `CANCELED`: the paid term is running but will not renew;
+  - `PAST_DUE`: a renewal failed and Stripe is retrying;
+  - `ENDED`: expired, or revoked by a refund.
+- `plan` is the paid plan: its interval and the price the subscription is billed at. That is the purchase price, which renewals also charge; later admin price changes do not apply. `plan` stays shown after the subscription ended, and is `null` without any paid term.
+- `currentPeriod` is the paid billing period running now, or `null` without active paid access.
+- `nextRenewalAt` is the period end while the subscription will renew (`autoRenew`: active, backed by Stripe, not canceled, not past due).
+- `canceledAt` and `pastDueSince` are the stored cancellation and first-failure times.
+
+`GET /v1/subscription/payments?page=1&limit=20` (`limit` 1–100, default 20) returns `{ items, meta }` in the project's paginated shape (`page`, `limit`, `total`, `totalPages`, `hasPreviousPage`, `hasNextPage`). It covers every payment attempt and refund of the caller, newest first. Ties are ordered by record time and ID, so pages are stable. Each entry has:
+
+- `id`, `type` (`PAYMENT` or `REFUND`), `purpose` (`NEW_SUBSCRIPTION` or `RENEWAL`; for a refund, that of the refunded payment);
+- `status`, `amountCents`, `currency`, `date`, `billingInterval` and the billed `period`:
+  - a payment is `SUCCEEDED`, `FAILED`, `PARTIALLY_REFUNDED` or `REFUNDED`; its date is when it was paid or failed, and it has `refundedAmountCents`;
+  - a refund is `PENDING`, `REQUIRES_ACTION`, `SUCCEEDED`, `FAILED` or `CANCELED`; its date is when Stripe created it, and `paymentId` names the refunded payment entry;
+- for failed payments, a `failureReason` such as `insufficient_funds` or `expired_card`. Decline codes that Stripe advises not to show customers (e.g. `stolen_card`, `fraudulent`) are reported as `card_declined`.
+
+Cancellations do not add entries; they appear in the billing information.
+
+#### Cancellation at period end
+
+`POST /v1/subscription/cancel` (bearer token, no body) cancels the caller's own paid subscription at the end of its current period. The subscription is always the token user's: user or subscription IDs in the body or query are ignored, so nobody can cancel another user's subscription. Response (`200`):
+
+```json
+{
+  "status": "PRO",
+  "hasProAccess": true,
+  "autoRenew": false,
+  "canceledAt": "2026-03-10T09:00:00.000Z",
+  "endsAt": "2026-03-31T10:00:00.000Z",
+  "accessExpiresAt": "2026-03-31T10:00:00.000Z",
+  "alreadyCanceled": false
+}
+```
+
+- Only a running paid term backed by a Stripe subscription can be canceled. Otherwise the response is `409 You do not have an active paid Pro subscription to cancel`: no subscription, trial only, an ended term (access ends exactly at `proExpiresAt`), or a term without a Stripe subscription.
+- The API first asks Stripe to set `cancel_at_period_end`, outside any database transaction and with an idempotency key per subscription and term. Nothing is refunded or shortened.
+- The cancellation is recorded only when Stripe confirms it. It sets `UserSubscription.proCanceledAt` to Stripe's cancellation time and appends one `CANCELED` `SubscriptionEvent` with the same time, plus an audit record by the user. `proExpiresAt` never changes: Pro features stay available until the period ends, and `GET /v1/subscription` shows `pro.canceledAt`.
+- The cancellation is saved only after Stripe responds positively. If the request fails or Stripe's answer does not confirm it, nothing is saved and the response is `503 Cancellation could not be confirmed; please retry or check subscription status`. The API does not claim the subscription will renew: Stripe may have canceled even if its response was lost. If Stripe canceled but its response was lost, a retry or Stripe's `customer.subscription.updated` webhook records it.
+- Repeated requests return the same cancellation (`alreadyCanceled: true`) without calling Stripe. Concurrent requests and webhooks are serialized by the user's row lock, and only the first sets `proCanceledAt`. A partial unique index (migration `20261116120000_subscription_cancellation`) also refuses a second `CANCELED` event for the same cancellation.
+- `customer.subscription.updated` (re-read from Stripe) records a period-end cancellation made outside MuseCue, e.g. in the Stripe dashboard. It never reverses a recorded cancellation, so stale or out-of-order updates change nothing.
+- When Stripe ends the subscription at period end (`customer.subscription.deleted`), nothing is added: the cancellation and expiry are already recorded.
+- A canceled but running term still counts as an active subscription, so a new checkout returns `409` until it ends. Trial history, payments and renewal rules are unchanged.
+
+#### Refunds
+
+Refunds are made in Stripe (for example from the dashboard); MuseCue has no refund endpoint. Stripe reports them with `charge.refunded`, `charge.refund.updated`, `refund.created`, `refund.updated` or `refund.failed`. Each event only names the charge. The API then reads the charge and all of its refunds from the Stripe API, finds the invoice the charge paid, and matches it to the recorded payment (its `providerPaymentId`). It checks that the charge is the user's own Stripe customer, in USD, for the recorded amount. One transaction under the user's row lock then:
+
+- stores every Stripe refund once in `PaymentRefund`, keyed by its Stripe `re_…` ID. A `PENDING`, `FAILED` or `CANCELED` refund is stored with its status but changes nothing else;
+- sets the payment's `refundedAmountCents` to the sum of its succeeded refunds and `refundedAt` to the latest of them. The status becomes `REFUNDED` for a full refund and `PARTIALLY_REFUNDED` for a partial one (partial refunds can later complete to `REFUNDED`);
+- appends one `PAYMENT_REFUNDED` event for each refund that newly succeeded;
+- revokes, immediately, the access the refunded payment paid for, full or partial: `proExpiresAt` is cut to now even if the period had not ended, and the stored `status` is recomputed (normally `EXPIRED`). `GET /v1/subscription` and `ProAccessGuard` deny Pro from that instant.
+
+Only the refunded payment's access is revoked. If its period is already over, the current access comes from a newer payment and is left alone. A duplicate payment that never granted access can be refunded without touching anyone's access. A later paid period (for example Stripe's next renewal, since a refund does not cancel the Stripe subscription) starts a new term and grants access again.
+
+Repeated or delayed events add no rows or events. Because the current state is always re-read from Stripe, a stale `pending` event cannot undo a succeeded refund. Refunded amounts only grow, and the term is only ever shortened, so no event can restore revoked access; replays of the payment's own `invoice.paid` or checkout events are already recorded. A refund Stripe reports as failed after it succeeded keeps its effect and is logged for review. If a refund arrives before its payment was recorded, the webhook answers `503` so Stripe retries after the payment event. The payment event then applies it at once: after a first payment or renewal is recorded, the API asks Stripe whether that invoice's charge has refunded money and, if so, records the refunds and revokes the access in the same delivery, not at Stripe's next retry of the refund event. If Stripe cannot be asked at that point, the payment stays recorded and the retried refund event applies the refund.
+
+Handled events: `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `checkout.session.async_payment_failed`, `checkout.session.expired`, `invoice.paid`, `invoice.payment_failed`, `customer.subscription.updated`, `customer.subscription.deleted`, `charge.refunded`, `charge.refund.updated`, `refund.created`, `refund.updated`, `refund.failed`. Other events are acknowledged and ignored. Transient failures return `5xx`, so Stripe retries.
+
+#### Webhook security and reliability
+
+- **Verified first:** every event goes through `StripeWebhookService.receive`. It verifies the `Stripe-Signature` header against the raw body before anything is read or written; a missing, forged, tampered, other-secret or stale (more than 5 minutes old) signature gets `400` and changes nothing. Only `verifyEvent` produces a `VerifiedStripeEvent`, and `handleEvent` accepts nothing else (a compile-time guarantee).
+- **Facts from the API:** payment facts are then always re-read from the Stripe API and matched to what MuseCue stored (customer, subscription, checkout, price, interval, amount). Payloads are never trusted for them.
+- **Events that are not ours:** events of connected accounts (`account` set) or of the other mode (a live event at a test key, or the reverse) are acknowledged without effect (`NOT_FOR_THIS_ACCOUNT`). So is an event naming an object that does not exist in this Stripe account (`UNKNOWN_OBJECT`), instead of being retried for days.
+- **Event log:** each verified event is recorded in `PaymentWebhookEvent` (migration `20261118120000_payment_webhook_events`) before processing. The row has the Stripe event ID, type, object ID, mode and creation time, but no payload. It is then updated with the status (`PROCESSED` or `FAILED`), the outcome, the number of deliveries and, on failure, an error class (never a message).
+- **Failures:** a failure answers a generic `500 Webhook processing failed` (no internal details), or `503` for retry-later cases. Because every change is one transaction, nothing is half-applied, and Stripe's redelivery applies the event once. An event still `FAILED` after Stripe's retries can be resent from the Stripe dashboard (events are kept for 30 days):
+
+  ```sql
+  SELECT "providerEventId", "type", "attempts", "lastErrorCode", "receivedAt"
+    FROM "PaymentWebhookEvent" WHERE "status" = 'FAILED' ORDER BY "receivedAt";
+  ```
+
+- **Early arrivals:** a renewal, or a cancellation made in Stripe, can arrive before the subscription's first payment is recorded. It answers `503` so Stripe delivers it again, instead of being acknowledged and lost.
+
+Review notes (November 2026):
+
+- **What was checked:** every event type for signature handling, payload trust, cross-customer matching, duplicates, concurrency, delays and ordering, and failures after Stripe confirmed a payment. Most of it was already correct:
+  - signature before processing;
+  - re-reading payment facts from Stripe;
+  - customer/subscription matching;
+  - one transaction per change under the user's row lock;
+  - idempotency keyed by Stripe IDs;
+  - terms that are only ever extended by newer paid periods and only ever shortened by refunds.
+- **Problems found and fixed:**
+  1. A processing error returned the raw internal error message (database details and IDs) in the webhook response body.
+  2. A renewal arriving before its subscription's first payment was recorded was answered `200` and so lost for good.
+  3. The same happened to a period-end cancellation made in Stripe.
+  4. Connected-account events were processed like the account's own.
+  5. A refund event for a charge outside this Stripe account was answered `500`, so Stripe retried it for days.
+  6. A verified event that kept failing left no trace once Stripe stopped retrying.
+- **Checks that now run:**
+  - `test/stripe-webhook-reliability.e2e-spec.ts` (PostgreSQL): database failures are injected with real triggers after Stripe confirmed a payment, renewal or refund, and everything rolls back and is applied once on redelivery; it also covers a whole lifecycle delivered reversed, duplicated and concurrently, replays after a refund, and foreign and invalid events.
+  - `src/subscription/stripe/stripe-webhook.reliability.spec.ts` (unit): the same cases.
+- **Known limits:**
+  - Processing uses the provider state at the time of processing, so a refund revokes access when the refund event is processed, not retroactively.
+  - An older renewal applied after a newer one after a gap cannot merge into the term (see above).
+  - Cancellations requested through `POST /v1/subscription/cancel` are saved from Stripe's direct API response, not from a webhook, as required for that endpoint.
+
+#### Payment lifecycle integration tests
+
+- **What `test/stripe-payment-lifecycle.e2e-spec.ts` runs (PostgreSQL, simulated Stripe):**
+  - the whole lifecycle for monthly and yearly plans, through the HTTP API and signed webhooks, with test users and a frozen clock at month-end and leap-day anchors: checkout, redirect only, confirmed payment, activation, renewal, failed payment, recovery, cancellation, restart, expiration, full and partial refund, and no payment;
+  - checks on status, Pro access at exact instants, amounts, period lengths, Stripe references and the stored event history;
+  - concurrent checkouts, webhooks and cancellations; duplicated events; an application restart;
+  - a free-trial user buying Pro: the trial history never changes through purchase, renewal, cancellation and expiration; a refund during the trial ends only the paid term;
+  - billing boundaries: concurrent checkouts while a lapsed term's renewal is still being collected are refused (one Stripe subscription), and a refund made before its payment was recorded is applied as soon as the payment is;
+  - the same lifecycle delivered reversed and in three shuffled orders, duplicated and concurrent, compared with the in-order stored state;
+  - after every test, SQL checks of database invariants: each access change has a collected payment; terms are covered by payments; refund totals match; no duplicate payments or events; every webhook logged as processed.
+- **Problems found and fixed:**
+  1. A renewal delivered while its first payment was being recorded could be answered `200` as "unknown subscription", so the paid renewal was lost. The same race could drop a subscription end.
+  2. The end of a subscription delivered before its first payment was recorded was lost.
+  3. An ended subscription stored its end time instead of Stripe's cancellation time (`canceled_at`).
+  4. A failed concurrent duplicate delivery could mark an already processed webhook as `FAILED`.
+  5. (Final review) A user whose paid term had lapsed locally, but whose Stripe subscription could still renew, could start a second subscription and be charged twice. Checkout now waits until Stripe reports the subscription ended.
+  6. (Final review) A refund made before its payment was recorded left Pro granted until Stripe's next retry of the refund event. It is now applied as soon as the payment is recorded.
+- **Known limit:** when a renewal is recorded before an older renewal that bridges it to the current term, only the "Pro since" date (`proStartedAt`) differs from in-order delivery (see the limitation below). Payments, periods, events and current access are the same.
+
+Configuration (`.env.example`): `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_CHECKOUT_SUCCESS_URL`, `STRIPE_CHECKOUT_CANCEL_URL` (absolute http(s) URLs), optional `STRIPE_PRO_PRODUCT_ID`, and `STRIPE_CHECKOUT_EXPIRES_MINUTES` (31–1440, default 60). In the Stripe dashboard, create a webhook endpoint for `https://<api>/v1/webhooks/stripe` with the thirteen events above. For local development, forward events with the Stripe CLI and use the printed signing secret:
+
+```bash
+stripe listen --events checkout.session.completed,checkout.session.async_payment_succeeded,checkout.session.async_payment_failed,checkout.session.expired,invoice.paid,invoice.payment_failed,customer.subscription.updated,customer.subscription.deleted,charge.refunded,charge.refund.updated,refund.created,refund.updated,refund.failed --forward-to localhost:5000/v1/webhooks/stripe
+```
+
+Migration `20261113120000_add_stripe_checkout` adds `PaymentCustomer` and `CheckoutSession`. Database rules enforce one pending checkout per user, forward-only checkout status, an immutable price, interval, customer and provider session, and completion only by a `SUCCEEDED` payment of the same subscription. The webhook needs the raw body, so `main.ts` creates the app with `rawBody: true`.
+
+Not implemented yet: immediate cancellation (including canceling a past-due subscription to stop Stripe's retries), undoing a cancellation (a cancellation reversed in Stripe is not reflected), the customer portal (so users cannot update their card in-app; Stripe's own emails and hosted invoice page can be used), exposing the past-due state in `GET /v1/subscription`, requesting refunds from MuseCue, disputes (`charge.dispute.*`), canceling the Stripe subscription automatically when a payment is refunded, revoking an active free trial on refund (a trial is not a payment and keeps running), reactions to other `customer.subscription.updated` changes (e.g. `unpaid`), and automatic refunds or cancellation of duplicate payments and subscriptions. Renewal delays within Stripe's retry window (up to 3 days) are handled. If a renewal for an older period arrives after a newer one, the older period is recorded but cannot be merged into the term: the database allows one payment per term change.
+
+Database tests (`test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`, `test/privacy-export.e2e-spec.ts`, `test/account-deletion.e2e-spec.ts`, `test/account-erasure.e2e-spec.ts`, `test/stripe-checkout.e2e-spec.ts`, `test/stripe-renewal.e2e-spec.ts`, `test/stripe-payment-failure.e2e-spec.ts`, `test/stripe-cancellation.e2e-spec.ts`, `test/stripe-refund.e2e-spec.ts`, `test/subscription-billing.e2e-spec.ts`, `test/stripe-webhook-reliability.e2e-spec.ts`, `test/stripe-payment-lifecycle.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
 
 ```bash
 TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json test/subscription-plan test/user-subscription test/subscription-trial test/subscription-status test/pro-access test/trial-lifecycle test/billing test/subscription-security test/privacy-export test/account-deletion test/account-erasure
@@ -382,172 +622,28 @@ TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --
 Personal data export unit tests (no database or Redis needed):
 
 ```bash
-npm test -- --runInBand privacy
+TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json test/subscription-plan test/user-subscription test/subscription-trial test/subscription-status test/pro-access test/trial-lifecycle test/billing test/subscription-security test/stripe-checkout test/stripe-renewal test/stripe-payment-failure test/stripe-cancellation test/stripe-refund test/subscription-billing test/stripe-webhook-reliability test/stripe-payment-lifecycle
 ```
 
+All payment database suites (each uses its own schema, so they can run in parallel workers):
 
-### Personal data export
-
-Routes require a bearer token. The owner is always the token's user; requests cannot name another user.
-
-| Method | Route                            | Purpose                                          |
-| ------ | -------------------------------- | ------------------------------------------------ |
-| `POST` | `/v1/privacy/exports`            | Queue a ZIP export of the caller's data (`202`)  |
-| `GET`  | `/v1/privacy/exports`            | List the caller's 20 most recent exports         |
-| `GET`  | `/v1/privacy/exports/:exportId`  | Poll one export's status and progress            |
-| `GET`  | `/v1/privacy/exports/:exportId/download` | Get a signed download link (max 15 minutes) |
-| `GET`  | `/v1/privacy/exports/:exportId/archive?expires&signature` | Download the archive with the signed link |
-
-`POST /v1/privacy/exports` takes no body; any body field (for example `userId`) is rejected with `400`. An optional `Idempotency-Key` header (1-128 characters of `A-Z a-z 0-9 _ . : -`) returns the same export on retry. Only one export per user can be `QUEUED` or `PROCESSING` at a time (a partial unique index); further requests, including concurrent ones, return that export instead of starting another. The route uses the strict rate limit. If the queue is unavailable the export is recorded as `FAILED` and the request returns `503`.
-
-Status responses contain `id`, `status` (`QUEUED`, `PROCESSING`, `COMPLETED`, `FAILED` or `EXPIRED`), `progress` (0-100), `requestedAt`, `startedAt`, `completedAt`, `expiresAt`, `sizeBytes`, `sha256`, `photoCount`, `missingPhotoCount`, `attempts`, and, for a `FAILED` export, a client-safe `error` message with a machine-readable `errorCode`. Storage locations and idempotency keys are never returned. Another user's export returns the same `404` as a missing one, and malformed IDs return `400`. A completed export reports `EXPIRED` once `expiresAt` (completion + 24 hours) has passed.
-
-The `privacy-export` BullMQ worker builds the archive outside the request:
-
-```text
-README.txt
-manifest.json               every file with its size and SHA-256, plus photos that could not be included
-data/account.json           account details and security settings (MFA on/off, last password change)
-data/profile.json           profile and avatar reference
-data/makeup-history.json    sessions, preferences, analyses, recommendations, guides, checks, questions, AI processing records
-data/subscription.json      current access status, subscription record, payments and lifecycle events
-data/sign-in-history.json
-data/email-history.json
-photos/profile/avatar.<ext>
-photos/sessions/<sessionId>/<imageId>.<ext>
+```bash
+TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npm run test:e2e:payments
 ```
 
-Every query is scoped to the owner, and every document is built from an explicit field allowlist. Password hashes, token versions, MFA secrets, OAuth provider subject IDs, storage keys, idempotency keys, raw AI results, payment-provider IDs, SMTP message IDs and activity-log rows (which can describe other users' records) are never exported. A photo is copied only if its storage key has exactly the format the image storage writes for that owner and scope (`<authId>/<sessionId or profile>/<file>.<jpg|png|webp>`). Keys with backslashes, `.`/`..`/empty segments, another owner or session, absolute paths or drive letters are refused. The shared private-storage resolver also rejects backslashes and dot segments on every platform. Photos are streamed one at a time. Missing files are listed in the manifest instead of failing the export.
+The Stripe unit tests do not need a database or a Stripe account; they run the real Stripe SDK against an in-memory emulation of the few Stripe endpoints used (`test/support/fake-stripe-api.ts`):
 
-Each worker attempt claims the export with a new `startedAt`. Progress, publication and failure are conditioned on that value, so a stalled attempt cannot overwrite a newer one. Retryable failures are retried 3 times with exponential backoff; between attempts the export shows `QUEUED` again with an increased `attempts`.
-
-Failure reasons (`errorCode`, each with a fixed user-facing `error` message):
-
-| `errorCode`           | When                                                         |
-| --------------------- | ------------------------------------------------------------ |
-| `GENERATION_FAILED`   | The archive could not be built after all retries             |
-| `STORAGE_FULL`        | The export storage ran out of space (`ENOSPC`/`EDQUOT`)      |
-| `ACCOUNT_UNAVAILABLE` | The account no longer exists (not retried)                   |
-| `INTERRUPTED`         | The job was lost or ended without finishing (recovery sweep) |
-| `QUEUE_UNAVAILABLE`   | The export could not be queued (the request returned `503`)  |
-
-The database requires every `FAILED` export to have `error`, `errorCode` and `completedAt`, and no archive.
-
-File cleanup and duplicates:
-
-- Archives are written as `<uuid>.zip.partial` and renamed to `<uuid>.zip` only when complete, so an incomplete archive never has the final name.
-- A failed attempt deletes its own partial archive. When an export finally fails, its status and reason are recorded first, then every file of the export is deleted and `filesDeletedAt` is set. If deletion fails, the export stays `FAILED` (the user still sees the reason) and the retention sweep retries the cleanup until it succeeds.
-- After a successful publication, files left by earlier attempts (for example a crashed worker's partial archive) are removed, so a completed export has exactly one file.
-- Repeated requests never create duplicate jobs: the same `Idempotency-Key` returns the same export (including a failed one), only one export per user can be waiting or running, and each export has exactly one BullMQ job (`jobId` = export ID). Redelivered jobs for completed or failed exports do nothing. A new request after a failure creates one new export.
-
-Every 60 seconds, recovery fails exports older than `PRIVACY_EXPORT_RECOVERY_GRACE_MS` whose job is missing or finished (`INTERRUPTED`), so users are never blocked by a lost job.
-
-#### Downloading a completed export
-
-`GET /v1/privacy/exports/:exportId/download` returns a temporary link for the caller's own completed export:
-
-```json
-{
-  "url": "/v1/privacy/exports/<id>/archive?expires=1788264900&signature=<43 base64url chars>",
-  "method": "GET",
-  "expiresAt": "2026-09-01T12:15:00.000Z",
-  "fileName": "musecue-data-export-2026-09-01.zip",
-  "sizeBytes": 123456,
-  "sha256": "<archive checksum>"
-}
+```bash
+npm test -- --runInBand stripe   # or: npm run test:stripe
+npm test -- --runInBand subscription-billing
 ```
 
-- The link expires after `PRIVACY_EXPORT_DOWNLOAD_TTL_SECONDS` (default and maximum 900 seconds, minimum 60), and never later than the archive's own `expiresAt`. The URL is relative to the API base URL. It is never built from the request's `Host` header.
-- `QUEUED`/`PROCESSING` and `FAILED` exports return `409`, expired exports return `410`, and another user's or an unknown export returns the same `404` as a missing one.
-- The signature is an HMAC-SHA256 over the export ID, the owner's user ID, the archive's SHA-256 and the expiry. The key is `PRIVACY_EXPORT_DOWNLOAD_SECRET`, or a purpose-bound key derived from `JWT_ACCESS_SECRET` with HKDF. Verification is constant-time. Rotating the key invalidates issued links.
-- **Using the link also requires the owner's bearer token.** The signature is checked against the caller's user ID, so a link that leaks (logs, screenshots, shared devices) is useless to anyone else. Without a token the response is `401`, with another user's token, a tampered expiry or signature, or another export's ID it is `403`, and after the link expires it is `410`. A link stops working early when the export expires or its archive is replaced or missing.
-- The archive is streamed with `Content-Type: application/zip`, `Content-Disposition: attachment`, `Cache-Control: private, no-store`, `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`. Its size must still match the recorded size.
-- Signed URLs are never logged: request logging and the exception filter redact `signature` (and `token`/`access_token`/`refresh_token`) query values.
-- Archives stay private in storage. They live under `PRIVATE_EXPORT_DIR`, outside any static directory, in owner-only directories (`0700`) and files (`0600`), with random, unguessable names. Only finished `.zip` files are served, and only as regular files opened without following symbolic links.
-
-#### Retention: expiry and cleanup
-
-An archive expires **24 hours after it was exported** (`expiresAt` = completion + 24 hours). From that moment the export reads as `EXPIRED`, and new links and existing links are refused with `410`. Download links themselves still last at most 15 minutes and never outlive the archive.
-
-Deletion does not depend on any user request. `PrivacyExportRetentionService` runs a sweep at startup, to catch up after downtime, and then every `PRIVACY_EXPORT_CLEANUP_INTERVAL_MS` (default 60 seconds) on every instance. It needs only PostgreSQL and storage, not Redis.
-
-1. **Expire.** `COMPLETED` exports with `expiresAt <= now` become `EXPIRED` (one guarded update). The row keeps `storageKey` and `sha256`; the database requires this for `EXPIRED` rows.
-2. **Delete files.** For every `FAILED`/`EXPIRED` export with `filesDeletedAt` null, that export's own directory (`<authId>/<exportId>/`) is deleted. Then `filesDeletedAt` is recorded. If deletion fails, nothing is recorded: the export stays pending with its reference and is retried on the next sweep. Pending exports are walked in ID order (up to 1,000 per sweep), so one export that keeps failing never blocks others.
-3. **Storage scan** (at most every `PRIVACY_EXPORT_ORPHAN_SCAN_INTERVAL_MS`, default 1 hour, and on an instance's first sweep). Export directories whose record no longer exists are removed once unchanged for 1 hour. This happens, for example, when deleting an account cascades away its export rows. Files reappearing for exports already cleaned up are removed too. Directories of waiting, running and downloadable exports, and anything without the `<authId>/<exportId>` layout, are never touched.
-
-Sweeps are idempotent and can run concurrently on several instances. Repeating a sweep changes nothing, and each step only ever affects the expired or failed export it is about, never other users' exports. All instances must share the same `PRIVACY_EXPORT_DIR` storage, because a sweep on one instance must be able to delete files that another instance wrote.
-
-### Account deletion
-
-Routes require a bearer token. The account is always the token's user. A request cannot name another account, and any extra body field (for example `userId`) is rejected with `400`.
-
-| Method | Route | Purpose |
-| ------ | ----- | ------- |
-| `POST` | `/v1/privacy/account-deletion/confirmation-code` | Email a one-time confirmation code (accounts without a password, e.g. Google sign-in) |
-| `POST` | `/v1/privacy/account-deletion` | Confirm identity and request permanent deletion (`202`) |
-
-**Identity verification** follows the login conventions. Every deletion is confirmed with a one-time code sent to the account's email address (`POST .../confirmation-code`, no body):
-
-- Accounts with a password send **both** `{ "password": "...", "code": "A1B2C3" }`. The password check uses constant-time bcrypt, and wrong passwords count toward the same lockout as failed logins (5 failures lock the account for 30 minutes and revoke its tokens). A wrong password does not use up the code.
-- Accounts without a password (Google sign-in) send `{ "code": "A1B2C3" }` only; a password is rejected.
-- Codes are 6 characters, stored only as a hash bound to the account, valid 10 minutes, single-use and limited to 5 guesses. At most 3 codes can be requested per 15 minutes.
-- Missing proof or the wrong kind of proof returns `400`; a wrong password or code returns `403` (`Identity verification failed`). Confirmations are limited to 5 per 15 minutes (`429`).
-
-**Acceptance and token invalidation.** In one transaction, the account moves from `ACTIVE` to `PENDING_DELETION` (a guarded update), its `tokenVersion` is incremented, and an `AccountDeletionRequest` is recorded.
-
-- **Before the transaction commits,** the new token version is written to the token cache. If that write fails, the transaction rolls back and the request returns `503`, so a deletion is never approved while old tokens could still work.
-- `AuthGuard` fills an empty cache entry only with `SET NX`, so a request that read the account just before the approval cannot put the old version back.
-- After the commit, every refresh session is removed. Login, token refresh and Google sign-in refuse any account that is not `ACTIVE`.
-- The response is `202` with `{ id, status, requestedAt, accountBlockedAt, sessionsRevoked }`.
-
-**Multiple requests.** Only one open (not `COMPLETED`) request per account can exist; a partial unique index enforces this. Concurrent requests are serialized by the row lock and all receive the same request. A repeated request after approval is refused with `401`.
-
-#### Erasure (hard deletion)
-
-`AccountDeletionRecoveryService` runs at startup and every 30 seconds. It finishes any pending session revocation and hands every open request whose processing lease (`lockedUntil`, 5 minutes) is free or expired to `AccountErasureService`. Each step is recorded on the request, so a crash or failure resumes from the last completed step. **The account stays closed (`PENDING_DELETION`, no token works) and is not deleted until its private files are gone.**
-
-1. **Record files (transaction, `filesRecordedAt`).**
-   - Cancels the account's running exports (they become `FAILED`/`ACCOUNT_UNAVAILABLE`). See "Coordination with export workers" below for why no worker can create or publish a file after this point.
-   - Records every private file as an `AccountDeletionFile` reference:
-     - each photo and avatar inside the account's own image scope;
-     - each generated export archive;
-     - the account's image and export directories, to catch files no row references and temporary (`.partial`) archives.
-   - Mock captures, URLs and keys outside the account's scope are never recorded.
-2. **Delete files (`filesDeletedAt`)** through the private storage adapters. Every operation is owner-scoped: `listOwnerFiles(authId)`, `deleteOwnerFile(authId, key)` and `pruneOwnerDirectories(authId)`. The adapters refuse any key outside `<authId>/`, never follow symbolic links and never use recursive deletion. Each reference ends in one of four states:
-   - `DELETED`;
-   - `MISSING`: already absent from storage (reported, or `ENOENT`), which counts as done;
-   - `RETAINED`, with a `note`: another account's image or avatar still references the key, or the reference lies outside the account's scope;
-   - `PENDING`, with `attempts` and a path-free `lastError`, after a storage error (including listing or pruning).
-
-   A directory sweep attempts every file even after a failure. References are kept and retried on every sweep. Until all are resolved, the request stays `PROCESSING` and the account is not deleted.
-
-   Before any file is touched, the step waits until none of the account's exports holds a live worker lease (`Waiting for N export worker(s) of the account to stop`). After all references are resolved, both storage directories are listed again. Anything still there (for example the last bytes a cancelled worker wrote, or a file that reappeared) is first recorded as a reference and then deleted, and the check repeats. Files only count as deleted (`filesDeletedAt`) when storage is verifiably empty; if files keep appearing, the request stays incomplete.
-3. **Erase data (one transaction, `dataErasedAt`).**
-   - Deletes activity-log entries about the account.
-   - Anonymizes the account's entries about shared records (actor, IP, user agent and device are cleared; the change is kept).
-   - Hard-deletes the `authUser` row, guarded by `status = PENDING_DELETION`. Foreign keys cascade to every row the account owns, and payments survive, detached. Either everything commits or nothing does.
-4. **Completion.** Once sessions are revoked, the request becomes `COMPLETED`. Cached authentication data of the account and any outstanding code are removed.
-
-**Coordination with export workers.**
-
-- While building an archive, an export worker holds a lease on its export (`DataExport.workerLeaseUntil`). It is set at claim time, renewed by a heartbeat every 15 seconds (`PRIVACY_EXPORT_WORKER_HEARTBEAT_MS`, lease `PRIVACY_EXPORT_WORKER_LEASE_MS` = 60 s), and released only after the worker's last storage operation, including removing its own partial archive.
-- Each heartbeat also checks whether the export was cancelled and stops the build at the next entry.
-- Creating the archive file and renaming it to `.zip` run under a fence: a guarded `UPDATE` of the export row, matching only while it is still `PROCESSING` by this attempt, which holds the row lock while the file operation runs. Erasure's cancellation updates the same rows, so a file is either created before the cancellation (and cleanup finds it) or refused after it.
-- A crashed worker's lease simply expires.
-
-**Concurrent and repeated processing.**
-
-- Every claim of a request increments its `attempts`, which serves as the worker's fencing token.
-- Every later write (each file outcome, each step, completion) and every storage operation first renews the lease conditional on that token. A worker whose lease expired and was taken over stops before its next operation and records nothing more; a file it was deleting at that moment stays a pending reference for the new holder.
-- Several instances sweeping at once, or repeated deletion requests, therefore perform each deletion once.
-- A database or storage failure at any point leaves the saved references and recorded steps intact for the next sweep.
-
-The database allows `COMPLETED` only after these steps, and files only count as deleted after they were recorded. The request and its file references (no foreign key to the account, no personal data besides storage keys) remain as the record that the deletion happened. A foreign-key audit test checks that the account's cascade never reaches the deletion request and file tables, the plan or payments: nothing `RESTRICT`s a user's deletion, and only `ActivityLogEvent.actionedBy` and `PaymentTransaction.subscriptionId` are set to `NULL`.
 
 ## Domain
 
 ```text
 authUser
+|-- PaymentCustomer (0..1 per provider)
 |-- UserSubscription (0..1)
 |-- DataExport
 |-- (AccountDeletionRequest -> AccountDeletionFile: references authId without a foreign key)

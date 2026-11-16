@@ -27,6 +27,7 @@ model authUser {
   aiRuns            AiRun[]
   subscription      UserSubscription?
   dataExports       DataExport[]
+  paymentCustomers  PaymentCustomer[]
 
   @@index([email, id, providerId])
   @@index([username])
