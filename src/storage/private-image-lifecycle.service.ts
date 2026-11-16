@@ -521,7 +521,9 @@ export class PrivateImageLifecycleService
       this.prisma.imageAsset.count({
         where: { storageKey: ref.key, storageProvider: ref.provider },
       }),
-      this.prisma.userProfile.count({ where: { avatarUrl: ref.key } }),
+      this.prisma.userProfile.count({
+        where: { avatarUrl: ref.key, avatarStorageProvider: ref.provider },
+      }),
     ]);
     return images + avatars > 0;
   }

@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto';
  * including the legacy "HTTP 400 with the real status in the body" errors.
  */
 export type FakeOperation =
+  | 'list'
   | 'bucket'
   | 'upload'
   | 'download'
@@ -152,6 +153,34 @@ export class FakeSupabaseStorage {
 
     const bucketPrefix = `/object/${FAKE_SUPABASE.bucket}/`;
     switch (op) {
+      case 'list': {
+        const {
+          prefix = '',
+          offset = 0,
+          limit = 100,
+        } = JSON.parse(init?.body as string) as {
+          prefix?: string;
+          offset?: number;
+          limit?: number;
+        };
+        const entries = new Map<string, { name: string; id: string | null }>();
+        for (const objectKey of this.objects.keys()) {
+          if (!objectKey.startsWith(prefix + '/')) continue;
+          const tail = objectKey.slice(prefix.length + 1);
+          const name = tail.split('/')[0];
+          entries.set(name, {
+            name,
+            id: tail.includes('/') ? null : objectKey,
+          });
+        }
+        return json(
+          200,
+          [...entries.values()]
+            .sort((a, b) => a.name.localeCompare(b.name))
+            .slice(offset, offset + limit),
+        );
+      }
+
       case 'bucket':
         return json(200, {
           id: FAKE_SUPABASE.bucket,
@@ -311,6 +340,8 @@ export class FakeSupabaseStorage {
     path: string,
   ): { op: FakeOperation; key?: string } {
     const bucket = FAKE_SUPABASE.bucket;
+    if (method === 'POST' && path === `/object/list/${bucket}`)
+      return { op: 'list' };
     if (method === 'GET' && path === `/bucket/${bucket}`)
       return { op: 'bucket' };
     if (method === 'DELETE' && path === `/object/${bucket}`) {

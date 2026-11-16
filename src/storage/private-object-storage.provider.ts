@@ -29,6 +29,9 @@ export interface PrivateObjectStorageProvider {
    */
   isConfigured(): boolean;
 
+  /** Enumerates one owner's objects for account erasure, including orphans. */
+  listOwnerFiles?(authId: string): Promise<string[]>;
+
   put(key: string, bytes: Buffer, contentType: string): Promise<void>;
 
   get(key: string): Promise<Buffer>;

@@ -15,6 +15,8 @@ enum userStatus {
   SUSPENDED
   DELETED
   BLOCKED
+  // The owner asked for permanent deletion; the account is locked out.
+  PENDING_DELETION
 }
 
 enum mfaMethod {
@@ -171,4 +173,96 @@ enum SubscriptionEventType {
   RENEWED
   CANCELED
   EXPIRED
+  PAYMENT_FAILED
+  PAYMENT_REFUNDED
+}
+
+// Status of a provider refund. Only SUCCEEDED refunds count towards the
+// payment's refunded amount; the status only moves forward.
+enum RefundStatus {
+  PENDING
+  REQUIRES_ACTION
+  SUCCEEDED
+  FAILED
+  CANCELED
+}
+
+// One hosted checkout attempt with the payment provider. CREATING, OPEN and
+// PROCESSING are pending: a user has at most one pending checkout (partial
+// unique index). COMPLETED, EXPIRED and FAILED are terminal.
+enum CheckoutSessionStatus {
+  CREATING
+  OPEN
+  PROCESSING
+  COMPLETED
+  EXPIRED
+  FAILED
+}
+
+// Processing state of a verified provider webhook event.
+enum WebhookEventStatus {
+  RECEIVED
+  PROCESSED
+  FAILED
+}
+
+// ================================
+// Privacy Related Enums
+// ================================
+
+enum DataExportStatus {
+  QUEUED
+  PROCESSING
+  COMPLETED
+  FAILED
+  EXPIRED
+}
+
+enum DataExportErrorCode {
+  GENERATION_FAILED
+  STORAGE_FULL
+  ACCOUNT_UNAVAILABLE
+  INTERRUPTED
+  QUEUE_UNAVAILABLE
+}
+
+enum AccountDeletionStatus {
+  // Accepted: the account is blocked and awaits erasure.
+  PENDING
+  PROCESSING
+  COMPLETED
+}
+
+enum AccountDeletionVerification {
+  // Legacy: password only (requests accepted before codes were required).
+  PASSWORD
+  // The account password and an emailed code.
+  PASSWORD_AND_EMAIL_CODE
+  // An emailed code (accounts without a password, e.g. Google sign-in).
+  EMAIL_CODE
+}
+
+enum AccountDeletionFileKind {
+  // One private image (session photo or avatar): an image storage key.
+  PRIVATE_IMAGE
+  // Every remaining file in the owner's image directory (`<authId>`),
+  // including files no database row references any more.
+  IMAGE_OWNER_DIRECTORY
+  // Every remaining file in the owner's export directory (`<authId>`),
+  // including partial (temporary) archives.
+  EXPORT_OWNER_DIRECTORY
+  // One generated export archive: an export storage key.
+  EXPORT_ARCHIVE
+}
+
+enum AccountDeletionFileStatus {
+  // Not yet deleted (or the last attempt failed; retried).
+  PENDING
+  // Deleted from storage.
+  DELETED
+  // Already absent from storage: nothing to delete.
+  MISSING
+  // Deliberately kept: another account references it, or it lies outside
+  // the account's storage scope.
+  RETAINED
 }

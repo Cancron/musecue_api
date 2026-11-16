@@ -47,6 +47,10 @@ class AppError extends HttpException {
     return new AppError(HttpStatus.INTERNAL_SERVER_ERROR, message);
   }
 
+  static gone(message: string = 'Gone'): AppError {
+    return new AppError(HttpStatus.GONE, message);
+  }
+
   static tooManyRequests(message: string = 'Too Many Requests'): AppError {
     return new AppError(HttpStatus.TOO_MANY_REQUESTS, message);
   }

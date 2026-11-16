@@ -9,6 +9,7 @@ import {
 import { Response, Request } from 'express';
 import { WINSTON_MODULE_PROVIDER } from 'nest-winston';
 import { Logger } from 'winston';
+import { redactUrl } from '../utils/redact-url';
 
 @Catch()
 export class AllExceptionsFilter implements ExceptionFilter {
@@ -62,7 +63,7 @@ export class AllExceptionsFilter implements ExceptionFilter {
     const logContext = {
       context: 'AllExceptionsFilter',
       statusCode,
-      path: request.url,
+      path: redactUrl(request.url),
       method: request.method,
       exception:
         exception instanceof Error ? exception.message : String(exception),
@@ -80,7 +81,7 @@ export class AllExceptionsFilter implements ExceptionFilter {
       message,
       error,
       timestamp: new Date().toISOString(),
-      path: request.url,
+      path: redactUrl(request.url),
     });
   }
 }

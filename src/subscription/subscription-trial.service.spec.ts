@@ -36,6 +36,7 @@ describe('SubscriptionTrialService', () => {
     proCanceledAt: null,
     paymentProvider: null,
     providerSubscriptionId: null,
+    pastDueSince: null,
   };
 
   const writes = () => [

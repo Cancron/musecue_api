@@ -142,21 +142,30 @@ describeWithDatabase('Payments and subscription events (PostgreSQL)', () => {
       ).rejects.toMatchObject({ code: 'P2003' });
     });
 
-    it('keeps payments as financial records: a user with payments cannot be hard-deleted', async () => {
-      const { authId } = await newSubscriber();
+    it('keeps payments as financial records when their user is hard-deleted (detached, otherwise unchanged)', async () => {
+      const { authId, subscriptionId } = await newSubscriber();
       await givenProPurchased(client, authId, {
         billingInterval: MONTHLY,
         startedAt: T0,
         expiresAt: month(T0),
       });
+      const before = await client.paymentTransaction.findFirstOrThrow({
+        where: { subscriptionId },
+      });
+
+      await client.authUser.delete({ where: { id: authId } });
+
+      const after = await client.paymentTransaction.findUniqueOrThrow({
+        where: { id: before.id },
+      });
+      expect(after).toEqual({
+        ...before,
+        subscriptionId: null,
+        updatedAt: after.updatedAt,
+      });
       await expect(
-        client.authUser.delete({ where: { id: authId } }),
-      ).rejects.toThrow();
-      await expect(
-        client.paymentTransaction.count({
-          where: { subscription: { authId } },
-        }),
-      ).resolves.toBe(1);
+        client.userSubscription.count({ where: { id: subscriptionId } }),
+      ).resolves.toBe(0);
     });
 
     it('still deletes a user without payments together with their subscription events', async () => {

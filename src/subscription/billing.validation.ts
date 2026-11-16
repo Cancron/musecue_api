@@ -3,11 +3,12 @@ import type { SubscriptionPlanSettings } from './interfaces/subscription-plan.in
 import { SUBSCRIPTION_PLAN_CURRENCY } from './subscription-plan.constants';
 
 /**
- * Billing rules for the single Pro plan, shared by future checkout and webhook
- * code. They mirror the database rules in migrations
- * 20260918120000_add_payments_and_subscription_events and
- * 20260920120000_calendar_billing_periods_and_gap_free_terms, which enforce
- * the same rules for every writer.
+ * Billing rules for the single Pro plan, shared by the Stripe checkout and
+ * webhook code. They mirror the database rules in migrations
+ * 20260918120000_add_payments_and_subscription_events,
+ * 20260920120000_calendar_billing_periods_and_gap_free_terms and
+ * 20261114120000_stripe_anchored_billing_periods, which enforce the same rules
+ * for every writer.
  */
 
 /**
@@ -30,16 +31,39 @@ export function addBillingInterval(
   return target;
 }
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+const monthIndex = (date: Date) =>
+  date.getUTCFullYear() * 12 + date.getUTCMonth();
+const lastDayOfMonth = (date: Date) =>
+  new Date(
+    Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 0),
+  ).getUTCDate();
+
 /**
- * Whether [start, end) is exactly one billing period: `end` must be the
- * calendar expiry computed by addBillingInterval (same as the database CHECK).
+ * Whether [start, end) is one billing period as Stripe bills it (same rule as
+ * the database CHECK "PaymentTransaction_billing_period", migration
+ * 20261114120000_stripe_anchored_billing_periods):
+ *
+ * - exactly one calendar interval: `end` is addBillingInterval(start); or
+ * - a period anchored on a day the start month does not have: Stripe bills a
+ *   subscription started on Jan 31 on Feb 28, then Mar 31. Such a period
+ *   starts on the last day of its month and ends later in the following month
+ *   (following year for YEARLY), at the same time of day.
  */
 export function isValidBillingPeriod(
   start: Date,
   end: Date,
   interval: BillingInterval,
 ): boolean {
-  return end.getTime() === addBillingInterval(start, interval).getTime();
+  const calendarEnd = addBillingInterval(start, interval);
+  if (end.getTime() === calendarEnd.getTime()) return true;
+  const months = interval === BillingInterval.MONTHLY ? 1 : 12;
+  return (
+    start.getUTCDate() === lastDayOfMonth(start) &&
+    end.getTime() > calendarEnd.getTime() &&
+    monthIndex(end) === monthIndex(start) + months &&
+    end.getTime() % DAY_MS === start.getTime() % DAY_MS
+  );
 }
 
 /** The plan's current price for an interval, in US cents. */
@@ -129,7 +153,8 @@ export type PaidTermRejection =
   | 'UNPAID_GAP';
 
 export interface PaidTermPayment {
-  subscriptionId: string;
+  // NULL once the subscription was deleted (the payment is kept, detached).
+  subscriptionId: string | null;
   status: PaymentStatus;
   billingInterval: BillingInterval;
   periodStart: Date;

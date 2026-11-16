@@ -92,8 +92,11 @@ export class AuthGuard implements CanActivate {
       throw new UnauthorizedException('User account is not active');
     }
 
-    // Cache for 1 hour (or until security event invalidates it)
-    await this.redisService.set(cacheKey, user.tokenVersion, 3600);
+    // Cache for 1 hour (or until a security event replaces it). Only fill an
+    // empty cache entry: this database read may be older than a concurrent
+    // security event (for example an account deletion) that already cached
+    // a newer version, which must never be overwritten with a stale one.
+    await this.redisService.setNX(cacheKey, user.tokenVersion, 3600);
 
     return user.tokenVersion;
   }

@@ -37,6 +37,14 @@ export class FakeS3CompatibleStorage implements PrivateObjectStorageProvider {
     private configured = true,
   ) {}
 
+  listOwnerFiles(authId: string): Promise<string[]> {
+    return Promise.resolve(
+      [...this.objects.keys()]
+        .filter((key) => key.startsWith(authId + '/'))
+        .sort(),
+    );
+  }
+
   isConfigured(): boolean {
     return this.configured;
   }

@@ -56,6 +56,42 @@ export class SupabaseStorageProvider implements PrivateObjectStorageProvider {
     return this.client !== undefined;
   }
 
+  async listOwnerFiles(authId: string): Promise<string[]> {
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(authId)) {
+      throw new PrivateStorageError('INVALID_STORAGE_KEY');
+    }
+    const client = this.requireClient('get');
+    const keys: string[] = [];
+    const walk = async (prefix: string): Promise<void> => {
+      for (let offset = 0; ; offset += 100) {
+        const { data, error } = await this.call('get', () =>
+          client.from(this.bucket).list(prefix, {
+            limit: 100,
+            offset,
+            sortBy: { column: 'name', order: 'asc' },
+          }),
+        );
+        if (error) throw this.toStorageError(error, 'get');
+        if (!data) throw new PrivateStorageError('INVALID_PROVIDER_RESPONSE');
+        for (const object of data) {
+          if (
+            !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,255}$/.test(object.name) ||
+            object.name === '.' ||
+            object.name === '..'
+          ) {
+            throw new PrivateStorageError('INVALID_PROVIDER_RESPONSE');
+          }
+          const key = prefix + '/' + object.name;
+          if (object.id === null) await walk(key);
+          else keys.push(key);
+        }
+        if (data.length < 100) return;
+      }
+    };
+    await walk(authId);
+    return keys.sort();
+  }
+
   async put(key: string, bytes: Buffer, contentType: string): Promise<void> {
     const client = this.requireClient('put');
     await this.ensurePrivateBucket(client);

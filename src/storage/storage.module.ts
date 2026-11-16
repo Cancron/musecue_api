@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PrivateImageLifecycleService } from './private-image-lifecycle.service';
 import { PrivateImageStorageService } from './private-image-storage.service';
+import { PrivacyExportStorageService } from './privacy-export-storage.service';
 import {
   PRIVATE_OBJECT_STORAGE_PROVIDERS,
   type PrivateObjectStorageProvider,
@@ -54,7 +55,12 @@ import { SupabaseStorageProvider } from './providers/supabase-storage.provider';
     },
     PrivateImageStorageService,
     PrivateImageLifecycleService,
+    PrivacyExportStorageService,
   ],
-  exports: [PrivateImageStorageService, PrivateImageLifecycleService],
+  exports: [
+    PrivateImageStorageService,
+    PrivateImageLifecycleService,
+    PrivacyExportStorageService,
+  ],
 })
 export class StorageModule {}

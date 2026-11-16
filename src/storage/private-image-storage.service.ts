@@ -1,3 +1,9 @@
+import {
+  deleteOwnedFile,
+  pruneOwnerDirectories,
+  OwnerScopeViolationError,
+} from './private-storage-owner-files';
+import { LOCAL_STORAGE_PROVIDER_ID } from './private-storage.config';
 import { Inject, Injectable } from '@nestjs/common';
 import { WINSTON_MODULE_PROVIDER } from 'nest-winston';
 import type { Logger } from 'winston';
@@ -44,7 +50,8 @@ export class PrivateImageStorageService {
   constructor(
     @Inject(PRIVATE_OBJECT_STORAGE_PROVIDERS)
     providers: PrivateObjectStorageProvider[],
-    @Inject(PRIVATE_STORAGE_CONFIG) config: PrivateStorageConfig,
+    @Inject(PRIVATE_STORAGE_CONFIG)
+    private readonly config: PrivateStorageConfig,
     @Inject(WINSTON_MODULE_PROVIDER) private readonly logger: Logger,
   ) {
     const registry = new Map<string, PrivateObjectStorageProvider>();
@@ -69,6 +76,42 @@ export class PrivateImageStorageService {
     }
     this.providers = registry;
     this.activeProvider = active;
+  }
+
+  /** Owner sweeps use the backend recorded with the erasure reference. */
+  async listOwnerFiles(
+    authId: string,
+    provider = LOCAL_STORAGE_PROVIDER_ID,
+  ): Promise<string[]> {
+    const backend = this.resolve(provider);
+    if (!backend.listOwnerFiles)
+      throw new PrivateStorageError('STORAGE_MISCONFIGURED');
+    return backend.listOwnerFiles(authId);
+  }
+
+  async deleteOwnerFile(
+    authId: string,
+    key: string,
+    provider = LOCAL_STORAGE_PROVIDER_ID,
+  ): Promise<boolean> {
+    if (
+      !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(authId) ||
+      !key.startsWith(authId + '/')
+    ) {
+      throw new OwnerScopeViolationError();
+    }
+    if (provider === LOCAL_STORAGE_PROVIDER_ID)
+      return deleteOwnedFile(this.config.localRoot, authId, key);
+    await this.delete({ provider, key });
+    return true;
+  }
+
+  async pruneOwnerDirectories(
+    authId: string,
+    provider = LOCAL_STORAGE_PROVIDER_ID,
+  ): Promise<void> {
+    if (provider === LOCAL_STORAGE_PROVIDER_ID)
+      await pruneOwnerDirectories(this.config.localRoot, authId);
   }
 
   /** Provider id used for new uploads. */

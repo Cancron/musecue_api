@@ -1,3 +1,4 @@
+import { listOwnerFiles } from '../private-storage-owner-files';
 import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import type {
@@ -23,6 +24,10 @@ export class LocalFilesystemStorageProvider implements PrivateObjectStorageProvi
     private readonly root: string,
     private readonly options: { writable: boolean } = { writable: true },
   ) {}
+
+  listOwnerFiles(authId: string): Promise<string[]> {
+    return listOwnerFiles(this.root, authId);
+  }
 
   isConfigured(): boolean {
     return true;

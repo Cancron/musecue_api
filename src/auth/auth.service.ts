@@ -516,7 +516,9 @@ export class AuthService {
       );
     }
 
-    if (user.status === 'DELETED' || user.status === 'INACTIVE') {
+    // Any other non-active state (DELETED, INACTIVE, PENDING_DELETION, or a
+    // future status) must never receive tokens.
+    if (user.status !== 'ACTIVE') {
       // Run bcrypt to maintain consistent timing
       await bcrypt.compare(password, user.password);
       throw invalidCredentialsError;
@@ -959,6 +961,90 @@ export class AuthService {
       `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.REFRESH_TOKEN}:${userId}:`,
       0,
       1,
+    );
+  }
+
+  /**
+   * Revokes every session of a user after a security event that already
+   * incremented the user's tokenVersion to `tokenVersion`: deletes all refresh
+   * tokens and overwrites the cached token version, so access tokens issued
+   * before stop working at once. Throws when Redis cannot confirm either
+   * step, so callers can record the revocation as pending and retry.
+   */
+  async revokeAllSessions(userId: string, tokenVersion: number): Promise<void> {
+    await this.revokeAllUserTokens(userId);
+    await this.publishTokenVersion(userId, tokenVersion);
+  }
+
+  /**
+   * Overwrites the cached token version, so every access token carrying an
+   * older version is rejected by AuthGuard at once. Throws when Redis cannot
+   * confirm the write, so callers can fail closed.
+   */
+  async publishTokenVersion(
+    userId: string,
+    tokenVersion: number,
+  ): Promise<void> {
+    const cacheKey = `${config.redis_cache_key_prefix}:token_version:${userId}`;
+    const cached = await this.redisService.set(cacheKey, tokenVersion, 3600);
+    if (!cached) {
+      throw new Error('The cached token version could not be updated');
+    }
+  }
+
+  /**
+   * Drops the cached token version so the next request reloads it from the
+   * database (used to undo publishTokenVersion when its transaction failed).
+   */
+  async forgetCachedTokenVersion(userId: string): Promise<void> {
+    await this.redisService.del(
+      `${config.redis_cache_key_prefix}:token_version:${userId}`,
+    );
+  }
+
+  /**
+   * Removes short-lived authentication data kept in Redis for a deleted
+   * account: sessions, the cached token version (set to 0, which matches no
+   * token) and keys that contain the email address. Best effort: every key
+   * also expires on its own.
+   */
+  async forgetDeletedAccount(userId: string, email: string | null) {
+    await this.revokeAllUserTokens(userId).catch(() => undefined);
+    await this.redisService.set(
+      `${config.redis_cache_key_prefix}:token_version:${userId}`,
+      0,
+      3600,
+    );
+    if (email) {
+      const rateLimit = `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.RATE_LIMIT}login:email:${email}`;
+      await Promise.all([
+        this.redisService.del(
+          `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.VERIFICATION_TOKEN}:${email}`,
+        ),
+        this.redisService.del(rateLimit),
+        this.redisService.del(`${rateLimit}:locked`),
+      ]);
+    }
+  }
+
+  /**
+   * Counts a wrong password entered by a signed-in user to confirm a
+   * sensitive action (for example account deletion) toward the same lockout
+   * as failed logins; reaching the lockout also revokes the user's tokens.
+   */
+  async recordFailedPasswordConfirmation(
+    userId: string,
+    currentFailedAttempts: number,
+    meta: { ip: string; userAgent: string; device?: string },
+  ): Promise<void> {
+    const { MAX_FAILED_ATTEMPTS, LOCKOUT_DURATION_MS } =
+      AUTH_CONFIG.ACCOUNT_LOCKOUT;
+    await this.handleFailedLoginAttempt(
+      userId,
+      currentFailedAttempts,
+      MAX_FAILED_ATTEMPTS,
+      LOCKOUT_DURATION_MS,
+      meta,
     );
   }
 

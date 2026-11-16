@@ -1,0 +1,126 @@
+// ================================
+// Personal Data Export
+// ================================
+
+// One user-requested archive of the user's own data (account, profile,
+// makeup history, subscription and private photos). Rows are created by
+// POST /v1/privacy/exports and advanced only by the `privacy-export` BullMQ
+// worker: QUEUED -> PROCESSING -> COMPLETED | FAILED (a retrying attempt goes
+// back to QUEUED) -> EXPIRED. A COMPLETED export expires 24 hours after
+// completion (`expiresAt`): reads and downloads treat it as expired from that
+// moment, and the retention sweep marks it EXPIRED, deletes its files and sets
+// `filesDeletedAt`. An EXPIRED export keeps `storageKey`, so a cleanup that
+// failed or did not run is retried from the database, never lost.
+//
+// `storageKey` locates the ZIP in the private export storage root and is never
+// returned by the API. A FAILED export always carries a client-safe `error`
+// message and `errorCode`, and never an archive; `filesDeletedAt` records that
+// every (partial) file of the export was removed, and stays null until a
+// cleanup attempt succeeds so the recovery sweep can retry it. Consistency
+// rules (one active export per user, the fields a COMPLETED or FAILED export
+// must have) are enforced in the migrations.
+model DataExport {
+  id                String               @id @default(uuid())
+  authId            String
+  status            DataExportStatus     @default(QUEUED)
+  progress          Int                  @default(0)
+  idempotencyKey    String               @db.VarChar(128)
+  attempts          Int                  @default(0)
+  storageKey        String?              @db.VarChar(512)
+  sizeBytes         BigInt?
+  sha256            String?              @db.Char(64)
+  photoCount        Int?
+  missingPhotoCount Int?
+  error             String?              @db.VarChar(500)
+  errorCode         DataExportErrorCode?
+  startedAt         DateTime?
+  completedAt       DateTime?
+  expiresAt         DateTime?
+  filesDeletedAt    DateTime?
+  // Set while a worker is building this export (renewed by its heartbeat,
+  // cleared after its last storage operation). Account erasure waits until
+  // no export of the account has a live worker lease.
+  workerLeaseUntil  DateTime?
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @updatedAt
+
+  authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
+
+  @@unique([authId, idempotencyKey])
+  @@index([authId, createdAt])
+  @@index([status, expiresAt])
+  @@index([status, filesDeletedAt])
+  @@index([authId, workerLeaseUntil])
+}
+
+// ================================
+// Account Deletion Request
+// ================================
+
+// The owner's request to permanently delete their account, and the state of
+// its processing so an interrupted deletion is always resumed.
+//
+// Steps (each recorded when done, in this order):
+//   accountBlockedAt  - accepted: account PENDING_DELETION, tokens invalidated
+//   sessionsRevokedAt - every refresh session removed
+//   filesRecordedAt   - every private file of the account recorded as an
+//                       AccountDeletionFile reference (running exports stopped)
+//   filesDeletedAt    - every reference resolved: the files are deleted from
+//                       private storage (or missing, or retained because
+//                       another account uses them). Until then the account
+//                       stays closed and is NOT deleted.
+//   dataErasedAt      - one transaction hard-deleted the account and its data
+//   completedAt       - status COMPLETED
+// `lockedUntil` is a short processing lease so only one worker processes a
+// request at a time; an expired lease is picked up again.
+//
+// Deliberately no foreign key to authUser: the request must outlive the
+// account it deletes, so it stores only the pseudonymous account ID and no
+// personal data. At most one request per account is open (not COMPLETED) at a
+// time (partial unique index in the migration).
+model AccountDeletionRequest {
+  id                  String                      @id @default(uuid())
+  authId              String
+  status              AccountDeletionStatus       @default(PENDING)
+  verificationMethod  AccountDeletionVerification
+  requestedAt         DateTime                    @default(now())
+  accountBlockedAt    DateTime
+  sessionsRevokedAt   DateTime?
+  processingStartedAt DateTime?
+  filesRecordedAt     DateTime?
+  dataErasedAt        DateTime?
+  filesDeletedAt      DateTime?
+  completedAt         DateTime?
+  lockedUntil         DateTime?
+  attempts            Int                         @default(0)
+  lastError           String?                     @db.VarChar(500)
+  updatedAt           DateTime                    @updatedAt
+
+  files AccountDeletionFile[]
+
+  @@index([authId])
+  @@index([status, sessionsRevokedAt])
+  @@index([status, lockedUntil])
+}
+
+// A file (or an owner directory) of an account being deleted that must be
+// removed from private storage. References are kept until they are resolved
+// (and afterwards, as the record), so failed deletions are retried from them.
+model AccountDeletionFile {
+  id         String                    @id @default(uuid())
+  requestId  String
+  kind       AccountDeletionFileKind
+  storageKey String                    @db.VarChar(512)
+  storageProvider String               @default("local") @db.VarChar(32)
+  status     AccountDeletionFileStatus @default(PENDING)
+  attempts   Int                       @default(0)
+  lastError  String?                   @db.VarChar(200)
+  note       String?                   @db.VarChar(200)
+  resolvedAt DateTime?
+  createdAt  DateTime                  @default(now())
+
+  request AccountDeletionRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  @@unique([requestId, kind, storageProvider, storageKey], map: "AccountDeletionFile_object_key")
+  @@index([requestId, status])
+}
