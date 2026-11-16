@@ -70,6 +70,8 @@ const USER_DATA_TABLES = [
   'UserSubscription',
   'SubscriptionEvent',
   'DataExport',
+  'PaymentCustomer',
+  'CheckoutSession',
 ] as const;
 
 describeWithDatabase('Account erasure (PostgreSQL)', () => {
@@ -378,6 +380,20 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
     const payment = await client.paymentTransaction.findFirstOrThrow({
       where: { subscriptionId: subscription.id },
     });
+    const providerCustomerId = `cus_erasure_${tag}`;
+    await client.paymentCustomer.create({
+      data: { authId: user.id, provider: 'stripe', providerCustomerId },
+    });
+    await client.checkoutSession.create({
+      data: {
+        subscriptionId: subscription.id,
+        provider: 'stripe',
+        providerCustomerId,
+        billingInterval: 'MONTHLY',
+        amountCents: 1900,
+        expiresAt: new Date(Date.now() + 30 * 60_000),
+      },
+    });
 
     await client.activityLogEvent.create({
       data: {
@@ -416,7 +432,7 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
         const where =
           table === 'authUser'
             ? `"id" = '${authId}'`
-            : table === 'SubscriptionEvent'
+            : ['SubscriptionEvent', 'CheckoutSession'].includes(table)
               ? `"subscriptionId" = '${subscriptionId}'`
               : [
                     'ImageAsset',
