@@ -483,9 +483,7 @@ describeWithDatabase('Subscription security (PostgreSQL, full stack)', () => {
       ['post', '/v1/subscription/pro'],
       ['post', '/v1/subscription/activate'],
       ['post', '/v1/subscription/renew'],
-      ['post', '/v1/subscription/cancel'],
       ['post', '/v1/subscription/payments'],
-      ['get', '/v1/subscription/payments'],
       ['patch', '/v1/subscription/payments/any-id'],
       ['post', '/v1/payments'],
       ['post', '/v1/payments/webhook'],
@@ -505,6 +503,59 @@ describeWithDatabase('Subscription security (PostgreSQL, full stack)', () => {
         })
         .expect(404);
       await expect(snapshot(userId)).resolves.toEqual(before);
+    });
+
+    // POST /v1/subscription/cancel exists since cancellation at period end was
+    // added; it must not let client-supplied values change anything either.
+    // GET /v1/subscription/billing and /payments exist since billing history
+    // was added; they are read-only and never show another user's data.
+    it('cannot change state or read another user through the billing routes', async () => {
+      const userId = await createUser(client);
+      const victim = await createUser(client);
+      const before = await snapshot(userId);
+      const victimBefore = await snapshot(victim);
+      await http()
+        .get(`/v1/subscription/payments?userId=${victim}&status=PRO`)
+        .set('Authorization', bearer(userId, UserRole.SUPERADMIN))
+        .expect(400);
+      const own = await http()
+        .get('/v1/subscription/payments')
+        .set('Authorization', bearer(userId, UserRole.SUPERADMIN))
+        .send({ userId: victim, status: 'PRO', amountCents: 1900 })
+        .expect(200);
+      expect(own.body).toMatchObject({
+        data: { items: [], meta: { total: 0 } },
+      });
+      const billing = await http()
+        .get('/v1/subscription/billing')
+        .set('Authorization', bearer(userId, UserRole.SUPERADMIN))
+        .send({ userId: victim, proExpiresAt: '2099-01-01T00:00:00Z' })
+        .expect(200);
+      expect(billing.body).toMatchObject({
+        data: { subscriptionState: 'NONE', plan: null, hasProAccess: false },
+      });
+      await expect(snapshot(userId)).resolves.toEqual(before);
+      await expect(snapshot(victim)).resolves.toEqual(victimBefore);
+    });
+
+    it('cannot change subscription state through the cancel route', async () => {
+      const userId = await createUser(client);
+      const victim = await createUser(client);
+      const before = await snapshot(userId);
+      const victimBefore = await snapshot(victim);
+      await http()
+        .post('/v1/subscription/cancel?status=PRO&userId=' + victim)
+        .set('Authorization', bearer(userId, UserRole.SUPERADMIN))
+        .send({
+          userId: victim,
+          status: 'PRO',
+          proExpiresAt: '2099-01-01T00:00:00Z',
+          amountCents: 1900,
+          paymentStatus: 'SUCCEEDED',
+        })
+        .expect(409);
+      await expect(snapshot(userId)).resolves.toEqual(before);
+      await expect(snapshot(victim)).resolves.toEqual(victimBefore);
     });
 
     it('does not grant Pro access from spoofed headers, query parameters or body', async () => {

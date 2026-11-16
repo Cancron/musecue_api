@@ -84,6 +84,7 @@ const row = (overrides: Partial<Row>): Row => ({
   proCanceledAt: null,
   paymentProvider: null,
   providerSubscriptionId: null,
+  pastDueSince: null,
   ...overrides,
 });
 
