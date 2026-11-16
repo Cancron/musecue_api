@@ -9,6 +9,7 @@ import {
 } from 'nest-winston';
 import { Logger } from 'winston';
 import helmet from 'helmet';
+import { createCorsOptions } from './common/config/cors.config';
 import { setupSwagger } from './common/config/swagger.config';
 // import { AllExceptionFilter } from './common/filters/all-exception.filter';
 
@@ -82,15 +83,7 @@ async function bootstrap() {
 
   app.use(helmet(helmetConfig));
 
-  const configuredOrigins = process.env.CORS_ORIGINS?.split(',')
-    .map((origin) => origin.trim())
-    .filter(Boolean);
-  app.enableCors({
-    origin: configuredOrigins?.length
-      ? configuredOrigins
-      : ['http://localhost:8081', 'http://localhost:19006'],
-    credentials: true,
-  });
+  app.enableCors(createCorsOptions(process.env.CORS_ORIGINS));
 
   // Setup Swagger documentation
   // In production, you may want to disable or protect this endpoint

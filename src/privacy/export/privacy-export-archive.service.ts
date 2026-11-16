@@ -1,3 +1,4 @@
+import { isMissingPrivateObject } from '../../storage/private-storage.error';
 import { Injectable } from '@nestjs/common';
 import { createHash } from 'node:crypto';
 import { PrivateImageStorageService } from '../../storage/private-image-storage.service';
@@ -90,9 +91,13 @@ export class PrivacyExportArchiveService {
         stopIfCancelled();
         let bytes: Buffer;
         try {
-          bytes = await this.images.read(photo.storageKey);
+          bytes = await this.images.read({
+            provider: photo.storageProvider ?? 'local',
+            key: photo.storageKey,
+          });
         } catch (error) {
-          if (!isMissingFileError(error)) throw error;
+          if (!isMissingFileError(error) && !isMissingPrivateObject(error))
+            throw error;
           unavailable.push({
             kind: photo.kind,
             imageId: photo.imageId,

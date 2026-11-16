@@ -6,7 +6,7 @@ This NestJS service is the application authority for MuseCue — AI makeup guida
 
 ## Architecture rules
 
-- Supabase is not used. NestJS is the only authentication and application backend.
+- Supabase Auth, Database, and client SDKs are not used. NestJS is the only authentication and application backend. Supabase Storage is used only as a server-side private object store behind `StorageModule`.
 - AI may analyze, recommend, generate, and evaluate. NestJS must validate AI output, persist it, and decide workflow transitions.
 - Do not allow AI responses to mutate application state directly.
 - Long-running AI and image operations belong in BullMQ workers, not synchronous request handlers.

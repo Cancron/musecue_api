@@ -1,10 +1,25 @@
+import {
+  FakeSupabaseStorage,
+  FAKE_SUPABASE,
+  unavailable,
+} from './support/fake-supabase-storage';
+import { SupabaseStorageProvider } from '../src/storage/providers/supabase-storage.provider';
+import { LocalFilesystemStorageProvider } from '../src/storage/providers/local-filesystem-storage.provider';
+import { localImageStorage } from './support/local-image-storage';
 import { ConfigService } from '@nestjs/config';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient } from '@prisma/client';
 import * as bcrypt from 'bcryptjs';
 import { mock } from 'jest-mock-extended';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { Logger } from 'winston';
@@ -31,7 +46,10 @@ import { ActivityLogService } from '../src/common/services/activity-log.service'
 import { SubscriptionAccessService } from '../src/subscription/subscription-access.service';
 import { SubscriptionPlanService } from '../src/subscription/subscription-plan.service';
 import type { Job } from 'bullmq';
-import { PrivateImageStorageService } from '../src/storage/private-image-storage.service';
+import {
+  PrivateImageStorageService,
+  type PrivateObjectRef,
+} from '../src/storage/private-image-storage.service';
 import { PrivacyExportStorageService } from '../src/storage/privacy-export-storage.service';
 import { FakeRedis } from './support/account-deletion-fakes';
 import {
@@ -100,7 +118,10 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
     await applyMigrations(schema, migrationNames());
     client = new PrismaClient({
       adapter: new PrismaPg(
-        { connectionString: TEST_DATABASE_URL as string },
+        {
+          connectionString: TEST_DATABASE_URL as string,
+          options: `-c search_path=${schema}`,
+        },
         { schema },
       ),
     });
@@ -128,7 +149,7 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
       codes,
       mock<Logger>(),
     );
-    images = new PrivateImageStorageService();
+    images = localImageStorage();
     exportsStorage = new PrivacyExportStorageService();
     erasure = new AccountErasureService(
       prisma,
@@ -140,7 +161,7 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
     );
     // A real export worker (with its own storage instances, so tests can
     // pause it while it reads a photo).
-    workerImages = new PrivateImageStorageService();
+    workerImages = localImageStorage();
     const workerLogger = mock<Logger>();
     exportProcessor = new PrivacyExportProcessor(
       prisma,
@@ -254,7 +275,12 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
     const avatarKey = `${user.id}/profile/${randomUUID()}.png`;
     await putFile('images', avatarKey);
     await client.userProfile.create({
-      data: { authId: user.id, firstName: 'First', avatarUrl: avatarKey },
+      data: {
+        authId: user.id,
+        firstName: 'First',
+        avatarUrl: avatarKey,
+        avatarStorageProvider: 'local',
+      },
     });
 
     const session = await client.makeupSession.create({
@@ -294,6 +320,7 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
         sessionId: session.id,
         purpose: 'INITIAL_ANALYSIS',
         source: 'PRIVATE_UPLOAD',
+        storageProvider: 'local',
         storageKey: photoKey,
         mimeType: 'image/jpeg',
         width: 1,
@@ -823,7 +850,7 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
     // The failing file is still on disk and still referenced; the other
     // files were deleted.
     const left = (await filesUnder('images', victim.id)).map((path) =>
-      path.slice(join(root, 'images').length + 1),
+      path.slice(join(root, 'images').length + 1).replaceAll('\\', '/'),
     );
     expect(left).toEqual([photoKey]);
     expect(pending.files.filter((file) => file.status === 'PENDING')).toEqual(
@@ -868,6 +895,7 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
         sessionId: bystanderSession.id,
         purpose: 'COMPLETION',
         source: 'PRIVATE_UPLOAD',
+        storageProvider: 'local',
         storageKey: sharedKey,
         mimeType: 'image/jpeg',
         width: 1,
@@ -880,7 +908,7 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
     await expect(recovery.resume()).resolves.toMatchObject({ completed: 1 });
 
     const left = (await filesUnder('images', victim.id)).map((path) =>
-      path.slice(join(root, 'images').length + 1),
+      path.slice(join(root, 'images').length + 1).replaceAll('\\', '/'),
     );
     expect(left).toEqual([sharedKey]);
     const files = await client.accountDeletionFile.findMany({
@@ -938,11 +966,11 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
       const gate = new Promise<void>((resolve) => (resume = resolve));
       let paused = false;
       const read = workerImages.read.bind(workerImages) as (
-        key: string,
+        ref: PrivateObjectRef,
       ) => Promise<Buffer>;
       const readSpy = jest
         .spyOn(workerImages, 'read')
-        .mockImplementation(async (key: string) => {
+        .mockImplementation(async (key) => {
           paused = true;
           await gate;
           return read(key);
@@ -1123,7 +1151,7 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
       const bystanderFiles = await filesUnder('images', bystander.id);
       const requestId = await acceptDeletion(victim.id);
       // Worker A gets stuck inside its first storage operation.
-      const slowImages = new PrivateImageStorageService();
+      const slowImages = localImageStorage();
       const deleteFile = slowImages.deleteOwnerFile.bind(slowImages) as (
         authId: string,
         key: string,
@@ -1196,7 +1224,7 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
       // Several instances sweep at the same time; count real deletions.
       const deleted: string[] = [];
       const instances = Array.from({ length: 3 }, () => {
-        const instanceImages = new PrivateImageStorageService();
+        const instanceImages = localImageStorage();
         const realDelete = instanceImages.deleteOwnerFile.bind(
           instanceImages,
         ) as (authId: string, key: string) => Promise<boolean>;
@@ -1245,6 +1273,135 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
       expect(await filesUnder('images', bystander.id)).toEqual(bystanderFiles);
     });
   });
+
+  it('retries cloud account erasure after restart using each saved provider, including orphan objects', async () => {
+    const victim = await seedAccount();
+    const api = new FakeSupabaseStorage();
+    const cloud = new PrivateImageStorageService(
+      [
+        new SupabaseStorageProvider(
+          {
+            storageUrl: FAKE_SUPABASE.url,
+            serviceKey: FAKE_SUPABASE.serviceKey,
+            bucket: FAKE_SUPABASE.bucket,
+            timeoutMs: 1000,
+          },
+          api.fetch,
+        ),
+        new LocalFilesystemStorageProvider(join(root, 'images')),
+      ],
+      { activeProvider: 'supabase', localRoot: join(root, 'images') },
+      mock<Logger>(),
+    );
+    for (const file of await filesUnder('images', victim.id)) {
+      const key = file
+        .slice(join(root, 'images').length + 1)
+        .replaceAll('\\', '/');
+      api.objects.set(key, {
+        bytes: await readFile(file),
+        contentType: 'image/jpeg',
+      });
+      await images.deleteOwnerFile(victim.id, key);
+    }
+    api.objects.set(victim.id + '/profile/orphan.jpg', {
+      bytes: Buffer.from('orphan'),
+      contentType: 'image/jpeg',
+    });
+    api.objects.set('another/profile/keep.jpg', {
+      bytes: Buffer.from('keep'),
+      contentType: 'image/jpeg',
+    });
+    await client.imageAsset.updateMany({
+      where: { session: { authId: victim.id } },
+      data: { storageProvider: 'supabase' },
+    });
+    await client.userProfile.update({
+      where: { authId: victim.id },
+      data: { avatarStorageProvider: 'supabase' },
+    });
+    const requestId = await acceptDeletion(victim.id);
+    const instance = () =>
+      new AccountErasureService(
+        prisma,
+        auth,
+        codes,
+        cloud,
+        exportsStorage,
+        mock<Logger>(),
+      );
+    api.failNext('remove', unavailable);
+    await expect(instance().process(requestId)).resolves.toBe('PENDING');
+    expect(
+      await client.authUser.findUnique({ where: { id: victim.id } }),
+    ).not.toBeNull();
+    expect(
+      await client.accountDeletionFile.count({
+        where: { requestId, storageProvider: 'supabase', status: 'PENDING' },
+      }),
+    ).toBeGreaterThan(0);
+    const recovered = await instance().process(requestId);
+    expect(
+      await client.accountDeletionRequest.findUnique({
+        where: { id: requestId },
+        select: { status: true, lastError: true },
+      }),
+    ).toMatchObject({ status: 'COMPLETED', lastError: null });
+    expect(recovered).toBe('COMPLETED');
+    expect(
+      await client.authUser.findUnique({ where: { id: victim.id } }),
+    ).toBeNull();
+    expect([...api.objects.keys()]).toEqual(['another/profile/keep.jpg']);
+  });
+
+  it.each([
+    ['an unregistered backend', 'retired-storage'],
+    ['an unconfigured backend', 'supabase'],
+  ])(
+    'does not complete erasure while orphan cleanup needs %s',
+    async (_label, provider) => {
+      const victim = await seedAccount();
+      const key = victim.id + '/profile/orphan-only-in-cleanup.jpg';
+      await client.privateStorageCleanup.create({
+        data: {
+          provider,
+          storageKey: key,
+          reason: 'UPLOAD_ABANDONED',
+          status: 'FAILED',
+        },
+      });
+      const requestId = await acceptDeletion(victim.id);
+      const instanceStorage = new PrivateImageStorageService(
+        [
+          new LocalFilesystemStorageProvider(join(root, 'images')),
+          new SupabaseStorageProvider(undefined),
+        ],
+        { activeProvider: 'local', localRoot: join(root, 'images') },
+        mock<Logger>(),
+      );
+      const instance = new AccountErasureService(
+        prisma,
+        auth,
+        codes,
+        instanceStorage,
+        exportsStorage,
+        mock<Logger>(),
+      );
+      await expect(instance.process(requestId)).resolves.toBe('PENDING');
+      expect(
+        await client.authUser.findUnique({ where: { id: victim.id } }),
+      ).not.toBeNull();
+      expect(
+        await client.accountDeletionRequest.findUnique({
+          where: { id: requestId },
+        }),
+      ).toMatchObject({ completedAt: null });
+      expect(
+        await client.privateStorageCleanup.findUnique({
+          where: { provider_storageKey: { provider, storageKey: key } },
+        }),
+      ).not.toBeNull();
+    },
+  );
 
   it('performs the deletion once, however often or concurrently it is processed', async () => {
     const victim = await seedAccount();

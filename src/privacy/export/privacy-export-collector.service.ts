@@ -36,6 +36,7 @@ const ACCOUNT_SELECT = {
       lastName: true,
       bio: true,
       avatarUrl: true,
+      avatarStorageProvider: true,
       createdAt: true,
       updatedAt: true,
     },
@@ -257,6 +258,7 @@ export type PhotoUnavailableReason =
 
 /** A private photo to copy into the archive. */
 export interface ExportPhoto {
+  storageProvider?: string;
   archivePath: string;
   kind: 'AVATAR' | 'SESSION_IMAGE';
   imageId: string | null;
@@ -278,7 +280,10 @@ export interface PrivacyExportSnapshot {
   generatedAt: Date;
   account: Omit<ExportAccount, 'authSecurity' | 'userProfile'>;
   security: ExportAccount['authSecurity'];
-  profile: Omit<NonNullable<ExportAccount['userProfile']>, 'avatarUrl'> | null;
+  profile: Omit<
+    NonNullable<ExportAccount['userProfile']>,
+    'avatarUrl' | 'avatarStorageProvider'
+  > | null;
   /** An avatar hosted elsewhere (for example by the OAuth provider). */
   externalAvatarUrl: string | null;
   sessions: ExportSession[];
@@ -335,6 +340,7 @@ export class PrivacyExportCollectorService {
           source: true,
           mimeType: true,
           storageKey: true,
+          storageProvider: true,
         },
       }),
       this.prisma.aiRun.findMany({
@@ -382,6 +388,7 @@ export class PrivacyExportCollectorService {
           ...photo,
           archivePath: `photos/profile/avatar${extension}`,
           storageKey: avatarKey,
+          storageProvider: userProfile?.avatarStorageProvider ?? 'local',
         });
       } else {
         unavailablePhotos.push({ ...photo, reason: 'UNAVAILABLE' });
@@ -411,6 +418,7 @@ export class PrivacyExportCollectorService {
           ...photo,
           archivePath: `photos/sessions/${image.sessionId}/${image.id}${extension}`,
           storageKey: image.storageKey,
+          storageProvider: image.storageProvider ?? 'local',
         });
       }
     }

@@ -59,7 +59,11 @@ export class AccountNotPendingDeletionError extends Error {
   }
 }
 
-type FileReference = { kind: AccountDeletionFileKind; storageKey: string };
+type FileReference = {
+  kind: AccountDeletionFileKind;
+  storageKey: string;
+  storageProvider?: string;
+};
 type FileResolution = {
   status: Exclude<AccountDeletionFileStatus, 'PENDING'>;
   note?: string;
@@ -248,6 +252,32 @@ export class AccountErasureService {
     });
   }
 
+  /**
+   * Pending/failed cleanup can be the only reference to an orphan image.
+   * Keep its provider in the erasure scan even when it is unavailable, so
+   * erasure waits for recovery rather than reporting that storage is clean.
+   */
+  private async imageProviders(
+    tx: Prisma.TransactionClient,
+    authId: string,
+    referenced: string[] = [],
+  ): Promise<string[]> {
+    const cleanup = await tx.privateStorageCleanup.findMany({
+      where: { storageKey: { startsWith: authId + '/' } },
+      select: { provider: true },
+      distinct: ['provider'],
+    });
+    const providers = new Set(
+      (this.images.registeredProviderIds ?? ['local']).filter(
+        (provider) =>
+          !this.images.isAvailable || this.images.isAvailable(provider),
+      ),
+    );
+    for (const provider of referenced) providers.add(provider);
+    for (const row of cleanup ?? []) providers.add(row.provider);
+    return [...providers].sort();
+  }
+
   /** Every private file the account has. */
   private async collectFiles(
     tx: Prisma.TransactionClient,
@@ -256,7 +286,12 @@ export class AccountErasureService {
     const files: FileReference[] = [];
     const images = await tx.imageAsset.findMany({
       where: { session: { authId } },
-      select: { sessionId: true, storageKey: true, source: true },
+      select: {
+        sessionId: true,
+        storageKey: true,
+        storageProvider: true,
+        source: true,
+      },
     });
     for (const image of images) {
       // Only private uploads inside the owner's own scope; shared assets
@@ -265,18 +300,26 @@ export class AccountErasureService {
         image.source === 'PRIVATE_UPLOAD' &&
         isOwnedPrivateImageKey(image.storageKey, authId, image.sessionId)
       ) {
-        files.push({ kind: 'PRIVATE_IMAGE', storageKey: image.storageKey });
+        files.push({
+          kind: 'PRIVATE_IMAGE',
+          storageKey: image.storageKey,
+          storageProvider: image.storageProvider ?? 'local',
+        });
       }
     }
     const profile = await tx.userProfile.findUnique({
       where: { authId },
-      select: { avatarUrl: true },
+      select: { avatarUrl: true, avatarStorageProvider: true },
     });
     if (
       profile?.avatarUrl &&
       isOwnedPrivateImageKey(profile.avatarUrl, authId, 'profile')
     ) {
-      files.push({ kind: 'PRIVATE_IMAGE', storageKey: profile.avatarUrl });
+      files.push({
+        kind: 'PRIVATE_IMAGE',
+        storageKey: profile.avatarUrl,
+        storageProvider: profile.avatarStorageProvider ?? 'local',
+      });
     }
     const archives = await tx.dataExport.findMany({
       where: { authId, storageKey: { not: null } },
@@ -291,10 +334,21 @@ export class AccountErasureService {
       }
     }
     // Directory sweeps catch files no row references (and partial archives).
-    files.push(
-      { kind: 'IMAGE_OWNER_DIRECTORY', storageKey: authId },
-      { kind: 'EXPORT_OWNER_DIRECTORY', storageKey: authId },
-    );
+    files.push({ kind: 'EXPORT_OWNER_DIRECTORY', storageKey: authId });
+    const referencedProviders = files
+      .filter((file) => file.kind === 'PRIVATE_IMAGE')
+      .map((file) => file.storageProvider ?? 'local');
+    for (const provider of await this.imageProviders(
+      tx,
+      authId,
+      referencedProviders,
+    )) {
+      files.push({
+        kind: 'IMAGE_OWNER_DIRECTORY',
+        storageKey: authId,
+        storageProvider: provider,
+      });
+    }
     return files;
   }
 
@@ -408,14 +462,25 @@ export class AccountErasureService {
       (
         await this.prisma.accountDeletionFile.findMany({
           where: { requestId: request.id, status: 'RETAINED' },
-          select: { storageKey: true },
+          select: { storageKey: true, storageProvider: true },
         })
-      ).map((file) => file.storageKey),
+      ).map(
+        (file) => (file.storageProvider ?? 'local') + ':' + file.storageKey,
+      ),
     );
     const leftovers: FileReference[] = [];
-    for (const key of await this.images.listOwnerFiles(authId)) {
-      if (!retained.has(key) && !(await this.isSharedImage(key, authId))) {
-        leftovers.push({ kind: 'PRIVATE_IMAGE', storageKey: key });
+    for (const provider of await this.imageProviders(this.prisma, authId)) {
+      for (const key of await this.images.listOwnerFiles(authId, provider)) {
+        if (
+          !retained.has(provider + ':' + key) &&
+          !(await this.isSharedImage(key, authId, provider))
+        ) {
+          leftovers.push({
+            kind: 'PRIVATE_IMAGE',
+            storageKey: key,
+            storageProvider: provider,
+          });
+        }
       }
     }
     for (const key of await this.exports.listOwnerFiles(authId)) {
@@ -436,6 +501,7 @@ export class AccountErasureService {
             requestId: request.id,
             kind: file.kind,
             storageKey: file.storageKey,
+            storageProvider: file.storageProvider ?? 'local',
             status: { in: ['DELETED', 'MISSING'] },
           },
           data: {
@@ -458,11 +524,23 @@ export class AccountErasureService {
         if (!this.isInOwnerScope(file.storageKey, authId)) {
           return { status: 'RETAINED', note: FILE_NOTES.OUT_OF_SCOPE };
         }
-        if (await this.isSharedImage(file.storageKey, authId)) {
+        if (
+          await this.isSharedImage(
+            file.storageKey,
+            authId,
+            file.storageProvider,
+          )
+        ) {
           return { status: 'RETAINED', note: FILE_NOTES.SHARED };
         }
         return this.deleteOne(() =>
-          this.images.deleteOwnerFile(authId, file.storageKey),
+          file.storageProvider && file.storageProvider !== 'local'
+            ? this.images.deleteOwnerFile(
+                authId,
+                file.storageKey,
+                file.storageProvider,
+              )
+            : this.images.deleteOwnerFile(authId, file.storageKey),
         );
       }
       case 'EXPORT_ARCHIVE': {
@@ -474,8 +552,24 @@ export class AccountErasureService {
         );
       }
       case 'IMAGE_OWNER_DIRECTORY':
-        return this.sweepOwnerDirectory(authId, file, this.images, (key) =>
-          this.isSharedImage(key, authId),
+        return this.sweepOwnerDirectory(
+          authId,
+          file,
+          {
+            listOwnerFiles: (owner) =>
+              file.storageProvider && file.storageProvider !== 'local'
+                ? this.images.listOwnerFiles(owner, file.storageProvider)
+                : this.images.listOwnerFiles(owner),
+            deleteOwnerFile: (owner, key) =>
+              file.storageProvider && file.storageProvider !== 'local'
+                ? this.images.deleteOwnerFile(owner, key, file.storageProvider)
+                : this.images.deleteOwnerFile(owner, key),
+            pruneOwnerDirectories: (owner) =>
+              file.storageProvider && file.storageProvider !== 'local'
+                ? this.images.pruneOwnerDirectories(owner, file.storageProvider)
+                : this.images.pruneOwnerDirectories(owner),
+          },
+          (key) => this.isSharedImage(key, authId, file.storageProvider),
         );
       case 'EXPORT_OWNER_DIRECTORY':
         // Archives (finished and partial) are never shared.
@@ -548,13 +642,22 @@ export class AccountErasureService {
   private async isSharedImage(
     storageKey: string,
     authId: string,
+    provider = 'local',
   ): Promise<boolean> {
     const [images, avatars] = await Promise.all([
       this.prisma.imageAsset.count({
-        where: { storageKey, session: { authId: { not: authId } } },
+        where: {
+          storageKey,
+          storageProvider: provider,
+          session: { authId: { not: authId } },
+        },
       }),
       this.prisma.userProfile.count({
-        where: { avatarUrl: storageKey, authId: { not: authId } },
+        where: {
+          avatarUrl: storageKey,
+          avatarStorageProvider: provider,
+          authId: { not: authId },
+        },
       }),
     ]);
     return images + avatars > 0;

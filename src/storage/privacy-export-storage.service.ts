@@ -175,7 +175,13 @@ export class PrivacyExportStorageService {
     const scope = this.scopeKey(authId, exportId);
     const directory = resolve(this.root, scope);
     if (!options.keep) {
-      await rm(directory, { recursive: true, force: true });
+      // Concurrent sweepers can transiently hold the directory open on Windows.
+      await rm(directory, {
+        recursive: true,
+        force: true,
+        maxRetries: 3,
+        retryDelay: 25,
+      });
       await rmdir(resolve(this.root, authId)).catch(() => undefined);
       return;
     }
@@ -193,7 +199,13 @@ export class PrivacyExportStorageService {
     }
     for (const entry of entries) {
       const path = join(directory, entry);
-      if (path !== keepPath) await rm(path, { recursive: true, force: true });
+      if (path !== keepPath)
+        await rm(path, {
+          recursive: true,
+          force: true,
+          maxRetries: 3,
+          retryDelay: 25,
+        });
     }
   }
 

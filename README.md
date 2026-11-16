@@ -2,7 +2,7 @@
 
 **AI makeup guidance, made for your face.**
 
-The MuseCue API is the NestJS authority for authentication, authorization, workflow state, persistence, and AI orchestration. Supabase is not used. AI providers may interpret or generate data, but only NestJS validates results and advances application state.
+The MuseCue API is the NestJS authority for authentication, authorization, workflow state, persistence, and AI orchestration. Supabase Auth and Database are not used; Supabase Storage serves only as the server-side private image store. AI providers may interpret or generate data, but only NestJS validates results and advances application state.
 
 The companion mobile application and detailed product specifications live in `../face_makeup_app`.
 
@@ -11,7 +11,7 @@ The companion mobile application and detailed product specifications live in `..
 - PostgreSQL/Prisma local accounts, SMTP verification through BullMQ, login auditing, account lockout, and Google OAuth foundations
 - short-lived JWT access tokens and rotating, revocable Redis-backed refresh tokens
 - owner-scoped makeup sessions and the documented workflow state machine
-- validated multipart image upload, private filesystem storage, image metadata, structured preferences, face analysis, ranked recommendations, saved looks, and selection
+- validated multipart image upload, private object storage (a private Supabase Storage bucket by default, behind a provider interface), image metadata, structured preferences, face analysis, ranked recommendations, saved looks, and selection
 - generated guides, authoritative step progression, retained visual attempts, contextual questions, completion history, profile statistics, and optional private profile avatars
 - BullMQ jobs for personalization, guide generation, visual checks, and guide questions
 - `AiRun` audit records containing operation, provider, model, prompt version, latency, progress, result/error, and status
@@ -24,7 +24,9 @@ Migration `20260827174107_add_makeup_workflow` adds the makeup aggregate and rem
 
 Intentionally deferred:
 
-- a production cloud object-storage adapter and short-lived signed reads; the current private filesystem adapter is intended for local/self-hosted deployments
+- signed URLs for avatars and for images still on the local filesystem (they keep using the authenticated content routes)
+- copying images stored on the filesystem before the Supabase migration into the bucket (they remain readable through the `local` provider while its directory is present)
+- additional S3-compatible storage providers (the provider interface is in place; see "Private image storage")
 - generated preview images (recommendation reasoning is live, while the existing curated preview-image contract remains in place)
 - production retention/deletion automation and AI cost accounting
 
@@ -159,7 +161,126 @@ The API defaults to `http://localhost:5000`; development Swagger is at `http://l
 
 Important environment variables are documented in `.env.example`. Never commit the real `.env` or log SMTP credentials, tokens, image contents, or future signed URLs.
 
-`PRIVATE_UPLOAD_DIR` controls the private image root and defaults to `.data/private-images`. The directory is ignored by Git and is never mounted as a public static directory.
+### Private image storage
+
+Face photos, step snapshots, and profile avatars are written to a **private** Supabase Storage bucket by default. The API validates the image and checks ownership first, then uploads the bytes with a server-side secret key. It records the object key and the provider that holds it (`ImageAsset.storageKey` + `storageProvider`, `userProfile.avatarUrl` + `avatarStorageProvider`). Clients never receive the credentials. Images are served through the authenticated content routes, or through a 60-second signed URL (see "Signed image URLs").
+
+1. In the Supabase dashboard, create a bucket (for example `musecue-private-images`) with **Public bucket switched off**. We recommend a 10 MB file size limit and allowed MIME types `image/jpeg, image/png, image/webp`. No RLS policies are needed: only the server's secret key accesses the bucket.
+2. Set the server-side variables (see `.env.example`):
+
+   ```dotenv
+   PRIVATE_STORAGE_PROVIDER=supabase
+   SUPABASE_URL=https://your-project-ref.supabase.co
+   SUPABASE_SERVICE_ROLE_KEY=your-secret-or-service-role-key
+   SUPABASE_STORAGE_BUCKET=musecue-private-images
+   # SUPABASE_STORAGE_TIMEOUT_MS=15000
+   ```
+
+3. Run `npx prisma migrate deploy` (migrations `20261112120000_add_private_storage_provider`, `20261112130000_add_private_storage_cleanup` and `20261112140000_enforce_avatar_storage_provider`) and restart the API and workers.
+
+For Docker deployments, `docker-compose.prod.yaml` passes these variables into the container at runtime. Compose reads them from the deploy host's environment or from the `.env` file next to the compose files on the server. `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` and `SUPABASE_STORAGE_BUCKET` are required; if one is missing, `docker-compose` stops before starting anything. `.dockerignore` excludes `.env` and `.env.*` (except `.env.example`), so secrets never enter the build context or image layers.
+
+Startup fails when the active provider is misconfigured: a missing variable, a non-https URL (http is accepted only for a local Supabase stack on loopback), or a publishable/anon key. Errors name the variable, never its value. Before uploading, the API checks that the bucket exists and is private. It re-checks every 5 minutes and refuses uploads to a public bucket. Never expose `SUPABASE_*` values to the mobile app or through an `EXPO_PUBLIC_`-style variable.
+
+Every workflow reads, signs and deletes an image through the provider and key recorded on its row; nothing derives a filesystem path. This covers face photos, step snapshots and checks, avatar uploads, replacements and removals, session deletion, and the AI worker. New uploads always go to the active provider (Supabase). The local filesystem provider stays registered only so images stored before the migration (marked `local`) can still be read and deleted. It is **read-only** unless `PRIVATE_STORAGE_PROVIDER=local`, so no new image can land on the filesystem. Keep `PRIVATE_UPLOAD_DIR` (default `.data/private-images`, ignored by Git and never served statically) available until those old files are copied to the bucket or expire. `PRIVATE_STORAGE_PROVIDER=local` writes new uploads to that directory for offline development. Test runs (`NODE_ENV=test`) use `local` unless configured otherwise.
+
+Avatars are either a private upload (`avatarUrl` holds the storage key and `avatarStorageProvider` holds its provider) or an external URL such as a Google profile photo (`avatarStorageProvider` is `NULL`). A database CHECK constraint enforces this, so a provider is never guessed. External avatar URLs are returned unchanged by `GET /v1/profile`, are never sent to storage, and are never deleted. Avatar uploads, replacements and removals lock the profile row. A first upload creates the row before locking it, so parallel uploads always leave exactly one stored avatar.
+
+Storage failures never expose provider details to clients:
+
+| Situation                                             | Upload / image read response                             | Worker (analysis, visual check)         |
+| ----------------------------------------------------- | -------------------------------------------------------- | --------------------------------------- |
+| Object missing                                        | read: `404` (`Image content is unavailable`)             | run fails immediately with a clear message |
+| Network error, timeout, rate limit, provider `5xx`     | `503` `Image storage is temporarily unavailable. Please try again.` | retried within the job's retry budget   |
+| Misconfiguration, public/missing bucket, rejected key | `500` `Image storage is unavailable`                     | run fails                               |
+
+Logs include the provider, operation, error code, and HTTP status, never URLs, credentials, or image bytes.
+
+#### Failed uploads, replacements, and deletions
+
+The `PrivateStorageCleanup` table records every object that is, or may become, unreferenced. It is written so that no case depends on a log line:
+
+| Case | What is recorded, and when | Outcome |
+| ---- | -------------------------- | ------- |
+| Upload | An `UPLOAD_PENDING` reservation, **before** any bytes are written. If it cannot be saved, nothing is uploaded (`503`). | The transaction that stores the image reference removes the reservation. |
+| Upload rejected by the provider (4xx, access denied) | Nothing was stored. | The reservation is removed. |
+| Upload timeout, network error or provider `5xx` | The bytes may have been stored, or may still land after the client gave up. | The reservation becomes `UPLOAD_ABANDONED` and is deleted after a 10-minute settle period, so a late write cannot outlive the deletion. |
+| Database write fails after the upload | The rollback keeps the reservation. | It becomes `UPLOAD_ABANDONED` and is deleted. If the database itself is down, the cleaner deletes it once the 1-hour reservation expires. |
+| Process crash between upload and commit | The reservation stays. | After 1 hour the cleaner marks it abandoned and deletes it. A late commit is then refused with `409`. |
+| Replaced image or avatar, deleted session or avatar, discarded check image | A row (`IMAGE_REPLACED`, `AVATAR_REPLACED`, `SESSION_DELETED`, `AVATAR_REMOVED`, `IMAGE_DISCARDED`) in the **same transaction** that removes the reference. | Deleted right after the commit, then by the cleaner. |
+
+A row is removed only after the provider confirms the deletion. A failed deletion is never treated as done. Supabase's bulk remove answers `200` with an empty list both for an already-missing object and for a delete that was silently not applied (for example, missing permissions). The API therefore counts a removal as done only if the key is listed as removed, or a follow-up lookup confirms the object is gone; otherwise it records `DELETE_NOT_APPLIED` and retries. The row stays `PENDING` with `attempts`, `lastErrorCode`, `lastAttemptAt` and `nextAttemptAt`, and is retried with exponential backoff (30 s doubling, capped at 6 h). After 14 attempts, or immediately for an invalid key, it becomes `FAILED`: it stays in the table for manual recovery, the cleaner no longer retries it, and an error is logged (`Private image deletion failed permanently; manual recovery required`). The user's request still succeeds: the database change is committed and the object deletion is pending.
+
+A background cleaner runs every minute on each API/worker instance (not when `NODE_ENV=test`). Instances claim rows atomically, so each deletion is attempted by one instance at a time, and a database error on one row does not stop the rest of the batch. Only full, validated object keys (`<user>/<scope>/<uuid>.<ext>`) are ever sent to the provider for deletion. A folder-like or empty key is refused before any request and marked `FAILED` (`INVALID_STORAGE_KEY`), so no row can remove other images by prefix. Before deleting, the cleaner checks that no `ImageAsset` or avatar still references the key; if one does, it keeps the object and drops the row.
+
+How failures during deletion are handled:
+
+- **Provider crash or timeout.** After the first transient failure for a provider, the remaining deletions for that provider are left queued (`PENDING`, due) instead of each waiting for a timeout. A session with many images therefore costs one timeout, not one per image, and the cleaner keeps serving other providers in the same pass.
+- **Database failure.**
+  - The reference change and its deletion records commit together, or neither does.
+  - If the object was deleted but its row could not be removed, the row is retried after its lease; the delete is idempotent.
+  - If a failed deletion could not be recorded, it is retried after the lease and recorded then.
+- **Process crash.** At each point (after the commit, after claiming a row, after the provider deleted the object) the row stays in the table, and any instance completes it after the 5-minute lease.
+- **Repeats and concurrency.**
+  - Every cleaner write is fenced on its own claim (`lastAttemptAt`). A stale or slow cleaner can never remove a row that a newer request has re-recorded.
+  - Recording a deletion for an object that already has a row re-arms that row (pending, due now, attempts reset) instead of silently skipping it.
+  - Each object is deleted once, however often requests or recovery run.
+- **Other users' files.** Deletions are recorded only for keys inside the requesting user's own folder (`<userId>/...`). A corrupted reference into another user's folder is refused and logged, never queued.
+
+Every row keeps the `provider` and `storageKey` needed for recovery until the provider confirms the deletion.
+
+To inspect or recover:
+
+```sql
+SELECT id, provider, "storageKey", reason, status, attempts, "lastErrorCode", "nextAttemptAt"
+FROM "PrivateStorageCleanup" ORDER BY "createdAt";
+
+-- After fixing the cause (credentials, bucket, provider outage), requeue failed rows:
+UPDATE "PrivateStorageCleanup"
+SET status = 'PENDING', attempts = 0, "nextAttemptAt" = now(), "lastAttemptAt" = NULL
+WHERE status = 'FAILED';
+```
+
+The same recovery is available in code as `PrivateImageLifecycleService.requeueFailedDeletions({ provider?, ids? })`. It only touches `FAILED` rows, keeps provider, key, reason and last error, and is safe to run repeatedly or while the cleaner runs. No HTTP endpoint is exposed for it.
+
+#### Signed image URLs
+
+`GET /v1/images/:imageId/signed-url` (bearer token) returns a direct download URL for an image the caller owns:
+
+```json
+{ "url": "https://<project>.supabase.co/storage/v1/object/sign/<bucket>/<key>?token=...", "expiresAt": "2026-11-12T12:01:00.000Z", "expiresInSeconds": 60 }
+```
+
+- The URL is generated from the provider and key stored on the image and is valid for 60 seconds. Each call issues a new URL, so clients request another one when it expires. URLs are never stored or logged, and the response is sent with `Cache-Control: private, no-store`.
+- The URL contains only an object-scoped token signed by Supabase, never the server key. It reveals the Supabase host, the bucket name and the object key (which contains the user's own id and session id).
+- `expiresAt` is the expiry reported by the storage provider (for Supabase, the signed token's `exp`), never the API's request time + 60 s. `expiresInSeconds` is the provider's issued lifetime (`exp − iat`), so `expiresAt = issuedAt + expiresInSeconds` always holds. Both come from the provider's clock: a slow signing call or a clock difference between the API and the provider is reflected exactly. Clients that don't trust their own clock should count down `expiresInSeconds` from when they received the response.
+- The maximum lifetime is strictly 60 seconds. The API asks for 60 s, and both the facade and the provider refuse longer requests. It accepts a provider response only if it is a signed URL for exactly that bucket and key, and its token is a JWT whose signed lifetime (`exp − iat`) is at most the requested 60 s. There is no clock-skew allowance. Tokens without readable `iat`/`exp` claims are rejected rather than trusted. Because the lifetime comes from the issuer's own claims, this does not depend on the API and Supabase clocks agreeing.
+- Responses: `401` without a valid token. `404` `Image not found` for a missing image *or another user's image* (they are indistinguishable). `404` `Image content is unavailable` for a missing object or a non-uploaded image. `409` for images still on the local filesystem (use `/content`). `503` or `500` for storage failures, as in the table above.
+- `GET /v1/images/:imageId/content` is unchanged.
+- Clients download directly from the Supabase host, so the mobile app must be allowed to reach it.
+
+`GET /v1/profile/avatar/signed-url` (bearer token) returns the same `{ url, expiresAt, expiresInSeconds: 60 }` for the caller's **own** uploaded avatar:
+
+- It goes through the same code path as makeup images (`issueSignedImageUrl`), so the safeguards are identical: the provider and key stored on the profile, the strict 60-second limit checked against the provider's token, nothing stored or logged, `Cache-Control: private, no-store`, and the same safe error mapping.
+- The user comes only from the access token; there is no route or query parameter to select another user. A stored avatar key must also be inside the caller's `<userId>/profile/` folder. Otherwise the API answers `404` and contacts no storage provider, so even a corrupted profile row cannot expose another user's file. The same check now protects `GET /v1/profile/avatar/content`.
+- Responses: `401` without a valid token. `404` `Avatar image is unavailable` when there is no avatar or its object is missing. `409` for external avatars, and for avatars still on the local filesystem (use `/v1/profile/avatar/content`). `503` or `500` for storage failures.
+- External avatars (for example a Google profile photo) are never signed or replaced. `GET /v1/profile` keeps returning their URL unchanged, and this endpoint answers `409` `This avatar is an external image and has no signed URL. Use avatarUrl from the profile instead.`
+- Changing or removing an avatar never leaves the profile pointing at a missing file. The new file is confirmed in the same transaction that updates the profile, the old file is only recorded for deletion in that transaction, and the old file is deleted only after the commit. Signed URLs issued for an old avatar stop working once it is deleted.
+
+#### Storage providers
+
+New uploads go to the provider named by `PRIVATE_STORAGE_PROVIDER` (default `supabase`). Every image and avatar row stores the provider that holds it. Downloads, deletions, signed URLs and AI-worker reads always use that stored provider, never the current default. Changing the default therefore only affects new uploads:
+- Images stored earlier keep working, as long as their provider stays registered and configured.
+- Replacing or deleting an old image removes it from its own provider.
+- Switching back later works the same way.
+
+To add a backend such as an S3-compatible service:
+
+1. Implement `PrivateObjectStorageProvider` (`src/storage/private-object-storage.provider.ts`): `put` (write-once), `get`, `delete` (exact key, idempotent, only report success once the object is really gone), `createSignedUrl`, and `isConfigured`. `createSignedUrl` must return the provider's own validity window (`issuedAt`/`expiresAt`, for example from `X-Amz-Date` + `X-Amz-Expires`) and refuse lifetimes above 60 s. Errors must be `PrivateStorageError`s with safe messages.
+2. Give it a stable id matching `^[a-z][a-z0-9-]{0,31}$` (stored in `VARCHAR(32)` columns), register it in `StorageModule`, and validate its settings at startup.
+3. Add it to the provider contract suite (`src/storage/provider-contract.private-cloud.spec.ts`). Supabase, a fake S3-compatible store and the local filesystem all pass the same cases there. Keys, ownership checks, validation and the image workflows need no changes.
+
+Never rename or unregister a provider, or remove its credentials, while rows still reference it. At startup the API logs an error (`Stored images reference a storage provider that is not registered or not configured`) for every such provider found in images, avatars or pending deletions. While a provider is missing, its images answer `500 Image storage is unavailable`, AI runs that need them fail with a safe message, and their deletions stay `PENDING` in the cleanup ledger until the provider is registered again. They are never counted as done. The focused storage tests run with `npx jest private-cloud`.
 
 Private storage keys always use `/` (for example `<authId>/<sessionId>/<uuid>.jpg`) on every operating system; only the resolved filesystem path uses the platform separator. Keys containing `\`, `.`/`..` or empty segments are rejected, so the same stored keys work on Linux, macOS and Windows.
 
@@ -177,7 +298,23 @@ OPENROUTER_MODEL=openrouter/free
 
 Restart the API and BullMQ worker after changing environment variables. Use `AI_MODE=mock` for deterministic offline development. The optional analysis, guide, vision, and question model variables allow each operation to be routed independently without changing services or mobile API contracts.
 
-Initial analysis and makeup checks read owned images from private storage and send them to OpenRouter as in-request data URLs. They are never exposed through permanent public URLs. Structured responses are validated again by Zod before any transaction changes workflow state. Provider timeouts, rate limits, and server failures use the existing BullMQ job retry budget; invalid credentials and other non-retryable requests fail immediately.
+Initial analysis and makeup checks load owned images through the same code path as `GET /v1/images/:id/content` (`loadOwnedPrivateImage`). It looks the image up scoped to its owner, then reads the original bytes through the storage provider and key stored on the image, just as the filesystem adapter used to be read, and checks them against the stored type. The worker calls that code path directly rather than the HTTP endpoint, because it holds no user access token.
+
+Before anything is sent to OpenRouter, **every** image is normalized, whatever its size:
+- decoded with the same 8192 × 8192 limit as uploads
+- turned upright from its EXIF orientation
+- resized to fit `OPENROUTER_IMAGE_MAX_EDGE`
+- flattened onto white and re-encoded as JPEG, which removes all metadata (EXIF location, device, XMP)
+- reduced a few times if still over `OPENROUTER_IMAGE_MAX_BYTES`
+
+Only those bytes are embedded as a `data:` URL; no storage URL, key, bucket or credential is ever part of the request. An undecodable image fails with `AI_IMAGE_INVALID` and an image that cannot be made small enough with `AI_IMAGE_TOO_LARGE`. Both are non-retryable and OpenRouter is not contacted. Previously an undecodable image was reported as a retryable "Unable to reach OpenRouter".
+
+When the worker cannot load an image, the run stores only a generic message and never names the provider, bucket or key:
+- **Missing image or record:** fails immediately with "The photo for this request is no longer available. Please upload it again."
+- **Storage timeout or outage:** retried within the job's retry budget.
+- **Rejected credentials, unknown provider, or an object that is not the recorded image:** fails with "Your photo could not be loaded right now. Please try again."
+
+Images are never exposed through permanent public URLs. Structured responses are validated again by Zod before any transaction changes workflow state. Provider timeouts, rate limits, and server failures use the existing BullMQ job retry budget; invalid credentials and other non-retryable requests fail immediately.
 
 `openrouter/free` is useful for development, but model choice and availability can vary. For face-photo privacy, review the chosen model/provider policy and optionally set `OPENROUTER_DATA_COLLECTION=deny`; that restriction may leave fewer or no free providers. Production should pin evaluated vision/text models rather than rely on the free router.
 
@@ -253,6 +390,7 @@ Makeup routes require a bearer token:
 | `DELETE` | `/v1/sessions/:sessionId`                                          | Delete a completed session                         |
 | `POST`   | `/v1/sessions/:sessionId/images`                                   | Upload an initial face image                       |
 | `GET`    | `/v1/images/:imageId/content`                                      | Read an owned private image                        |
+| `GET`    | `/v1/images/:imageId/signed-url`                                   | 60-second signed download URL for an owned image   |
 | `PATCH`  | `/v1/sessions/:sessionId/preferences`                              | Save preferences                                   |
 | `POST`   | `/v1/sessions/:sessionId/analyze`                                  | Queue personalization analysis                     |
 | `POST`   | `/v1/sessions/:sessionId/recommendations/:recommendationId/select` | Select a look and queue its guide                  |
@@ -267,6 +405,7 @@ Makeup routes require a bearer token:
 | `GET`    | `/v1/profile`                                                      | Return the current user's profile                  |
 | `POST`   | `/v1/profile/avatar`                                               | Upload or replace a private avatar                 |
 | `GET`    | `/v1/profile/avatar/content`                                       | Read the current user's avatar                     |
+| `GET`    | `/v1/profile/avatar/signed-url`                                    | 60-second signed download URL for the own avatar   |
 | `DELETE` | `/v1/profile/avatar`                                               | Remove the current user's avatar                   |
 
 Queueing mutations accept an `Idempotency-Key`. Every owned record is scoped with the JWT user ID; clients cannot supply another user's owner ID.
@@ -275,7 +414,21 @@ The image endpoint accepts `multipart/form-data` fields `image` and `purpose=INI
 
 The avatar upload accepts a single `image` field. The mobile client crops and compresses it before upload; the API independently validates JPEG, PNG, or WebP content up to 5 MB and stores it under the authenticated user's private profile scope.
 
-Private image reads require the same bearer token and verify ownership through the image's session. Completed-session deletion cascades through its guide, steps, attempts, questions, recommendations, and image metadata, then removes its private files. Active workflows cannot be deleted through the history endpoint.
+Private image reads require the same bearer token and verify ownership through the image's session.
+
+`GET /v1/images/:imageId/content` returns the original bytes exactly as stored. `Content-Type` is the type validated and recorded at upload, and it is checked against the bytes' own format signature. A provider answer that is not that image (a corrupted object, an error page, a different file) is never served; it becomes `500 Image storage is unavailable`. `Content-Length` is set.
+
+Every response from this route, including errors, carries `Cache-Control: private, no-store, max-age=0`, `Pragma: no-cache`, `Expires: 0`, `Vary: Authorization` and `X-Content-Type-Options: nosniff`, so no proxy, CDN or client cache keeps private images. No ETag or cookie is sent, and no header reveals the storage provider.
+
+The mobile app authenticates exactly as for every other route: `Authorization: Bearer <access token>` (React Native / Expo image components accept request headers). Tokens in the URL are never accepted. An expired token answers a JSON `401` (`Token has expired`), so the app can refresh through `POST /auth/refresh-token` and retry. Image components that cannot send headers should use the 60-second signed URL from `GET /v1/images/:imageId/signed-url` instead.
+
+Responses:
+- `404 Image not found` for a missing image *or another user's image* (they are indistinguishable).
+- `404 Image content is unavailable` for a missing object or a non-uploaded image.
+- `503` for storage timeouts or outages.
+- `500` for misconfiguration or an integrity failure.
+
+None of these name the provider. Completed-session deletion cascades through its guide, steps, attempts, questions, recommendations, and image metadata, then removes its private files. Active workflows cannot be deleted through the history endpoint.
 
 Successful responses use one envelope:
 
@@ -668,8 +821,14 @@ npm run start:dev
 npm run build
 npm run lint
 npm test
+npx jest private-cloud   # private image storage unit tests
+TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json test/private-cloud   # storage workflows + cleanup ledger on PostgreSQL (mocked Supabase)
 npm run test:e2e
 npx prisma generate
 npx prisma migrate dev
 npx prisma migrate deploy
 ```
+
+### Storage merge and privacy workflows
+
+Privacy exports read photos from their recorded provider and object key. Account erasure preserves that provider on each deletion record and sweeps each configured backend, including legacy local files. Apply the `20261119120000_account_erasure_storage_provider` migration with the merge so deletion retries continue to target the correct backend. New providers must implement owner enumeration for account erasure.

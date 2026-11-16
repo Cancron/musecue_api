@@ -1,3 +1,4 @@
+import { localImageStorage } from './support/local-image-storage';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient } from '@prisma/client';
 import type { Job } from 'bullmq';
@@ -32,7 +33,7 @@ import { PrivacyExportLifecycleService } from '../src/privacy/queues/privacy-exp
 import { PrivacyExportRetentionService } from '../src/privacy/queues/privacy-export-retention.service';
 import { PrivacyExportProcessor } from '../src/privacy/queues/privacy-export.processor';
 import type { PrivacyExportQueueService } from '../src/privacy/queues/privacy-export.queue';
-import { PrivateImageStorageService } from '../src/storage/private-image-storage.service';
+import type { PrivateImageStorageService } from '../src/storage/private-image-storage.service';
 import { PrivacyExportStorageService } from '../src/storage/privacy-export-storage.service';
 import { SubscriptionAccessService } from '../src/subscription/subscription-access.service';
 import { SubscriptionPlanService } from '../src/subscription/subscription-plan.service';
@@ -274,7 +275,10 @@ describeWithDatabase('Personal data export (PostgreSQL)', () => {
     await applyMigrations(schema, migrationNames());
     client = new PrismaClient({
       adapter: new PrismaPg(
-        { connectionString: TEST_DATABASE_URL as string },
+        {
+          connectionString: TEST_DATABASE_URL as string,
+          options: `-c search_path=${schema}`,
+        },
         { schema },
       ),
     });
@@ -290,7 +294,7 @@ describeWithDatabase('Personal data export (PostgreSQL)', () => {
       return Promise.resolve();
     });
     exportStorage = new PrivacyExportStorageService();
-    images = new PrivateImageStorageService();
+    images = localImageStorage();
     const logger = mock<Logger>();
     lifecycle = new PrivacyExportLifecycleService(
       prisma,
@@ -449,6 +453,7 @@ describeWithDatabase('Personal data export (PostgreSQL)', () => {
         lastName: `${label}-LAST-NAME`,
         bio: `${label}-BIO-${tag}`,
         avatarUrl: avatarKey,
+        avatarStorageProvider: 'local',
       },
     });
 
@@ -498,6 +503,7 @@ describeWithDatabase('Personal data export (PostgreSQL)', () => {
         sessionId: session.id,
         purpose: 'INITIAL_ANALYSIS',
         source: 'PRIVATE_UPLOAD',
+        storageProvider: 'local',
         storageKey: photoKey,
         mimeType: 'image/jpeg',
         width: 800,
@@ -902,6 +908,7 @@ describeWithDatabase('Personal data export (PostgreSQL)', () => {
         sessionId: session.id,
         purpose: 'INITIAL_ANALYSIS',
         source: 'PRIVATE_UPLOAD',
+        storageProvider: 'local',
         storageKey: photoKey,
         mimeType: 'image/jpeg',
         width: 1,

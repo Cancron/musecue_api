@@ -1,6 +1,12 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import sharp from 'sharp';
+
+/** Same decoding limit as upload validation (8192 x 8192). */
+const MAX_INPUT_PIXELS = 8192 * 8192;
+const IMAGE_SHRINK_ATTEMPTS = 4;
+const MIN_IMAGE_EDGE = 512;
+const MIN_IMAGE_QUALITY = 50;
 import { z } from 'zod';
 import type { AiOperation } from '../../interfaces/makeup.interface';
 import {
@@ -458,22 +464,56 @@ export class OpenRouterProvider implements StructuredAiProvider {
       : undefined;
   }
 
+  /**
+   * Every image is normalized before it leaves the server, whatever its size:
+   * decoded with strict limits (a corrupt or non-image payload fails here,
+   * not as a transport error), turned upright from its EXIF orientation,
+   * resized to fit `OPENROUTER_IMAGE_MAX_EDGE`, flattened and re-encoded as
+   * JPEG. Re-encoding drops all metadata (EXIF location, device, XMP), and
+   * only these bytes are embedded as a `data:` URL, so no storage URL, key
+   * or credential can reach the AI provider. If the result still exceeds
+   * `OPENROUTER_IMAGE_MAX_BYTES`, edge and quality are reduced a few times.
+   */
   private async prepareImage(
     image: NonNullable<StructuredGenerationRequest['image']>,
   ): Promise<NonNullable<StructuredGenerationRequest['image']>> {
-    if (image.bytes.length <= this.imageMaxBytes) return image;
-    const bytes = await sharp(image.bytes)
-      .rotate()
-      .resize({
-        width: this.imageMaxEdge,
-        height: this.imageMaxEdge,
-        fit: 'inside',
-        withoutEnlargement: true,
-      })
-      .flatten({ background: '#ffffff' })
-      .jpeg({ quality: this.imageQuality, mozjpeg: true })
-      .toBuffer();
-    return { bytes, mimeType: 'image/jpeg' };
+    let edge = this.imageMaxEdge;
+    let quality = this.imageQuality;
+    for (let attempt = 0; attempt < IMAGE_SHRINK_ATTEMPTS; attempt += 1) {
+      let bytes: Buffer;
+      try {
+        bytes = await sharp(image.bytes, {
+          failOn: 'error',
+          limitInputPixels: MAX_INPUT_PIXELS,
+        })
+          .rotate()
+          .resize({
+            width: edge,
+            height: edge,
+            fit: 'inside',
+            withoutEnlargement: true,
+          })
+          .flatten({ background: '#ffffff' })
+          .jpeg({ quality, mozjpeg: true })
+          .toBuffer();
+      } catch {
+        throw new AiProviderError(
+          'AI_IMAGE_INVALID',
+          'The photo could not be processed. Please upload it again.',
+          false,
+        );
+      }
+      if (bytes.length <= this.imageMaxBytes) {
+        return { bytes, mimeType: 'image/jpeg' };
+      }
+      edge = Math.max(MIN_IMAGE_EDGE, Math.floor(edge * 0.75));
+      quality = Math.max(MIN_IMAGE_QUALITY, quality - 10);
+    }
+    throw new AiProviderError(
+      'AI_IMAGE_TOO_LARGE',
+      'The photo is too large to analyse. Please upload a smaller photo.',
+      false,
+    );
   }
 
   private modelSelection(

@@ -1,6 +1,7 @@
 import { mock, mockDeep } from 'jest-mock-extended';
 import type { Prisma } from '@prisma/client';
 import { PrismaService } from '../common/services/prisma.service';
+import { PrivateImageLifecycleService } from '../storage/private-image-lifecycle.service';
 import { PrivateImageStorageService } from '../storage/private-image-storage.service';
 import { MakeupService } from './makeup.service';
 import { MakeupQueueService } from './queues/makeup.queue';
@@ -16,6 +17,7 @@ describe('workflow concurrency guards', () => {
     queue,
     mock<ImageValidationService>(),
     mock<PrivateImageStorageService>(),
+    mock<PrivateImageLifecycleService>(),
     ai,
   );
   beforeEach(() => {

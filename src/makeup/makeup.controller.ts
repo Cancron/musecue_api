@@ -3,6 +3,7 @@ import {
   Controller,
   Delete,
   Get,
+  Header,
   Headers,
   Param,
   Patch,
@@ -35,6 +36,23 @@ import { MakeupService } from './makeup.service';
 
 interface AuthenticatedRequest extends Request {
   user: AuthenticatedUser;
+}
+
+/**
+ * Private image responses must never be stored by shared caches (proxies,
+ * CDNs) or by the client: `no-store` covers HTTP/1.1 caches, `Pragma` and
+ * `Expires` cover HTTP/1.0 intermediaries, adding `Authorization` to `Vary`
+ * (next to the CORS middleware's `Origin`) keeps a misbehaving cache from
+ * serving one user's response to another, and `nosniff` stops browsers from
+ * reinterpreting the bytes.
+ */
+function setPrivateNoStoreHeaders(response: Response): void {
+  response.setHeader('Cache-Control', 'private, no-store, max-age=0');
+  response.setHeader('Pragma', 'no-cache');
+  response.setHeader('Expires', '0');
+  // Append, never replace: the CORS middleware has already set `Vary: Origin`.
+  response.vary('Authorization');
+  response.setHeader('X-Content-Type-Options', 'nosniff');
 }
 
 @ApiTags('makeup')
@@ -74,6 +92,13 @@ export class MakeupController {
     return this.makeup.deleteSession(req.user.userId, sessionId);
   }
 
+  /**
+   * Streams an owned private image: the original bytes and the content type
+   * recorded when it was stored. Authenticated with the same bearer access
+   * token as every other route (the mobile app sends `Authorization` on image
+   * requests; tokens in URLs are not accepted). Nothing about the storage
+   * provider is exposed, and no cache may keep the response.
+   */
   @Get('images/:imageId/content')
   @Throttle({ default: THROTTLER_CONFIG.RELAXED })
   async getImageContent(
@@ -81,11 +106,26 @@ export class MakeupController {
     @Param('imageId') imageId: string,
     @Res() response: Response,
   ) {
+    // Set first, so error responses for this private route are not cached either.
+    setPrivateNoStoreHeaders(response);
     const image = await this.makeup.getImageContent(req.user.userId, imageId);
     response.setHeader('Content-Type', image.mimeType);
-    response.setHeader('Cache-Control', 'private, no-store');
-    response.setHeader('X-Content-Type-Options', 'nosniff');
-    response.send(image.bytes);
+    response.setHeader('Content-Length', String(image.bytes.length));
+    response.setHeader('Content-Disposition', 'inline');
+    response.end(image.bytes);
+  }
+
+  /**
+   * Short-lived (60 s) direct download URL for an owned private image. A new
+   * URL is issued on every call; nothing is stored, and caching is disabled.
+   */
+  @Get('images/:imageId/signed-url')
+  @Header('Cache-Control', 'private, no-store')
+  getImageSignedUrl(
+    @Req() req: AuthenticatedRequest,
+    @Param('imageId') imageId: string,
+  ) {
+    return this.makeup.getImageSignedUrl(req.user.userId, imageId);
   }
 
   @Post('sessions/:sessionId/images')

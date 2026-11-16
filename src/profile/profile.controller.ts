@@ -2,6 +2,7 @@ import {
   Controller,
   Delete,
   Get,
+  Header,
   Post,
   Req,
   Res,
@@ -58,6 +59,17 @@ export class ProfileController {
   @Delete('avatar')
   deleteAvatar(@Req() req: AuthenticatedRequest) {
     return this.profile.deleteAvatar(req.user.userId);
+  }
+
+  /**
+   * Short-lived (60 s) direct download URL for the caller's own uploaded
+   * avatar. A new URL is issued on every call; nothing is stored, and caching
+   * is disabled. External avatars (e.g. Google) answer 409: use `avatarUrl`.
+   */
+  @Get('avatar/signed-url')
+  @Header('Cache-Control', 'private, no-store')
+  getAvatarSignedUrl(@Req() req: AuthenticatedRequest) {
+    return this.profile.getAvatarSignedUrl(req.user.userId);
   }
 
   @Get('avatar/content')

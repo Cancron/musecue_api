@@ -111,6 +111,7 @@ model AccountDeletionFile {
   requestId  String
   kind       AccountDeletionFileKind
   storageKey String                    @db.VarChar(512)
+  storageProvider String               @default("local") @db.VarChar(32)
   status     AccountDeletionFileStatus @default(PENDING)
   attempts   Int                       @default(0)
   lastError  String?                   @db.VarChar(200)
@@ -120,6 +121,6 @@ model AccountDeletionFile {
 
   request AccountDeletionRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
 
-  @@unique([requestId, kind, storageKey])
+  @@unique([requestId, kind, storageProvider, storageKey], map: "AccountDeletionFile_object_key")
   @@index([requestId, status])
 }

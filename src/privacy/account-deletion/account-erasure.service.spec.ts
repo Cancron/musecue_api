@@ -172,6 +172,7 @@ describe('AccountErasureService private file cleanup (scripted storage)', () => 
         fileRows.push({
           id: randomUUID(),
           status: 'PENDING',
+          storageProvider: 'local',
           attempts: 0,
           lastError: null,
           note: null,
@@ -436,6 +437,7 @@ describe('AccountErasureService private file cleanup (scripted storage)', () => 
           id: randomUUID(),
           requestId: request.id,
           status: 'PENDING' as const,
+          storageProvider: 'local',
           attempts: 0,
           lastError: null,
           note: null,

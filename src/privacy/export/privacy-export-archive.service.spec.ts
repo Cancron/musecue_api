@@ -1,3 +1,7 @@
+import { FakeS3CompatibleStorage } from '../../../test/support/fake-s3-compatible-storage';
+import type { Logger } from 'winston';
+import { PrivateImageStorageService } from '../../storage/private-image-storage.service';
+import { localImageStorage } from '../../../test/support/local-image-storage';
 import { mock } from 'jest-mock-extended';
 import { createHash } from 'node:crypto';
 import {
@@ -30,7 +34,6 @@ import {
   type PrivacyPrismaFake,
 } from '../../../test/support/privacy-fixtures';
 import { readZip, type ZipContents } from '../../../test/support/read-zip';
-import { PrivateImageStorageService } from '../../storage/private-image-storage.service';
 import { PrivacyExportStorageService } from '../../storage/privacy-export-storage.service';
 import type { SubscriptionAccessService } from '../../subscription/subscription-access.service';
 import { PrivacyExportArchiveService } from './privacy-export-archive.service';
@@ -87,7 +90,7 @@ describe('PrivacyExportArchiveService (privacy ZIP archive)', () => {
     subscriptions.getStatus.mockResolvedValue(SUBSCRIPTION_STATUS);
     service = new PrivacyExportArchiveService(
       new PrivacyExportCollectorService(prisma, subscriptions),
-      new PrivateImageStorageService(),
+      localImageStorage(),
       new PrivacyExportStorageService(),
     );
   });
@@ -352,10 +355,47 @@ describe('PrivacyExportArchiveService (privacy ZIP archive)', () => {
 
   it('removes the partial archive when reading a photo fails', async () => {
     await chmod(join(imageRoot, OWNER_PHOTO_KEY), 0o000);
-    if (process.getuid?.() === 0) return; // root ignores file permissions
+    if (process.platform === 'win32' || process.getuid?.() === 0) return; // Windows chmod/root cannot simulate read denial
 
-    await expect(build()).rejects.toMatchObject({ code: 'EACCES' });
+    await expect(build()).rejects.toMatchObject({
+      code: 'STORAGE_MISCONFIGURED',
+    });
     expect(await readdir(join(exportRoot, OWNER_ID))).toEqual([]);
+  });
+
+  it('exports cloud photos through their saved provider after the active provider changes', async () => {
+    const saved = new FakeS3CompatibleStorage('previous-store');
+    const active = new FakeS3CompatibleStorage('new-store');
+    await saved.put(OWNER_PHOTO_KEY, PHOTO_BYTES.uploaded, 'image/jpeg');
+    await saved.put(OWNER_AVATAR_KEY, PHOTO_BYTES.avatar, 'image/png');
+    const collector = new PrivacyExportCollectorService(prisma, subscriptions);
+    const snapshot = await collector.collect(OWNER_ID, EXPORT_ID);
+    const collect = jest.spyOn(collector, 'collect').mockResolvedValue({
+      ...snapshot,
+      photos: snapshot.photos.map((photo) => ({
+        ...photo,
+        storageProvider: 'previous-store',
+      })),
+    });
+    const storage = new PrivateImageStorageService(
+      [saved, active],
+      { activeProvider: 'new-store', localRoot: imageRoot },
+      mock<Logger>(),
+    );
+    const cloudArchive = new PrivacyExportArchiveService(
+      collector,
+      storage,
+      new PrivacyExportStorageService(),
+    );
+    const result = await cloudArchive.build(OWNER_ID, EXPORT_ID, () =>
+      Promise.resolve(),
+    );
+    expect(result.photoCount).toBe(2);
+    expect(active.calls).toEqual([]);
+    expect(
+      saved.calls.filter((call) => call.op === 'get').map((call) => call.key),
+    ).toEqual(expect.arrayContaining([OWNER_PHOTO_KEY, OWNER_AVATAR_KEY]));
+    collect.mockRestore();
   });
 
   it('stops and removes the partial archive when the attempt is superseded', async () => {

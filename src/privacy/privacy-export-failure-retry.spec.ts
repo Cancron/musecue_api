@@ -1,3 +1,4 @@
+import { localImageStorage } from '../../test/support/local-image-storage';
 import { ConfigService } from '@nestjs/config';
 import type { Job } from 'bullmq';
 import { mock } from 'jest-mock-extended';
@@ -23,7 +24,7 @@ import {
   type PrivacyPrismaFake,
 } from '../../test/support/privacy-fixtures';
 import { readZip } from '../../test/support/read-zip';
-import { PrivateImageStorageService } from '../storage/private-image-storage.service';
+import type { PrivateImageStorageService } from '../storage/private-image-storage.service';
 import { PrivacyExportStorageService } from '../storage/privacy-export-storage.service';
 import type { SubscriptionAccessService } from '../subscription/subscription-access.service';
 import { PrivacyExportArchiveService } from './export/privacy-export-archive.service';
@@ -81,7 +82,7 @@ describe('Privacy export failures, cleanup and retries', () => {
     const subscriptions = mock<SubscriptionAccessService>();
     subscriptions.getStatus.mockResolvedValue(SUBSCRIPTION_STATUS);
     const logger = mock<Logger>();
-    images = new PrivateImageStorageService();
+    images = localImageStorage();
     exportStorage = new PrivacyExportStorageService();
     lifecycle = new PrivacyExportLifecycleService(
       prisma,
@@ -330,7 +331,7 @@ describe('Privacy export failures, cleanup and retries', () => {
       const id = await requestExport();
       const seen: string[][] = [];
       const read = jest.spyOn(images, 'read');
-      read.mockImplementation(async (key: string) => {
+      read.mockImplementation(async (key) => {
         seen.push(await filesOf(id));
         read.mockRestore();
         return images.read(key);

@@ -1,3 +1,7 @@
+import {
+  localImageStorage,
+  saveLocalImage,
+} from '../../test/support/local-image-storage';
 /**
  * Private storage under Windows path semantics.
  *
@@ -111,7 +115,6 @@ jest.mock('node:fs', () => {
 });
 
 import { join, sep } from 'node:path';
-import { PrivateImageStorageService } from './private-image-storage.service';
 import {
   isOwnedPrivateImageKey,
   resolvePrivateStorageKey,
@@ -167,10 +170,16 @@ describe('Private storage on Windows (privacy export prerequisites)', () => {
     ] as const)(
       'saves %s with a portable "/" key and stores it at the Windows path',
       async (_label, scope, mimeType, extension) => {
-        const storage = new PrivateImageStorageService();
+        const storage = localImageStorage();
         const bytes = Buffer.from(`${scope}-bytes`);
 
-        const key = await storage.save(OWNER, scope, mimeType, bytes);
+        const key = await saveLocalImage(
+          storage,
+          OWNER,
+          scope,
+          mimeType,
+          bytes,
+        );
 
         expect(key).toMatch(
           new RegExp(`^${OWNER}/${scope}/${UUID_FILE}\\.${extension}$`),
@@ -182,16 +191,18 @@ describe('Private storage on Windows (privacy export prerequisites)', () => {
         ]);
         // The same key reads back, and is accepted by the export's
         // ownership check exactly as on Linux.
-        await expect(storage.read(key)).resolves.toEqual(bytes);
+        await expect(storage.read({ provider: 'local', key })).resolves.toEqual(
+          bytes,
+        );
         expect(isOwnedPrivateImageKey(key, OWNER, scope)).toBe(true);
 
-        await storage.delete(key);
+        await storage.delete({ provider: 'local', key });
         expect(mockFiles.size).toBe(0);
       },
     );
 
     it('keeps rejecting backslash traversal on Windows', async () => {
-      const storage = new PrivateImageStorageService();
+      const storage = localImageStorage();
       mockFiles.set(
         `${IMAGE_ROOT}\\${OTHER}\\${SESSION}\\photo.jpg`,
         Buffer.from('other user'),
@@ -204,27 +215,32 @@ describe('Private storage on Windows (privacy export prerequisites)', () => {
       ]) {
         // Whether read() throws or rejects, the file is never opened.
         await expect(
-          Promise.resolve().then(() => storage.read(key)),
-        ).rejects.toThrow('Invalid private image storage key');
+          Promise.resolve().then(() =>
+            storage.read({ provider: 'local', key }),
+          ),
+        ).rejects.toMatchObject({ code: 'INVALID_STORAGE_KEY' });
         expect(isOwnedPrivateImageKey(key, OWNER, SESSION)).toBe(false);
       }
     });
 
     it('lists and deletes an owner’s files with "/" keys, and refuses other owners', async () => {
-      const storage = new PrivateImageStorageService();
-      const mine = await storage.save(
+      const storage = localImageStorage();
+      const mine = await saveLocalImage(
+        storage,
         OWNER,
         SESSION,
         'image/jpeg',
         Buffer.from('a'),
       );
-      const avatar = await storage.save(
+      const avatar = await saveLocalImage(
+        storage,
         OWNER,
         'profile',
         'image/png',
         Buffer.from('b'),
       );
-      const theirs = await storage.save(
+      const theirs = await saveLocalImage(
+        storage,
         OTHER,
         SESSION,
         'image/jpeg',

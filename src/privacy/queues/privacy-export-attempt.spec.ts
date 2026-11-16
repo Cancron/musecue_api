@@ -1,3 +1,4 @@
+import { localImageStorage } from '../../../test/support/local-image-storage';
 import { ConfigService } from '@nestjs/config';
 import type { Job } from 'bullmq';
 import { mock } from 'jest-mock-extended';
@@ -15,7 +16,7 @@ import {
   privacyPrismaFake,
   type PrivacyPrismaFake,
 } from '../../../test/support/privacy-fixtures';
-import { PrivateImageStorageService } from '../../storage/private-image-storage.service';
+import type { PrivateImageStorageService } from '../../storage/private-image-storage.service';
 import { PrivacyExportStorageService } from '../../storage/privacy-export-storage.service';
 import type { SubscriptionAccessService } from '../../subscription/subscription-access.service';
 import { PrivacyExportArchiveService } from '../export/privacy-export-archive.service';
@@ -159,7 +160,7 @@ describe('Export worker coordination (privacy)', () => {
       }
       const subscriptions = mock<SubscriptionAccessService>();
       subscriptions.getStatus.mockResolvedValue(SUBSCRIPTION_STATUS);
-      images = new PrivateImageStorageService();
+      images = localImageStorage();
       exportStorage = new PrivacyExportStorageService();
       const logger = mock<Logger>();
       processor = new PrivacyExportProcessor(
@@ -213,8 +214,8 @@ describe('Export worker coordination (privacy)', () => {
       let resume!: () => void;
       const gate = new Promise<void>((resolve) => (resume = resolve));
       let paused = false;
-      const reader = new PrivateImageStorageService();
-      jest.spyOn(images, 'read').mockImplementation(async (key: string) => {
+      const reader = localImageStorage();
+      jest.spyOn(images, 'read').mockImplementation(async (key) => {
         paused = true;
         await gate;
         return reader.read(key);

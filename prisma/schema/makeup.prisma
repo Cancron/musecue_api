@@ -19,17 +19,19 @@ model MakeupSession {
 }
 
 model ImageAsset {
-  id          String       @id @default(uuid())
-  sessionId   String
-  guideStepId String?
-  purpose     ImagePurpose
-  source      ImageSource
-  storageKey  String
-  mimeType    String
-  width       Int
-  height      Int
-  sizeBytes   Int
-  createdAt   DateTime     @default(now())
+  id              String       @id @default(uuid())
+  sessionId       String
+  guideStepId     String?
+  purpose         ImagePurpose
+  source          ImageSource
+  storageKey      String
+  /// Private object storage backend holding `storageKey` (e.g. "supabase", "local").
+  storageProvider String       @db.VarChar(32)
+  mimeType        String
+  width           Int
+  height          Int
+  sizeBytes       Int
+  createdAt       DateTime     @default(now())
 
   session      MakeupSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
   guideStep    GuideStep?    @relation(fields: [guideStepId], references: [id], onDelete: SetNull)
@@ -37,6 +39,7 @@ model ImageAsset {
 
   @@index([sessionId, purpose, createdAt])
   @@index([guideStepId, createdAt])
+  @@index([storageKey])
 }
 
 model MakeupPreferences {

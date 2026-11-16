@@ -1,3 +1,5 @@
+import { resolve } from 'node:path';
+import { localImageStorage } from '../../../test/support/local-image-storage';
 import { mock } from 'jest-mock-extended';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -16,7 +18,6 @@ import {
   privacyPrismaFake,
 } from '../../../test/support/privacy-fixtures';
 import { readZip } from '../../../test/support/read-zip';
-import { PrivateImageStorageService } from '../../storage/private-image-storage.service';
 import {
   isOwnedPrivateImageKey,
   resolvePrivateStorageKey,
@@ -139,7 +140,7 @@ describe('Privacy export photo ownership (path traversal)', () => {
 
     it('still resolves canonical keys', () => {
       expect(resolvePrivateStorageKey('/private', `${A}/${S}/${FILE}`)).toBe(
-        join('/private', A, S, FILE),
+        resolve('/private', A, S, FILE),
       );
     });
   });
@@ -199,7 +200,7 @@ describe('Privacy export photo ownership (path traversal)', () => {
       ] as never);
       const subscriptions = mock<SubscriptionAccessService>();
       subscriptions.getStatus.mockResolvedValue(SUBSCRIPTION_STATUS);
-      const images = new PrivateImageStorageService();
+      const images = localImageStorage();
       // Records every storage read while keeping the real implementation.
       const readSpy = jest.spyOn(images, 'read');
       const collector = new PrivacyExportCollectorService(
@@ -216,7 +217,7 @@ describe('Privacy export photo ownership (path traversal)', () => {
       const result = await service.build(A, EXPORT_ID, () => Promise.resolve());
 
       // Only the owner's canonical keys are ever opened.
-      const reads = readSpy.mock.calls.map(([key]) => key);
+      const reads = readSpy.mock.calls.map(([ref]) => ref.key);
       expect(reads.sort()).toEqual([OWNER_AVATAR_KEY, OWNER_PHOTO_KEY].sort());
       expect(snapshot.photos.map((photo) => photo.storageKey).sort()).toEqual(
         [OWNER_AVATAR_KEY, OWNER_PHOTO_KEY].sort(),

@@ -156,10 +156,13 @@ describe('PrivacyExportStorageService (privacy export archives)', () => {
     });
   });
 
-  it('creates archives readable only by the service account', async () => {
-    const key = await write();
-    expect((await stat(join(root, key))).mode & 0o777).toBe(0o600);
-  });
+  (process.platform === 'win32' ? it.skip : it)(
+    'creates archives readable only by the service account',
+    async () => {
+      const key = await write();
+      expect((await stat(join(root, key))).mode & 0o777).toBe(0o600);
+    },
+  );
 
   it.each([
     ['../escape', EXPORT_ID],

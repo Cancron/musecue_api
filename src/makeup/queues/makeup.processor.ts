@@ -8,6 +8,14 @@ import { Logger } from 'winston';
 import { PrismaService } from '../../common/services/prisma.service';
 import { PrivateImageStorageService } from '../../storage/private-image-storage.service';
 import {
+  PrivateImageUnavailableError,
+  loadOwnedPrivateImage,
+} from '../private-image-content';
+import {
+  isMissingPrivateObject,
+  isPrivateStorageError,
+} from '../../storage/private-storage.error';
+import {
   AI_GATEWAY,
   type AiCallMetadata,
   type AiGateway,
@@ -22,6 +30,17 @@ import type {
 import type { MakeupAiJob } from './makeup.queue';
 import { canPublishRun, failRun } from './run-lifecycle';
 import { lockSession } from '../workflow-lock';
+
+/** A Prisma/driver error code (e.g. P1001) for logs; never the message. */
+function errorCodeOf(error: unknown): string | undefined {
+  if (typeof error !== 'object' || error === null || !('code' in error)) {
+    return undefined;
+  }
+  const { code } = error;
+  return typeof code === 'string' || typeof code === 'number'
+    ? String(code)
+    : undefined;
+}
 
 @Processor('makeup-ai', {
   concurrency: 8,
@@ -333,21 +352,57 @@ export class MakeupProcessor extends WorkerHost {
     });
   }
 
+  /**
+   * Loads the original private image through the same owner-scoped path as
+   * `GET /v1/images/:id/content` (storage provider + stored key, verified
+   * type). Failures keep the job's retry semantics: missing or unusable
+   * images fail the run immediately, transient storage outages use the
+   * normal retry budget. Messages are safe to persist on the run and show to
+   * the user; they never name the storage provider, bucket or key.
+   */
   private async loadImage(
     authId: string,
     imageId: string,
   ): Promise<AiImageInput> {
-    const image = await this.prisma.imageAsset.findFirstOrThrow({
-      where: { id: imageId, session: { authId } },
-      select: { storageKey: true, mimeType: true },
-    });
-    if (!['image/jpeg', 'image/png', 'image/webp'].includes(image.mimeType)) {
-      throw new Error('Stored image has an unsupported media type');
+    try {
+      return await loadOwnedPrivateImage(
+        this.prisma,
+        this.imageStorage,
+        authId,
+        imageId,
+      );
+    } catch (error) {
+      if (
+        error instanceof PrivateImageUnavailableError ||
+        isMissingPrivateObject(error)
+      ) {
+        throw new AiProviderError(
+          'IMAGE_NOT_FOUND',
+          'The photo for this request is no longer available. Please upload it again.',
+          false,
+        );
+      }
+      if (!isPrivateStorageError(error)) {
+        // E.g. the database is unreachable. Retry within the job budget, and
+        // never persist the raw error text (it can name internal hosts) on a
+        // run that the client can read.
+        this.logger.warn('Private image could not be loaded; will retry', {
+          context: 'MakeupProcessor',
+          errorType: error instanceof Error ? error.name : typeof error,
+          errorCode: errorCodeOf(error),
+        });
+        throw new AiProviderError(
+          'IMAGE_LOAD_FAILED',
+          'Your photo could not be loaded right now. Please try again.',
+          true,
+        );
+      }
+      throw new AiProviderError(
+        error.retryable ? 'IMAGE_STORAGE_UNAVAILABLE' : 'IMAGE_STORAGE_FAILED',
+        'Your photo could not be loaded right now. Please try again.',
+        error.retryable,
+      );
     }
-    return {
-      bytes: await this.imageStorage.read(image.storageKey),
-      mimeType: image.mimeType as AiImageInput['mimeType'],
-    };
   }
 
   private toGuideStep(step: GuideStepResult): GuideStepResult {

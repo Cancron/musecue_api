@@ -1,5 +1,7 @@
+import type { Prisma } from '@prisma/client';
 import { mock, mockDeep } from 'jest-mock-extended';
 import { PrismaService } from '../common/services/prisma.service';
+import { PrivateImageLifecycleService } from '../storage/private-image-lifecycle.service';
 import { PrivateImageStorageService } from '../storage/private-image-storage.service';
 import { MakeupQueueService } from './queues/makeup.queue';
 import { ImageValidationService } from './services/image-validation.service';
@@ -11,17 +13,25 @@ describe('MakeupService history media and deletion', () => {
   const queue = mock<MakeupQueueService>();
   const imageValidation = mock<ImageValidationService>();
   const imageStorage = mock<PrivateImageStorageService>();
+  const imageLifecycle = mock<PrivateImageLifecycleService>();
   const aiGateway = mock<AiGateway>();
   const service = new MakeupService(
     prisma,
     queue,
     imageValidation,
     imageStorage,
+    imageLifecycle,
     aiGateway,
   );
+  const runInline = ((
+    callback: (tx: Prisma.TransactionClient) => Promise<unknown>,
+  ) => callback(prisma)) as PrismaService['$transaction'];
 
   beforeEach(() => {
     jest.clearAllMocks();
+    imageLifecycle.scheduleDeletion.mockImplementation((_tx, refs) =>
+      Promise.resolve(refs),
+    );
     prisma.$queryRaw.mockResolvedValue([{ status: 'IN_PROGRESS' }]);
     prisma.guideStep.findUnique.mockResolvedValue({
       status: 'CURRENT',
@@ -32,10 +42,11 @@ describe('MakeupService history media and deletion', () => {
     const bytes = Buffer.from('private-image');
     prisma.imageAsset.findFirst.mockResolvedValue({
       storageKey: 'owner/session/image.jpg',
+      storageProvider: 'supabase',
       mimeType: 'image/jpeg',
       source: 'PRIVATE_UPLOAD',
     } as never);
-    imageStorage.read.mockResolvedValue(bytes);
+    imageStorage.readImage.mockResolvedValue(bytes);
 
     await expect(
       service.getImageContent('owner-id', 'image-id'),
@@ -45,8 +56,17 @@ describe('MakeupService history media and deletion', () => {
     });
     expect(prisma.imageAsset.findFirst.mock.calls[0]?.[0]).toEqual({
       where: { id: 'image-id', session: { authId: 'owner-id' } },
-      select: { storageKey: true, mimeType: true, source: true },
+      select: {
+        storageKey: true,
+        storageProvider: true,
+        mimeType: true,
+        source: true,
+      },
     });
+    expect(imageStorage.readImage.mock.calls[0]).toEqual([
+      { provider: 'supabase', key: 'owner/session/image.jpg' },
+      'image/jpeg',
+    ]);
   });
 
   it('does not read storage when the image is not owned by the user', async () => {
@@ -55,26 +75,33 @@ describe('MakeupService history media and deletion', () => {
     await expect(
       service.getImageContent('other-user', 'image-id'),
     ).rejects.toThrow('Image not found');
-    expect(imageStorage.read.mock.calls).toHaveLength(0);
+    expect(imageStorage.readImage.mock.calls).toHaveLength(0);
   });
 
   it('deletes a completed aggregate and its private files', async () => {
     prisma.makeupSession.findFirst.mockResolvedValue({
       id: 'session-id',
       status: 'COMPLETED',
-      images: [{ storageKey: 'owner/session/image.jpg' }],
     } as never);
+    prisma.$transaction.mockImplementation(runInline);
+    prisma.imageAsset.findMany.mockResolvedValue([
+      { storageKey: 'owner/session/image.jpg', storageProvider: 'supabase' },
+    ] as never);
     prisma.makeupSession.deleteMany.mockResolvedValue({ count: 1 });
-    imageStorage.delete.mockResolvedValue();
+    imageLifecycle.processRefs.mockResolvedValue(['DELETED']);
 
     await expect(
       service.deleteSession('owner-id', 'session-id'),
     ).resolves.toEqual({
       id: 'session-id',
     });
-    expect(imageStorage.delete.mock.calls[0]?.[0]).toBe(
-      'owner/session/image.jpg',
-    );
+    const ref = { provider: 'supabase', key: 'owner/session/image.jpg' };
+    expect(imageLifecycle.scheduleDeletion.mock.calls[0]?.slice(1)).toEqual([
+      [ref],
+      'SESSION_DELETED',
+      'owner-id',
+    ]);
+    expect(imageLifecycle.processRefs.mock.calls).toEqual([[[ref]]]);
   });
 
   it('refuses to delete an active workflow from history', async () => {
@@ -151,32 +178,42 @@ describe('MakeupService history media and deletion', () => {
       height: 640,
       sizeBytes: 100,
     });
-    imageStorage.save.mockResolvedValue('owner/session/duplicate.jpg');
-    imageStorage.delete.mockResolvedValue();
+    imageLifecycle.upload.mockResolvedValue({
+      provider: 'supabase',
+      key: 'owner/session/duplicate.jpg',
+    });
+    imageLifecycle.processRefs.mockResolvedValue(['DELETED']);
     prisma.imageAsset.create.mockResolvedValue({
       id: 'duplicate-image',
     } as never);
-    prisma.imageAsset.delete.mockResolvedValue({
-      id: 'duplicate-image',
-    } as never);
+    prisma.imageAsset.deleteMany.mockResolvedValue({ count: 1 });
     aiGateway.describe.mockReturnValue({
       provider: 'openrouter',
       model: 'model',
       promptVersion: 'version',
     });
-    prisma.$transaction.mockRejectedValue({ code: 'P2002' });
+    // 1st transaction stores the image; the run insert then loses the
+    // idempotency race; the discard transaction succeeds.
+    prisma.$transaction
+      .mockImplementationOnce(runInline)
+      .mockRejectedValueOnce({ code: 'P2002' })
+      .mockImplementation(runInline);
 
     const result = await service.checkStep('owner-id', 'step-id', 'same-key', {
       buffer: Buffer.from('photo'),
     } as Express.Multer.File);
 
     expect(result).toBe(existingRun);
-    expect(prisma.imageAsset.delete.mock.calls).toContainEqual([
+    expect(prisma.imageAsset.deleteMany.mock.calls).toContainEqual([
       { where: { id: 'duplicate-image' } },
     ]);
-    expect(imageStorage.delete.mock.calls).toContainEqual([
-      'owner/session/duplicate.jpg',
+    const ref = { provider: 'supabase', key: 'owner/session/duplicate.jpg' };
+    expect(imageLifecycle.scheduleDeletion.mock.calls[0]?.slice(1)).toEqual([
+      [ref],
+      'IMAGE_DISCARDED',
+      'owner-id',
     ]);
+    expect(imageLifecycle.processRefs.mock.calls).toEqual([[[ref]]]);
     expect(queue.enqueue.mock.calls).toHaveLength(0);
   });
 
@@ -192,7 +229,10 @@ describe('MakeupService history media and deletion', () => {
       height: 640,
       sizeBytes: 100,
     });
-    imageStorage.save.mockResolvedValue('owner/session/final-step.jpg');
+    imageLifecycle.upload.mockResolvedValue({
+      provider: 'supabase',
+      key: 'owner/session/final-step.jpg',
+    });
     prisma.imageAsset.create.mockResolvedValue({
       id: 'snapshot-image',
     } as never);
@@ -213,6 +253,8 @@ describe('MakeupService history media and deletion', () => {
         sessionId: 'session-id',
         guideStepId: 'step-id',
         purpose: 'STEP_CHECK',
+        storageKey: 'owner/session/final-step.jpg',
+        storageProvider: 'supabase',
       },
     });
     expect(prisma.stepAttempt.findFirst.mock.calls).toHaveLength(0);

@@ -3,14 +3,16 @@
 // ================================
 
 model userProfile {
-  id        String   @id @default(uuid())
-  authId    String   @unique
-  firstName String?
-  lastName  String?
-  bio       String?
-  avatarUrl String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id                    String   @id @default(uuid())
+  authId                String   @unique
+  firstName             String?
+  lastName              String?
+  bio                   String?
+  /// Private storage key for uploaded avatars, or an external URL (e.g. Google) when `avatarStorageProvider` is null.
+  avatarUrl             String?
+  avatarStorageProvider String?  @db.VarChar(32)
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
 
   // Relations
   authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
