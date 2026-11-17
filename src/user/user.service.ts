@@ -7,7 +7,7 @@ import { CustomLoggerService } from '../common/services/custom-logger.service';
 export class UserService {
   constructor(private readonly customLogger: CustomLoggerService) {}
 
-  create(createUserDto: CreateUserDto) {
+  create(_createUserDto: CreateUserDto) {
     this.customLogger.log('Creating new user', 'UserService');
     return 'This action adds a new user';
   }
@@ -22,7 +22,7 @@ export class UserService {
     return `This action returns a #${id} user`;
   }
 
-  update(id: number, updateUserDto: UpdateUserDto) {
+  update(id: number, _updateUserDto: UpdateUserDto) {
     this.customLogger.log(`Updating user with id: ${id}`, 'UserService');
     return `This action updates a #${id} user`;
   }

@@ -136,9 +136,9 @@ describe('MakeupService history media and deletion', () => {
       id: 'session-id',
       status: 'COMPLETED',
     } as never);
-    prisma.$transaction.mockImplementation(async (callback) =>
-      (callback as (client: PrismaService) => Promise<unknown>)(prisma),
-    );
+    prisma.$transaction.mockImplementation(((
+      callback: (client: Prisma.TransactionClient) => Promise<unknown>,
+    ) => callback(prisma)) as PrismaService['$transaction']);
     prisma.guideStep.findUniqueOrThrow.mockResolvedValue({
       id: 'final-step',
       guideId: 'guide-id',
@@ -240,9 +240,9 @@ describe('MakeupService history media and deletion', () => {
       id: 'session-id',
       status: 'IN_PROGRESS',
     } as never);
-    prisma.$transaction.mockImplementation(async (callback) =>
-      (callback as (client: PrismaService) => Promise<unknown>)(prisma),
-    );
+    prisma.$transaction.mockImplementation(((
+      callback: (client: Prisma.TransactionClient) => Promise<unknown>,
+    ) => callback(prisma)) as PrismaService['$transaction']);
 
     await service.saveStepSnapshot('owner-id', 'step-id', {
       buffer: Buffer.from('photo'),

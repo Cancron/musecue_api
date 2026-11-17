@@ -22,9 +22,9 @@ describe('workflow concurrency guards', () => {
   );
   beforeEach(() => {
     jest.resetAllMocks();
-    prisma.$transaction.mockImplementation(async (callback) =>
-      (callback as (tx: Prisma.TransactionClient) => Promise<unknown>)(prisma),
-    );
+    prisma.$transaction.mockImplementation(((
+      callback: (tx: Prisma.TransactionClient) => Promise<unknown>,
+    ) => callback(prisma)) as PrismaService['$transaction']);
     prisma.$queryRaw.mockResolvedValue([{ status: 'IN_PROGRESS' }]);
     prisma.guideStep.findFirst.mockResolvedValue({
       id: 'old-step',

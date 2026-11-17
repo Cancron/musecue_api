@@ -6,15 +6,24 @@ const validation = new ImageValidationService();
 const file = (buffer: Buffer) =>
   ({ buffer, size: buffer.length }) as Express.Multer.File;
 
+/**
+ * Noise from a fixed seed, so every run encodes the same image. (sharp's
+ * generated noise differs per run; with some random images the corrupted JPEG
+ * below happened to decode, which made the test fail about once in 150 runs.)
+ */
+function noisePixels(width: number, height: number): Buffer {
+  const pixels = Buffer.alloc(width * height * 3);
+  let seed = 0x2f6b1c3d;
+  for (let index = 0; index < pixels.length; index += 1) {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    pixels[index] = seed >>> 24;
+  }
+  return pixels;
+}
+
 const noisy = (format: 'jpeg' | 'png' | 'webp') =>
-  sharp({
-    create: {
-      width: 800,
-      height: 600,
-      channels: 3,
-      background: '#000000',
-      noise: { type: 'gaussian', mean: 128, sigma: 40 },
-    },
+  sharp(noisePixels(800, 600), {
+    raw: { width: 800, height: 600, channels: 3 },
   })
     .toFormat(format)
     .toBuffer();

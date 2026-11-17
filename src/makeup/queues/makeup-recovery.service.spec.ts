@@ -32,9 +32,9 @@ describe('AI job recovery', () => {
     prisma.aiRun.findUnique.mockResolvedValue(run as never);
     prisma.$queryRaw.mockResolvedValue([{ status: 'GUIDE_GENERATING' }]);
     prisma.aiRun.updateMany.mockResolvedValue({ count: 1 });
-    prisma.$transaction.mockImplementation(async (callback) =>
-      (callback as (tx: Prisma.TransactionClient) => Promise<unknown>)(prisma),
-    );
+    prisma.$transaction.mockImplementation(((
+      callback: (tx: Prisma.TransactionClient) => Promise<unknown>,
+    ) => callback(prisma)) as PrismaService['$transaction']);
   });
   it.each(['failed', 'completed', 'unknown'] as const)(
     'settles stranded database runs when queue state is %s',

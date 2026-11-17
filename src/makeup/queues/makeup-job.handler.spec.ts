@@ -24,9 +24,9 @@ function workflowPrisma() {
     createdAt: new Date(0),
   } as never);
   prisma.aiRun.updateMany.mockResolvedValue({ count: 1 });
-  prisma.$transaction.mockImplementation(async (callback) =>
-    (callback as (tx: Prisma.TransactionClient) => Promise<unknown>)(prisma),
-  );
+  prisma.$transaction.mockImplementation(((
+    callback: (tx: Prisma.TransactionClient) => Promise<unknown>,
+  ) => callback(prisma)) as PrismaService['$transaction']);
   return prisma;
 }
 
@@ -130,10 +130,9 @@ describe('MakeupJobHandler delivery semantics', () => {
       ],
       faceAnalysis: null,
     } as never);
-    prisma.$transaction.mockImplementation(
-      (callback: (tx: Prisma.TransactionClient) => Promise<unknown>) =>
-        callback(prisma),
-    );
+    prisma.$transaction.mockImplementation(((
+      callback: (tx: Prisma.TransactionClient) => Promise<unknown>,
+    ) => callback(prisma)) as PrismaService['$transaction']);
     const processor = new MakeupJobHandler(
       prisma,
       ai,
@@ -189,10 +188,9 @@ describe('MakeupJobHandler delivery semantics', () => {
       source: 'PRIVATE_UPLOAD',
     } as never);
     storage.readImage.mockResolvedValue(Buffer.from('test'));
-    prisma.$transaction.mockImplementation(
-      (callback: (tx: Prisma.TransactionClient) => Promise<unknown>) =>
-        callback(prisma),
-    );
+    prisma.$transaction.mockImplementation(((
+      callback: (tx: Prisma.TransactionClient) => Promise<unknown>,
+    ) => callback(prisma)) as PrismaService['$transaction']);
     const processor = new MakeupJobHandler(
       prisma,
       ai,
@@ -325,7 +323,7 @@ describe('MakeupJobHandler delivery semantics', () => {
     expect(
       prisma.aiRun.updateMany.mock.calls.some(
         ([args]) =>
-          args.where.id === 'run-id' &&
+          args.where?.id === 'run-id' &&
           args.data.status === 'FAILED' &&
           args.data.progress === 100,
       ),

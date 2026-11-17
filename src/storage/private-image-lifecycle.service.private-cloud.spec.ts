@@ -63,14 +63,15 @@ describe('PrivateImageLifecycleService (private cloud cleanup ledger)', () => {
   afterEach(() => jest.useRealTimers());
 
   it('does not retain an object because an avatar has the same key in another provider', async () => {
-    prisma.userProfile.count.mockImplementation((args) =>
+    prisma.userProfile.count.mockImplementation(((args?: {
+      where?: { avatarStorageProvider?: string };
+    }) =>
       Promise.resolve(
         !args?.where?.avatarStorageProvider ||
           args.where.avatarStorageProvider === 'fake-s3'
           ? 1
           : 0,
-      ),
-    );
+      )) as never);
     await expect(lifecycle.processRefs([REF])).resolves.toEqual(['DELETED']);
     expect(storage.delete.mock.calls).toEqual([[REF]]);
     expect(prisma.userProfile.count.mock.calls[0]?.[0]).toEqual({

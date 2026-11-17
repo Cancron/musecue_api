@@ -4,7 +4,7 @@ import { LiveAiGateway } from './live-ai.gateway';
 import { GUIDE_SPEECH_TASK, EVALUATION_SPEECH_TASK } from './ai.prompts';
 
 describe('LiveAiGateway', () => {
-  const provider = mock<StructuredAiProvider>();
+  const provider = mock<StructuredAiProvider>({ name: 'openrouter' });
   const gateway = new LiveAiGateway(provider);
   const input = {
     image: {
@@ -23,7 +23,6 @@ describe('LiveAiGateway', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
-    provider.name = 'openrouter';
     provider.validateConfiguration.mockReturnValue();
     provider.modelFor.mockReturnValue('openrouter/free');
   });

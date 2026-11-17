@@ -1,4 +1,4 @@
-import { Test, TestingModule } from '@nestjs/testing';
+import { mock, mockDeep, mockReset } from 'jest-mock-extended';
 import { AuthService } from './auth.service';
 import { AuthUtilsService } from './services/auth-utils.service';
 import { PrismaService } from '../common/services/prisma.service';
@@ -9,8 +9,6 @@ import { TokenVersionCache } from '../infrastructure/token-version/token-version
 import { EmailQueueService } from '../common/queues/email/email.queue';
 import { CustomLoggerService } from '../common/services/custom-logger.service';
 import AppError from '../common/errors/app.error';
-import * as bcrypt from 'bcryptjs';
-import { mock, mockReset } from 'jest-mock-extended';
 
 // Mock the AUTH_CONFIG to use numeric values for VERIFICATION
 jest.mock('./config/auth.config', () => ({
@@ -46,113 +44,32 @@ jest.mock('./config/auth.config', () => ({
 }));
 
 describe('AuthService', () => {
-  let service: AuthService;
-  let prismaService: jest.Mocked<PrismaService>;
-  let authUtilsService: jest.Mocked<AuthUtilsService>;
-  let activityLogService: jest.Mocked<ActivityLogService>;
+  const prismaService = mockDeep<PrismaService>();
+  const authUtilsService = mock<AuthUtilsService>();
   const challenges = mock<AuthChallengeRepository>();
-  let emailQueueService: jest.Mocked<EmailQueueService>;
+  const emailQueueService = mock<EmailQueueService>();
+  const service = new AuthService(
+    authUtilsService,
+    prismaService,
+    mock<ActivityLogService>(),
+    mock<RefreshSessionRepository>(),
+    challenges,
+    mock<TokenVersionCache>(),
+    emailQueueService,
+    mock<CustomLoggerService>(),
+  );
 
-  const mockTransaction = jest.fn();
+  /** Runs every transaction callback with `tx` as its client. */
+  const runTransactionsWith = (tx: unknown) =>
+    prismaService.$transaction.mockImplementation(((
+      callback: (client: unknown) => Promise<unknown>,
+    ) => callback(tx)) as PrismaService['$transaction']);
 
-  beforeEach(async () => {
-    const mockPrismaService = {
-      authUser: {
-        findFirst: jest.fn(),
-        findUnique: jest.fn(),
-        create: jest.fn(),
-        update: jest.fn(),
-      },
-      authSecurity: {
-        create: jest.fn(),
-        findUnique: jest.fn(),
-        update: jest.fn(),
-      },
-      emailHistory: {
-        create: jest.fn(),
-        updateMany: jest.fn(),
-      },
-      $transaction: mockTransaction,
-    };
-
-    const mockAuthUtilsService = {
-      checkRateLimit: jest.fn(),
-      validatePassword: jest.fn(),
-      generateVerificationCode: jest.fn(),
-      hashToken: jest.fn(),
-      createAccessToken: jest.fn(),
-      createRefreshToken: jest.fn(),
-      generateSecureId: jest.fn(),
-    };
-
-    const mockActivityLogService = {
-      logCreate: jest.fn(),
-      logUpdate: jest.fn(),
-      logCustomEvent: jest.fn(),
-    };
-
+  beforeEach(() => {
+    mockReset(prismaService);
+    mockReset(authUtilsService);
     mockReset(challenges);
-
-    const mockEmailQueueService = {
-      sendVerificationEmail: jest.fn(),
-      sendWelcomeEmail: jest.fn(),
-    };
-
-    const mockCustomLoggerService = {
-      log: jest.fn(),
-      error: jest.fn(),
-      warn: jest.fn(),
-      debug: jest.fn(),
-      verbose: jest.fn(),
-    };
-
-    const module: TestingModule = await Test.createTestingModule({
-      providers: [
-        AuthService,
-        {
-          provide: AuthUtilsService,
-          useValue: mockAuthUtilsService,
-        },
-        {
-          provide: PrismaService,
-          useValue: mockPrismaService,
-        },
-        {
-          provide: ActivityLogService,
-          useValue: mockActivityLogService,
-        },
-        {
-          provide: AuthChallengeRepository,
-          useValue: challenges,
-        },
-        {
-          provide: RefreshSessionRepository,
-          useValue: {},
-        },
-        {
-          provide: TokenVersionCache,
-          useValue: {},
-        },
-        {
-          provide: EmailQueueService,
-          useValue: mockEmailQueueService,
-        },
-        {
-          provide: CustomLoggerService,
-          useValue: mockCustomLoggerService,
-        },
-      ],
-    }).compile();
-
-    service = module.get<AuthService>(AuthService);
-    prismaService = module.get(PrismaService);
-    authUtilsService = module.get(AuthUtilsService);
-    activityLogService = module.get(ActivityLogService);
-    emailQueueService = module.get(EmailQueueService);
-  });
-
-  afterEach(() => {
-    jest.clearAllMocks();
+    mockReset(emailQueueService);
   });
 
   it('should be defined', () => {
@@ -174,7 +91,7 @@ describe('AuthService', () => {
 
     it('should create a new user successfully', async () => {
       // Mock dependencies
-      authUtilsService.checkRateLimit.mockResolvedValue(undefined);
+      authUtilsService.checkRateLimit.mockResolvedValue(true);
       authUtilsService.validatePassword.mockReturnValue(true);
       authUtilsService.generateVerificationCode.mockReturnValue('123456');
       prismaService.authUser.findFirst.mockResolvedValue(null);
@@ -196,7 +113,7 @@ describe('AuthService', () => {
           create: jest.fn().mockResolvedValue({}),
         },
       };
-      mockTransaction.mockImplementation(async (callback) => callback(tx));
+      runTransactionsWith(tx);
 
       challenges.issue.mockResolvedValue(undefined);
       emailQueueService.sendVerificationEmail.mockResolvedValue(undefined);
@@ -205,19 +122,21 @@ describe('AuthService', () => {
       await service.create(createAuthDto, meta);
 
       // Assertions
-      expect(authUtilsService.checkRateLimit).toHaveBeenCalledTimes(2);
-      expect(authUtilsService.validatePassword).toHaveBeenCalledWith(
+      expect(authUtilsService.checkRateLimit.mock.calls).toHaveLength(2);
+      expect(authUtilsService.validatePassword.mock.calls).toContainEqual([
         createAuthDto.password,
-      );
-      expect(prismaService.authUser.findFirst).toHaveBeenCalledWith({
-        where: {
-          OR: [
-            { email: createAuthDto.email },
-            { username: createAuthDto.username },
-          ],
+      ]);
+      expect(prismaService.authUser.findFirst.mock.calls).toContainEqual([
+        {
+          where: {
+            OR: [
+              { email: createAuthDto.email },
+              { username: createAuthDto.username },
+            ],
+          },
         },
-      });
-      expect(mockTransaction).toHaveBeenCalled();
+      ]);
+      expect(prismaService.$transaction.mock.calls).toHaveLength(1);
       // The code is stored (hashed by the repository) with the new account,
       // in the same transaction.
       expect(challenges.issue.mock.calls).toEqual([
@@ -229,35 +148,32 @@ describe('AuthService', () => {
           tx,
         ],
       ]);
-      expect(emailQueueService.sendVerificationEmail).toHaveBeenCalledWith(
-        createAuthDto.email,
-        createAuthDto.username,
-        '123456',
-        mockUser.id,
+      expect(emailQueueService.sendVerificationEmail.mock.calls).toContainEqual(
+        [createAuthDto.email, createAuthDto.username, '123456', mockUser.id],
       );
     });
 
     it('should throw error if password is weak', async () => {
-      authUtilsService.checkRateLimit.mockResolvedValue(undefined);
+      authUtilsService.checkRateLimit.mockResolvedValue(true);
       authUtilsService.validatePassword.mockReturnValue(false);
 
       await expect(service.create(createAuthDto, meta)).rejects.toThrow(
         'Password must be at least 6 characters',
       );
 
-      expect(authUtilsService.validatePassword).toHaveBeenCalledWith(
+      expect(authUtilsService.validatePassword.mock.calls).toContainEqual([
         createAuthDto.password,
-      );
+      ]);
     });
 
     it('should throw error if email already exists', async () => {
-      authUtilsService.checkRateLimit.mockResolvedValue(undefined);
+      authUtilsService.checkRateLimit.mockResolvedValue(true);
       authUtilsService.validatePassword.mockReturnValue(true);
       prismaService.authUser.findFirst.mockResolvedValue({
         id: 'existing-user',
         email: createAuthDto.email,
         username: 'different-username',
-      } as any);
+      } as never);
 
       await expect(service.create(createAuthDto, meta)).rejects.toThrow(
         'Email already exists!',
@@ -265,13 +181,13 @@ describe('AuthService', () => {
     });
 
     it('should throw error if username already exists', async () => {
-      authUtilsService.checkRateLimit.mockResolvedValue(undefined);
+      authUtilsService.checkRateLimit.mockResolvedValue(true);
       authUtilsService.validatePassword.mockReturnValue(true);
       prismaService.authUser.findFirst.mockResolvedValue({
         id: 'existing-user',
         email: 'different@example.com',
         username: createAuthDto.username,
-      } as any);
+      } as never);
 
       await expect(service.create(createAuthDto, meta)).rejects.toThrow(
         'Username already exists!',
@@ -284,7 +200,9 @@ describe('AuthService', () => {
       );
 
       await expect(service.create(createAuthDto, meta)).rejects.toThrow();
-      expect(authUtilsService.checkRateLimit).toHaveBeenCalled();
+      expect(authUtilsService.checkRateLimit.mock.calls.length).toBeGreaterThan(
+        0,
+      );
     });
   });
 
@@ -313,7 +231,7 @@ describe('AuthService', () => {
     }
 
     it('should verify email successfully', async () => {
-      prismaService.authUser.findUnique.mockResolvedValue(mockUser as any);
+      prismaService.authUser.findUnique.mockResolvedValue(mockUser as never);
       const tx = {
         authUser: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
       };
@@ -323,9 +241,11 @@ describe('AuthService', () => {
       const result = await service.verifyEmail(email, code, meta);
 
       expect(result).toEqual({ message: 'Email verified successfully' });
-      expect(prismaService.authUser.findUnique).toHaveBeenCalledWith({
-        where: { email },
-      });
+      expect(prismaService.authUser.findUnique.mock.calls).toContainEqual([
+        {
+          where: { email },
+        },
+      ]);
       // The code is checked (and consumed) for this account only, and the
       // account is marked verified in the same transaction.
       expect(challenges.verify.mock.calls[0]?.slice(0, 3)).toEqual([
@@ -336,19 +256,21 @@ describe('AuthService', () => {
       expect(typeof challenges.verify.mock.calls[0]?.[3]?.onValid).toBe(
         'function',
       );
-      expect(tx.authUser.updateMany).toHaveBeenCalledWith({
-        where: { id: mockUser.id, verified: false },
-        data: { verified: true },
-      });
-      expect(emailQueueService.sendWelcomeEmail).toHaveBeenCalledWith(
+      expect(tx.authUser.updateMany.mock.calls).toContainEqual([
+        {
+          where: { id: mockUser.id, verified: false },
+          data: { verified: true },
+        },
+      ]);
+      expect(emailQueueService.sendWelcomeEmail.mock.calls).toContainEqual([
         email,
         mockUser.username,
         mockUser.id,
-      );
+      ]);
     });
 
     it('should throw error if verification code is expired or not found', async () => {
-      prismaService.authUser.findUnique.mockResolvedValue(mockUser as any);
+      prismaService.authUser.findUnique.mockResolvedValue(mockUser as never);
       challenges.verify.mockResolvedValue('EXPIRED');
 
       await expect(service.verifyEmail(email, code, meta)).rejects.toThrow(
@@ -357,7 +279,7 @@ describe('AuthService', () => {
     });
 
     it('should throw error if verification code is invalid', async () => {
-      prismaService.authUser.findUnique.mockResolvedValue(mockUser as any);
+      prismaService.authUser.findUnique.mockResolvedValue(mockUser as never);
       challenges.verify.mockResolvedValue('INVALID');
 
       await expect(service.verifyEmail(email, code, meta)).rejects.toThrow(
@@ -379,7 +301,7 @@ describe('AuthService', () => {
       prismaService.authUser.findUnique.mockResolvedValue({
         ...mockUser,
         verified: true,
-      } as any);
+      } as never);
       validCode({
         authUser: { updateMany: jest.fn().mockResolvedValue({ count: 0 }) },
       });
@@ -406,11 +328,11 @@ describe('AuthService', () => {
         verified: false,
       };
 
-      authUtilsService.checkRateLimit.mockResolvedValue(undefined);
-      prismaService.authUser.findUnique.mockResolvedValue(mockUser as any);
+      authUtilsService.checkRateLimit.mockResolvedValue(true);
+      prismaService.authUser.findUnique.mockResolvedValue(mockUser as never);
       authUtilsService.generateVerificationCode.mockReturnValue('654321');
       challenges.issue.mockResolvedValue(undefined);
-      prismaService.emailHistory.create.mockResolvedValue({} as any);
+      prismaService.emailHistory.create.mockResolvedValue({} as never);
       emailQueueService.sendVerificationEmail.mockResolvedValue(undefined);
 
       const result = await service.resendVerificationEmail(email, meta);
@@ -418,10 +340,14 @@ describe('AuthService', () => {
       expect(result).toEqual({
         message: 'Verification email sent successfully',
       });
-      expect(authUtilsService.checkRateLimit).toHaveBeenCalled();
-      expect(prismaService.authUser.findUnique).toHaveBeenCalledWith({
-        where: { email },
-      });
+      expect(authUtilsService.checkRateLimit.mock.calls.length).toBeGreaterThan(
+        0,
+      );
+      expect(prismaService.authUser.findUnique.mock.calls).toContainEqual([
+        {
+          where: { email },
+        },
+      ]);
       // The new code replaces the previous one (fresh expiry and attempts).
       expect(challenges.issue.mock.calls).toEqual([
         [
@@ -431,11 +357,13 @@ describe('AuthService', () => {
           { expiresAt: expect.any(Date) as unknown, maxAttempts: 5 },
         ],
       ]);
-      expect(emailQueueService.sendVerificationEmail).toHaveBeenCalled();
+      expect(
+        emailQueueService.sendVerificationEmail.mock.calls.length,
+      ).toBeGreaterThan(0);
     });
 
     it('should throw error if user not found', async () => {
-      authUtilsService.checkRateLimit.mockResolvedValue(undefined);
+      authUtilsService.checkRateLimit.mockResolvedValue(true);
       prismaService.authUser.findUnique.mockResolvedValue(null);
 
       await expect(
@@ -451,8 +379,8 @@ describe('AuthService', () => {
         verified: true, // Already verified
       };
 
-      authUtilsService.checkRateLimit.mockResolvedValue(undefined);
-      prismaService.authUser.findUnique.mockResolvedValue(mockUser as any);
+      authUtilsService.checkRateLimit.mockResolvedValue(true);
+      prismaService.authUser.findUnique.mockResolvedValue(mockUser as never);
 
       await expect(
         service.resendVerificationEmail(email, meta),
@@ -477,14 +405,14 @@ describe('AuthService', () => {
         verified: false,
       };
 
-      authUtilsService.checkRateLimit.mockResolvedValue(undefined);
-      prismaService.authUser.findUnique.mockResolvedValue(mockUser as any);
+      authUtilsService.checkRateLimit.mockResolvedValue(true);
+      prismaService.authUser.findUnique.mockResolvedValue(mockUser as never);
       authUtilsService.generateVerificationCode.mockReturnValue('654321');
       challenges.issue.mockResolvedValue(undefined);
-      prismaService.emailHistory.create.mockResolvedValue({} as any);
+      prismaService.emailHistory.create.mockResolvedValue({} as never);
       prismaService.emailHistory.updateMany.mockResolvedValue({
         count: 1,
-      } as any);
+      } as never);
       emailQueueService.sendVerificationEmail.mockRejectedValue(
         new Error('Queue error'),
       );
@@ -492,7 +420,9 @@ describe('AuthService', () => {
       await expect(
         service.resendVerificationEmail(email, meta),
       ).rejects.toThrow('Failed to send verification email');
-      expect(prismaService.emailHistory.updateMany).toHaveBeenCalled();
+      expect(
+        prismaService.emailHistory.updateMany.mock.calls.length,
+      ).toBeGreaterThan(0);
     });
   });
 });

@@ -1,5 +1,5 @@
 import { Type, applyDecorators } from '@nestjs/common';
-import { ApiProperty, ApiExtraModels, getSchemaPath } from '@nestjs/swagger';
+import { ApiProperty, ApiExtraModels } from '@nestjs/swagger';
 import { ApiSuccessResponseDecorator } from './api-response.decorator';
 
 /**
