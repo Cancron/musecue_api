@@ -22,7 +22,8 @@
     "test:e2e:payments": "jest --config ./test/jest-e2e.json --maxWorkers=4 stripe subscription-billing",
     "postinstall": "prisma generate",
     "docker:dev": "docker compose -f docker-compose.yaml up -d",
-    "setup:services": "bash scripts/setup-services.sh"
+    "setup:services": "bash scripts/setup-services.sh",
+    "setup:prisma": "bash scripts/setup-prisma.sh"
   },
   "dependencies": {
     "@nest-lab/throttler-storage-redis": "^1.1.0",
