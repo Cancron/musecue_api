@@ -68,3 +68,5 @@ nestjs-explore-with-ec2-pujon2.pem
 *.crt
 
 docs
+
+/prisma/prisma-engines/schema-engine-*
