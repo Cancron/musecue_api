@@ -20,6 +20,10 @@ async function bootstrap() {
     rawBody: true,
   });
 
+  // Run shutdown hooks on SIGTERM/SIGINT, so background workers (BullMQ, or
+  // the PostgreSQL job worker) stop taking jobs and hand running ones back.
+  app.enableShutdownHooks();
+
   // Use Winston logger
   const nestLogger = app.get<LoggerService>(WINSTON_MODULE_NEST_PROVIDER);
   app.useLogger(nestLogger);

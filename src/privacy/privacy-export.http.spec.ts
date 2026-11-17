@@ -20,7 +20,8 @@ import { AllExceptionsFilter } from '../common/filters/all-exception.filter';
 import { AuthGuard } from '../common/guards/auth.guard';
 import { TransformInterceptor } from '../common/interceptors/transform.interceptor';
 import { PrismaService } from '../common/services/prisma.service';
-import { RedisService } from '../common/services/redis.service';
+import { RateLimitStore } from '../infrastructure/rate-limit/rate-limit.store';
+import { TokenVersionCache } from '../infrastructure/token-version/token-version.cache';
 import { PrivacyExportStorageService } from '../storage/privacy-export-storage.service';
 import type { DataExportView } from './interfaces/privacy-export.interface';
 import {
@@ -60,7 +61,7 @@ function complete(table: DataExportTable, id: string, completedAt: Date) {
 }
 
 const prisma = mockDeep<PrismaService>();
-const redis = mock<RedisService>();
+const tokenVersions = mock<TokenVersionCache>();
 const queue = mock<PrivacyExportQueueService>();
 const storage = mock<PrivacyExportStorageService>();
 
@@ -68,10 +69,10 @@ const storage = mock<PrivacyExportStorageService>();
 @Module({
   providers: [
     { provide: PrismaService, useValue: prisma },
-    { provide: RedisService, useValue: redis },
+    { provide: TokenVersionCache, useValue: tokenVersions },
     { provide: WINSTON_MODULE_PROVIDER, useValue: mock<Logger>() },
   ],
-  exports: [PrismaService, RedisService, WINSTON_MODULE_PROVIDER],
+  exports: [PrismaService, TokenVersionCache, WINSTON_MODULE_PROVIDER],
 })
 class TestInfrastructureModule {}
 
@@ -79,7 +80,7 @@ describe('Privacy export endpoints (HTTP)', () => {
   let app: INestApplication<App>;
   let table: DataExportTable;
   let originalSecret: string;
-  const tokens = new AuthUtilsService(mock<RedisService>());
+  const tokens = new AuthUtilsService(mock<RateLimitStore>());
   const bearer = (userId: string) =>
     `Bearer ${tokens.createAccessToken({ userId, role: UserRole.USER, tokenVersion: 1 })}`;
   const http = () => request(app.getHttpServer());
@@ -132,7 +133,7 @@ describe('Privacy export endpoints (HTTP)', () => {
     jest.resetAllMocks();
     table = new DataExportTable();
     // AuthGuard: the token version cached for every user is 1.
-    redis.get.mockResolvedValue(1 as never);
+    tokenVersions.get.mockResolvedValue(1);
     table.attach(prisma);
     // Owners are active unless a test says otherwise.
     prisma.authUser.findUnique.mockResolvedValue({ status: 'ACTIVE' } as never);
@@ -151,7 +152,7 @@ describe('Privacy export endpoints (HTTP)', () => {
     });
 
     it('rejects a token signed with another secret', async () => {
-      const forged = new AuthUtilsService(mock<RedisService>());
+      const forged = new AuthUtilsService(mock<RateLimitStore>());
       config.jwt_access_secret = 'attacker-secret';
       const token = forged.createAccessToken({
         userId: USER_A,
@@ -168,7 +169,7 @@ describe('Privacy export endpoints (HTTP)', () => {
     });
 
     it('rejects a revoked token (token version changed)', async () => {
-      redis.get.mockResolvedValue(2 as never);
+      tokenVersions.get.mockResolvedValue(2);
 
       await requestExport(USER_A).expect(401);
       expect(table.rows).toHaveLength(0);

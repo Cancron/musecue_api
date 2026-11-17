@@ -1,0 +1,62 @@
+// ================================
+// Infrastructure (REDIS_ENABLED=false)
+// ================================
+
+// A durable background job of the PostgreSQL queue driver, used instead of
+// BullMQ when REDIS_ENABLED=false. Jobs are claimed by the in-process worker
+// with a renewable lease (`leaseToken`, `leaseExpiresAt`); a job whose lease
+// expired (the worker stopped) is retried or, after its last attempt, failed.
+// `jobKey` deduplicates jobs of a queue (BullMQ's jobId). The payload is
+// encrypted with AES-256-GCM and cleared once the job completes; `lastError`
+// holds only the error class and code, never a message. `authId` is the
+// account the job belongs to: deleting (erasing) the account deletes its
+// jobs, waiting or finished, so none runs or is kept afterwards.
+model InfrastructureJob {
+  id               String                  @id
+  authId           String?
+  queue            String                  @db.VarChar(64)
+  name             String                  @db.VarChar(100)
+  jobKey           String?                 @db.VarChar(255)
+  payload          String?
+  priority         Int                     @default(0)
+  status           InfrastructureJobStatus @default(WAITING)
+  attemptsMade     Int                     @default(0)
+  maxAttempts      Int
+  backoffType      String?                 @db.VarChar(16)
+  backoffDelayMs   Int                     @default(0)
+  backoffJitter    Float                   @default(0)
+  // Remove the row as soon as the job completes / finally fails (jobs that
+  // carry secrets, e.g. one-time codes).
+  removeOnComplete Boolean                 @default(false)
+  removeOnFail     Boolean                 @default(false)
+  availableAt      DateTime                @default(now())
+  leaseToken       String?                 @db.VarChar(64)
+  leaseExpiresAt   DateTime?
+  startedAt        DateTime?
+  finishedAt       DateTime?
+  lastError        String?                 @db.VarChar(200)
+  createdAt        DateTime                @default(now())
+  updatedAt        DateTime                @default(now())
+
+  authUser authUser? @relation(fields: [authId], references: [id], onDelete: Cascade)
+
+  @@unique([queue, jobKey])
+  @@index([authId])
+  @@index([queue, status, priority, availableAt])
+  @@index([status, leaseExpiresAt])
+  @@index([status, finishedAt])
+}
+
+// A fixed-window rate-limit counter of the PostgreSQL rate-limit driver
+// (REDIS_ENABLED=false). The key is an HMAC of the limited identifier (route,
+// IP address, email), so no raw identifier is stored. Expired buckets are
+// removed by a periodic sweep.
+model RateLimitBucket {
+  keyHash         String    @id @db.Char(64)
+  hits            Int
+  windowExpiresAt DateTime
+  blockExpiresAt  DateTime?
+  updatedAt       DateTime  @default(now())
+
+  @@index([windowExpiresAt])
+}

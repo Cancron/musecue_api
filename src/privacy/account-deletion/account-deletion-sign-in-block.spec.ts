@@ -2,7 +2,10 @@ import * as bcrypt from 'bcryptjs';
 import { mock } from 'jest-mock-extended';
 import {
   AccountStore,
-  FakeRedis,
+  FakeAuthChallenges,
+  FakeRateLimits,
+  FakeRefreshSessions,
+  FakeTokenVersionCache,
 } from '../../../test/support/account-deletion-fakes';
 import { AuthService } from '../../auth/auth.service';
 import { AuthUtilsService } from '../../auth/services/auth-utils.service';
@@ -11,9 +14,9 @@ import config from '../../common/config/app.config';
 import type { EmailQueueService } from '../../common/queues/email/email.queue';
 import type { ActivityLogService } from '../../common/services/activity-log.service';
 import type { CustomLoggerService } from '../../common/services/custom-logger.service';
+import type { OAuthStateRepository } from '../../auth/state/oauth-state.repository';
 
 const PASSWORD = 'correct horse battery staple';
-const PREFIX = config.redis_cache_key_prefix;
 const META = { ip: '203.0.113.1', userAgent: 'spec' };
 
 /**
@@ -22,7 +25,7 @@ const META = { ip: '203.0.113.1', userAgent: 'spec' };
  */
 describe('Accounts pending deletion cannot sign in again (privacy)', () => {
   let store: AccountStore;
-  let redis: FakeRedis;
+  let sessions: FakeRefreshSessions;
   let utils: AuthUtilsService;
   let auth: AuthService;
   const originalSecrets = {
@@ -41,13 +44,15 @@ describe('Accounts pending deletion cannot sign in again (privacy)', () => {
 
   beforeEach(() => {
     store = new AccountStore();
-    redis = new FakeRedis();
-    utils = new AuthUtilsService(redis.asService());
+    sessions = new FakeRefreshSessions();
+    utils = new AuthUtilsService(new FakeRateLimits());
     auth = new AuthService(
       utils,
       store.prisma,
       mock<ActivityLogService>(),
-      redis.asService(),
+      sessions.asRepository(),
+      new FakeAuthChallenges(store.prisma).asRepository(),
+      new FakeTokenVersionCache(),
       mock<EmailQueueService>(),
       mock<CustomLoggerService>(),
     );
@@ -89,20 +94,14 @@ describe('Accounts pending deletion cannot sign in again (privacy)', () => {
     const pending = user('PENDING_DELETION');
     const jti = 'device-a';
     const refreshToken = utils.createRefreshToken({ userId: pending.id }, jti);
-    redis.put(`${PREFIX}:refresh:user:${pending.id}:${jti}`, {
-      userId: pending.id,
-      jti,
-      tokenHash: utils.hashToken(refreshToken),
-    });
-    redis.put(`${PREFIX}:sessions:user:${pending.id}`, [jti]);
+    sessions.add(pending.id, jti, utils.hashToken(refreshToken));
 
     await expect(auth.refreshToken(refreshToken, META)).rejects.toMatchObject({
       status: 401,
     });
 
-    expect(
-      redis.raw(`${PREFIX}:refresh:user:${pending.id}:${jti}`),
-    ).toBeUndefined();
+    expect(sessions.activeOf(pending.id)).toEqual([]);
+    expect(sessions.sessions.get(jti)?.revokedReason).toBe('ACCOUNT_INACTIVE');
   });
 
   it('refuses a Google sign-in without issuing tokens', async () => {
@@ -118,7 +117,8 @@ describe('Accounts pending deletion cannot sign in again (privacy)', () => {
     } as never);
     const google = new GoogleOAuthService(
       mock<CustomLoggerService>(),
-      redis.asService(),
+      mock<OAuthStateRepository>(),
+      sessions.asRepository(),
       store.prisma,
       mock<ActivityLogService>(),
       utils,

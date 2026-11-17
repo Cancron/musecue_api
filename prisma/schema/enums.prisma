@@ -26,6 +26,27 @@ enum mfaMethod {
   webauthn
 }
 
+// Why a refresh session stopped working.
+enum RefreshSessionRevocation {
+  // Replaced by rotation (POST /auth/refresh-token).
+  ROTATED
+  LOGOUT
+  LOGOUT_ALL
+  // Oldest session removed when a new login exceeded the device limit.
+  DEVICE_LIMIT
+  // A token whose hash did not match was presented for the session's user.
+  REUSE_DETECTED
+  // The account is no longer active.
+  ACCOUNT_INACTIVE
+  // A security event (e.g. account deletion) revoked every session.
+  SECURITY_EVENT
+}
+
+enum AuthChallengePurpose {
+  EMAIL_VERIFICATION
+  ACCOUNT_DELETION
+}
+
 enum loginAction {
   login
   logout
@@ -265,4 +286,18 @@ enum AccountDeletionFileStatus {
   // Deliberately kept: another account references it, or it lies outside
   // the account's storage scope.
   RETAINED
+}
+
+// ================================
+// Infrastructure Related Enums
+// ================================
+
+// State of a job in the PostgreSQL queue driver (REDIS_ENABLED=false).
+// WAITING jobs run once `availableAt` has passed (a later `availableAt` is a
+// delayed retry); ACTIVE jobs are leased by a worker.
+enum InfrastructureJobStatus {
+  WAITING
+  ACTIVE
+  COMPLETED
+  FAILED
 }

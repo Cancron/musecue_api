@@ -1,8 +1,6 @@
-import { Processor, WorkerHost } from '@nestjs/bullmq';
-import { Inject } from '@nestjs/common';
+import { Inject, Injectable, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type { DataExportErrorCode } from '@prisma/client';
-import type { Job } from 'bullmq';
 import { WINSTON_MODULE_PROVIDER } from 'nest-winston';
 import type { Logger } from 'winston';
 import { PrismaService } from '../../common/services/prisma.service';
@@ -12,11 +10,13 @@ import {
   PrivacyExportPermanentError,
   PrivacyExportSupersededError,
 } from '../export/privacy-export.errors';
+import type {
+  AbandonedJob,
+  JobExecution,
+  JobHandler,
+} from '../../infrastructure/jobs/job.types';
 import type { PrivacyExportJob } from '../interfaces/privacy-export.interface';
-import {
-  PRIVACY_EXPORT_QUEUE,
-  PRIVACY_EXPORT_RETENTION_MS,
-} from '../privacy-export.constants';
+import { PRIVACY_EXPORT_RETENTION_MS } from '../privacy-export.constants';
 import {
   DEFAULT_EXPORT_ATTEMPT_TIMING,
   ExportAttempt,
@@ -34,25 +34,24 @@ const PROGRESS_STEP = 5;
 const STORAGE_FULL_CODES = new Set(['ENOSPC', 'EDQUOT']);
 
 /**
- * Builds personal-data export archives outside the request cycle.
+ * Builds personal-data export archives outside the request cycle. Used by
+ * both queue drivers (the BullMQ processor and the PostgreSQL worker).
  *
  * Each attempt claims the export by stamping a new `startedAt`; progress,
  * publication and failure are all conditioned on that stamp, so a stalled
  * attempt that resumes late can neither overwrite nor publish over a newer
  * one.
  */
-@Processor(PRIVACY_EXPORT_QUEUE, { concurrency: 2 })
-export class PrivacyExportProcessor extends WorkerHost {
+@Injectable()
+export class PrivacyExportJobHandler implements JobHandler<PrivacyExportJob> {
   constructor(
     private readonly prisma: PrismaService,
     private readonly archive: PrivacyExportArchiveService,
     private readonly storage: PrivacyExportStorageService,
     private readonly lifecycle: PrivacyExportLifecycleService,
     @Inject(WINSTON_MODULE_PROVIDER) private readonly logger: Logger,
-    private readonly config?: ConfigService,
-  ) {
-    super();
-  }
+    @Optional() private readonly config?: ConfigService,
+  ) {}
 
   /** Worker lease and heartbeat (configurable mainly for tests). */
   private timing(): ExportAttemptTiming {
@@ -72,7 +71,7 @@ export class PrivacyExportProcessor extends WorkerHost {
     };
   }
 
-  async process(job: Job<PrivacyExportJob>): Promise<void> {
+  async process(job: JobExecution<PrivacyExportJob>): Promise<void> {
     const { exportId, authId } = job.data;
     const startedAt = new Date();
     const attempt = new ExportAttempt(
@@ -176,6 +175,22 @@ export class PrivacyExportProcessor extends WorkerHost {
     throw await this.handleFailure(job, failure, startedAt);
   }
 
+  /**
+   * The job's last attempt was interrupted (the worker stopped) or its
+   * payload was unreadable: fail the export at once, as the recovery sweep
+   * does for exports whose job is gone. The job ID is the export ID.
+   */
+  async onAbandoned(job: AbandonedJob<PrivacyExportJob>): Promise<void> {
+    const exportId = job.data?.exportId ?? job.id;
+    const failed = await this.lifecycle.fail(exportId, 'INTERRUPTED');
+    if (failed) {
+      this.logger.warn('Failed an interrupted personal data export', {
+        context: 'PrivacyExportProcessor',
+        exportId,
+      });
+    }
+  }
+
   private progressReporter(exportId: string, startedAt: Date) {
     let persisted = PROGRESS_STEP;
     return async (progress: number): Promise<void> => {
@@ -191,13 +206,13 @@ export class PrivacyExportProcessor extends WorkerHost {
   }
 
   private async handleFailure(
-    job: Job<PrivacyExportJob>,
+    job: JobExecution<PrivacyExportJob>,
     error: unknown,
     startedAt: Date,
   ): Promise<Error> {
     const { exportId } = job.data;
     const permanent = error instanceof PrivacyExportPermanentError;
-    const maxAttempts = job.opts.attempts ?? 1;
+    const maxAttempts = job.maxAttempts;
     const finalAttempt = permanent || job.attemptsMade + 1 >= maxAttempts;
     // Log the error class and code only: messages of filesystem errors
     // contain private storage paths.

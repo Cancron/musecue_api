@@ -1,4 +1,3 @@
-import { InjectQueue } from '@nestjs/bullmq';
 import {
   Inject,
   Injectable,
@@ -6,11 +5,10 @@ import {
   OnModuleInit,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Queue } from 'bullmq';
 import { WINSTON_MODULE_PROVIDER } from 'nest-winston';
 import type { Logger } from 'winston';
 import { PrismaService } from '../../common/services/prisma.service';
-import type { PrivacyExportJob } from '../interfaces/privacy-export.interface';
+import { JobInspector } from '../../infrastructure/jobs/job.types';
 import { PRIVACY_EXPORT_QUEUE } from '../privacy-export.constants';
 import { PrivacyExportLifecycleService } from './privacy-export-lifecycle.service';
 
@@ -18,13 +16,14 @@ const MIN_GRACE_MS = 120_000;
 const BATCH_SIZE = 100;
 
 /**
- * Fails exports whose BullMQ job no longer exists or has already finished,
- * so they stop blocking the owner's next request (only one export may be
- * active per user) and clients stop polling. Healthy waiting, delayed or
- * active jobs are left alone; a Redis outage postpones recovery.
+ * Fails exports whose job (on the selected queue driver) no longer exists or
+ * has already finished, so they stop blocking the owner's next request (only
+ * one export may be active per user) and clients stop polling. Healthy
+ * waiting, delayed or active jobs are left alone; a queue outage postpones
+ * recovery.
  *
  * File cleanup of failed and expired exports is done by
- * PrivacyExportRetentionService, which needs no Redis.
+ * PrivacyExportRetentionService, which needs no queue.
  */
 @Injectable()
 export class PrivacyExportRecoveryService
@@ -36,8 +35,7 @@ export class PrivacyExportRecoveryService
   constructor(
     private readonly prisma: PrismaService,
     private readonly lifecycle: PrivacyExportLifecycleService,
-    @InjectQueue(PRIVACY_EXPORT_QUEUE)
-    private readonly queue: Queue<PrivacyExportJob>,
+    private readonly jobs: JobInspector,
     private readonly config: ConfigService,
     @Inject(WINSTON_MODULE_PROVIDER) private readonly logger: Logger,
   ) {}
@@ -77,9 +75,11 @@ export class PrivacyExportRecoveryService
           ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
         });
         for (const item of exports) {
-          // Redis errors must abort this pass, not be treated as absent jobs.
-          const job = await this.queue.getJob(item.id);
-          const state = job ? await job.getState() : 'unknown';
+          // Queue errors must abort this pass, not be treated as absent jobs.
+          const state = await this.jobs.getJobState(
+            PRIVACY_EXPORT_QUEUE,
+            item.id,
+          );
           if (['failed', 'completed', 'unknown'].includes(state)) {
             const failed = await this.lifecycle.fail(item.id, 'INTERRUPTED', {
               updatedAt: item.updatedAt,

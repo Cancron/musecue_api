@@ -6,13 +6,18 @@ import { randomBytes } from 'node:crypto';
 import type { Logger } from 'winston';
 import { AuthService } from '../src/auth/auth.service';
 import { AuthUtilsService } from '../src/auth/services/auth-utils.service';
+import { AuthChallengeRepository } from '../src/auth/state/auth-challenge.repository';
+import { RefreshSessionRepository } from '../src/auth/state/refresh-session.repository';
+import { ConfigService } from '@nestjs/config';
+import config from '../src/common/config/app.config';
 import type { EmailQueueService } from '../src/common/queues/email/email.queue';
 import type { ActivityLogService } from '../src/common/services/activity-log.service';
 import type { CustomLoggerService } from '../src/common/services/custom-logger.service';
 import type { PrismaService } from '../src/common/services/prisma.service';
 import { AccountDeletionCodeService } from '../src/privacy/account-deletion/account-deletion-code.service';
 import { AccountDeletionService } from '../src/privacy/account-deletion/account-deletion.service';
-import { FakeRedis } from './support/account-deletion-fakes';
+import { PostgresRateLimitStore } from '../src/infrastructure/rate-limit/postgres-rate-limit.store';
+import { NoopTokenVersionCache } from '../src/infrastructure/token-version/token-version.cache';
 import {
   TEST_DATABASE_URL,
   applyMigrations,
@@ -32,6 +37,7 @@ describeWithDatabase('Account deletion requests (PostgreSQL)', () => {
   let client: PrismaClient;
   let deletions: AccountDeletionService;
   let passwordHash: string;
+  let originalRefreshSecret: string;
   const emailQueue = mock<EmailQueueService>();
 
   /** The owner's full proof: the password and a freshly emailed code. */
@@ -46,18 +52,32 @@ describeWithDatabase('Account deletion requests (PostgreSQL)', () => {
     await applyMigrations(schema, migrationNames());
     client = new PrismaClient({
       adapter: new PrismaPg(
-        { connectionString: TEST_DATABASE_URL as string },
+        {
+          connectionString: TEST_DATABASE_URL as string,
+          options: `-c search_path=${schema}`,
+        },
         { schema },
       ),
     });
     const prisma = client as unknown as PrismaService;
-    const redis = new FakeRedis().asService();
-    const utils = new AuthUtilsService(redis);
+    // Authentication state lives in PostgreSQL (REDIS_ENABLED=false drivers).
+    originalRefreshSecret = config.jwt_refresh_secret;
+    config.jwt_refresh_secret ||= 'account-deletion-e2e-refresh-secret';
+    const utils = new AuthUtilsService(
+      new PostgresRateLimitStore(
+        prisma,
+        new ConfigService({ NODE_ENV: 'test' }),
+        mock<Logger>(),
+      ),
+    );
+    const challenges = new AuthChallengeRepository(prisma);
     const auth = new AuthService(
       utils,
       prisma,
       mock<ActivityLogService>(),
-      redis,
+      new RefreshSessionRepository(prisma),
+      challenges,
+      new NoopTokenVersionCache(),
       mock<EmailQueueService>(),
       mock<CustomLoggerService>(),
     );
@@ -66,13 +86,14 @@ describeWithDatabase('Account deletion requests (PostgreSQL)', () => {
       prisma,
       auth,
       utils,
-      new AccountDeletionCodeService(redis, utils, emailQueue),
+      new AccountDeletionCodeService(challenges, utils, emailQueue),
       mock<Logger>(),
     );
     passwordHash = await bcrypt.hash(PASSWORD, 4);
   });
 
   afterAll(async () => {
+    config.jwt_refresh_secret = originalRefreshSecret;
     await client?.$disconnect();
     if (schema) await dropSchema(schema);
   });

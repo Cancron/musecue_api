@@ -27,12 +27,13 @@ import { AuthGuard } from '../common/guards/auth.guard';
 import { TransformInterceptor } from '../common/interceptors/transform.interceptor';
 import { CustomLoggerService } from '../common/services/custom-logger.service';
 import { PrismaService } from '../common/services/prisma.service';
-import { RedisService } from '../common/services/redis.service';
+import { RateLimitStore } from '../infrastructure/rate-limit/rate-limit.store';
+import { TokenVersionCache } from '../infrastructure/token-version/token-version.cache';
 import { ProAccessGuard, type ProAccessRequest } from './pro-access.guard';
 import { SubscriptionModule } from './subscription.module';
 
 const prisma = mockDeep<PrismaService>();
-const redis = mock<RedisService>();
+const tokenVersions = mock<TokenVersionCache>();
 const proHandler = jest.fn();
 
 /** A stand-in feature module, wired the way a real Pro feature would be. */
@@ -55,7 +56,7 @@ class FeatureTestController {
 @Module({
   imports: [SubscriptionModule],
   controllers: [FeatureTestController],
-  providers: [AuthGuard, RedisService],
+  providers: [AuthGuard],
 })
 class FeatureTestModule {}
 
@@ -64,8 +65,9 @@ class FeatureTestModule {}
   providers: [
     { provide: PrismaService, useValue: prisma },
     { provide: CustomLoggerService, useValue: mock<CustomLoggerService>() },
+    { provide: TokenVersionCache, useValue: tokenVersions },
   ],
-  exports: [PrismaService, CustomLoggerService],
+  exports: [PrismaService, CustomLoggerService, TokenVersionCache],
 })
 class TestInfrastructureModule {}
 
@@ -92,7 +94,7 @@ describe('Pro feature endpoints behind ProAccessGuard (HTTP)', () => {
   let app: INestApplication<App>;
   let originalSecret: string;
   let subscriptions: Map<string, Row>;
-  const tokens = new AuthUtilsService(mock<RedisService>());
+  const tokens = new AuthUtilsService(mock<RateLimitStore>());
 
   const call = (path: string, userId?: string, now: Date = at(10)) => {
     freezeTime(now);
@@ -110,10 +112,7 @@ describe('Pro feature endpoints behind ProAccessGuard (HTTP)', () => {
     config.jwt_access_secret = 'pro-access-spec-secret';
     const moduleRef = await Test.createTestingModule({
       imports: [TestInfrastructureModule, FeatureTestModule],
-    })
-      .overrideProvider(RedisService)
-      .useValue(redis)
-      .compile();
+    }).compile();
     app = moduleRef.createNestApplication();
     const logger = mock<Logger>();
     app.useGlobalFilters(new AllExceptionsFilter(logger));
@@ -164,7 +163,7 @@ describe('Pro feature endpoints behind ProAccessGuard (HTTP)', () => {
         }),
       ],
     ]);
-    redis.get.mockResolvedValue(1 as never);
+    tokenVersions.get.mockResolvedValue(1);
     prisma.userSubscription.findUnique.mockImplementation(((args: {
       where: { authId: string };
     }) =>

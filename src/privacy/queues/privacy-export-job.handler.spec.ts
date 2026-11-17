@@ -1,4 +1,4 @@
-import type { Job } from 'bullmq';
+import type { JobExecution } from '../../infrastructure/jobs/job.types';
 import { mock, mockDeep } from 'jest-mock-extended';
 import type { Logger } from 'winston';
 import type { PrismaService } from '../../common/services/prisma.service';
@@ -11,7 +11,7 @@ import type {
 } from '../interfaces/privacy-export.interface';
 import { PRIVACY_EXPORT_RETENTION_MS } from '../privacy-export.constants';
 import type { PrivacyExportLifecycleService } from './privacy-export-lifecycle.service';
-import { PrivacyExportProcessor } from './privacy-export.processor';
+import { PrivacyExportJobHandler } from './privacy-export-job.handler';
 
 const OWNER = 'owner-id';
 const EXPORT_ID = 'export-id';
@@ -29,23 +29,23 @@ type UpdateManyArgs = {
   data: Record<string, unknown>;
 };
 
-describe('PrivacyExportProcessor (privacy export worker)', () => {
+describe('PrivacyExportJobHandler (privacy export worker)', () => {
   let prisma: ReturnType<typeof mockDeep<PrismaService>>;
   let archive: ReturnType<typeof mock<PrivacyExportArchiveService>>;
   let storage: ReturnType<typeof mock<PrivacyExportStorageService>>;
   let lifecycle: ReturnType<typeof mock<PrivacyExportLifecycleService>>;
   let logger: ReturnType<typeof mock<Logger>>;
-  let processor: PrivacyExportProcessor;
+  let processor: PrivacyExportJobHandler;
 
   const job = (attemptsMade = 0, data: Partial<PrivacyExportJob> = {}) => {
     const discard = jest.fn();
     return {
       job: {
         data: { exportId: EXPORT_ID, authId: OWNER, ...data },
-        opts: { attempts: 3 },
+        maxAttempts: 3,
         attemptsMade,
         discard,
-      } as unknown as Job<PrivacyExportJob>,
+      } as unknown as JobExecution<PrivacyExportJob>,
       discard,
     };
   };
@@ -68,7 +68,7 @@ describe('PrivacyExportProcessor (privacy export worker)', () => {
     lifecycle = mock<PrivacyExportLifecycleService>();
     lifecycle.fail.mockResolvedValue(true);
     lifecycle.removeStaleAttemptFiles.mockResolvedValue();
-    processor = new PrivacyExportProcessor(
+    processor = new PrivacyExportJobHandler(
       prisma,
       archive,
       storage,
@@ -215,7 +215,7 @@ describe('PrivacyExportProcessor (privacy export worker)', () => {
     expect(lifecycle.removeStaleAttemptFiles.mock.calls).toHaveLength(0);
   });
 
-  it('returns a retryable failure to the queue and rethrows for BullMQ backoff', async () => {
+  it('returns a retryable failure to the queue and rethrows for the queue backoff', async () => {
     const error = Object.assign(new Error('disk hiccup'), { code: 'EIO' });
     archive.build.mockRejectedValue(error);
     const { job: first, discard } = job(0);
@@ -302,5 +302,26 @@ describe('PrivacyExportProcessor (privacy export worker)', () => {
     await expect(processor.process(job().job)).rejects.toBe(error);
 
     expect(storage.delete.mock.calls).toContainEqual([ARCHIVE.storageKey]);
+  });
+
+  it('fails an export whose job was abandoned by the PostgreSQL worker', async () => {
+    await processor.onAbandoned({
+      id: 'export-1',
+      name: 'BUILD_ARCHIVE',
+      data: { exportId: 'export-1', authId: 'owner-1' },
+      reason: 'INTERRUPTED',
+    });
+    // Without a readable payload the job ID (the export ID) is used.
+    await processor.onAbandoned({
+      id: 'export-2',
+      name: 'BUILD_ARCHIVE',
+      data: undefined,
+      reason: 'UNREADABLE',
+    });
+
+    expect(lifecycle.fail.mock.calls).toEqual([
+      ['export-1', 'INTERRUPTED'],
+      ['export-2', 'INTERRUPTED'],
+    ]);
   });
 });

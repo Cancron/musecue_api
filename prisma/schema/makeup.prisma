@@ -179,6 +179,11 @@ model AiRun {
   model              String      @default("musecue-deterministic-v1")
   promptVersion      String
   idempotencyKey     String
+  // Operation input captured when the run is created (e.g. `imageId` of a
+  // VISION_CHECK, `question` of a GUIDE_QUESTION), so the worker never depends
+  // on the queue payload alone. Immutable (database trigger); null for runs
+  // created before it existed. Never returned by the API.
+  jobInput           Json?
   result             Json?
   providerResponseId String?
   usage              Json?

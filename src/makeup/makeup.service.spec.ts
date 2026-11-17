@@ -261,4 +261,57 @@ describe('MakeupService history media and deletion', () => {
     expect(queue.enqueue.mock.calls).toHaveLength(0);
     expect(aiGateway.describe.mock.calls).toHaveLength(0);
   });
+
+  it('records the operation input on the run and never returns it', async () => {
+    prisma.guideStep.findFirst.mockResolvedValue({
+      id: 'step-id',
+      status: 'CURRENT',
+      guide: { sessionId: 'session-id', steps: [] },
+    } as never);
+    prisma.aiRun.findUnique.mockResolvedValue(null);
+    prisma.$transaction.mockImplementation(runInline);
+    aiGateway.describe.mockReturnValue({
+      provider: 'mock',
+      model: 'model',
+      promptVersion: 'version',
+    });
+    const created = { id: 'run-id', status: 'QUEUED' };
+    prisma.aiRun.create.mockResolvedValue(created as never);
+
+    const run = await service.askQuestion(
+      'owner-id',
+      'step-id',
+      {
+        question: 'How much blush?',
+      },
+      'question-key',
+    );
+
+    expect(run).toBe(created);
+    const args = prisma.aiRun.create.mock.calls[0]?.[0];
+    expect(args?.data).toMatchObject({
+      operation: 'GUIDE_QUESTION',
+      stepId: 'step-id',
+      jobInput: { question: 'How much blush?' },
+    });
+    expect(args?.omit).toEqual({ jobInput: true });
+    expect(queue.enqueue.mock.calls[0]).toEqual([
+      'GUIDE_QUESTION',
+      {
+        runId: 'run-id',
+        authId: 'owner-id',
+        sessionId: 'session-id',
+        stepId: 'step-id',
+        imageId: undefined,
+        question: 'How much blush?',
+      },
+    ]);
+    // Every client-facing read of a run leaves the input out.
+    prisma.aiRun.findFirst.mockResolvedValue(created as never);
+    await service.getRun('owner-id', 'run-id');
+    expect(prisma.aiRun.findFirst.mock.calls.at(-1)?.[0]).toMatchObject({
+      where: { id: 'run-id', authId: 'owner-id' },
+      omit: { jobInput: true },
+    });
+  });
 });

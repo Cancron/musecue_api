@@ -16,7 +16,8 @@ import { AllExceptionsFilter } from '../../common/filters/all-exception.filter';
 import { TransformInterceptor } from '../../common/interceptors/transform.interceptor';
 import { CustomLoggerService } from '../../common/services/custom-logger.service';
 import { PrismaService } from '../../common/services/prisma.service';
-import { RedisService } from '../../common/services/redis.service';
+import { RateLimitStore } from '../../infrastructure/rate-limit/rate-limit.store';
+import { TokenVersionCache } from '../../infrastructure/token-version/token-version.cache';
 import type { CheckoutSessionView } from '../interfaces/checkout.interface';
 import { SubscriptionModule } from '../subscription.module';
 import {
@@ -24,7 +25,7 @@ import {
   StripeCheckoutService,
 } from './stripe-checkout.service';
 
-const redis = mock<RedisService>();
+const tokenVersions = mock<TokenVersionCache>();
 const checkout = mock<StripeCheckoutService>();
 
 @Global()
@@ -32,8 +33,9 @@ const checkout = mock<StripeCheckoutService>();
   providers: [
     { provide: PrismaService, useValue: mockDeep<PrismaService>() },
     { provide: CustomLoggerService, useValue: mock<CustomLoggerService>() },
+    { provide: TokenVersionCache, useValue: tokenVersions },
   ],
-  exports: [PrismaService, CustomLoggerService],
+  exports: [PrismaService, CustomLoggerService, TokenVersionCache],
 })
 class TestInfrastructureModule {}
 
@@ -42,7 +44,7 @@ const ROUTE = '/v1/subscription/checkout';
 describe('POST /v1/subscription/checkout (Stripe checkout HTTP)', () => {
   let app: INestApplication<App>;
   let originalSecret: string;
-  const tokens = new AuthUtilsService(mock<RedisService>());
+  const tokens = new AuthUtilsService(mock<RateLimitStore>());
   const bearer = (userId: string) =>
     `Bearer ${tokens.createAccessToken({ userId, role: UserRole.USER, tokenVersion: 1 })}`;
 
@@ -64,8 +66,6 @@ describe('POST /v1/subscription/checkout (Stripe checkout HTTP)', () => {
     const moduleRef = await Test.createTestingModule({
       imports: [TestInfrastructureModule, SubscriptionModule],
     })
-      .overrideProvider(RedisService)
-      .useValue(redis)
       .overrideProvider(StripeCheckoutService)
       .useValue(checkout)
       .compile();
@@ -90,7 +90,7 @@ describe('POST /v1/subscription/checkout (Stripe checkout HTTP)', () => {
 
   beforeEach(() => {
     jest.resetAllMocks();
-    redis.get.mockResolvedValue(1 as never);
+    tokenVersions.get.mockResolvedValue(1);
     checkout.createCheckout.mockResolvedValue(view);
   });
 

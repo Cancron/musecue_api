@@ -3,11 +3,14 @@ import { AuthService } from './auth.service';
 import { AuthUtilsService } from './services/auth-utils.service';
 import { PrismaService } from '../common/services/prisma.service';
 import { ActivityLogService } from '../common/services/activity-log.service';
-import { RedisService } from '../common/services/redis.service';
+import { AuthChallengeRepository } from './state/auth-challenge.repository';
+import { RefreshSessionRepository } from './state/refresh-session.repository';
+import { TokenVersionCache } from '../infrastructure/token-version/token-version.cache';
 import { EmailQueueService } from '../common/queues/email/email.queue';
 import { CustomLoggerService } from '../common/services/custom-logger.service';
 import AppError from '../common/errors/app.error';
 import * as bcrypt from 'bcryptjs';
+import { mock, mockReset } from 'jest-mock-extended';
 
 // Mock the AUTH_CONFIG to use numeric values for VERIFICATION
 jest.mock('./config/auth.config', () => ({
@@ -29,6 +32,7 @@ jest.mock('./config/auth.config', () => ({
       MAX_FAILED_ATTEMPTS: 5,
       LOCKOUT_DURATION_MS: 30 * 60 * 1000,
     },
+    VERIFICATION_CODE_MAX_ATTEMPTS: 5,
     SESSION: {
       MAX_DEVICES_PER_USER: 5,
     },
@@ -38,12 +42,6 @@ jest.mock('./config/auth.config', () => ({
       ADMIN: 3,
       SUPERADMIN: 4,
     },
-    CACHE_PREFIXES: {
-      VERIFICATION_TOKEN: 'verification',
-      PASSWORD_RESET_TOKEN: 'password_reset',
-      REFRESH_TOKEN: 'refresh_token',
-      USER_SESSIONS: 'user_sessions',
-    },
   },
 }));
 
@@ -52,7 +50,7 @@ describe('AuthService', () => {
   let prismaService: jest.Mocked<PrismaService>;
   let authUtilsService: jest.Mocked<AuthUtilsService>;
   let activityLogService: jest.Mocked<ActivityLogService>;
-  let redisService: jest.Mocked<RedisService>;
+  const challenges = mock<AuthChallengeRepository>();
   let emailQueueService: jest.Mocked<EmailQueueService>;
 
   const mockTransaction = jest.fn();
@@ -93,11 +91,7 @@ describe('AuthService', () => {
       logCustomEvent: jest.fn(),
     };
 
-    const mockRedisService = {
-      set: jest.fn(),
-      get: jest.fn(),
-      del: jest.fn(),
-    };
+    mockReset(challenges);
 
     const mockEmailQueueService = {
       sendVerificationEmail: jest.fn(),
@@ -128,8 +122,16 @@ describe('AuthService', () => {
           useValue: mockActivityLogService,
         },
         {
-          provide: RedisService,
-          useValue: mockRedisService,
+          provide: AuthChallengeRepository,
+          useValue: challenges,
+        },
+        {
+          provide: RefreshSessionRepository,
+          useValue: {},
+        },
+        {
+          provide: TokenVersionCache,
+          useValue: {},
         },
         {
           provide: EmailQueueService,
@@ -146,7 +148,6 @@ describe('AuthService', () => {
     prismaService = module.get(PrismaService);
     authUtilsService = module.get(AuthUtilsService);
     activityLogService = module.get(ActivityLogService);
-    redisService = module.get(RedisService);
     emailQueueService = module.get(EmailQueueService);
   });
 
@@ -184,21 +185,20 @@ describe('AuthService', () => {
         username: createAuthDto.username,
       };
 
-      mockTransaction.mockImplementation(async (callback) => {
-        return callback({
-          authUser: {
-            create: jest.fn().mockResolvedValue(mockUser),
-          },
-          authSecurity: {
-            create: jest.fn().mockResolvedValue({}),
-          },
-          emailHistory: {
-            create: jest.fn().mockResolvedValue({}),
-          },
-        });
-      });
+      const tx = {
+        authUser: {
+          create: jest.fn().mockResolvedValue(mockUser),
+        },
+        authSecurity: {
+          create: jest.fn().mockResolvedValue({}),
+        },
+        emailHistory: {
+          create: jest.fn().mockResolvedValue({}),
+        },
+      };
+      mockTransaction.mockImplementation(async (callback) => callback(tx));
 
-      redisService.set.mockResolvedValue(undefined);
+      challenges.issue.mockResolvedValue(undefined);
       emailQueueService.sendVerificationEmail.mockResolvedValue(undefined);
 
       // Execute
@@ -218,7 +218,17 @@ describe('AuthService', () => {
         },
       });
       expect(mockTransaction).toHaveBeenCalled();
-      expect(redisService.set).toHaveBeenCalled();
+      // The code is stored (hashed by the repository) with the new account,
+      // in the same transaction.
+      expect(challenges.issue.mock.calls).toEqual([
+        [
+          mockUser.id,
+          'EMAIL_VERIFICATION',
+          '123456',
+          { expiresAt: expect.any(Date) as unknown, maxAttempts: 5 },
+          tx,
+        ],
+      ]);
       expect(emailQueueService.sendVerificationEmail).toHaveBeenCalledWith(
         createAuthDto.email,
         createAuthDto.username,
@@ -285,47 +295,51 @@ describe('AuthService', () => {
       ip: '127.0.0.1',
       userAgent: 'Jest Test Agent',
     };
+    const mockUser = {
+      id: 'user-123',
+      email,
+      username: 'testuser',
+      verified: false,
+    };
+
+    /** Runs the repository's onValid callback, as a matching code would. */
+    function validCode(tx: { authUser: { updateMany: jest.Mock } }) {
+      challenges.verify.mockImplementation(
+        async (_id, _purpose, _code, opts) => {
+          await opts?.onValid?.(tx as never);
+          return 'VALID';
+        },
+      );
+    }
 
     it('should verify email successfully', async () => {
-      const mockVerificationData = {
-        code: '123456',
-        userId: 'user-123',
-        email,
-        expiresAt: new Date(Date.now() + 10000).toISOString(),
-      };
-
-      const mockUser = {
-        id: 'user-123',
-        email,
-        username: 'testuser',
-        verified: false,
-      };
-
-      redisService.get.mockResolvedValue(mockVerificationData);
       prismaService.authUser.findUnique.mockResolvedValue(mockUser as any);
-
-      mockTransaction.mockImplementation(async (callback) => {
-        return callback({
-          authUser: {
-            update: jest
-              .fn()
-              .mockResolvedValue({ ...mockUser, verified: true }),
-          },
-        });
-      });
-
-      redisService.del.mockResolvedValue(1);
+      const tx = {
+        authUser: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+      };
+      validCode(tx);
       emailQueueService.sendWelcomeEmail.mockResolvedValue(undefined);
 
       const result = await service.verifyEmail(email, code, meta);
 
       expect(result).toEqual({ message: 'Email verified successfully' });
-      expect(redisService.get).toHaveBeenCalled();
       expect(prismaService.authUser.findUnique).toHaveBeenCalledWith({
         where: { email },
       });
-      expect(mockTransaction).toHaveBeenCalled();
-      expect(redisService.del).toHaveBeenCalled();
+      // The code is checked (and consumed) for this account only, and the
+      // account is marked verified in the same transaction.
+      expect(challenges.verify.mock.calls[0]?.slice(0, 3)).toEqual([
+        mockUser.id,
+        'EMAIL_VERIFICATION',
+        code,
+      ]);
+      expect(typeof challenges.verify.mock.calls[0]?.[3]?.onValid).toBe(
+        'function',
+      );
+      expect(tx.authUser.updateMany).toHaveBeenCalledWith({
+        where: { id: mockUser.id, verified: false },
+        data: { verified: true },
+      });
       expect(emailQueueService.sendWelcomeEmail).toHaveBeenCalledWith(
         email,
         mockUser.username,
@@ -334,7 +348,8 @@ describe('AuthService', () => {
     });
 
     it('should throw error if verification code is expired or not found', async () => {
-      redisService.get.mockResolvedValue(null);
+      prismaService.authUser.findUnique.mockResolvedValue(mockUser as any);
+      challenges.verify.mockResolvedValue('EXPIRED');
 
       await expect(service.verifyEmail(email, code, meta)).rejects.toThrow(
         'Verification code expired or invalid',
@@ -342,57 +357,37 @@ describe('AuthService', () => {
     });
 
     it('should throw error if verification code is invalid', async () => {
-      const mockVerificationData = {
-        code: '654321', // Different code
-        userId: 'user-123',
-        email,
-        expiresAt: new Date(Date.now() + 10000).toISOString(),
-      };
-
-      redisService.get.mockResolvedValue(mockVerificationData);
+      prismaService.authUser.findUnique.mockResolvedValue(mockUser as any);
+      challenges.verify.mockResolvedValue('INVALID');
 
       await expect(service.verifyEmail(email, code, meta)).rejects.toThrow(
         'Invalid verification code',
       );
+      expect(emailQueueService.sendWelcomeEmail.mock.calls).toHaveLength(0);
     });
 
-    it('should throw error if user not found', async () => {
-      const mockVerificationData = {
-        code: '123456',
-        userId: 'user-123',
-        email,
-        expiresAt: new Date(Date.now() + 10000).toISOString(),
-      };
-
-      redisService.get.mockResolvedValue(mockVerificationData);
+    it('treats an unknown email like an expired code', async () => {
       prismaService.authUser.findUnique.mockResolvedValue(null);
 
       await expect(service.verifyEmail(email, code, meta)).rejects.toThrow(
-        'User not found',
+        'Verification code expired or invalid',
       );
+      expect(challenges.verify.mock.calls).toHaveLength(0);
     });
 
     it('should throw error if email is already verified', async () => {
-      const mockVerificationData = {
-        code: '123456',
-        userId: 'user-123',
-        email,
-        expiresAt: new Date(Date.now() + 10000).toISOString(),
-      };
-
-      const mockUser = {
-        id: 'user-123',
-        email,
-        username: 'testuser',
-        verified: true, // Already verified
-      };
-
-      redisService.get.mockResolvedValue(mockVerificationData);
-      prismaService.authUser.findUnique.mockResolvedValue(mockUser as any);
+      prismaService.authUser.findUnique.mockResolvedValue({
+        ...mockUser,
+        verified: true,
+      } as any);
+      validCode({
+        authUser: { updateMany: jest.fn().mockResolvedValue({ count: 0 }) },
+      });
 
       await expect(service.verifyEmail(email, code, meta)).rejects.toThrow(
         'Email already verified',
       );
+      expect(emailQueueService.sendWelcomeEmail.mock.calls).toHaveLength(0);
     });
   });
 
@@ -414,7 +409,7 @@ describe('AuthService', () => {
       authUtilsService.checkRateLimit.mockResolvedValue(undefined);
       prismaService.authUser.findUnique.mockResolvedValue(mockUser as any);
       authUtilsService.generateVerificationCode.mockReturnValue('654321');
-      redisService.set.mockResolvedValue(undefined);
+      challenges.issue.mockResolvedValue(undefined);
       prismaService.emailHistory.create.mockResolvedValue({} as any);
       emailQueueService.sendVerificationEmail.mockResolvedValue(undefined);
 
@@ -427,7 +422,15 @@ describe('AuthService', () => {
       expect(prismaService.authUser.findUnique).toHaveBeenCalledWith({
         where: { email },
       });
-      expect(redisService.set).toHaveBeenCalled();
+      // The new code replaces the previous one (fresh expiry and attempts).
+      expect(challenges.issue.mock.calls).toEqual([
+        [
+          mockUser.id,
+          'EMAIL_VERIFICATION',
+          '654321',
+          { expiresAt: expect.any(Date) as unknown, maxAttempts: 5 },
+        ],
+      ]);
       expect(emailQueueService.sendVerificationEmail).toHaveBeenCalled();
     });
 
@@ -477,7 +480,7 @@ describe('AuthService', () => {
       authUtilsService.checkRateLimit.mockResolvedValue(undefined);
       prismaService.authUser.findUnique.mockResolvedValue(mockUser as any);
       authUtilsService.generateVerificationCode.mockReturnValue('654321');
-      redisService.set.mockResolvedValue(undefined);
+      challenges.issue.mockResolvedValue(undefined);
       prismaService.emailHistory.create.mockResolvedValue({} as any);
       prismaService.emailHistory.updateMany.mockResolvedValue({
         count: 1,

@@ -8,7 +8,7 @@ import type { Logger } from 'winston';
 import type { PrismaService } from '../src/common/services/prisma.service';
 import { MockAiGateway } from '../src/makeup/ai/mock-ai.gateway';
 import { MakeupService } from '../src/makeup/makeup.service';
-import { MakeupProcessor } from '../src/makeup/queues/makeup.processor';
+import { MakeupJobHandler } from '../src/makeup/queues/makeup-job.handler';
 import type {
   MakeupAiJob,
   MakeupQueueService,
@@ -603,13 +603,23 @@ describeWithDatabase(
         ).avatarUrl as string;
         supabase.latencyMs = 5;
 
-        await Promise.all([
-          makeup.deleteSession(owner, session.id),
-          makeup.deleteSession(owner, session.id).catch(() => undefined),
+        const [deletions] = await Promise.all([
+          Promise.allSettled([
+            makeup.deleteSession(owner, session.id),
+            makeup.deleteSession(owner, session.id),
+          ]),
           lifecycle.processDue(),
           restartedLifecycle().processDue(),
           profile.getAvatarContent(other),
         ]);
+        // Either concurrent deletion may win the session lock; the other
+        // finds nothing left to delete.
+        expect(
+          deletions.filter((result) => result.status === 'fulfilled'),
+        ).toHaveLength(1);
+        expect(
+          deletions.find((result) => result.status === 'rejected'),
+        ).toMatchObject({ reason: { status: 404 } });
         await makeDue();
         await lifecycle.processDue();
 
@@ -791,7 +801,7 @@ describeWithDatabase(
           .mockRejectedValue(
             new Error("Can't reach database server at `db.internal:5432`"),
           );
-        const processor = new MakeupProcessor(
+        const processor = new MakeupJobHandler(
           prisma,
           new MockAiGateway(),
           storage,
@@ -803,7 +813,7 @@ describeWithDatabase(
           processor.process({
             name: 'VISION_CHECK',
             data: payload,
-            opts: { attempts: 3 },
+            maxAttempts: 3,
             attemptsMade: 2,
             discard: jest.fn(),
             updateData: jest.fn(),

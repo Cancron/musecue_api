@@ -16,7 +16,7 @@ export const AUTH_CONFIG = {
     PASSWORD_RESET: '1h',
   },
 
-  // Rate Limiting (removed user-agent to prevent Redis key explosion)
+  // Rate Limiting (no user-agent keys, to prevent key explosion)
   RATE_LIMIT: {
     LOGIN_MAX_ATTEMPTS: 5,
     LOGIN_WINDOW_MS: 15 * 60 * 1000, // 15 minutes
@@ -30,6 +30,9 @@ export const AUTH_CONFIG = {
     LOCKOUT_DURATION_MS: 30 * 60 * 1000, // 30 minutes
   },
 
+  // Checks allowed per email verification code (a new code resets them)
+  VERIFICATION_CODE_MAX_ATTEMPTS: 5,
+
   // Session/Device Management
   SESSION: {
     MAX_DEVICES_PER_USER: 5, // Max concurrent refresh tokens per user
@@ -42,15 +45,4 @@ export const AUTH_CONFIG = {
     ADMIN: 3,
     SUPERADMIN: 4,
   } satisfies Record<UserRole, number>,
-
-  // Cache Prefixes (improved naming convention)
-  CACHE_PREFIXES: {
-    ACCESS_TOKEN: 'access_token',
-    REFRESH_TOKEN: 'refresh:user', // refresh:user:{userId}:{jti}
-    USER_SESSIONS: 'sessions:user', // sessions:user:{userId}
-    RATE_LIMIT: 'rate_limit:',
-    VERIFICATION_TOKEN: 'verification_token',
-    PASSWORD_RESET_TOKEN: 'password_reset_token',
-    TOKEN_BLACKLIST: 'token_blacklist',
-  },
 } as const;

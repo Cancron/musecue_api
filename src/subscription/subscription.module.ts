@@ -3,7 +3,6 @@ import Stripe from 'stripe';
 import { AuthGuard } from '../common/guards/auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { ActivityLogService } from '../common/services/activity-log.service';
-import { RedisService } from '../common/services/redis.service';
 import { ProAccessGuard } from './pro-access.guard';
 import { SubscriptionAccessService } from './subscription-access.service';
 import { SubscriptionBillingService } from './subscription-billing.service';
@@ -38,7 +37,6 @@ import { STRIPE_CLIENT, StripeGateway } from './stripe/stripe.gateway';
     AuthGuard,
     RolesGuard,
     ProAccessGuard,
-    RedisService,
     // Stripe checkout and webhooks (see src/subscription/stripe).
     {
       provide: STRIPE_SETTINGS,

@@ -3,10 +3,12 @@ import crypto from 'crypto';
 import * as jwt from 'jsonwebtoken';
 import { JwksClient } from 'jwks-rsa';
 import { CustomLoggerService } from '../../common/services/custom-logger.service';
-import { RedisService } from '../../common/services/redis.service';
 import { PrismaService } from '../../common/services/prisma.service';
 import { ActivityLogService } from '../../common/services/activity-log.service';
 import { AuthUtilsService } from './auth-utils.service';
+import { storeLoginSession } from '../state/login-session';
+import { OAuthStateRepository } from '../state/oauth-state.repository';
+import { RefreshSessionRepository } from '../state/refresh-session.repository';
 import {
   GOOGLE_OAUTH_CONFIG,
   getGoogleOAuthCredentials,
@@ -19,9 +21,8 @@ import {
   IGoogleOAuthLoginResponse,
   IGoogleIdTokenClaims,
 } from '../interfaces/google-oauth.interface';
-import { IStoredRefreshToken, UserRole } from '../interfaces/auth.interface';
+import { UserRole } from '../interfaces/auth.interface';
 import AppError from '../../common/errors/app.error';
-import config from '../../common/config/app.config';
 
 /* eslint-disable @typescript-eslint/no-unsafe-assignment */
 
@@ -36,7 +37,8 @@ export class GoogleOAuthService {
 
   constructor(
     private readonly customLogger: CustomLoggerService,
-    private readonly redisService: RedisService,
+    private readonly oauthStates: OAuthStateRepository,
+    private readonly sessions: RefreshSessionRepository,
     private readonly prismaService: PrismaService,
     private readonly activityLogService: ActivityLogService,
     private readonly authUtilsService: AuthUtilsService,
@@ -188,7 +190,7 @@ export class GoogleOAuthService {
     const codeVerifier = this.generateCodeVerifier();
     const codeChallenge = this.generateCodeChallenge(codeVerifier);
 
-    // Store state and code verifier in Redis for validation
+    // Store the state (hashed) with the encrypted code verifier for validation
     const stateData: IGoogleOAuthState = {
       state,
       codeVerifier,
@@ -198,9 +200,9 @@ export class GoogleOAuthService {
       createdAt: new Date().toISOString(),
     };
 
-    const stateKey = `${config.redis_cache_key_prefix}:${GOOGLE_OAUTH_CONFIG.STATE.CACHE_PREFIX}:${state}`;
-    await this.redisService.set(
-      stateKey,
+    await this.oauthStates.create(
+      GOOGLE_OAUTH_CONFIG.STATE.PROVIDER,
+      state,
       stateData,
       GOOGLE_OAUTH_CONFIG.STATE.TTL_SECONDS,
     );
@@ -302,9 +304,11 @@ export class GoogleOAuthService {
   ): Promise<IGoogleOAuthLoginResponse> {
     const { ip, userAgent, device } = meta;
 
-    // Validate state parameter
-    const stateKey = `${config.redis_cache_key_prefix}:${GOOGLE_OAUTH_CONFIG.STATE.CACHE_PREFIX}:${state}`;
-    const stateData = await this.redisService.get<IGoogleOAuthState>(stateKey);
+    // Validate and consume the state parameter (single-use, atomic)
+    const stateData = await this.oauthStates.consume<IGoogleOAuthState>(
+      GOOGLE_OAUTH_CONFIG.STATE.PROVIDER,
+      state,
+    );
 
     if (!stateData) {
       this.customLogger.warn(
@@ -315,9 +319,6 @@ export class GoogleOAuthService {
         'Invalid or expired OAuth state. Please try again.',
       );
     }
-
-    // Delete state from Redis (single-use)
-    await this.redisService.del(stateKey);
 
     // Validate state matches
     if (stateData.state !== state) {
@@ -564,102 +565,58 @@ export class GoogleOAuthService {
   ): Promise<IGoogleOAuthLoginResponse> {
     const { ip, userAgent, device } = meta;
 
-    // Distributed lock to prevent concurrent login race conditions
-    const lockKey = `${config.redis_cache_key_prefix}:lock:login:${user.id}`;
-    const lockAcquired = await this.redisService.setNX(lockKey, '1', 5);
+    // Generate JTI
+    const jti = this.authUtilsService.generateSecureId();
 
-    if (!lockAcquired) {
-      throw AppError.conflict(
-        'Another login is in progress. Please try again in a moment.',
-      );
-    }
+    // Create access token
+    const accessToken = this.authUtilsService.createAccessToken({
+      userId: user.id,
+      role: user.role as unknown as UserRole,
+      tokenVersion: user.tokenVersion, // Include tokenVersion for hybrid JWT validation
+    });
 
-    try {
-      // Generate JTI
-      const jti = this.authUtilsService.generateSecureId();
+    // Create refresh token with JTI
+    const refreshToken = this.authUtilsService.createRefreshToken(
+      { userId: user.id },
+      jti,
+    );
 
-      // Create access token
-      const accessToken = this.authUtilsService.createAccessToken({
-        userId: user.id,
-        role: user.role as unknown as UserRole,
-        tokenVersion: user.tokenVersion, // Include tokenVersion for hybrid JWT validation
-      });
+    // Store the refresh session (hash only) under the per-user login lock;
+    // the oldest sessions beyond the device limit are revoked
+    await storeLoginSession(
+      this.sessions,
+      this.authUtilsService,
+      user.id,
+      jti,
+      refreshToken,
+      { ip, userAgent, device },
+    );
 
-      // Create refresh token with JTI
-      const refreshToken = this.authUtilsService.createRefreshToken(
-        { userId: user.id },
-        jti,
-      );
+    // Log login attempt (fire-and-forget)
+    void this.logLoginAttempt({
+      authId: user.id,
+      ip,
+      userAgent,
+      device,
+      success: true,
+      provider: 'google',
+    });
 
-      // Hash the refresh token for storage
-      const tokenHash = this.authUtilsService.hashToken(refreshToken);
-
-      // Calculate TTL
-      const refreshTokenTTL = this.parseExpiryToSeconds(
-        AUTH_CONFIG.TOKEN_EXPIRY.REFRESH,
-      );
-
-      // Store refresh token in Redis
-      const refreshTokenKey = `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.REFRESH_TOKEN}:${user.id}:${jti}`;
-
-      const storedTokenData: IStoredRefreshToken = {
-        userId: user.id,
-        jti,
-        tokenHash,
-        ip,
-        userAgent,
-        device,
-        createdAt: new Date().toISOString(),
-      };
-
-      await this.redisService.set(
-        refreshTokenKey,
-        storedTokenData,
-        refreshTokenTTL,
-      );
-
-      // Track session
-      await this.addUserSession(user.id, jti, refreshTokenTTL);
-
-      // Enforce max devices
-      await this.enforceMaxDevices(
-        user.id,
-        AUTH_CONFIG.SESSION.MAX_DEVICES_PER_USER,
-      ).catch((error) => {
-        this.customLogger.warn(
-          `Failed to enforce max devices: ${error instanceof Error ? error.message : String(error)}`,
-          this.context,
-        );
-      });
-
-      // Log login attempt (fire-and-forget)
-      void this.logLoginAttempt({
-        authId: user.id,
-        ip,
-        userAgent,
-        device,
-        success: true,
-        provider: 'google',
-      });
-
-      return {
-        accessToken,
-        refreshToken,
-        user: {
-          id: user.id,
-          email: user.email,
-          username: user.username,
-          role: user.role,
-          verified: user.verified,
-          provider: user.provider,
-          providerId: user.providerId || '',
-        },
-        expiresIn: this.parseExpiryToSeconds(AUTH_CONFIG.TOKEN_EXPIRY.ACCESS),
-        isNewUser,
-      };
-    } finally {
-      await this.redisService.del(lockKey);
-    }
+    return {
+      accessToken,
+      refreshToken,
+      user: {
+        id: user.id,
+        email: user.email,
+        username: user.username,
+        role: user.role,
+        verified: user.verified,
+        provider: user.provider,
+        providerId: user.providerId || '',
+      },
+      expiresIn: this.parseExpiryToSeconds(AUTH_CONFIG.TOKEN_EXPIRY.ACCESS),
+      isNewUser,
+    };
   }
 
   /**
@@ -683,49 +640,6 @@ export class GoogleOAuthService {
         return value * 86400;
       default:
         return 900;
-    }
-  }
-
-  /**
-   * Add session to user's session list
-   */
-  private async addUserSession(
-    userId: string,
-    jti: string,
-    ttl: number,
-  ): Promise<void> {
-    const sessionKey = `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.USER_SESSIONS}:${userId}`;
-    const sessions = (await this.redisService.get<string[]>(sessionKey)) || [];
-
-    if (!sessions.includes(jti)) {
-      sessions.push(jti);
-    }
-
-    await this.redisService.set(sessionKey, sessions, ttl);
-  }
-
-  /**
-   * Enforce maximum number of devices per user
-   */
-  private async enforceMaxDevices(
-    userId: string,
-    maxDevices: number,
-  ): Promise<void> {
-    const sessionKey = `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.USER_SESSIONS}:${userId}`;
-    const sessions = (await this.redisService.get<string[]>(sessionKey)) || [];
-
-    if (sessions.length > maxDevices) {
-      // Remove oldest sessions
-      const sessionsToRemove = sessions.slice(0, sessions.length - maxDevices);
-
-      for (const jti of sessionsToRemove) {
-        const tokenKey = `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.REFRESH_TOKEN}:${userId}:${jti}`;
-        await this.redisService.del(tokenKey);
-      }
-
-      // Update session list
-      const remainingSessions = sessions.slice(sessions.length - maxDevices);
-      await this.redisService.set(sessionKey, remainingSessions);
     }
   }
 

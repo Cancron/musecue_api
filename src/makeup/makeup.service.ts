@@ -26,7 +26,12 @@ import { ImageValidationService } from './services/image-validation.service';
 import { AI_GATEWAY, type AiGateway } from './ai/ai.gateway';
 import type { AiOperation } from './interfaces/makeup.interface';
 import { lockSession, requireSessionStatus } from './workflow-lock';
-import { failRun } from './queues/run-lifecycle';
+import { failRun, toRunJobInput } from './queues/run-lifecycle';
+
+/** Columns of an AI run that are never returned by the API. */
+const RUN_OMIT = { jobInput: true } as const satisfies Prisma.AiRunOmit;
+/** An AI run as returned by the API. */
+type AiRunView = Omit<AiRun, keyof typeof RUN_OMIT>;
 
 const SESSION_INCLUDE = {
   images: {
@@ -339,6 +344,7 @@ export class MakeupService {
     ].includes(session.status);
     if (guideAlreadyRequested && recommendation.selectedAt) {
       const existingRun = await this.prisma.aiRun.findFirst({
+        omit: RUN_OMIT,
         where: {
           authId,
           sessionId,
@@ -400,6 +406,7 @@ export class MakeupService {
   ) {
     const existing = await this.prisma.aiRun.findUnique({
       where: { authId_idempotencyKey: { authId, idempotencyKey } },
+      omit: RUN_OMIT,
     });
     if (existing) {
       if (existing.operation !== 'VISION_CHECK' || existing.stepId !== stepId) {
@@ -609,6 +616,7 @@ export class MakeupService {
   async getRun(authId: string, runId: string) {
     const run = await this.prisma.aiRun.findFirst({
       where: { id: runId, authId },
+      omit: RUN_OMIT,
     });
     if (!run) throw AppError.notFound('AI job not found');
     return run;
@@ -698,22 +706,24 @@ export class MakeupService {
     nextStatus?: 'ANALYZING' | 'GUIDE_GENERATING',
     imageId?: string,
     recommendationId?: string,
-  ): Promise<{ run: AiRun; created: boolean }> {
+  ): Promise<{ run: AiRunView; created: boolean }> {
     const existing = await this.prisma.aiRun.findUnique({
       where: { authId_idempotencyKey: { authId, idempotencyKey } },
+      omit: RUN_OMIT,
     });
     if (existing) {
       this.assertRunAction(existing, sessionId, operation, stepId);
       return { run: existing, created: false };
     }
     const descriptor = this.aiGateway.describe(operation);
-    let run: AiRun;
+    let run: AiRunView;
     let created = false;
     try {
       run = await this.prisma.$transaction(async (tx) => {
         const status = await lockSession(tx, authId, sessionId);
         const duplicate = await tx.aiRun.findUnique({
           where: { authId_idempotencyKey: { authId, idempotencyKey } },
+          omit: RUN_OMIT,
         });
         if (duplicate) {
           this.assertRunAction(duplicate, sessionId, operation, stepId);
@@ -763,13 +773,17 @@ export class MakeupService {
             model: descriptor.model,
             promptVersion: descriptor.promptVersion,
             idempotencyKey,
+            // Immutable: the worker reads the operation input from the run.
+            jobInput: toRunJobInput({ imageId, question }),
           },
+          omit: RUN_OMIT,
         });
       });
     } catch (error) {
       if (this.isUniqueConstraintError(error)) {
         const concurrentRun = await this.prisma.aiRun.findUnique({
           where: { authId_idempotencyKey: { authId, idempotencyKey } },
+          omit: RUN_OMIT,
         });
         if (concurrentRun) {
           this.assertRunAction(concurrentRun, sessionId, operation, stepId);
@@ -811,7 +825,7 @@ export class MakeupService {
   }
 
   private assertRunAction(
-    run: AiRun,
+    run: AiRunView,
     sessionId: string,
     operation: AiOperation,
     stepId?: string,

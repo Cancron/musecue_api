@@ -1,6 +1,6 @@
 import { localImageStorage } from '../../../test/support/local-image-storage';
 import { ConfigService } from '@nestjs/config';
-import type { Job } from 'bullmq';
+import type { JobExecution } from '../../infrastructure/jobs/job.types';
 import { mock } from 'jest-mock-extended';
 import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -26,7 +26,7 @@ import { PrivacyZipWriter } from '../export/privacy-zip-writer';
 import type { PrivacyExportJob } from '../interfaces/privacy-export.interface';
 import { ExportAttempt } from './privacy-export-attempt';
 import { PrivacyExportLifecycleService } from './privacy-export-lifecycle.service';
-import { PrivacyExportProcessor } from './privacy-export.processor';
+import { PrivacyExportJobHandler } from './privacy-export-job.handler';
 
 const TIMING = { leaseMs: 1_000, heartbeatMs: 10 };
 const waitFor = async (condition: () => boolean, timeoutMs = 2_000) => {
@@ -139,7 +139,7 @@ describe('Export worker coordination (privacy)', () => {
     let exportRoot: string;
     let images: PrivateImageStorageService;
     let exportStorage: PrivacyExportStorageService;
-    let processor: PrivacyExportProcessor;
+    let processor: PrivacyExportJobHandler;
     const env = {
       images: process.env.PRIVATE_UPLOAD_DIR,
       exports: process.env.PRIVATE_EXPORT_DIR,
@@ -163,7 +163,7 @@ describe('Export worker coordination (privacy)', () => {
       images = localImageStorage();
       exportStorage = new PrivacyExportStorageService();
       const logger = mock<Logger>();
-      processor = new PrivacyExportProcessor(
+      processor = new PrivacyExportJobHandler(
         prisma,
         new PrivacyExportArchiveService(
           new PrivacyExportCollectorService(prisma, subscriptions),
@@ -197,10 +197,10 @@ describe('Export worker coordination (privacy)', () => {
     const deliver = (exportId: string) =>
       processor.process({
         data: { exportId, authId: OWNER_ID },
-        opts: { attempts: 3 },
+        maxAttempts: 3,
         attemptsMade: 0,
         discard: jest.fn(),
-      } as unknown as Job<PrivacyExportJob>);
+      } as unknown as JobExecution<PrivacyExportJob>);
     const filesOf = async (exportId: string) => {
       try {
         return await readdir(join(exportRoot, OWNER_ID, exportId));
@@ -306,7 +306,7 @@ describe('Export worker coordination (privacy)', () => {
     });
 
     it('registers its worker lease at claim time, before its first heartbeat', async () => {
-      const slowHeartbeat = new PrivacyExportProcessor(
+      const slowHeartbeat = new PrivacyExportJobHandler(
         prisma,
         new PrivacyExportArchiveService(
           new PrivacyExportCollectorService(
@@ -350,10 +350,10 @@ describe('Export worker coordination (privacy)', () => {
 
       const running = slowHeartbeat.process({
         data: { exportId: row.id, authId: OWNER_ID },
-        opts: { attempts: 3 },
+        maxAttempts: 3,
         attemptsMade: 0,
         discard: jest.fn(),
-      } as unknown as Job<PrivacyExportJob>);
+      } as unknown as JobExecution<PrivacyExportJob>);
       await waitFor(build.isPaused);
 
       // Visible to account erasure from the very start of the attempt.

@@ -1,6 +1,5 @@
 import { Injectable } from '@nestjs/common';
 import jwt, { JwtPayload, SignOptions } from 'jsonwebtoken';
-import { Response } from 'express';
 import httpStatus from 'http-status';
 import config from '../../common/config/app.config';
 import {
@@ -10,7 +9,7 @@ import {
   UserRole,
 } from '../interfaces/auth.interface';
 import { AUTH_CONFIG } from '../config/auth.config';
-import { RedisService } from '../../common/services/redis.service';
+import { RateLimitStore } from '../../infrastructure/rate-limit/rate-limit.store';
 import AppError from '../../common/errors/app.error';
 import crypto from 'crypto';
 
@@ -25,7 +24,7 @@ interface TokenOptions {
  */
 @Injectable()
 export class AuthUtilsService {
-  constructor(private readonly redisService: RedisService) {}
+  constructor(private readonly rateLimits: RateLimitStore) {}
 
   /**
    * Generates a cryptographically secure random ID
@@ -168,56 +167,28 @@ export class AuthUtilsService {
   }
 
   /**
-   * Removes user tokens from cache and cookies
-   */
-  async removeTokens(
-    res: Response,
-    prefix: string,
-    email: string,
-  ): Promise<void> {
-    const accessTokenKey = `${prefix}:user:${email}:accessToken`;
-    const refreshTokenKey = `${prefix}:user:${email}:refreshToken`;
-
-    await Promise.all([
-      this.redisService.del(accessTokenKey),
-      this.redisService.del(refreshTokenKey),
-    ]);
-
-    res.clearCookie('accessToken');
-    res.clearCookie('refreshToken');
-  }
-
-  /**
-   * Checks rate limiting for operations
+   * Checks a custom rate limit (login, registration, resend and deletion
+   * limits) on the selected rate-limit store: `maxAttempts` per `windowMs`,
+   * then refused for `windowMs`. When the store itself is unavailable the
+   * check is skipped, as before; the account lockout still applies.
    */
   async checkRateLimit(
     key: string,
     maxAttempts: number,
     windowMs: number,
   ): Promise<boolean> {
-    const cacheKey = `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.RATE_LIMIT}${key}`;
-    const lockKey = `${cacheKey}:locked`;
-
-    // First check if we're in a locked state
-    const isLocked = await this.redisService.exists(lockKey);
-    if (isLocked) {
-      throw new AppError(
-        httpStatus.TOO_MANY_REQUESTS,
-        `Rate limit exceeded. Please try again after ${windowMs / 1000} seconds.`,
-      );
+    let blocked: boolean;
+    try {
+      ({ blocked } = await this.rateLimits.hit(key, {
+        limit: maxAttempts,
+        windowMs,
+        blockMs: windowMs,
+      }));
+    } catch {
+      return true;
     }
 
-    // Use Redis INCR to atomically increment the counter
-    const currentAttempts = await this.redisService.incr(cacheKey);
-
-    // Set expiry on first attempt
-    if (currentAttempts === 1) {
-      await this.redisService.expire(cacheKey, windowMs / 1000);
-    }
-
-    if (currentAttempts && currentAttempts > maxAttempts) {
-      // Set a lock with TTL instead of continuing to increment
-      await this.redisService.set(lockKey, '1', windowMs / 1000);
+    if (blocked) {
       throw new AppError(
         httpStatus.TOO_MANY_REQUESTS,
         `Rate limit exceeded. Please try again after ${windowMs / 1000} seconds.`,
@@ -225,6 +196,11 @@ export class AuthUtilsService {
     }
 
     return true;
+  }
+
+  /** Forgets a custom rate limit (e.g. for an erased account). */
+  async resetRateLimit(key: string): Promise<void> {
+    await this.rateLimits.reset(key);
   }
 
   /**

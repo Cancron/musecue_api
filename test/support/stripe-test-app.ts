@@ -19,7 +19,8 @@ import { AllExceptionsFilter } from '../../src/common/filters/all-exception.filt
 import { TransformInterceptor } from '../../src/common/interceptors/transform.interceptor';
 import { CustomLoggerService } from '../../src/common/services/custom-logger.service';
 import { PrismaService } from '../../src/common/services/prisma.service';
-import { RedisService } from '../../src/common/services/redis.service';
+import { RateLimitStore } from '../../src/infrastructure/rate-limit/rate-limit.store';
+import { TokenVersionCache } from '../../src/infrastructure/token-version/token-version.cache';
 import {
   STRIPE_SETTINGS,
   type StripeSettings,
@@ -72,7 +73,7 @@ export async function createStripeTestApp(): Promise<StripeTestApp> {
   const stripe = { api: new FakeStripeApi(5) };
   const originalSecret = config.jwt_access_secret;
   config.jwt_access_secret = `stripe-e2e-${schema}`;
-  const tokens = new AuthUtilsService(mock<RedisService>());
+  const tokens = new AuthUtilsService(mock<RateLimitStore>());
   const bearer = (userId: string) =>
     `Bearer ${tokens.createAccessToken({ userId, role: UserRole.USER, tokenVersion: 1 })}`;
 
@@ -129,13 +130,17 @@ async function boot(
     adapter: new PrismaPg({ connectionString: url.toString() }, { schema }),
   });
 
+  const tokenVersions = mock<TokenVersionCache>();
+  tokenVersions.get.mockResolvedValue(1);
+
   @Global()
   @Module({
     providers: [
       { provide: PrismaService, useValue: client },
       { provide: CustomLoggerService, useValue: mock<CustomLoggerService>() },
+      { provide: TokenVersionCache, useValue: tokenVersions },
     ],
-    exports: [PrismaService, CustomLoggerService],
+    exports: [PrismaService, CustomLoggerService, TokenVersionCache],
   })
   class TestInfrastructureModule {}
 
@@ -156,13 +161,9 @@ async function boot(
     checkoutExpiresMinutes: 60,
   };
 
-  const redis = mock<RedisService>();
-  redis.get.mockResolvedValue(1 as never);
   const moduleRef = await Test.createTestingModule({
     imports: [TestInfrastructureModule, SubscriptionModule],
   })
-    .overrideProvider(RedisService)
-    .useValue(redis)
     .overrideProvider(STRIPE_SETTINGS)
     .useValue(settings)
     .overrideProvider(STRIPE_CLIENT)

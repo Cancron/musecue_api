@@ -4,17 +4,21 @@ import { AuthUtilsService } from './services/auth-utils.service';
 import { AUTH_CONFIG } from './config/auth.config';
 import { PrismaService } from '../common/services/prisma.service';
 import { ActivityLogService } from '../common/services/activity-log.service';
-import { RedisService } from '../common/services/redis.service';
 import { EmailQueueService } from '../common/queues/email/email.queue';
 import { CustomLoggerService } from '../common/services/custom-logger.service';
 import AppError from '../common/errors/app.error';
 import * as bcrypt from 'bcryptjs';
-import config from '../common/config/app.config';
+import { TokenVersionCache } from '../infrastructure/token-version/token-version.cache';
+import { ILoginResponse, UserRole } from './interfaces/auth.interface';
+import { AuthChallengeRepository } from './state/auth-challenge.repository';
+import { storeLoginSession } from './state/login-session';
 import {
-  ILoginResponse,
-  IStoredRefreshToken,
-  UserRole,
-} from './interfaces/auth.interface';
+  RefreshSessionRepository,
+  type StoredRefreshSession,
+} from './state/refresh-session.repository';
+
+/** Raised inside the verification transaction for an already verified user. */
+class EmailAlreadyVerifiedError extends Error {}
 
 /* eslint-disable @typescript-eslint/no-unsafe-assignment */
 /* eslint-disable @typescript-eslint/no-unsafe-member-access */
@@ -26,7 +30,9 @@ export class AuthService {
     private readonly authUtilsService: AuthUtilsService,
     private readonly prismaService: PrismaService,
     private readonly activityLogService: ActivityLogService,
-    private readonly redisService: RedisService,
+    private readonly sessions: RefreshSessionRepository,
+    private readonly challenges: AuthChallengeRepository,
+    private readonly tokenVersions: TokenVersionCache,
     private readonly emailQueueService: EmailQueueService,
     private readonly customLogger: CustomLoggerService,
   ) {}
@@ -89,7 +95,6 @@ export class AuthService {
       }
     }
 
-    // Generate verification code
     // Generate verification code
     const verificationCode = this.authUtilsService.generateVerificationCode();
     const expiresAt = new Date(
@@ -156,23 +161,20 @@ export class AuthService {
           tx,
         );
 
+        // Store the verification code (hashed) with the account
+        await this.challenges.issue(
+          user.id,
+          'EMAIL_VERIFICATION',
+          verificationCode,
+          {
+            expiresAt,
+            maxAttempts: AUTH_CONFIG.VERIFICATION_CODE_MAX_ATTEMPTS,
+          },
+          tx,
+        );
+
         return user;
       },
-    );
-
-    // Store verification code in Redis with expiry
-    const verificationKey = `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.VERIFICATION_TOKEN}:${email}`;
-    const ttlSeconds = Math.floor((expiresAt.getTime() - Date.now()) / 1000);
-
-    await this.redisService.set(
-      verificationKey,
-      {
-        code: verificationCode,
-        userId: newUser.id,
-        email: newUser.email,
-        expiresAt: expiresAt.toISOString(),
-      },
-      ttlSeconds,
     );
 
     // Queue verification email for async processing
@@ -225,74 +227,79 @@ export class AuthService {
       `Email verification attempt for: ${email}`,
       'AuthService',
     );
-    const verificationKey = `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.VERIFICATION_TOKEN}:${email}`;
+    const expiredError = AppError.badRequest(
+      'Verification code expired or invalid. Please request a new code.',
+    );
 
-    // Get verification data from Redis
-    const verificationData = await this.redisService.get<{
-      code: string;
-      userId: string;
-      email: string;
-      expiresAt: string;
-    }>(verificationKey);
+    // The code belongs to the account registered with this email
+    const user = await this.prismaService.authUser.findUnique({
+      where: { email },
+    });
 
-    if (!verificationData) {
+    if (!user) {
       this.customLogger.warn(
         `Verification failed: Code expired or invalid for ${email}`,
         'AuthService',
       );
-      throw AppError.badRequest(
-        'Verification code expired or invalid. Please request a new code.',
-      );
+      throw expiredError;
     }
 
-    // Validate code
-    if (verificationData.code !== code) {
+    // Check (and count) the code; a matching code is consumed in the same
+    // transaction that marks the email as verified
+    let check: Awaited<ReturnType<AuthChallengeRepository['verify']>>;
+    try {
+      check = await this.challenges.verify(
+        user.id,
+        'EMAIL_VERIFICATION',
+        code,
+        {
+          onValid: async (tx) => {
+            const verified = await tx.authUser.updateMany({
+              where: { id: user.id, verified: false },
+              data: { verified: true },
+            });
+            if (!verified.count) throw new EmailAlreadyVerifiedError();
+
+            // Log verification activity
+            await this.activityLogService.logCustomEvent(
+              'authUser',
+              user.id,
+              'profile_update',
+              { ip, userAgent, actionedBy: user.id },
+              [
+                {
+                  fieldName: 'verified',
+                  oldValue: 'false',
+                  newValue: 'true',
+                },
+              ],
+              tx,
+            );
+          },
+        },
+      );
+    } catch (error) {
+      if (error instanceof EmailAlreadyVerifiedError) {
+        throw AppError.badRequest('Email already verified');
+      }
+      throw error;
+    }
+
+    if (check === 'EXPIRED') {
+      this.customLogger.warn(
+        `Verification failed: Code expired or invalid for ${email}`,
+        'AuthService',
+      );
+      throw expiredError;
+    }
+
+    if (check === 'INVALID') {
       this.customLogger.warn(
         `Verification failed: Invalid code for ${email}`,
         'AuthService',
       );
       throw AppError.badRequest('Invalid verification code');
     }
-
-    // Find user
-    const user = await this.prismaService.authUser.findUnique({
-      where: { email },
-    });
-
-    if (!user) {
-      throw AppError.notFound('User not found');
-    }
-
-    if (user.verified) {
-      throw AppError.badRequest('Email already verified');
-    }
-
-    // Update user as verified
-    await this.prismaService.$transaction(async (tx) => {
-      await tx.authUser.update({
-        where: { id: user.id },
-        data: { verified: true },
-      });
-
-      // Log verification activity
-      await this.activityLogService.logCustomEvent(
-        'authUser',
-        user.id,
-        'profile_update',
-        { ip, userAgent, actionedBy: user.id },
-        [
-          {
-            fieldName: 'verified',
-            oldValue: 'false',
-            newValue: 'true',
-          },
-        ],
-        tx,
-      );
-    });
-
-    // Delete verification code from Redis
-    await this.redisService.del(verificationKey);
 
     // Queue welcome email for async processing
     try {
@@ -359,19 +366,15 @@ export class AuthService {
       Date.now() + this.parseExpiryToSeconds(VERIFICATION) * 1000,
     );
 
-    // Store new verification code in Redis
-    const verificationKey = `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.VERIFICATION_TOKEN}:${email}`;
-    const ttlSeconds = Math.floor((expiresAt.getTime() - Date.now()) / 1000);
-
-    await this.redisService.set(
-      verificationKey,
+    // Store the new verification code (hashed); it replaces the previous one
+    await this.challenges.issue(
+      user.id,
+      'EMAIL_VERIFICATION',
+      verificationCode,
       {
-        code: verificationCode,
-        userId: user.id,
-        email: user.email,
-        expiresAt: expiresAt.toISOString(),
+        expiresAt,
+        maxAttempts: AUTH_CONFIG.VERIFICATION_CODE_MAX_ATTEMPTS,
       },
-      ttlSeconds,
     );
 
     // Create new email history record
@@ -573,159 +576,74 @@ export class AuthService {
       );
     }
 
-    // Distributed lock to prevent concurrent login race conditions
-    const lockKey = `${config.redis_cache_key_prefix}:lock:login:${user.id}`;
-    const lockAcquired = await this.redisService.setNX(lockKey, '1', 5); // 5 second TTL
+    // Generate JTI FIRST (cryptographically secure)
+    const jti: string = this.authUtilsService.generateSecureId();
 
-    if (!lockAcquired) {
-      throw AppError.conflict(
-        'Another login is in progress. Please try again in a moment.',
-      );
-    }
+    // Create access token (stateless, minimal payload - no email)
+    const accessToken: string = this.authUtilsService.createAccessToken({
+      userId: user.id,
+      role: user.role as unknown as UserRole,
+      tokenVersion: user.tokenVersion, // Include tokenVersion for hybrid JWT validation
+    });
 
-    try {
-      // Generate JTI FIRST (cryptographically secure)
-      const jti: string = this.authUtilsService.generateSecureId();
+    // Create refresh token with JTI embedded
+    const refreshToken: string = this.authUtilsService.createRefreshToken(
+      { userId: user.id },
+      jti,
+    );
 
-      // Create access token (stateless, minimal payload - no email)
-      const accessToken: string = this.authUtilsService.createAccessToken({
-        userId: user.id,
-        role: user.role as unknown as UserRole,
-        tokenVersion: user.tokenVersion, // Include tokenVersion for hybrid JWT validation
-      });
+    // CRITICAL: Store the refresh session (hash only, never the raw token).
+    // A per-user lock rejects a concurrent login of the same user, and the
+    // oldest sessions beyond the device limit are revoked in the same
+    // transaction.
+    await storeLoginSession(
+      this.sessions,
+      this.authUtilsService,
+      user.id,
+      jti,
+      refreshToken,
+      { ip, userAgent, device },
+    );
 
-      // Create refresh token with JTI embedded
-      const refreshToken: string = this.authUtilsService.createRefreshToken(
-        { userId: user.id },
-        jti,
-      );
-
-      // Hash the refresh token for secure storage (never store raw tokens)
-      const tokenHash: string = this.authUtilsService.hashToken(refreshToken);
-
-      // Calculate TTL
-      const refreshTokenTTL = this.parseExpiryToSeconds(
-        AUTH_CONFIG.TOKEN_EXPIRY.REFRESH,
-      );
-
-      // Redis key with proper naming convention
-      const refreshTokenKey = `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.REFRESH_TOKEN}:${user.id}:${jti}`;
-
-      // Stored token data (with hash, not raw token)
-      const storedTokenData: IStoredRefreshToken = {
-        userId: user.id,
-        jti,
-        tokenHash, // Store hash, not raw token
+    // NON-CRITICAL: DB operations (fire-and-forget with detailed logging)
+    void Promise.allSettled([
+      security
+        ? this.prismaService.authSecurity.update({
+            where: { id: security.id },
+            data: {
+              failedAttempts: 0,
+              lastFailedAt: null,
+              lockExpiresAt: null,
+            },
+          })
+        : Promise.resolve(),
+      this.logLoginAttempt({
+        authId: user.id,
         ip,
         userAgent,
         device,
-        createdAt: new Date().toISOString(),
-      };
-
-      // Execute critical Redis operations with detailed error handling and rollback
-      try {
-        // CRITICAL: Store refresh token hash in Redis
-        const stored = await this.redisService.set(
-          refreshTokenKey,
-          storedTokenData,
-          refreshTokenTTL,
-        );
-        if (!stored) throw new Error('Refresh token persistence failed');
-      } catch (error) {
-        console.error('Failed to store refresh token in Redis:', {
-          userId: user.id,
-          jti,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        throw AppError.serviceUnavailable(
-          'Authentication service temporarily unavailable. Please try again.',
-        );
-      }
-
-      try {
-        // CRITICAL: Track session in user's session list
-        await this.addUserSession(user.id, jti, refreshTokenTTL);
-      } catch (error) {
-        console.error('Failed to add user session to Redis:', {
-          userId: user.id,
-          jti,
-          error: error instanceof Error ? error.message : String(error),
-        });
-
-        // Rollback: Remove the refresh token we just stored
-        await this.redisService.del(refreshTokenKey).catch((rollbackError) => {
-          console.error('CRITICAL: Failed to rollback refresh token:', {
-            userId: user.id,
-            jti,
-            error:
-              rollbackError instanceof Error
-                ? rollbackError.message
-                : String(rollbackError),
-          });
-        });
-
-        throw AppError.serviceUnavailable(
-          'Authentication service temporarily unavailable. Please try again.',
-        );
-      }
-
-      // NON-CRITICAL: Enforce max devices (log but don't fail login)
-      try {
-        await this.enforceMaxDevices(
-          user.id,
-          AUTH_CONFIG.SESSION.MAX_DEVICES_PER_USER,
-        );
-      } catch (error) {
-        console.error('Failed to enforce max devices (non-critical):', {
-          userId: user.id,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        // Continue - login still succeeds
-      }
-
-      // NON-CRITICAL: DB operations (fire-and-forget with detailed logging)
-      void Promise.allSettled([
-        security
-          ? this.prismaService.authSecurity.update({
-              where: { id: security.id },
-              data: {
-                failedAttempts: 0,
-                lastFailedAt: null,
-                lockExpiresAt: null,
-              },
-            })
-          : Promise.resolve(),
-        this.logLoginAttempt({
-          authId: user.id,
-          ip,
-          userAgent,
-          device,
-          success: true,
-        }),
-      ]).then((results) => {
-        results.forEach((result) => {
-          if (result.status === 'rejected') {
-            console.error('Non-critical login post-process failed:', result);
-          }
-        });
+        success: true,
+      }),
+    ]).then((results) => {
+      results.forEach((result) => {
+        if (result.status === 'rejected') {
+          console.error('Non-critical login post-process failed:', result);
+        }
       });
+    });
 
-      return {
-        accessToken,
-        refreshToken,
-        user: {
-          id: user.id,
-          email: user.email,
-          username: user.username,
-          role: user.role,
-          verified: user.verified,
-        },
-        expiresIn: this.parseExpiryToSeconds(AUTH_CONFIG.TOKEN_EXPIRY.ACCESS),
-      };
-    } finally {
-      // Always release the lock
-      await this.redisService.del(lockKey);
-    }
+    return {
+      accessToken,
+      refreshToken,
+      user: {
+        id: user.id,
+        email: user.email,
+        username: user.username,
+        role: user.role,
+        verified: user.verified,
+      },
+      expiresIn: this.parseExpiryToSeconds(AUTH_CONFIG.TOKEN_EXPIRY.ACCESS),
+    };
   }
 
   /**
@@ -761,21 +679,22 @@ export class AuthService {
       throw AppError.unauthorized('Invalid refresh token payload');
     }
 
-    // Get stored token data from Redis
-    const refreshTokenKey = `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.REFRESH_TOKEN}:${userId}:${jti}`;
-    let storedData: IStoredRefreshToken | null;
+    // Get the stored session
+    let storedData: StoredRefreshSession | null;
     try {
-      storedData =
-        await this.redisService.getRequired<IStoredRefreshToken>(
-          refreshTokenKey,
-        );
+      storedData = await this.sessions.find(jti);
     } catch {
       throw AppError.serviceUnavailable(
         'Authentication is temporarily unavailable',
       );
     }
 
-    if (!storedData) {
+    if (
+      !storedData ||
+      storedData.authId !== userId ||
+      storedData.revokedAt !== null ||
+      storedData.expiresAt.getTime() <= Date.now()
+    ) {
       // A concurrent request may already have rotated it. Reject this token,
       // without revoking the successful request's replacement or other devices.
       throw AppError.unauthorized(
@@ -787,7 +706,7 @@ export class AuthService {
     const tokenHash: string = this.authUtilsService.hashToken(refreshToken);
     if (storedData.tokenHash !== tokenHash) {
       // Token mismatch - potential attack, revoke all tokens
-      await this.revokeAllUserTokens(userId);
+      await this.revokeAllUserTokens(userId, 'REUSE_DETECTED');
       throw AppError.unauthorized('Invalid refresh token');
     }
 
@@ -798,7 +717,7 @@ export class AuthService {
     });
 
     if (!user || user.status !== 'ACTIVE') {
-      await this.revokeAllUserTokens(userId);
+      await this.revokeAllUserTokens(userId, 'ACCOUNT_INACTIVE');
       throw AppError.unauthorized('User account is not active');
     }
 
@@ -817,37 +736,26 @@ export class AuthService {
       newJti,
     );
 
-    const newTokenHash: string =
-      this.authUtilsService.hashToken(newRefreshToken);
     const refreshTokenTTL = this.parseExpiryToSeconds(
       AUTH_CONFIG.TOKEN_EXPIRY.REFRESH,
     );
 
-    const newRefreshTokenKey = `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.REFRESH_TOKEN}:${userId}:${newJti}`;
-
-    const newStoredData: IStoredRefreshToken = {
-      userId,
-      jti: newJti,
-      tokenHash: newTokenHash,
-      ip,
-      userAgent,
-      device,
-      createdAt: new Date().toISOString(),
-      rotatedFrom: jti, // Track rotation chain
-    };
-
+    // Revoke the presented session and store its replacement atomically:
+    // of concurrent requests with the same token, only one succeeds.
     let rotated: boolean;
     try {
-      rotated = await this.redisService.rotateRefreshToken({
-        oldKey: refreshTokenKey,
-        newKey: newRefreshTokenKey,
-        sessionsKey: `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.USER_SESSIONS}:${userId}`,
-        expectedHash: tokenHash,
-        oldJti: jti,
-        newJti,
-        newData: newStoredData,
-        ttlSeconds: refreshTokenTTL,
-      });
+      rotated = await this.sessions.rotate(
+        { authId: userId, tokenId: jti, tokenHash },
+        {
+          authId: userId,
+          tokenId: newJti,
+          tokenHash: this.authUtilsService.hashToken(newRefreshToken),
+          ipAddress: ip,
+          userAgent,
+          device,
+          expiresAt: new Date(Date.now() + refreshTokenTTL * 1000),
+        },
+      );
     } catch {
       throw AppError.serviceUnavailable(
         'Authentication is temporarily unavailable',
@@ -887,12 +795,7 @@ export class AuthService {
 
     const { jti } = decoded;
     if (jti) {
-      const refreshTokenKey = `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.REFRESH_TOKEN}:${userId}:${jti}`;
-
-      await Promise.all([
-        this.redisService.del(refreshTokenKey),
-        this.removeUserSession(userId, jti),
-      ]);
+      await this.sessions.revoke(userId, jti, 'LOGOUT');
     }
 
     return { message: 'Logged out successfully' };
@@ -902,94 +805,50 @@ export class AuthService {
    * Logout from all devices by revoking all refresh tokens
    */
   async logoutAllDevices(userId: string): Promise<{ message: string }> {
-    await this.revokeAllUserTokens(userId);
+    await this.revokeAllUserTokens(userId, 'LOGOUT_ALL');
     // Increment tokenVersion to immediately invalidate all access tokens
     await this.incrementTokenVersion(userId);
     return { message: 'Logged out from all devices successfully' };
   }
 
   /**
-   * Add a session (JTI) to user's session list
-   */
-  private async addUserSession(
-    userId: string,
-    jti: string,
-    ttl: number,
-  ): Promise<void> {
-    const userSessionsKey = `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.USER_SESSIONS}:${userId}`;
-
-    await this.redisService.updateSessionList(userSessionsKey, jti, true, ttl);
-  }
-
-  /**
-   * Remove a session from user's session list
-   */
-  private async removeUserSession(userId: string, jti: string): Promise<void> {
-    const userSessionsKey = `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.USER_SESSIONS}:${userId}`;
-
-    const ttl = this.parseExpiryToSeconds(AUTH_CONFIG.TOKEN_EXPIRY.REFRESH);
-    await this.redisService.updateSessionList(userSessionsKey, jti, false, ttl);
-  }
-
-  /**
-   * Enforce maximum devices per user
-   * Removes oldest sessions when limit exceeded
-   */
-  private async enforceMaxDevices(
-    userId: string,
-    maxDevices: number,
-  ): Promise<void> {
-    const userSessionsKey = `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.USER_SESSIONS}:${userId}`;
-
-    const ttl = this.parseExpiryToSeconds(AUTH_CONFIG.TOKEN_EXPIRY.REFRESH);
-    await this.redisService.pruneRefreshSessions(
-      userSessionsKey,
-      `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.REFRESH_TOKEN}:${userId}:`,
-      maxDevices,
-      ttl,
-    );
-  }
-
-  /**
    * Revoke all refresh tokens for a user (security measure)
    */
-  private async revokeAllUserTokens(userId: string): Promise<void> {
-    const userSessionsKey = `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.USER_SESSIONS}:${userId}`;
-
-    await this.redisService.pruneRefreshSessions(
-      userSessionsKey,
-      `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.REFRESH_TOKEN}:${userId}:`,
-      0,
-      1,
-    );
+  private async revokeAllUserTokens(
+    userId: string,
+    reason:
+      | 'LOGOUT_ALL'
+      | 'REUSE_DETECTED'
+      | 'ACCOUNT_INACTIVE'
+      | 'SECURITY_EVENT',
+  ): Promise<void> {
+    await this.sessions.revokeAll(userId, reason);
   }
 
   /**
    * Revokes every session of a user after a security event that already
    * incremented the user's tokenVersion to `tokenVersion`: deletes all refresh
-   * tokens and overwrites the cached token version, so access tokens issued
-   * before stop working at once. Throws when Redis cannot confirm either
-   * step, so callers can record the revocation as pending and retry.
+   * tokens and overwrites the cached token version (when a cache is
+   * enabled), so access tokens issued before stop working at once. Throws
+   * when either step cannot be confirmed, so callers can record the
+   * revocation as pending and retry.
    */
   async revokeAllSessions(userId: string, tokenVersion: number): Promise<void> {
-    await this.revokeAllUserTokens(userId);
+    await this.revokeAllUserTokens(userId, 'SECURITY_EVENT');
     await this.publishTokenVersion(userId, tokenVersion);
   }
 
   /**
    * Overwrites the cached token version, so every access token carrying an
-   * older version is rejected by AuthGuard at once. Throws when Redis cannot
-   * confirm the write, so callers can fail closed.
+   * older version is rejected by AuthGuard at once. Throws when the cache
+   * cannot confirm the write, so callers can fail closed. Without a cache
+   * (REDIS_ENABLED=false) AuthGuard reads the database, which is current.
    */
   async publishTokenVersion(
     userId: string,
     tokenVersion: number,
   ): Promise<void> {
-    const cacheKey = `${config.redis_cache_key_prefix}:token_version:${userId}`;
-    const cached = await this.redisService.set(cacheKey, tokenVersion, 3600);
-    if (!cached) {
-      throw new Error('The cached token version could not be updated');
-    }
+    await this.tokenVersions.publish(userId, tokenVersion);
   }
 
   /**
@@ -997,33 +856,25 @@ export class AuthService {
    * database (used to undo publishTokenVersion when its transaction failed).
    */
   async forgetCachedTokenVersion(userId: string): Promise<void> {
-    await this.redisService.del(
-      `${config.redis_cache_key_prefix}:token_version:${userId}`,
-    );
+    await this.tokenVersions.invalidate(userId);
   }
 
   /**
-   * Removes short-lived authentication data kept in Redis for a deleted
-   * account: sessions, the cached token version (set to 0, which matches no
-   * token) and keys that contain the email address. Best effort: every key
-   * also expires on its own.
+   * Removes short-lived authentication data of a deleted account: sessions
+   * and codes (also removed with the account's rows), the cached token
+   * version (set to 0, which matches no token) and the rate limits keyed by
+   * the email address. Best effort: everything also expires on its own.
    */
   async forgetDeletedAccount(userId: string, email: string | null) {
-    await this.revokeAllUserTokens(userId).catch(() => undefined);
-    await this.redisService.set(
-      `${config.redis_cache_key_prefix}:token_version:${userId}`,
-      0,
-      3600,
+    await this.revokeAllUserTokens(userId, 'SECURITY_EVENT').catch(
+      () => undefined,
     );
+    await this.challenges.remove(userId).catch(() => undefined);
+    await this.tokenVersions.publish(userId, 0).catch(() => undefined);
     if (email) {
-      const rateLimit = `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.RATE_LIMIT}login:email:${email}`;
-      await Promise.all([
-        this.redisService.del(
-          `${config.redis_cache_key_prefix}:${AUTH_CONFIG.CACHE_PREFIXES.VERIFICATION_TOKEN}:${email}`,
-        ),
-        this.redisService.del(rateLimit),
-        this.redisService.del(`${rateLimit}:locked`),
-      ]);
+      await this.authUtilsService
+        .resetRateLimit(`login:email:${email}`)
+        .catch(() => undefined);
     }
   }
 
@@ -1155,7 +1006,7 @@ export class AuthService {
   /**
    * Increment token version for a user to immediately invalidate all access tokens.
    * Called on security-critical events: password change, role change, admin block, force logout.
-   * Clears Redis cache to ensure AuthGuard will fetch new version from DB.
+   * Clears the token-version cache so AuthGuard fetches the new version from DB.
    *
    * @param userId - The user whose token version to increment
    */
@@ -1166,9 +1017,8 @@ export class AuthService {
       data: { tokenVersion: { increment: 1 } },
     });
 
-    // Invalidate Redis cache so next guard check fetches new version
-    const cacheKey = `${config.redis_cache_key_prefix}:token_version:${userId}`;
-    await this.redisService.del(cacheKey);
+    // Invalidate the cache so the next guard check fetches the new version
+    await this.tokenVersions.invalidate(userId);
 
     this.customLogger.log(`Token version incremented for user ${userId}, {
       context: 'AuthService.incrementTokenVersion',

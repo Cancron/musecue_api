@@ -9,7 +9,8 @@ This NestJS service is the application authority for MuseCue — AI makeup guida
 - Supabase Auth, Database, and client SDKs are not used. NestJS is the only authentication and application backend. Supabase Storage is used only as a server-side private object store behind `StorageModule`.
 - AI may analyze, recommend, generate, and evaluate. NestJS must validate AI output, persist it, and decide workflow transitions.
 - Do not allow AI responses to mutate application state directly.
-- Long-running AI and image operations belong in BullMQ workers, not synchronous request handlers.
+- Long-running AI and image operations belong in durable background jobs on the selected queue driver, not synchronous request handlers. `REDIS_ENABLED` selects the driver at startup (BullMQ when `true`, the PostgreSQL queue when `false`): dispatch through `JobDispatcher`, inspect through `JobInspector`, and put the processing in a transport-independent job handler registered with `registerJobHandler`. Never import BullMQ, `RedisService` or a driver implementation in feature code, and never fall back to running the work inside a request.
+- Infrastructure abstractions (`JobDispatcher`, `JobInspector`, `RateLimitStore`, `TokenVersionCache`) are provided by `InfrastructureModule`. New code must work in both modes; PostgreSQL is always available, Redis is not.
 - Every makeup resource must be scoped to the authenticated owner.
 - Store face images in private object storage and expose only short-lived signed URLs.
 - Never log image content, signed URLs, passwords, SMTP credentials, access tokens, refresh tokens, or raw AI prompts containing sensitive user data.
@@ -20,9 +21,10 @@ This NestJS service is the application authority for MuseCue — AI makeup guida
 ## Authentication
 
 - Access tokens are short-lived JWTs accepted through `Authorization: Bearer <token>`.
-- Refresh tokens rotate through `POST /auth/refresh-token` and are stored as hashes in Redis.
+- Refresh tokens rotate through `POST /auth/refresh-token` and are stored as hashes in PostgreSQL (`RefreshSession`, in both infrastructure modes); rotation revokes the presented session and stores its replacement in one transaction.
+- One-time codes (`AuthChallenge`) and OAuth states (`OAuthState`) are stored only as purpose-bound hashes, with any other secret data encrypted; never store or log them in plaintext.
 - Protected handlers must derive the user ID from `req.user`, never from a request body or query parameter.
-- Security events must invalidate cached token versions where applicable.
+- Security events must invalidate cached token versions where applicable (through `TokenVersionCache`; without Redis the database is read on every request).
 - SMTP email verification is required before password login.
 
 ## Commands

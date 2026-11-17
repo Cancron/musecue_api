@@ -35,7 +35,7 @@ export const GOOGLE_OAUTH_CONFIG = {
   // State token configuration
   STATE: {
     TTL_SECONDS: 600, // 10 minutes
-    CACHE_PREFIX: 'google_oauth_state',
+    PROVIDER: 'google', // OAuthState.provider
   },
 } as const;
 

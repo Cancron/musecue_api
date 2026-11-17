@@ -19,13 +19,18 @@ import type { App } from 'supertest/types';
 import type { Logger } from 'winston';
 import {
   AccountStore,
-  FakeRedis,
+  FakeAuthChallenges,
+  FakeRateLimits,
+  FakeRefreshSessions,
+  FakeTokenVersionCache,
   type StoredUser,
 } from '../../../test/support/account-deletion-fakes';
 import { freezeTime } from '../../../test/support/freeze-time';
 import { AuthService } from '../../auth/auth.service';
 import { UserRole } from '../../auth/interfaces/auth.interface';
 import { AuthUtilsService } from '../../auth/services/auth-utils.service';
+import { AuthChallengeRepository } from '../../auth/state/auth-challenge.repository';
+import { RefreshSessionRepository } from '../../auth/state/refresh-session.repository';
 import config from '../../common/config/app.config';
 import { AllExceptionsFilter } from '../../common/filters/all-exception.filter';
 import { AuthGuard } from '../../common/guards/auth.guard';
@@ -34,7 +39,8 @@ import { EmailQueueService } from '../../common/queues/email/email.queue';
 import { ActivityLogService } from '../../common/services/activity-log.service';
 import { CustomLoggerService } from '../../common/services/custom-logger.service';
 import { PrismaService } from '../../common/services/prisma.service';
-import { RedisService } from '../../common/services/redis.service';
+import { RateLimitStore } from '../../infrastructure/rate-limit/rate-limit.store';
+import { TokenVersionCache } from '../../infrastructure/token-version/token-version.cache';
 import { AccountDeletionCodeService } from './account-deletion-code.service';
 import { AccountDeletionRecoveryService } from './account-deletion-recovery.service';
 import { AccountDeletionController } from './account-deletion.controller';
@@ -45,10 +51,12 @@ import { AccountErasureService } from './account-erasure.service';
 const PASSWORD = 'correct horse battery staple';
 const PASSWORD_HASH = bcrypt.hashSync(PASSWORD, 4);
 const T0 = new Date('2026-09-01T12:00:00.000Z');
-const PREFIX = config.redis_cache_key_prefix;
 
 const store = new AccountStore();
-const redis = new FakeRedis();
+const tokenVersions = new FakeTokenVersionCache();
+const sessions = new FakeRefreshSessions();
+const challenges = new FakeAuthChallenges(store.prisma);
+const rateLimits = new FakeRateLimits();
 const emailQueue = mock<EmailQueueService>();
 const erasure = mock<AccountErasureService>();
 
@@ -66,13 +74,19 @@ class ProtectedController {
 @Module({
   providers: [
     { provide: PrismaService, useValue: store.prisma },
-    { provide: RedisService, useValue: redis.asService() },
+    { provide: TokenVersionCache, useValue: tokenVersions },
+    { provide: RateLimitStore, useValue: rateLimits },
+    { provide: RefreshSessionRepository, useValue: sessions.asRepository() },
+    { provide: AuthChallengeRepository, useValue: challenges.asRepository() },
     { provide: WINSTON_MODULE_PROVIDER, useValue: mock<Logger>() },
     { provide: CustomLoggerService, useValue: mock<CustomLoggerService>() },
   ],
   exports: [
     PrismaService,
-    RedisService,
+    TokenVersionCache,
+    RateLimitStore,
+    RefreshSessionRepository,
+    AuthChallengeRepository,
     WINSTON_MODULE_PROVIDER,
     CustomLoggerService,
   ],
@@ -88,7 +102,7 @@ describe('Account deletion requests (HTTP)', () => {
   let app: INestApplication<App>;
   let recovery: AccountDeletionRecoveryService;
   let originalSecret: string;
-  const tokens = new AuthUtilsService(mock<RedisService>());
+  const tokens = new AuthUtilsService(mock<RateLimitStore>());
 
   /** An access token as issued at login, for the user's current version. */
   const tokenFor = (user: StoredUser, tokenVersion = user.tokenVersion) =>
@@ -125,17 +139,12 @@ describe('Account deletion requests (HTTP)', () => {
     return user;
   }
   function signIn(user: StoredUser) {
-    const jtis = ['device-a', 'device-b'];
-    for (const jti of jtis) {
-      redis.put(`${PREFIX}:refresh:user:${user.id}:${jti}`, { jti });
+    for (const jti of ['device-a', 'device-b']) {
+      sessions.add(user.id, `${user.id}:${jti}`);
     }
-    redis.put(`${PREFIX}:sessions:user:${user.id}`, jtis);
-    redis.put(`${PREFIX}:token_version:${user.id}`, user.tokenVersion, 3600);
+    tokenVersions.put(user.id, user.tokenVersion, 3600);
   }
-  const refreshTokensOf = (user: StoredUser) =>
-    redis
-      .keys()
-      .filter((key) => key.startsWith(`${PREFIX}:refresh:user:${user.id}:`));
+  const refreshTokensOf = (user: StoredUser) => sessions.activeOf(user.id);
   const emailedCode = () =>
     emailQueue.sendAccountDeletionCode.mock.calls.at(-1)?.[2] as string;
 
@@ -205,8 +214,10 @@ describe('Account deletion requests (HTTP)', () => {
     jest.clearAllMocks();
     emailQueue.sendAccountDeletionCode.mockResolvedValue();
     erasure.process.mockResolvedValue('PENDING');
-    redis.failing.clear();
-    redis.clear();
+    tokenVersions.clear();
+    sessions.clear();
+    challenges.clear();
+    rateLimits.clear();
     store.reset();
   });
 
@@ -384,7 +395,7 @@ describe('Account deletion requests (HTTP)', () => {
         await requestDeletion(token, { code: wrong }).expect(403);
       }
       // Isolate the code rule from the separate per-user rate limit.
-      redis.remove(`${PREFIX}:rate_limit:account_deletion:user:${user.id}`);
+      rateLimits.remove(`account_deletion:user:${user.id}`);
 
       await requestDeletion(token, { code }).expect(403);
       expect(store.users.get(user.id)?.status).toBe('ACTIVE');
@@ -419,11 +430,7 @@ describe('Account deletion requests (HTTP)', () => {
 
     it('rate-limits confirmation attempts', async () => {
       const user = localUser();
-      redis.put(
-        `${PREFIX}:rate_limit:account_deletion:user:${user.id}`,
-        5,
-        900,
-      );
+      rateLimits.put(`account_deletion:user:${user.id}`, 5, 900);
 
       await confirmDeletion(429, user);
       expect(store.users.get(user.id)?.status).toBe('ACTIVE');
@@ -442,14 +449,14 @@ describe('Account deletion requests (HTTP)', () => {
       await protectedCall(token).expect(401);
       await protectedCall(otherDevice).expect(401);
       expect(refreshTokensOf(user)).toEqual([]);
-      expect(redis.raw(`${PREFIX}:token_version:${user.id}`)).toBe(2);
+      expect(tokenVersions.raw(user.id)).toBe(2);
     });
 
     it('does not approve the deletion when the token cache cannot be updated (nothing is committed)', async () => {
       const user = localUser();
       const token = tokenFor(user);
       await requestCode(token).expect(202);
-      redis.failing.add('set');
+      tokenVersions.failing.add('publish');
 
       const response = await requestDeletion(token, {
         password: PASSWORD,
@@ -462,7 +469,7 @@ describe('Account deletion requests (HTTP)', () => {
         tokenVersion: 1,
       });
       expect(requestsOf(user)).toEqual([]);
-      redis.failing.clear();
+      tokenVersions.failing.clear();
       await protectedCall(token).expect(200);
     });
 
@@ -472,7 +479,7 @@ describe('Account deletion requests (HTTP)', () => {
       await requestCode(token).expect(202);
       const code = emailedCode();
       // Cache miss: the guard will read the user from the database.
-      redis.remove(`${PREFIX}:token_version:${user.id}`);
+      tokenVersions.remove(user.id);
       // Pause that read after it saw the ACTIVE, version-1 row, until the
       // deletion has been approved.
       let approved!: () => void;
@@ -493,7 +500,7 @@ describe('Account deletion requests (HTTP)', () => {
       await staleRequest;
 
       // The stale read must not have restored the old version in the cache.
-      expect(redis.raw(`${PREFIX}:token_version:${user.id}`)).toBe(2);
+      expect(tokenVersions.raw(user.id)).toBe(2);
       await protectedCall(token).expect(401);
     });
 
@@ -501,7 +508,7 @@ describe('Account deletion requests (HTTP)', () => {
       const user = localUser();
       const token = tokenFor(user);
       await confirmDeletion(202, user, token);
-      redis.remove(`${PREFIX}:token_version:${user.id}`);
+      tokenVersions.remove(user.id);
 
       await protectedCall(token).expect(401);
     });
@@ -532,7 +539,7 @@ describe('Account deletion requests (HTTP)', () => {
 
     it('rejects forged and revoked tokens', async () => {
       const user = localUser();
-      const forged = new AuthUtilsService(mock<RedisService>());
+      const forged = new AuthUtilsService(mock<RateLimitStore>());
       config.jwt_access_secret = 'attacker-secret';
       const forgedToken = forged.createAccessToken({
         userId: user.id,
@@ -665,7 +672,7 @@ describe('Account deletion requests (HTTP)', () => {
       const user = localUser();
       const token = tokenFor(user);
       await requestCode(token).expect(202);
-      redis.failing.add('eval');
+      sessions.failing = true;
 
       const response = await requestDeletion(token, {
         password: PASSWORD,
@@ -682,7 +689,7 @@ describe('Account deletion requests (HTTP)', () => {
       // Access tokens are invalid already (published in the transaction).
       await protectedCall(token).expect(401);
 
-      redis.failing.clear();
+      sessions.failing = false;
       const result = await recovery.resume();
 
       expect(result.sessionsRevoked).toBe(1);

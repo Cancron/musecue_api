@@ -18,16 +18,19 @@ model authUser {
   updatedAt    DateTime   @updatedAt
 
   // Relations
-  userProfile       userProfile?
-  authSecurity      authSecurity?
-  loginHistory      loginHistory[]
-  emailHistory      emailHistory[]
-  activityLogEvents ActivityLogEvent[]
-  makeupSessions    MakeupSession[]
-  aiRuns            AiRun[]
-  subscription      UserSubscription?
-  dataExports       DataExport[]
-  paymentCustomers  PaymentCustomer[]
+  userProfile        userProfile?
+  authSecurity       authSecurity?
+  loginHistory       loginHistory[]
+  emailHistory       emailHistory[]
+  activityLogEvents  ActivityLogEvent[]
+  makeupSessions     MakeupSession[]
+  aiRuns             AiRun[]
+  subscription       UserSubscription?
+  dataExports        DataExport[]
+  paymentCustomers   PaymentCustomer[]
+  refreshSessions    RefreshSession[]
+  authChallenges     AuthChallenge[]
+  infrastructureJobs InfrastructureJob[]
 
   @@index([email, id, providerId])
   @@index([username])
@@ -54,4 +57,88 @@ model authSecurity {
   authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
 
   @@index([authId])
+}
+
+// ================================
+// Refresh Session Model
+// ================================
+
+// One signed-in device: the refresh token issued at login and every token it
+// was rotated into. Only the SHA-256 hash of a refresh token is stored, never
+// the token. POST /auth/refresh-token revokes the presented session (ROTATED)
+// and inserts its replacement in one transaction, so a refresh token works
+// exactly once even under concurrent requests. `rotatedFromId` records the
+// rotation lineage. Rows are removed by the cleanup sweep after `expiresAt`.
+model RefreshSession {
+  id            String                    @id @default(uuid())
+  authId        String
+  // The refresh token's JWT ID (`jti`).
+  tokenId       String                    @unique @db.VarChar(128)
+  // SHA-256 (hex) of the complete refresh token.
+  tokenHash     String                    @db.Char(64)
+  ipAddress     String?
+  userAgent     String?
+  device        String?
+  rotatedFromId String?                   @unique
+  createdAt     DateTime                  @default(now())
+  expiresAt     DateTime
+  revokedAt     DateTime?
+  revokedReason RefreshSessionRevocation?
+
+  authUser    authUser        @relation(fields: [authId], references: [id], onDelete: Cascade)
+  rotatedFrom RefreshSession? @relation("RefreshSessionRotation", fields: [rotatedFromId], references: [id], onDelete: SetNull)
+  rotatedTo   RefreshSession? @relation("RefreshSessionRotation")
+
+  @@index([authId, revokedAt, expiresAt])
+  @@index([expiresAt])
+}
+
+// ================================
+// Auth Challenge Model
+// ================================
+
+// A one-time code emailed to a user (email verification, account deletion
+// confirmation). Only a purpose-bound HMAC of the code is stored. A user has
+// at most one challenge per purpose: issuing a new code replaces the previous
+// one and resets its attempts. A challenge accepts `maxAttempts` guesses, then
+// stops working; a correct code is consumed (`consumedAt`) and never works
+// again.
+model AuthChallenge {
+  id          String               @id @default(uuid())
+  authId      String
+  purpose     AuthChallengePurpose
+  // HMAC-SHA-256 (hex) of the purpose, user and code.
+  codeHash    String               @db.Char(64)
+  attempts    Int                  @default(0)
+  maxAttempts Int
+  expiresAt   DateTime
+  consumedAt  DateTime?
+  createdAt   DateTime             @default(now())
+  updatedAt   DateTime             @updatedAt
+
+  authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
+
+  @@unique([authId, purpose])
+  @@index([expiresAt])
+}
+
+// ================================
+// OAuth State Model
+// ================================
+
+// The CSRF `state` of an OAuth authorization in progress, with its PKCE code
+// verifier and redirect target. The state is stored only as a hash and the
+// rest is encrypted (AES-256-GCM). A state is consumed (deleted) by the first
+// callback that presents it and expires after ten minutes.
+model OAuthState {
+  id        String   @id @default(uuid())
+  provider  String   @db.VarChar(32)
+  // SHA-256 (hex) of the state parameter.
+  stateHash String   @unique @db.Char(64)
+  // Encrypted JSON: PKCE code verifier, redirect URL and request metadata.
+  payload   String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([expiresAt])
 }

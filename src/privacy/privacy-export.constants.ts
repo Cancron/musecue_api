@@ -1,7 +1,8 @@
 import type { DataExportErrorCode } from '@prisma/client';
+import { PRIVACY_EXPORT_QUEUE } from '../infrastructure/jobs/job-queues';
 
-/** BullMQ queue that builds personal-data export archives. */
-export const PRIVACY_EXPORT_QUEUE = 'privacy-export';
+/** Queue that builds personal-data export archives. */
+export { PRIVACY_EXPORT_QUEUE };
 export const PRIVACY_EXPORT_JOB = 'BUILD_ARCHIVE';
 
 /** A completed archive is retained for 24 hours, then expires. */

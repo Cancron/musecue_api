@@ -17,19 +17,21 @@ import { AllExceptionsFilter } from '../common/filters/all-exception.filter';
 import { TransformInterceptor } from '../common/interceptors/transform.interceptor';
 import { CustomLoggerService } from '../common/services/custom-logger.service';
 import { PrismaService } from '../common/services/prisma.service';
-import { RedisService } from '../common/services/redis.service';
+import { RateLimitStore } from '../infrastructure/rate-limit/rate-limit.store';
+import { TokenVersionCache } from '../infrastructure/token-version/token-version.cache';
 import { SubscriptionModule } from './subscription.module';
 
 const prisma = mockDeep<PrismaService>();
-const redis = mock<RedisService>();
+const tokenVersions = mock<TokenVersionCache>();
 
 @Global()
 @Module({
   providers: [
     { provide: PrismaService, useValue: prisma },
     { provide: CustomLoggerService, useValue: mock<CustomLoggerService>() },
+    { provide: TokenVersionCache, useValue: tokenVersions },
   ],
-  exports: [PrismaService, CustomLoggerService],
+  exports: [PrismaService, CustomLoggerService, TokenVersionCache],
 })
 class TestInfrastructureModule {}
 
@@ -44,7 +46,7 @@ describe('Subscription plan administration (HTTP)', () => {
   let originalSecret: string;
   let stored: SubscriptionPlan | null;
   const updatedAt = new Date('2026-09-12T12:00:00.000Z');
-  const tokens = new AuthUtilsService(mock<RedisService>());
+  const tokens = new AuthUtilsService(mock<RateLimitStore>());
 
   /** A token minted by the unchanged production token code. */
   const bearer = (role: UserRole, userId = 'user-id') =>
@@ -56,10 +58,7 @@ describe('Subscription plan administration (HTTP)', () => {
 
     const moduleRef = await Test.createTestingModule({
       imports: [TestInfrastructureModule, SubscriptionModule],
-    })
-      .overrideProvider(RedisService)
-      .useValue(redis)
-      .compile();
+    }).compile();
 
     app = moduleRef.createNestApplication();
     const logger = mock<Logger>();
@@ -84,7 +83,7 @@ describe('Subscription plan administration (HTTP)', () => {
   beforeEach(() => {
     jest.resetAllMocks();
     stored = null;
-    redis.get.mockResolvedValue(1 as never); // cached tokenVersion
+    tokenVersions.get.mockResolvedValue(1); // cached tokenVersion
     prisma.$transaction.mockImplementation(((
       callback: (tx: PrismaService) => Promise<unknown>,
     ) => callback(prisma)) as never);

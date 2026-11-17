@@ -4,22 +4,28 @@ import {
   OnModuleDestroy,
   OnModuleInit,
 } from '@nestjs/common';
-import { InjectQueue } from '@nestjs/bullmq';
 import { ConfigService } from '@nestjs/config';
-import { Queue } from 'bullmq';
 import { WINSTON_MODULE_PROVIDER } from 'nest-winston';
 import type { Logger } from 'winston';
 import { PrismaService } from '../../common/services/prisma.service';
-import { failRun } from './run-lifecycle';
-import type { MakeupAiJob } from './makeup.queue';
+import { MAKEUP_AI_QUEUE } from '../../infrastructure/jobs/job-queues';
+import { JobInspector } from '../../infrastructure/jobs/job.types';
+import { failRun, INTERRUPTED_RUN_MESSAGE } from './run-lifecycle';
 
+/**
+ * Fails runs that are still waiting or processing long after their job
+ * finished or disappeared (for example it was lost with the queue), so
+ * clients stop polling. Inspects the selected queue driver; healthy waiting,
+ * delayed or active jobs are left alone, and a queue outage postpones
+ * recovery.
+ */
 @Injectable()
 export class MakeupRecoveryService implements OnModuleInit, OnModuleDestroy {
   private timer?: ReturnType<typeof setInterval>;
   private running = false;
   constructor(
     private readonly prisma: PrismaService,
-    @InjectQueue('makeup-ai') private readonly queue: Queue<MakeupAiJob>,
+    private readonly jobs: JobInspector,
     private readonly config: ConfigService,
     @Inject(WINSTON_MODULE_PROVIDER) private readonly logger: Logger,
   ) {}
@@ -57,14 +63,13 @@ export class MakeupRecoveryService implements OnModuleInit, OnModuleDestroy {
           ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
         });
         for (const run of runs) {
-          // Redis errors must abort this pass, not be treated as absent jobs.
-          const job = await this.queue.getJob(run.id);
-          const state = job ? await job.getState() : 'unknown';
+          // Queue errors must abort this pass, not be treated as absent jobs.
+          const state = await this.jobs.getJobState(MAKEUP_AI_QUEUE, run.id);
           if (['failed', 'completed', 'unknown'].includes(state)) {
             await failRun(
               this.prisma,
               run.id,
-              'Processing was interrupted. Please try again.',
+              INTERRUPTED_RUN_MESSAGE,
               run.updatedAt,
             );
           }

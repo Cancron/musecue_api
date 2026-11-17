@@ -1,4 +1,3 @@
-import type { Job } from 'bullmq';
 import type { Prisma } from '@prisma/client';
 import { mock, mockDeep } from 'jest-mock-extended';
 import type { Logger } from 'winston';
@@ -8,7 +7,8 @@ import { PrivateImageStorageService } from '../../storage/private-image-storage.
 import type { AiGateway } from '../ai/ai.gateway';
 import { AiProviderError } from '../ai/ai-provider.error';
 import { MockAiGateway } from '../ai/mock-ai.gateway';
-import { MakeupProcessor } from './makeup.processor';
+import { MakeupJobHandler } from './makeup-job.handler';
+import type { JobExecution } from '../../infrastructure/jobs/job.types';
 import type { MakeupAiJob } from './makeup.queue';
 
 function workflowPrisma() {
@@ -30,7 +30,7 @@ function workflowPrisma() {
   return prisma;
 }
 
-describe('MakeupProcessor delivery semantics', () => {
+describe('MakeupJobHandler delivery semantics', () => {
   beforeEach(() => jest.spyOn(Date, 'now').mockReturnValue(1000));
   afterEach(() => jest.restoreAllMocks());
   it.each([false, true])(
@@ -59,7 +59,7 @@ describe('MakeupProcessor delivery semantics', () => {
         faceAnalysis: null,
         recommendations: [{ id: 'look', selectedAt: new Date(), palette: [] }],
       } as never);
-      const processor = new MakeupProcessor(
+      const processor = new MakeupJobHandler(
         prisma,
         ai,
         mock<PrivateImageStorageService>(),
@@ -71,10 +71,10 @@ describe('MakeupProcessor delivery semantics', () => {
         processor.process({
           name: 'GUIDE_GENERATION',
           data: { runId: 'run', authId: 'owner', sessionId: 'session' },
-          opts: { attempts: 3 },
+          maxAttempts: 3,
           attemptsMade: 0,
           discard,
-        } as unknown as Job<MakeupAiJob>),
+        } as unknown as JobExecution<MakeupAiJob>),
       ).rejects.toBe(error);
       expect(discard).toHaveBeenCalledTimes(retryable ? 0 : 1);
       expect(prisma.aiRun.updateMany.mock.calls.at(-1)?.[0].data.status).toBe(
@@ -134,7 +134,7 @@ describe('MakeupProcessor delivery semantics', () => {
       (callback: (tx: Prisma.TransactionClient) => Promise<unknown>) =>
         callback(prisma),
     );
-    const processor = new MakeupProcessor(
+    const processor = new MakeupJobHandler(
       prisma,
       ai,
       mock<PrivateImageStorageService>(),
@@ -144,7 +144,7 @@ describe('MakeupProcessor delivery semantics', () => {
     await processor.process({
       name: 'GUIDE_GENERATION',
       data: { runId: 'run', authId: 'owner', sessionId: 'session' },
-    } as Job<MakeupAiJob>);
+    } as JobExecution<MakeupAiJob>);
     expect(prisma.guide.create.mock.calls[0]?.[0].data.steps).toEqual({
       create: guide.data.steps.map((step) => ({
         ...step,
@@ -193,7 +193,7 @@ describe('MakeupProcessor delivery semantics', () => {
       (callback: (tx: Prisma.TransactionClient) => Promise<unknown>) =>
         callback(prisma),
     );
-    const processor = new MakeupProcessor(
+    const processor = new MakeupJobHandler(
       prisma,
       ai,
       storage,
@@ -209,7 +209,7 @@ describe('MakeupProcessor delivery semantics', () => {
         stepId: 'step',
         imageId: 'photo',
       },
-    } as Job<MakeupAiJob>);
+    } as JobExecution<MakeupAiJob>);
     expect(prisma.stepAttempt.create.mock.calls[0]?.[0].data).toEqual({
       stepId: 'step',
       imageId: 'photo',
@@ -222,12 +222,12 @@ describe('MakeupProcessor delivery semantics', () => {
     expect(prisma.guideStep.update.mock.calls).toHaveLength(0);
     expect(ai.evaluateStep.mock.calls).toHaveLength(1);
   });
-  it('does not call the provider again when BullMQ redelivers a completed run', async () => {
+  it('does not call the provider again when the queue redelivers a completed run', async () => {
     const prisma = workflowPrisma();
     const ai = mock<AiGateway>();
     const storage = mock<PrivateImageStorageService>();
     const logger = mock<Logger>();
-    const processor = new MakeupProcessor(
+    const processor = new MakeupJobHandler(
       prisma,
       ai,
       storage,
@@ -242,7 +242,7 @@ describe('MakeupProcessor delivery semantics', () => {
         authId: 'auth-id',
         sessionId: 'session-id',
       },
-    } as Job<MakeupAiJob>;
+    } as JobExecution<MakeupAiJob>;
 
     await processor.process(job);
 
@@ -256,7 +256,7 @@ describe('MakeupProcessor delivery semantics', () => {
     const ai = mock<AiGateway>();
     const storage = mock<PrivateImageStorageService>();
     const logger = mock<Logger>();
-    const processor = new MakeupProcessor(
+    const processor = new MakeupJobHandler(
       prisma,
       ai,
       storage,
@@ -311,10 +311,10 @@ describe('MakeupProcessor delivery semantics', () => {
         authId: 'auth-id',
         sessionId: 'session-id',
       },
-      opts: { attempts: 3 },
+      maxAttempts: 3,
       attemptsMade: 0,
       discard,
-    } as unknown as Job<MakeupAiJob>;
+    } as unknown as JobExecution<MakeupAiJob>;
 
     await expect(processor.process(job)).rejects.toMatchObject({
       code: 'AI_CAPACITY_UNAVAILABLE',
@@ -330,5 +330,187 @@ describe('MakeupProcessor delivery semantics', () => {
           args.data.progress === 100,
       ),
     ).toBe(true);
+  });
+
+  describe('run input and queue-driver independence', () => {
+    function visionSetup(jobInput: unknown) {
+      const prisma = workflowPrisma();
+      // The first read loads the run's input; later reads see this attempt.
+      prisma.aiRun.findUnique
+        .mockResolvedValueOnce({ status: 'QUEUED', jobInput } as never)
+        .mockResolvedValue({
+          status: 'PROCESSING',
+          startedAt: new Date(1000),
+        } as never);
+      const ai = mock<AiGateway>();
+      const storage = mock<PrivateImageStorageService>();
+      ai.describe.mockReturnValue({
+        provider: 'mock',
+        model: 'test',
+        promptVersion: 'test',
+      });
+      const evaluation = {
+        result: 'PASS' as const,
+        feedback: 'Looks even.',
+        spokenFeedback: 'Looks even.',
+        confidence: 0.9,
+      };
+      ai.evaluateStep.mockResolvedValue({ data: evaluation });
+      prisma.guideStep.findFirstOrThrow.mockResolvedValue({
+        id: 'step',
+        attempts: [],
+        guide: {
+          recommendation: { name: 'Natural', tagline: 'Soft' },
+          session: { preferences: null },
+        },
+      } as never);
+      prisma.imageAsset.findFirst.mockResolvedValue({
+        storageKey: 'owned-image',
+        storageProvider: 'supabase',
+        mimeType: 'image/jpeg',
+        source: 'PRIVATE_UPLOAD',
+      } as never);
+      storage.readImage.mockResolvedValue(Buffer.from('test'));
+      const handler = new MakeupJobHandler(
+        prisma,
+        ai,
+        storage,
+        mock<Logger>(),
+        new ConfigService(),
+      );
+      const job = {
+        id: 'run',
+        name: 'VISION_CHECK',
+        data: {
+          runId: 'run',
+          authId: 'owner',
+          sessionId: 'session',
+          stepId: 'step',
+          imageId: 'payload-photo',
+        },
+        maxAttempts: 3,
+        attemptsMade: 0,
+      } as unknown as JobExecution<MakeupAiJob>;
+      return { prisma, handler, job };
+    }
+
+    it('evaluates the image recorded on the run, not the one in the queue payload', async () => {
+      const { prisma, handler, job } = visionSetup({ imageId: 'run-photo' });
+
+      await handler.process(job);
+
+      expect(prisma.aiRun.findUnique.mock.calls[0]?.[0]).toMatchObject({
+        select: { status: true, jobInput: true },
+      });
+      expect(prisma.imageAsset.findFirst.mock.calls[0]?.[0]).toMatchObject({
+        where: { id: 'run-photo', session: { authId: 'owner' } },
+      });
+      expect(prisma.stepAttempt.create.mock.calls[0]?.[0].data).toMatchObject({
+        imageId: 'run-photo',
+      });
+    });
+
+    it('falls back to the payload for runs created before the input was recorded', async () => {
+      const { prisma, handler, job } = visionSetup(null);
+
+      await handler.process(job);
+
+      expect(prisma.stepAttempt.create.mock.calls[0]?.[0].data).toMatchObject({
+        imageId: 'payload-photo',
+      });
+    });
+
+    it('postpones a briefly rate-limited run through the queue driver without using an attempt', async () => {
+      const prisma = workflowPrisma();
+      prisma.aiRun.findUnique.mockResolvedValue({
+        status: 'QUEUED',
+        jobInput: {},
+      } as never);
+      const ai = mock<AiGateway>();
+      ai.describe.mockReturnValue({
+        provider: 'openrouter',
+        model: 'test',
+        promptVersion: 'test',
+      });
+      ai.generateGuide.mockRejectedValue(
+        new AiProviderError('AI_HTTP_429', 'Slow down', true, 5_000),
+      );
+      prisma.makeupSession.findFirstOrThrow.mockResolvedValue({
+        preferences: {},
+        faceAnalysis: null,
+        recommendations: [{ id: 'look', selectedAt: new Date(), palette: [] }],
+      } as never);
+      const postponed = new Error('postponed by the driver');
+      const updateData = jest.fn().mockResolvedValue(undefined);
+      const rateLimit = jest.fn().mockResolvedValue(postponed);
+      const discard = jest.fn();
+      const handler = new MakeupJobHandler(
+        prisma,
+        ai,
+        mock<PrivateImageStorageService>(),
+        mock<Logger>(),
+        new ConfigService(),
+      );
+
+      await expect(
+        handler.process({
+          id: 'run',
+          name: 'GUIDE_GENERATION',
+          data: { runId: 'run', authId: 'owner', sessionId: 'session' },
+          maxAttempts: 3,
+          attemptsMade: 0,
+          discard,
+          updateData,
+          rateLimit,
+        }),
+      ).rejects.toBe(postponed);
+
+      expect(updateData).toHaveBeenCalledWith(
+        expect.objectContaining({ rateLimitDeferrals: 1 }),
+      );
+      expect(rateLimit).toHaveBeenCalledWith(5_000);
+      expect(discard).not.toHaveBeenCalled();
+      expect(prisma.aiRun.updateMany.mock.calls.at(-1)?.[0].data).toEqual({
+        status: 'QUEUED',
+        progress: 0,
+        error: null,
+        startedAt: null,
+      });
+    });
+
+    it('fails the run when its job is abandoned by the PostgreSQL worker', async () => {
+      const prisma = workflowPrisma();
+      prisma.aiRun.findUnique.mockResolvedValue({
+        id: 'run',
+        authId: 'owner',
+        sessionId: 'session',
+        operation: 'VISION_CHECK',
+        status: 'PROCESSING',
+        createdAt: new Date(0),
+      } as never);
+      const handler = new MakeupJobHandler(
+        prisma,
+        mock<AiGateway>(),
+        mock<PrivateImageStorageService>(),
+        mock<Logger>(),
+        new ConfigService(),
+      );
+
+      await handler.onAbandoned({
+        id: 'run',
+        name: 'VISION_CHECK',
+        data: undefined,
+        reason: 'UNREADABLE',
+      });
+
+      expect(prisma.aiRun.updateMany.mock.calls[0]?.[0]).toMatchObject({
+        where: { id: 'run' },
+        data: {
+          status: 'FAILED',
+          progress: 100,
+          error: 'Processing was interrupted. Please try again.',
+        },
+      });
+    });
   });
 });

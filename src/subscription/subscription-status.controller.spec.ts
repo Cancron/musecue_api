@@ -22,19 +22,21 @@ import { AllExceptionsFilter } from '../common/filters/all-exception.filter';
 import { TransformInterceptor } from '../common/interceptors/transform.interceptor';
 import { CustomLoggerService } from '../common/services/custom-logger.service';
 import { PrismaService } from '../common/services/prisma.service';
-import { RedisService } from '../common/services/redis.service';
+import { RateLimitStore } from '../infrastructure/rate-limit/rate-limit.store';
+import { TokenVersionCache } from '../infrastructure/token-version/token-version.cache';
 import { SubscriptionModule } from './subscription.module';
 
 const prisma = mockDeep<PrismaService>();
-const redis = mock<RedisService>();
+const tokenVersions = mock<TokenVersionCache>();
 
 @Global()
 @Module({
   providers: [
     { provide: PrismaService, useValue: prisma },
     { provide: CustomLoggerService, useValue: mock<CustomLoggerService>() },
+    { provide: TokenVersionCache, useValue: tokenVersions },
   ],
-  exports: [PrismaService, CustomLoggerService],
+  exports: [PrismaService, CustomLoggerService, TokenVersionCache],
 })
 class TestInfrastructureModule {}
 
@@ -98,7 +100,7 @@ const proRow = (
 describe('GET /v1/subscription (HTTP)', () => {
   let app: INestApplication<App>;
   let originalSecret: string;
-  const tokens = new AuthUtilsService(mock<RedisService>());
+  const tokens = new AuthUtilsService(mock<RateLimitStore>());
 
   // In-memory stand-ins for the database, keyed like the real tables.
   let subscriptions: Map<string, Row>;
@@ -119,10 +121,7 @@ describe('GET /v1/subscription (HTTP)', () => {
     config.jwt_access_secret = 'subscription-status-spec-secret';
     const moduleRef = await Test.createTestingModule({
       imports: [TestInfrastructureModule, SubscriptionModule],
-    })
-      .overrideProvider(RedisService)
-      .useValue(redis)
-      .compile();
+    }).compile();
     app = moduleRef.createNestApplication();
     const logger = mock<Logger>();
     app.useGlobalFilters(new AllExceptionsFilter(logger));
@@ -153,7 +152,7 @@ describe('GET /v1/subscription (HTTP)', () => {
       ['user-b', 'ACTIVE'],
     ]);
     plan = null; // defaults: plan and 7-day trial enabled
-    redis.get.mockResolvedValue(1 as never); // current tokenVersion
+    tokenVersions.get.mockResolvedValue(1); // current tokenVersion
     prisma.userSubscription.findUnique.mockImplementation(((args: {
       where: { authId: string };
     }) =>
@@ -219,7 +218,7 @@ describe('GET /v1/subscription (HTTP)', () => {
     });
 
     it('rejects a revoked token (tokenVersion changed)', async () => {
-      redis.get.mockResolvedValue(2 as never);
+      tokenVersions.get.mockResolvedValue(2);
       await getAs('user-a').expect(401);
       expect(subscriptionQueries()).toHaveLength(0);
     });

@@ -17,7 +17,7 @@ import { AllExceptionsFilter } from '../../common/filters/all-exception.filter';
 import { TransformInterceptor } from '../../common/interceptors/transform.interceptor';
 import { CustomLoggerService } from '../../common/services/custom-logger.service';
 import { PrismaService } from '../../common/services/prisma.service';
-import { RedisService } from '../../common/services/redis.service';
+import { TokenVersionCache } from '../../infrastructure/token-version/token-version.cache';
 import { SubscriptionModule } from '../subscription.module';
 import { StripeWebhookController } from './stripe-webhook.controller';
 import { StripeWebhookService } from './stripe-webhook.service';
@@ -31,8 +31,9 @@ const prisma = mockDeep<PrismaService>();
   providers: [
     { provide: PrismaService, useValue: prisma },
     { provide: CustomLoggerService, useValue: mock<CustomLoggerService>() },
+    { provide: TokenVersionCache, useValue: mock<TokenVersionCache>() },
   ],
-  exports: [PrismaService, CustomLoggerService],
+  exports: [PrismaService, CustomLoggerService, TokenVersionCache],
 })
 class TestInfrastructureModule {}
 
@@ -82,8 +83,6 @@ describe('POST /v1/webhooks/stripe (HTTP)', () => {
     const moduleRef = await Test.createTestingModule({
       imports: [TestInfrastructureModule, SubscriptionModule],
     })
-      .overrideProvider(RedisService)
-      .useValue(mock<RedisService>())
       .overrideProvider(STRIPE_SETTINGS)
       .useValue(settings)
       .overrideProvider(STRIPE_CLIENT)
