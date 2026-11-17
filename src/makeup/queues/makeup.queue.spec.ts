@@ -1,63 +1,65 @@
 import { ConfigService } from '@nestjs/config';
 import { mock } from 'jest-mock-extended';
-import type { Queue } from 'bullmq';
+import {
+  JobDispatcher,
+  JobInspector,
+} from '../../infrastructure/jobs/job.types';
 import { MakeupQueueService, type MakeupAiJob } from './makeup.queue';
 
 describe('MakeupQueueService', () => {
-  const queue = mock<Queue<MakeupAiJob>>();
+  const jobs = mock<JobDispatcher>();
+  const inspector = mock<JobInspector>();
+  const payload: MakeupAiJob = {
+    runId: 'run-id',
+    authId: 'auth-id',
+    sessionId: 'session-id',
+  };
 
   beforeEach(() => jest.clearAllMocks());
 
-  it('sets distributed concurrency and rate limits at startup', async () => {
-    const service = new MakeupQueueService(
-      queue,
-      new ConfigService({
-        AI_QUEUE_GLOBAL_CONCURRENCY: '12',
-        AI_QUEUE_RATE_LIMIT_MAX: '90',
-        AI_QUEUE_RATE_LIMIT_DURATION_MS: '60000',
-      }),
-    );
-
-    await service.onModuleInit();
-
-    expect(queue.setGlobalConcurrency.mock.calls).toContainEqual([12]);
-    expect(queue.setGlobalRateLimit.mock.calls).toContainEqual([90, 60_000]);
-  });
-
   it('prioritizes interactive work and adds jittered bounded retries', async () => {
-    queue.getJobCountByTypes.mockResolvedValue(0);
-    const service = new MakeupQueueService(queue, new ConfigService({}));
-    const payload = {
-      runId: 'run-id',
-      authId: 'auth-id',
-      sessionId: 'session-id',
-    };
+    inspector.countBacklog.mockResolvedValue(0);
+    const service = new MakeupQueueService(
+      jobs,
+      inspector,
+      new ConfigService({}),
+    );
 
     await service.enqueue('VISION_CHECK', payload);
     await service.enqueue('PERSONALIZATION', payload);
+    await service.enqueue('GUIDE_GENERATION', payload);
 
-    expect(queue.add.mock.calls[0]?.[2]).toMatchObject({
-      attempts: 3,
-      priority: 1,
-      backoff: { type: 'exponential', delay: 3_000, jitter: 0.5 },
-    });
-    expect(queue.add.mock.calls[1]?.[2]).toMatchObject({ priority: 10 });
+    expect(inspector.countBacklog.mock.calls[0]).toEqual(['makeup-ai']);
+    expect(jobs.dispatch.mock.calls[0]).toEqual([
+      'makeup-ai',
+      {
+        name: 'VISION_CHECK',
+        data: payload,
+        // Deduplicated per run, and deleted with the owner's account.
+        jobId: 'run-id',
+        ownerId: 'auth-id',
+        attempts: 3,
+        backoff: { type: 'exponential', delayMs: 3_000, jitter: 0.5 },
+        priority: 1,
+        removeOnComplete: 100,
+        removeOnFail: 500,
+      },
+    ]);
+    expect(jobs.dispatch.mock.calls[1]?.[1]).toMatchObject({ priority: 10 });
+    expect(jobs.dispatch.mock.calls[2]?.[1]).toMatchObject({ priority: 5 });
   });
 
   it('rejects new work when the configured backlog is full', async () => {
-    queue.getJobCountByTypes.mockResolvedValue(25);
+    inspector.countBacklog.mockResolvedValue(25);
     const service = new MakeupQueueService(
-      queue,
+      jobs,
+      inspector,
       new ConfigService({ AI_QUEUE_MAX_BACKLOG: '25' }),
     );
 
-    await expect(
-      service.enqueue('PERSONALIZATION', {
-        runId: 'run-id',
-        authId: 'auth-id',
-        sessionId: 'session-id',
-      }),
-    ).rejects.toThrow('backlog limit');
-    expect(queue.add.mock.calls).toHaveLength(0);
+    await expect(service.enqueue('PERSONALIZATION', payload)).rejects.toThrow(
+      'backlog limit',
+    );
+    expect(jobs.dispatch.mock.calls).toHaveLength(0);
   });
 });

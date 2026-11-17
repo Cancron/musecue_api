@@ -1,20 +1,18 @@
 import { ConfigService } from '@nestjs/config';
 import { mock, mockDeep } from 'jest-mock-extended';
-import type { Queue, Job } from 'bullmq';
 import type { Prisma } from '@prisma/client';
 import type { Logger } from 'winston';
 import { PrismaService } from '../../common/services/prisma.service';
+import { JobInspector } from '../../infrastructure/jobs/job.types';
 import { MakeupRecoveryService } from './makeup-recovery.service';
-import type { MakeupAiJob } from './makeup.queue';
 import { canPublishRun } from './run-lifecycle';
 
 describe('AI job recovery', () => {
   const prisma = mockDeep<PrismaService>();
-  const queue = mock<Queue<MakeupAiJob>>();
-  const job = mock<Job<MakeupAiJob>>();
+  const jobs = mock<JobInspector>();
   const service = new MakeupRecoveryService(
     prisma,
-    queue,
+    jobs,
     new ConfigService(),
     mock<Logger>(),
   );
@@ -41,9 +39,9 @@ describe('AI job recovery', () => {
   it.each(['failed', 'completed', 'unknown'] as const)(
     'settles stranded database runs when queue state is %s',
     async (state) => {
-      queue.getJob.mockResolvedValue(job);
-      job.getState.mockResolvedValue(state);
+      jobs.getJobState.mockResolvedValue(state);
       await service.reconcile();
+      expect(jobs.getJobState.mock.calls[0]).toEqual(['makeup-ai', 'run']);
       expect(prisma.aiRun.updateMany.mock.calls[0]?.[0]).toMatchObject({
         where: { id: 'run', updatedAt: run.updatedAt },
         data: { status: 'FAILED', progress: 100 },
@@ -54,8 +52,8 @@ describe('AI job recovery', () => {
       });
     },
   );
-  it('handles a missing Redis job', async () => {
-    queue.getJob.mockResolvedValue(undefined);
+  it('handles a missing queue job', async () => {
+    jobs.getJobState.mockResolvedValue('unknown');
     await service.reconcile();
     expect(prisma.aiRun.updateMany.mock.calls).toHaveLength(1);
   });
@@ -67,10 +65,9 @@ describe('AI job recovery', () => {
     prisma.aiRun.findMany
       .mockResolvedValueOnce(healthy as never)
       .mockResolvedValueOnce([run] as never);
-    queue.getJob.mockImplementation((id) =>
-      Promise.resolve(id === 'run' ? undefined : job),
+    jobs.getJobState.mockImplementation((_queue, id) =>
+      Promise.resolve(id === 'run' ? 'unknown' : 'prioritized'),
     );
-    job.getState.mockResolvedValue('prioritized');
     await service.reconcile();
     expect(prisma.aiRun.findMany.mock.calls[1]?.[0]).toMatchObject({
       cursor: { id: 'healthy-99' },
@@ -78,34 +75,28 @@ describe('AI job recovery', () => {
     });
     expect(prisma.aiRun.updateMany.mock.calls).toHaveLength(1);
   });
-  it.each([
-    'active',
-    'waiting',
-    'delayed',
-    'prioritized',
-    'waiting-children',
-  ] as const)(
+  it.each(['active', 'waiting', 'delayed', 'prioritized'] as const)(
     'does not fail healthy %s jobs because they are old',
     async (state) => {
-      queue.getJob.mockResolvedValue(job);
-      job.getState.mockResolvedValue(state);
+      jobs.getJobState.mockResolvedValue(state);
       await service.reconcile();
+      expect(jobs.getJobState.mock.calls[0]).toEqual(['makeup-ai', 'run']);
       expect(prisma.aiRun.updateMany.mock.calls).toHaveLength(0);
     },
   );
-  it('does not interpret Redis unavailability as missing jobs', async () => {
-    queue.getJob.mockRejectedValue(new Error('offline'));
+  it('does not interpret queue unavailability as missing jobs', async () => {
+    jobs.getJobState.mockRejectedValue(new Error('offline'));
     await service.reconcile();
     expect(prisma.aiRun.updateMany.mock.calls).toHaveLength(0);
   });
   it('does not regress a session when the run changed during recovery', async () => {
-    queue.getJob.mockResolvedValue(undefined);
+    jobs.getJobState.mockResolvedValue('unknown');
     prisma.aiRun.updateMany.mockResolvedValue({ count: 0 });
     await service.reconcile();
     expect(prisma.makeupSession.updateMany.mock.calls).toHaveLength(0);
   });
   it('does not regress a session with a newer job', async () => {
-    queue.getJob.mockResolvedValue(undefined);
+    jobs.getJobState.mockResolvedValue('unknown');
     prisma.aiRun.findFirst.mockResolvedValue({ id: 'newer' } as never);
     await service.reconcile();
     expect(prisma.makeupSession.updateMany.mock.calls).toHaveLength(0);

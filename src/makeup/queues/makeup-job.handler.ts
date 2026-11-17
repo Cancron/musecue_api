@@ -1,8 +1,6 @@
-import { Processor, WorkerHost } from '@nestjs/bullmq';
-import { Inject } from '@nestjs/common';
+import { Inject, Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Prisma } from '@prisma/client';
-import { Job, Worker } from 'bullmq';
 import { WINSTON_MODULE_PROVIDER } from 'nest-winston';
 import { Logger } from 'winston';
 import { PrismaService } from '../../common/services/prisma.service';
@@ -27,8 +25,18 @@ import type {
   GuideStepResult,
   RecommendationResult,
 } from '../interfaces/makeup.interface';
+import type {
+  AbandonedJob,
+  JobExecution,
+  JobHandler,
+} from '../../infrastructure/jobs/job.types';
 import type { MakeupAiJob } from './makeup.queue';
-import { canPublishRun, failRun } from './run-lifecycle';
+import {
+  canPublishRun,
+  failRun,
+  INTERRUPTED_RUN_MESSAGE,
+  readRunJobInput,
+} from './run-lifecycle';
 import { lockSession } from '../workflow-lock';
 
 /** A Prisma/driver error code (e.g. P1001) for logs; never the message. */
@@ -42,26 +50,26 @@ function errorCodeOf(error: unknown): string | undefined {
     : undefined;
 }
 
-@Processor('makeup-ai', {
-  concurrency: 8,
-  limiter: { max: 1_000_000, duration: 1_000 },
-})
-export class MakeupProcessor extends WorkerHost {
+/**
+ * Runs makeup AI jobs: loads the run's input, calls the AI gateway, validates
+ * and publishes the result, and decides retries and terminal failures. Used
+ * by both queue drivers (the BullMQ processor and the PostgreSQL worker).
+ */
+@Injectable()
+export class MakeupJobHandler implements JobHandler<MakeupAiJob> {
   constructor(
     private readonly prisma: PrismaService,
     @Inject(AI_GATEWAY) private readonly ai: AiGateway,
     private readonly imageStorage: PrivateImageStorageService,
     @Inject(WINSTON_MODULE_PROVIDER) private readonly logger: Logger,
     private readonly config: ConfigService,
-  ) {
-    super();
-  }
+  ) {}
 
-  async process(job: Job<MakeupAiJob>): Promise<void> {
+  async process(job: JobExecution<MakeupAiJob>): Promise<void> {
     const startedAt = Date.now();
     const existingRun = await this.prisma.aiRun.findUnique({
       where: { id: job.data.runId },
-      select: { status: true },
+      select: { status: true, jobInput: true },
     });
     if (
       !existingRun ||
@@ -69,11 +77,14 @@ export class MakeupProcessor extends WorkerHost {
       existingRun.status === 'FAILED'
     )
       return;
+    // The input recorded on the run is authoritative; the queue payload only
+    // carries it for runs created before it was recorded.
+    const data = { ...job.data, ...readRunJobInput(existingRun.jobInput) };
     const descriptor = this.ai.describe(job.name as AiOperation);
     const claim = await this.prisma.$transaction(async (tx) => {
-      await lockSession(tx, job.data.authId, job.data.sessionId);
+      await lockSession(tx, data.authId, data.sessionId);
       return tx.aiRun.updateMany({
-        where: { id: job.data.runId, status: { in: ['QUEUED', 'PROCESSING'] } },
+        where: { id: data.runId, status: { in: ['QUEUED', 'PROCESSING'] } },
         data: {
           status: 'PROCESSING',
           progress: 20,
@@ -90,16 +101,16 @@ export class MakeupProcessor extends WorkerHost {
     try {
       switch (job.name) {
         case 'PERSONALIZATION':
-          await this.personalize(job.data, startedAt);
+          await this.personalize(data, startedAt);
           break;
         case 'GUIDE_GENERATION':
-          await this.generateGuide(job.data, startedAt);
+          await this.generateGuide(data, startedAt);
           break;
         case 'VISION_CHECK':
-          await this.evaluateStep(job.data, startedAt);
+          await this.evaluateStep(data, startedAt);
           break;
         case 'GUIDE_QUESTION':
-          await this.answerQuestion(job.data, startedAt);
+          await this.answerQuestion(data, startedAt);
           break;
         default:
           throw new Error(`Unsupported makeup job: ${job.name}`);
@@ -108,6 +119,19 @@ export class MakeupProcessor extends WorkerHost {
       const propagatedError = await this.handleFailure(job, error, startedAt);
       throw propagatedError;
     }
+  }
+
+  /**
+   * The job's last attempt was interrupted (the worker stopped) or its
+   * payload was unreadable: fail the run at once, like the recovery sweep
+   * does for runs whose job is gone. The job ID is the run ID.
+   */
+  async onAbandoned(job: AbandonedJob<MakeupAiJob>): Promise<void> {
+    await failRun(
+      this.prisma,
+      job.data?.runId ?? job.id,
+      INTERRUPTED_RUN_MESSAGE,
+    );
   }
 
   private async personalize(data: MakeupAiJob, startedAt: number) {
@@ -460,7 +484,7 @@ export class MakeupProcessor extends WorkerHost {
   }
 
   private async handleFailure(
-    job: Job<MakeupAiJob>,
+    job: JobExecution<MakeupAiJob>,
     error: unknown,
     startedAt: number,
   ): Promise<Error> {
@@ -484,7 +508,7 @@ export class MakeupProcessor extends WorkerHost {
           ...job.data,
           rateLimitDeferrals: deferrals + 1,
         });
-        await this.worker.rateLimit(error.retryAfterMs);
+        const postponed = await job.rateLimit(error.retryAfterMs);
         await this.prisma.aiRun.updateMany({
           where: {
             id: job.data.runId,
@@ -503,7 +527,7 @@ export class MakeupProcessor extends WorkerHost {
             deferral: deferrals + 1,
           },
         );
-        return Worker.RateLimitError();
+        return postponed;
       }
       handledError = new AiProviderError(
         'AI_CAPACITY_UNAVAILABLE',
@@ -519,7 +543,7 @@ export class MakeupProcessor extends WorkerHost {
         ? handledError.message
         : 'Unknown AI failure';
     const retryable = isRetryableAiError(handledError);
-    const maxAttempts = job.opts.attempts ?? 1;
+    const maxAttempts = job.maxAttempts;
     const finalAttempt = !retryable || job.attemptsMade + 1 >= maxAttempts;
 
     if (!retryable) job.discard();

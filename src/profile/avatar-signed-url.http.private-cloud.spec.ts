@@ -13,7 +13,8 @@ import { AllExceptionsFilter } from '../common/filters/all-exception.filter';
 import { AuthGuard } from '../common/guards/auth.guard';
 import { TransformInterceptor } from '../common/interceptors/transform.interceptor';
 import { PrismaService } from '../common/services/prisma.service';
-import { RedisService } from '../common/services/redis.service';
+import { RateLimitStore } from '../infrastructure/rate-limit/rate-limit.store';
+import { TokenVersionCache } from '../infrastructure/token-version/token-version.cache';
 import { ImageValidationService } from '../makeup/services/image-validation.service';
 import { PrivateImageLifecycleService } from '../storage/private-image-lifecycle.service';
 import { PrivateImageStorageService } from '../storage/private-image-storage.service';
@@ -83,9 +84,9 @@ type Responder = (url: string, init?: RequestInit) => Promise<Response>;
 
 describe('GET /v1/profile/avatar/signed-url (HTTP, mocked Supabase)', () => {
   const prisma = mockDeep<PrismaService>();
-  const redis = mock<RedisService>();
+  const tokenVersions = mock<TokenVersionCache>();
   const logger = mock<Logger>();
-  const tokens = new AuthUtilsService(mock<RedisService>());
+  const tokens = new AuthUtilsService(mock<RateLimitStore>());
   const supabaseRequests: Array<{ url: string; init?: RequestInit }> = [];
   let respond: Responder;
   let app: INestApplication<App>;
@@ -150,7 +151,7 @@ describe('GET /v1/profile/avatar/signed-url (HTTP, mocked Supabase)', () => {
         ProfileService,
         AuthGuard,
         { provide: PrismaService, useValue: prisma },
-        { provide: RedisService, useValue: redis },
+        { provide: TokenVersionCache, useValue: tokenVersions },
         { provide: PrivateImageStorageService, useValue: storage },
         {
           provide: PrivateImageLifecycleService,
@@ -178,7 +179,7 @@ describe('GET /v1/profile/avatar/signed-url (HTTP, mocked Supabase)', () => {
     freezeTime(NOW);
     supabaseRequests.length = 0;
     respond = healthySupabase;
-    redis.get.mockResolvedValue(1 as never);
+    tokenVersions.get.mockResolvedValue(1);
     prisma.userProfile.findUnique.mockImplementation(((args: {
       where: { authId: string };
     }) => Promise.resolve(PROFILES[args.where.authId] ?? null)) as never);
@@ -232,7 +233,7 @@ describe('GET /v1/profile/avatar/signed-url (HTTP, mocked Supabase)', () => {
     });
 
     it('rejects a revoked token (token version changed)', async () => {
-      redis.get.mockResolvedValue(2 as never);
+      tokenVersions.get.mockResolvedValue(2);
 
       await getSignedUrl('alice').expect(401);
       expect(supabaseRequests).toHaveLength(0);

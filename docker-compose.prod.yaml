@@ -18,6 +18,8 @@ services:
       DATABASE_NAME: ${POSTGRES_DB}
       NODE_ENV: ${NODE_ENV}
 
+      # true (default): BullMQ + Redis; false: PostgreSQL only (see README).
+      REDIS_ENABLED: ${REDIS_ENABLED:-true}
       REDIS_HOST: redis
       REDIS_PORT: 6379
       REDIS_USER: ${REDIS_USER}

@@ -1,24 +1,29 @@
-import { Processor, WorkerHost } from '@nestjs/bullmq';
-import { Inject } from '@nestjs/common';
-import { Job } from 'bullmq';
-import { EmailJob } from './email.queue';
-import { EmailService } from 'src/common/services/email.service';
-import { PrismaService } from 'src/common/services/prisma.service';
+import { Inject, Injectable } from '@nestjs/common';
 import { WINSTON_MODULE_PROVIDER } from 'nest-winston';
 import { Logger } from 'winston';
+import type {
+  AbandonedJob,
+  JobExecution,
+  JobHandler,
+} from '../../../infrastructure/jobs/job.types';
+import { EmailService } from '../../services/email.service';
+import { PrismaService } from '../../services/prisma.service';
+import type { EmailJob } from './email.queue';
 
-@Processor('email')
-export class EmailProcessor extends WorkerHost {
+/**
+ * Sends queued emails. Used by both queue drivers (BullMQ processor and
+ * PostgreSQL worker); a thrown error fails the attempt and is retried.
+ */
+@Injectable()
+export class EmailJobHandler implements JobHandler<EmailJob> {
   constructor(
     @Inject(WINSTON_MODULE_PROVIDER)
     private readonly logger: Logger,
     private readonly emailService: EmailService,
     private readonly prismaService: PrismaService,
-  ) {
-    super();
-  }
+  ) {}
 
-  async process(job: Job<EmailJob>): Promise<void> {
+  async process(job: JobExecution<EmailJob>): Promise<void> {
     this.logger.info(`Processing email job: ${job.name} (ID: ${job.id})`, {
       context: 'EmailProcessor',
       jobId: job.id,
@@ -65,7 +70,21 @@ export class EmailProcessor extends WorkerHost {
     }
   }
 
-  private async handleVerificationEmail(job: Job<EmailJob>): Promise<void> {
+  /**
+   * A verification email whose sending was interrupted on its last attempt
+   * (PostgreSQL driver) is recorded as failed, like a failed send.
+   */
+  async onAbandoned(job: AbandonedJob<EmailJob>): Promise<void> {
+    if (job.data?.type !== 'verification') return;
+    await this.markVerificationFailed(
+      job.data.authId,
+      'Sending was interrupted',
+    );
+  }
+
+  private async handleVerificationEmail(
+    job: JobExecution<EmailJob>,
+  ): Promise<void> {
     const data = job.data as Extract<EmailJob, { type: 'verification' }>;
     const { email, username, verificationCode, authId } = data;
 
@@ -102,24 +121,33 @@ export class EmailProcessor extends WorkerHost {
         stack: error instanceof Error ? error.stack : undefined,
       });
       // Update email history status to 'failed'
-      await this.prismaService.emailHistory.updateMany({
-        where: {
-          authId,
-          emailType: 'verification',
-          emailStatus: 'pending',
-        },
-        data: {
-          emailStatus: 'failed',
-          errorMessage:
-            error instanceof Error ? error.message : 'Failed to send email',
-        },
-      });
+      await this.markVerificationFailed(
+        authId,
+        error instanceof Error ? error.message : 'Failed to send email',
+      );
 
       throw error; // Re-throw to trigger retry
     }
   }
 
-  private async handleWelcomeEmail(job: Job<EmailJob>): Promise<void> {
+  private async markVerificationFailed(
+    authId: string,
+    errorMessage: string,
+  ): Promise<void> {
+    await this.prismaService.emailHistory.updateMany({
+      where: {
+        authId,
+        emailType: 'verification',
+        emailStatus: 'pending',
+      },
+      data: {
+        emailStatus: 'failed',
+        errorMessage,
+      },
+    });
+  }
+
+  private async handleWelcomeEmail(job: JobExecution<EmailJob>): Promise<void> {
     const data = job.data as Extract<EmailJob, { type: 'welcome' }>;
     const { email, username } = data;
 

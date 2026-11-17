@@ -18,7 +18,8 @@ import { AllExceptionsFilter } from '../src/common/filters/all-exception.filter'
 import { TransformInterceptor } from '../src/common/interceptors/transform.interceptor';
 import { CustomLoggerService } from '../src/common/services/custom-logger.service';
 import { PrismaService } from '../src/common/services/prisma.service';
-import { RedisService } from '../src/common/services/redis.service';
+import { RateLimitStore } from '../src/infrastructure/rate-limit/rate-limit.store';
+import { TokenVersionCache } from '../src/infrastructure/token-version/token-version.cache';
 import { addBillingInterval } from '../src/subscription/billing.validation';
 import { SubscriptionModule } from '../src/subscription/subscription.module';
 import {
@@ -64,8 +65,8 @@ describeWithDatabase('GET /v1/subscription (PostgreSQL, full stack)', () => {
   let schema: string;
   let client: PrismaClient;
   let originalSecret: string;
-  const redis = mock<RedisService>();
-  const tokens = new AuthUtilsService(mock<RedisService>());
+  const tokenVersions = mock<TokenVersionCache>();
+  const tokens = new AuthUtilsService(mock<RateLimitStore>());
   const T0 = new Date('2026-03-01T09:30:00.000Z');
 
   const bearer = (userId: string) =>
@@ -102,8 +103,9 @@ describeWithDatabase('GET /v1/subscription (PostgreSQL, full stack)', () => {
       providers: [
         { provide: PrismaService, useValue: client },
         { provide: CustomLoggerService, useValue: mock<CustomLoggerService>() },
+        { provide: TokenVersionCache, useValue: tokenVersions },
       ],
-      exports: [PrismaService, CustomLoggerService],
+      exports: [PrismaService, CustomLoggerService, TokenVersionCache],
     })
     class DatabaseTestModule {}
 
@@ -111,10 +113,7 @@ describeWithDatabase('GET /v1/subscription (PostgreSQL, full stack)', () => {
     config.jwt_access_secret = 'subscription-status-e2e-secret';
     const moduleRef = await Test.createTestingModule({
       imports: [DatabaseTestModule, SubscriptionModule],
-    })
-      .overrideProvider(RedisService)
-      .useValue(redis)
-      .compile();
+    }).compile();
     app = moduleRef.createNestApplication();
     const logger = mock<Logger>();
     app.useGlobalFilters(new AllExceptionsFilter(logger));
@@ -138,7 +137,7 @@ describeWithDatabase('GET /v1/subscription (PostgreSQL, full stack)', () => {
   });
 
   beforeEach(() => {
-    redis.get.mockResolvedValue(1 as never); // current tokenVersion
+    tokenVersions.get.mockResolvedValue(1); // current tokenVersion
   });
 
   afterEach(() => jest.useRealTimers());

@@ -1,19 +1,37 @@
 import type {
   AccountDeletionRequest,
   AccountDeletionVerification,
+  AuthChallengePurpose,
+  Prisma,
+  RefreshSessionRevocation,
   userStatus,
 } from '@prisma/client';
 import { mockDeep, type DeepMockProxy } from 'jest-mock-extended';
 import { randomUUID } from 'node:crypto';
+import type {
+  AuthChallengeRepository,
+  ChallengeCheck,
+  ChallengeOptions,
+} from '../../src/auth/state/auth-challenge.repository';
+import type {
+  NewRefreshSession,
+  RefreshSessionRepository,
+  StoredRefreshSession,
+} from '../../src/auth/state/refresh-session.repository';
 import type { PrismaService } from '../../src/common/services/prisma.service';
-import type { RedisService } from '../../src/common/services/redis.service';
+import {
+  RateLimitStore,
+  type RateLimitPolicy,
+  type RateLimitResult,
+} from '../../src/infrastructure/rate-limit/rate-limit.store';
+import { TokenVersionCache } from '../../src/infrastructure/token-version/token-version.cache';
 
 /**
  * In-memory stand-ins for account deletion tests.
  *
- * FakeRedis implements the RedisService calls used by authentication
- * (token-version cache, refresh sessions, rate limits) and by deletion codes,
- * honoring TTLs against Date.now() so tests can move the clock. Outages can be
+ * The authentication-state fakes (token-version cache, refresh sessions,
+ * one-time codes, rate limits) follow the semantics of the real drivers and
+ * honor expiry against Date.now() so tests can move the clock. Outages can be
  * simulated per operation.
  *
  * AccountStore serves the Prisma calls of the deletion flow. Transactions are
@@ -22,130 +40,349 @@ import type { RedisService } from '../../src/common/services/redis.service';
  * deletion request per account).
  */
 
-interface Entry {
-  value: string;
-  expiresAt: number | null;
-}
+/** A token-version cache (like the Redis one) with simulated outages. */
+export class FakeTokenVersionCache extends TokenVersionCache {
+  private readonly entries = new Map<
+    string,
+    { value: number; expiresAt: number }
+  >();
+  /** Operations that fail as if the cache were unreachable. */
+  readonly failing = new Set<'get' | 'publish'>();
 
-export class FakeRedis {
-  private readonly entries = new Map<string, Entry>();
-  /** Operations that fail as if Redis were unreachable. */
-  readonly failing = new Set<'set' | 'eval' | 'get' | 'incr'>();
-
-  private live(key: string): Entry | undefined {
-    const entry = this.entries.get(key);
-    if (entry && entry.expiresAt !== null && entry.expiresAt <= Date.now()) {
-      this.entries.delete(key);
+  raw(userId: string): number | undefined {
+    const entry = this.entries.get(userId);
+    if (!entry) return undefined;
+    if (entry.expiresAt <= Date.now()) {
+      this.entries.delete(userId);
       return undefined;
     }
-    return entry;
+    return entry.value;
   }
 
-  raw(key: string): unknown {
-    const entry = this.live(key);
-    return entry ? (JSON.parse(entry.value) as unknown) : undefined;
+  put(userId: string, tokenVersion: number, ttlSeconds = 3600): void {
+    this.entries.set(userId, {
+      value: tokenVersion,
+      expiresAt: Date.now() + ttlSeconds * 1000,
+    });
   }
 
-  keys(): string[] {
-    return [...this.entries.keys()].filter((key) => this.live(key));
-  }
-
-  remove(key: string): void {
-    this.entries.delete(key);
+  remove(userId: string): void {
+    this.entries.delete(userId);
   }
 
   clear(): void {
     this.entries.clear();
+    this.failing.clear();
   }
 
-  put(key: string, value: unknown, ttlSeconds?: number): void {
-    this.entries.set(key, {
-      value: JSON.stringify(value),
-      expiresAt: ttlSeconds ? Date.now() + ttlSeconds * 1000 : null,
+  get(userId: string): Promise<number | null> {
+    if (this.failing.has('get')) return Promise.resolve(null);
+    return Promise.resolve(this.raw(userId) ?? null);
+  }
+
+  fill(userId: string, tokenVersion: number): Promise<void> {
+    if (this.raw(userId) === undefined) this.put(userId, tokenVersion);
+    return Promise.resolve();
+  }
+
+  publish(userId: string, tokenVersion: number): Promise<void> {
+    if (this.failing.has('publish')) {
+      return Promise.reject(new Error('Token cache unavailable'));
+    }
+    this.put(userId, tokenVersion);
+    return Promise.resolve();
+  }
+
+  invalidate(userId: string): Promise<void> {
+    this.entries.delete(userId);
+    return Promise.resolve();
+  }
+}
+
+interface FakeSession extends StoredRefreshSession {
+  tokenId: string;
+  createdAt: Date;
+  revokedReason: RefreshSessionRevocation | null;
+  rotatedFromId: string | null;
+}
+
+/** Refresh sessions with the repository's rotation and revocation rules. */
+export class FakeRefreshSessions {
+  readonly sessions = new Map<string, FakeSession>();
+  /** When set, every write fails as if the database were unreachable. */
+  failing = false;
+
+  add(
+    authId: string,
+    tokenId: string,
+    tokenHash = 'hash',
+    expiresAt = new Date(Date.now() + 7 * 24 * 3600_000),
+  ): void {
+    this.sessions.set(tokenId, {
+      id: randomUUID(),
+      authId,
+      tokenId,
+      tokenHash,
+      expiresAt,
+      createdAt: new Date(),
+      revokedAt: null,
+      revokedReason: null,
+      rotatedFromId: null,
     });
   }
 
-  /** A RedisService-shaped object backed by this store. */
-  asService(): RedisService {
-    const service = {
-      get: (key: string) => {
-        if (this.failing.has('get')) return Promise.resolve(null);
-        return Promise.resolve(this.raw(key) ?? null);
-      },
-      getRequired: (key: string) => {
-        if (this.failing.has('get')) {
-          return Promise.reject(new Error('Redis unavailable'));
-        }
-        return Promise.resolve(this.raw(key) ?? null);
-      },
-      set: (key: string, value: unknown, ttlSeconds?: number) => {
-        if (this.failing.has('set')) return Promise.resolve(false);
-        this.put(key, value, ttlSeconds);
-        return Promise.resolve(true);
-      },
-      setNX: (key: string, value: unknown, ttlSeconds: number) => {
-        if (this.live(key)) return Promise.resolve(false);
-        this.put(key, value, ttlSeconds);
-        return Promise.resolve(true);
-      },
-      del: (key: string) => Promise.resolve(this.entries.delete(key) ? 1 : 0),
-      exists: (key: string) => Promise.resolve(Boolean(this.live(key))),
-      incr: (key: string) => {
-        if (this.failing.has('incr')) return Promise.resolve(null);
-        const current = Number(this.raw(key) ?? 0) + 1;
-        const entry = this.live(key);
-        this.entries.set(key, {
-          value: JSON.stringify(current),
-          expiresAt: entry?.expiresAt ?? null,
-        });
-        return Promise.resolve(current);
-      },
-      expire: (key: string, ttlSeconds: number) => {
-        const entry = this.live(key);
-        if (entry) entry.expiresAt = Date.now() + ttlSeconds * 1000;
-        return Promise.resolve(Boolean(entry));
-      },
-      updateSessionList: (
-        key: string,
-        jti: string,
-        add: boolean,
-        ttl: number,
-      ) => {
-        if (this.failing.has('eval')) {
-          return Promise.reject(new Error('Redis unavailable'));
-        }
-        const sessions = ((this.raw(key) as string[] | undefined) ?? []).filter(
-          (value) => value !== jti,
-        );
-        if (add) sessions.push(jti);
-        if (sessions.length) this.put(key, sessions, ttl);
-        else this.entries.delete(key);
-        return Promise.resolve();
-      },
-      pruneRefreshSessions: (
-        key: string,
-        tokenPrefix: string,
+  /** Token IDs of the user's sessions that still work. */
+  activeOf(authId: string): string[] {
+    return [...this.sessions.values()]
+      .filter(
+        (session) =>
+          session.authId === authId &&
+          !session.revokedAt &&
+          session.expiresAt.getTime() > Date.now(),
+      )
+      .map((session) => session.tokenId);
+  }
+
+  clear(): void {
+    this.sessions.clear();
+    this.failing = false;
+  }
+
+  private guard(): Promise<void> {
+    return this.failing
+      ? Promise.reject(new Error('Database unavailable'))
+      : Promise.resolve();
+  }
+
+  private revokeWhere(
+    match: (session: FakeSession) => boolean,
+    reason: RefreshSessionRevocation,
+  ): number {
+    let count = 0;
+    for (const session of this.sessions.values()) {
+      if (!session.revokedAt && match(session)) {
+        session.revokedAt = new Date();
+        session.revokedReason = reason;
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  asRepository(maxDevicesOverride?: number): RefreshSessionRepository {
+    const repository = {
+      createForLogin: async (
+        session: NewRefreshSession,
         maxDevices: number,
-        ttl: number,
       ) => {
-        if (this.failing.has('eval')) {
-          return Promise.reject(new Error('Redis unavailable'));
-        }
-        const sessions = (this.raw(key) as string[] | undefined) ?? [];
-        if (maxDevices > 0 && sessions.length <= maxDevices) {
-          return Promise.resolve();
-        }
-        const keep = Math.max(0, maxDevices);
-        const kept = sessions.slice(sessions.length - keep);
-        for (const jti of sessions.slice(0, sessions.length - keep)) {
-          this.entries.delete(`${tokenPrefix}${jti}`);
-        }
-        if (kept.length) this.put(key, kept, ttl);
-        else this.entries.delete(key);
-        return Promise.resolve();
+        await this.guard();
+        this.add(
+          session.authId,
+          session.tokenId,
+          session.tokenHash,
+          session.expiresAt,
+        );
+        const keep = maxDevicesOverride ?? maxDevices;
+        const surplus = this.activeOf(session.authId)
+          .map((id) => this.sessions.get(id)!)
+          .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+          .slice(keep);
+        this.revokeWhere((item) => surplus.includes(item), 'DEVICE_LIMIT');
       },
+      find: (tokenId: string) =>
+        Promise.resolve(this.sessions.get(tokenId) ?? null),
+      rotate: async (
+        current: { authId: string; tokenId: string; tokenHash: string },
+        next: NewRefreshSession,
+      ) => {
+        await this.guard();
+        const session = this.sessions.get(current.tokenId);
+        if (
+          !session ||
+          session.authId !== current.authId ||
+          session.tokenHash !== current.tokenHash ||
+          session.revokedAt ||
+          session.expiresAt.getTime() <= Date.now()
+        ) {
+          return false;
+        }
+        session.revokedAt = new Date();
+        session.revokedReason = 'ROTATED';
+        this.add(next.authId, next.tokenId, next.tokenHash, next.expiresAt);
+        this.sessions.get(next.tokenId)!.rotatedFromId = session.id;
+        return true;
+      },
+      revoke: async (
+        authId: string,
+        tokenId: string,
+        reason: RefreshSessionRevocation,
+      ) => {
+        await this.guard();
+        this.revokeWhere(
+          (session) => session.authId === authId && session.tokenId === tokenId,
+          reason,
+        );
+      },
+      revokeAll: async (authId: string, reason: RefreshSessionRevocation) => {
+        await this.guard();
+        return this.revokeWhere((session) => session.authId === authId, reason);
+      },
+      deleteExpired: () => Promise.resolve(0),
     };
-    return service as unknown as RedisService;
+    return repository as unknown as RefreshSessionRepository;
+  }
+}
+
+interface FakeChallenge {
+  code: string;
+  attempts: number;
+  maxAttempts: number;
+  expiresAt: Date;
+  consumedAt: Date | null;
+}
+
+/** One-time codes with the repository's attempt, expiry and single-use rules. */
+export class FakeAuthChallenges {
+  readonly challenges = new Map<string, FakeChallenge>();
+  /** When set, every call fails as if the database were unreachable. */
+  failing = false;
+
+  constructor(private readonly tx?: Prisma.TransactionClient) {}
+
+  clear(): void {
+    this.challenges.clear();
+    this.failing = false;
+  }
+
+  private key(authId: string, purpose: AuthChallengePurpose): string {
+    return `${authId}:${purpose}`;
+  }
+
+  asRepository(): AuthChallengeRepository {
+    const guard = () =>
+      this.failing
+        ? Promise.reject(new Error('Database unavailable'))
+        : Promise.resolve();
+    const repository = {
+      issue: async (
+        authId: string,
+        purpose: AuthChallengePurpose,
+        code: string,
+        options: ChallengeOptions,
+      ) => {
+        await guard();
+        this.challenges.set(this.key(authId, purpose), {
+          code,
+          attempts: 0,
+          maxAttempts: options.maxAttempts,
+          expiresAt: options.expiresAt,
+          consumedAt: null,
+        });
+      },
+      verify: async (
+        authId: string,
+        purpose: AuthChallengePurpose,
+        code: string,
+        options: {
+          now?: Date;
+          onValid?: (tx: Prisma.TransactionClient) => Promise<void>;
+        } = {},
+      ): Promise<ChallengeCheck> => {
+        await guard();
+        const now = options.now ?? new Date();
+        const challenge = this.challenges.get(this.key(authId, purpose));
+        if (
+          !challenge ||
+          challenge.consumedAt ||
+          challenge.expiresAt.getTime() <= now.getTime() ||
+          challenge.attempts >= challenge.maxAttempts
+        ) {
+          return 'EXPIRED';
+        }
+        challenge.attempts += 1;
+        if (challenge.code !== code) return 'INVALID';
+        challenge.consumedAt = now;
+        if (options.onValid) {
+          try {
+            await options.onValid(this.tx as Prisma.TransactionClient);
+          } catch (error) {
+            challenge.consumedAt = null;
+            challenge.attempts -= 1;
+            throw error;
+          }
+        }
+        return 'VALID';
+      },
+      remove: async (authId: string, purpose?: AuthChallengePurpose) => {
+        await guard();
+        for (const key of [...this.challenges.keys()]) {
+          if (
+            purpose
+              ? key === this.key(authId, purpose)
+              : key.startsWith(`${authId}:`)
+          ) {
+            this.challenges.delete(key);
+          }
+        }
+      },
+      deleteExpired: () => Promise.resolve(0),
+    };
+    return repository as unknown as AuthChallengeRepository;
+  }
+}
+
+/** Fixed-window rate limits with the PostgreSQL store's semantics. */
+export class FakeRateLimits extends RateLimitStore {
+  private readonly buckets = new Map<
+    string,
+    { hits: number; windowExpiresAt: number; blockExpiresAt: number }
+  >();
+
+  /** Seeds a counter, e.g. to start a test at the limit. */
+  put(key: string, hits: number, ttlSeconds: number): void {
+    this.buckets.set(key, {
+      hits,
+      windowExpiresAt: Date.now() + ttlSeconds * 1000,
+      blockExpiresAt: 0,
+    });
+  }
+
+  remove(key: string): void {
+    this.buckets.delete(key);
+  }
+
+  clear(): void {
+    this.buckets.clear();
+  }
+
+  hit(key: string, policy: RateLimitPolicy): Promise<RateLimitResult> {
+    const now = Date.now();
+    const bucket = this.buckets.get(key) ?? {
+      hits: 0,
+      windowExpiresAt: 0,
+      blockExpiresAt: 0,
+    };
+    if (bucket.windowExpiresAt <= now) {
+      bucket.hits = 0;
+      bucket.windowExpiresAt = now + policy.windowMs;
+    }
+    bucket.hits += 1;
+    if (bucket.blockExpiresAt <= now && bucket.hits > policy.limit) {
+      bucket.blockExpiresAt = now + policy.blockMs;
+    }
+    this.buckets.set(key, bucket);
+    const blocked = bucket.blockExpiresAt > now;
+    return Promise.resolve({
+      totalHits: bucket.hits,
+      windowExpiresInMs: bucket.windowExpiresAt - now,
+      blocked,
+      blockExpiresInMs: blocked ? bucket.blockExpiresAt - now : 0,
+    });
+  }
+
+  reset(key: string): Promise<void> {
+    this.buckets.delete(key);
+    return Promise.resolve();
   }
 }
 

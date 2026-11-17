@@ -3,6 +3,47 @@ import type { PrismaService } from '../../common/services/prisma.service';
 import { lockSession } from '../workflow-lock';
 import type { MakeupAiJob } from './makeup.queue';
 
+/** Shown on a run whose processing stopped without a result. */
+export const INTERRUPTED_RUN_MESSAGE =
+  'Processing was interrupted. Please try again.';
+
+/**
+ * Operation input of an AI run, recorded on `AiRun.jobInput` when the run is
+ * created (immutable). The other job fields (owner, session, step) are
+ * columns of the run.
+ */
+export interface MakeupRunInput {
+  imageId?: string;
+  question?: string;
+}
+
+/** The JSON stored in `AiRun.jobInput` (only the fields that are set). */
+export function toRunJobInput(input: MakeupRunInput): Prisma.InputJsonObject {
+  return {
+    ...(input.imageId !== undefined ? { imageId: input.imageId } : {}),
+    ...(input.question !== undefined ? { question: input.question } : {}),
+  };
+}
+
+/**
+ * Reads `AiRun.jobInput`. Returns an empty object for runs created before
+ * the input was recorded (null), so the queue payload's fields are used.
+ */
+export function readRunJobInput(
+  value: Prisma.JsonValue | null | undefined,
+): MakeupRunInput {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const record = value;
+  const input: MakeupRunInput = {};
+  // A recorded input is complete: absent fields are cleared, not taken from
+  // the payload.
+  input.imageId =
+    typeof record.imageId === 'string' ? record.imageId : undefined;
+  input.question =
+    typeof record.question === 'string' ? record.question : undefined;
+  return input;
+}
+
 /** Serialize publication with workflow changes and recovery; terminal runs cannot publish. */
 export async function canPublishRun(
   tx: Prisma.TransactionClient,

@@ -1,7 +1,7 @@
 import { localImageStorage } from './support/local-image-storage';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient } from '@prisma/client';
-import type { Job } from 'bullmq';
+import type { JobExecution } from '../src/infrastructure/jobs/job.types';
 import { mock } from 'jest-mock-extended';
 import { randomBytes, randomUUID } from 'node:crypto';
 import {
@@ -31,7 +31,7 @@ import { PrivacyExportDownloadService } from '../src/privacy/download/privacy-ex
 import { PrivacyExportLinkSigner } from '../src/privacy/download/privacy-export-link.signer';
 import { PrivacyExportLifecycleService } from '../src/privacy/queues/privacy-export-lifecycle.service';
 import { PrivacyExportRetentionService } from '../src/privacy/queues/privacy-export-retention.service';
-import { PrivacyExportProcessor } from '../src/privacy/queues/privacy-export.processor';
+import { PrivacyExportJobHandler } from '../src/privacy/queues/privacy-export-job.handler';
 import type { PrivacyExportQueueService } from '../src/privacy/queues/privacy-export.queue';
 import type { PrivateImageStorageService } from '../src/storage/private-image-storage.service';
 import { PrivacyExportStorageService } from '../src/storage/privacy-export-storage.service';
@@ -258,7 +258,7 @@ describeWithDatabase('Personal data export (PostgreSQL)', () => {
   let prisma: PrismaService;
   let root: string;
   let exportsService: PrivacyExportService;
-  let processor: PrivacyExportProcessor;
+  let processor: PrivacyExportJobHandler;
   let exportStorage: PrivacyExportStorageService;
   let images: PrivateImageStorageService;
   let lifecycle: PrivacyExportLifecycleService;
@@ -327,7 +327,7 @@ describeWithDatabase('Personal data export (PostgreSQL)', () => {
         new ActivityLogService(prisma, mock<CustomLoggerService>()),
       ),
     );
-    processor = new PrivacyExportProcessor(
+    processor = new PrivacyExportJobHandler(
       prisma,
       new PrivacyExportArchiveService(
         new PrivacyExportCollectorService(prisma, subscriptions),
@@ -375,10 +375,10 @@ describeWithDatabase('Personal data export (PostgreSQL)', () => {
   const runQueuedJob = async (job: PrivacyExportJob, attemptsMade = 0) =>
     processor.process({
       data: job,
-      opts: { attempts: 3 },
+      maxAttempts: 3,
       attemptsMade,
       discard: jest.fn(),
-    } as unknown as Job<PrivacyExportJob>);
+    } as unknown as JobExecution<PrivacyExportJob>);
 
   /** Files stored for an export (a missing directory means none). */
   const exportFiles = async (authId: string, exportId: string) => {

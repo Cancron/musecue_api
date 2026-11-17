@@ -1,8 +1,9 @@
 /**
  * Rate Limiting Configuration
  *
- * Uses @nestjs/throttler with Redis storage for distributed rate limiting.
- * This ensures consistent rate limits across multiple app instances.
+ * Uses @nestjs/throttler with the storage selected by REDIS_ENABLED: Redis
+ * (distributed across instances) or PostgreSQL. Limits are the same in both
+ * modes.
  */
 
 export const THROTTLER_CONFIG = {

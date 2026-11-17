@@ -47,20 +47,6 @@ export interface ITokenPayload {
 }
 
 /**
- * Stored refresh token data in Redis
- */
-export interface IStoredRefreshToken {
-  userId: string;
-  jti: string;
-  tokenHash: string; // SHA-256 hash of the actual token
-  ip: string;
-  userAgent: string;
-  device?: string;
-  createdAt: string;
-  rotatedFrom?: string; // JTI of the token this was rotated from
-}
-
-/**
  * Login response structure
  */
 export interface ILoginResponse {

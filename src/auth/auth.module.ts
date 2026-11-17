@@ -5,9 +5,12 @@ import { AuthUtilsService } from './services/auth-utils.service';
 import { GoogleOAuthService } from './services/google-oauth.service';
 import { ActivityLogService } from '../common/services/activity-log.service';
 import { EmailService } from '../common/services/email.service';
-import { RedisService } from '../common/services/redis.service';
 import { QueueModule } from '../common/modules';
 import { AuthGuard } from '../common/guards/auth.guard';
+import { AuthChallengeRepository } from './state/auth-challenge.repository';
+import { AuthStateCleanupService } from './state/auth-state-cleanup.service';
+import { OAuthStateRepository } from './state/oauth-state.repository';
+import { RefreshSessionRepository } from './state/refresh-session.repository';
 
 @Module({
   imports: [QueueModule],
@@ -18,9 +21,19 @@ import { AuthGuard } from '../common/guards/auth.guard';
     GoogleOAuthService,
     ActivityLogService,
     EmailService,
-    RedisService,
     AuthGuard,
+    // Authentication security state lives in PostgreSQL in both
+    // infrastructure modes.
+    RefreshSessionRepository,
+    AuthChallengeRepository,
+    OAuthStateRepository,
+    AuthStateCleanupService,
   ],
-  exports: [AuthService, AuthUtilsService, GoogleOAuthService],
+  exports: [
+    AuthService,
+    AuthUtilsService,
+    GoogleOAuthService,
+    AuthChallengeRepository,
+  ],
 })
 export class AuthModule {}

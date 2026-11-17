@@ -1,7 +1,9 @@
-import { InjectQueue } from '@nestjs/bullmq';
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Queue } from 'bullmq';
+import {
+  JobDispatcher,
+  JobInspector,
+} from '../../infrastructure/jobs/job.types';
 import type { PrivacyExportJob } from '../interfaces/privacy-export.interface';
 import {
   PRIVACY_EXPORT_JOB,
@@ -16,29 +18,28 @@ export class PrivacyExportQueueCapacityError extends Error {
   }
 }
 
+/** Queues export archive builds on the selected queue driver. */
 @Injectable()
 export class PrivacyExportQueueService {
   constructor(
-    @InjectQueue(PRIVACY_EXPORT_QUEUE)
-    private readonly queue: Queue<PrivacyExportJob>,
+    private readonly jobs: JobDispatcher,
+    private readonly inspector: JobInspector,
     private readonly config: ConfigService,
   ) {}
 
   async enqueue(job: PrivacyExportJob): Promise<void> {
-    const backlog = await this.queue.getJobCountByTypes(
-      'wait',
-      'active',
-      'delayed',
-      'prioritized',
-    );
+    const backlog = await this.inspector.countBacklog(PRIVACY_EXPORT_QUEUE);
     if (backlog >= this.positiveInteger('PRIVACY_EXPORT_MAX_BACKLOG', 500)) {
       throw new PrivacyExportQueueCapacityError();
     }
-    await this.queue.add(PRIVACY_EXPORT_JOB, job, {
-      // One BullMQ job per export: a duplicate add is a no-op.
+    await this.jobs.dispatch(PRIVACY_EXPORT_QUEUE, {
+      name: PRIVACY_EXPORT_JOB,
+      data: job,
+      // One job per export: a duplicate add is a no-op.
       jobId: job.exportId,
+      ownerId: job.authId,
       attempts: PRIVACY_EXPORT_MAX_ATTEMPTS,
-      backoff: { type: 'exponential', delay: 15_000, jitter: 0.5 },
+      backoff: { type: 'exponential', delayMs: 15_000, jitter: 0.5 },
       removeOnComplete: 100,
       removeOnFail: 500,
     });

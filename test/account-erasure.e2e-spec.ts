@@ -41,17 +41,21 @@ import { PrivacyExportSupersededError } from '../src/privacy/export/privacy-expo
 import type { PrivacyExportJob } from '../src/privacy/interfaces/privacy-export.interface';
 import { ExportAttempt } from '../src/privacy/queues/privacy-export-attempt';
 import { PrivacyExportLifecycleService } from '../src/privacy/queues/privacy-export-lifecycle.service';
-import { PrivacyExportProcessor } from '../src/privacy/queues/privacy-export.processor';
+import { PrivacyExportJobHandler } from '../src/privacy/queues/privacy-export-job.handler';
 import { ActivityLogService } from '../src/common/services/activity-log.service';
 import { SubscriptionAccessService } from '../src/subscription/subscription-access.service';
 import { SubscriptionPlanService } from '../src/subscription/subscription-plan.service';
-import type { Job } from 'bullmq';
+import type { JobExecution } from '../src/infrastructure/jobs/job.types';
 import {
   PrivateImageStorageService,
   type PrivateObjectRef,
 } from '../src/storage/private-image-storage.service';
 import { PrivacyExportStorageService } from '../src/storage/privacy-export-storage.service';
-import { FakeRedis } from './support/account-deletion-fakes';
+import { AuthChallengeRepository } from '../src/auth/state/auth-challenge.repository';
+import { RefreshSessionRepository } from '../src/auth/state/refresh-session.repository';
+import config from '../src/common/config/app.config';
+import { PostgresRateLimitStore } from '../src/infrastructure/rate-limit/postgres-rate-limit.store';
+import { NoopTokenVersionCache } from '../src/infrastructure/token-version/token-version.cache';
 import {
   TEST_DATABASE_URL,
   applyMigrations,
@@ -90,6 +94,9 @@ const USER_DATA_TABLES = [
   'DataExport',
   'PaymentCustomer',
   'CheckoutSession',
+  'RefreshSession',
+  'AuthChallenge',
+  'InfrastructureJob',
 ] as const;
 
 describeWithDatabase('Account erasure (PostgreSQL)', () => {
@@ -104,9 +111,10 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
   let auth: AuthService;
   let codes: AccountDeletionCodeService;
   let exportsStorage: PrivacyExportStorageService;
-  let exportProcessor: PrivacyExportProcessor;
+  let exportProcessor: PrivacyExportJobHandler;
   let workerImages: PrivateImageStorageService;
   let passwordHash: string;
+  let originalRefreshSecret: string;
   const emailQueue = mock<EmailQueueService>();
   const env = {
     images: process.env.PRIVATE_UPLOAD_DIR,
@@ -130,18 +138,29 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
     process.env.PRIVATE_UPLOAD_DIR = join(root, 'images');
     process.env.PRIVATE_EXPORT_DIR = join(root, 'exports');
 
-    const redis = new FakeRedis().asService();
-    const utils = new AuthUtilsService(redis);
+    // Authentication state lives in PostgreSQL (REDIS_ENABLED=false drivers).
+    originalRefreshSecret = config.jwt_refresh_secret;
+    config.jwt_refresh_secret ||= 'account-erasure-e2e-refresh-secret';
+    const utils = new AuthUtilsService(
+      new PostgresRateLimitStore(
+        prisma,
+        new ConfigService({ NODE_ENV: 'test' }),
+        mock<Logger>(),
+      ),
+    );
+    const challenges = new AuthChallengeRepository(prisma);
     auth = new AuthService(
       utils,
       prisma,
       mock<ActivityLogService>(),
-      redis,
+      new RefreshSessionRepository(prisma),
+      challenges,
+      new NoopTokenVersionCache(),
       mock<EmailQueueService>(),
       mock<CustomLoggerService>(),
     );
     emailQueue.sendAccountDeletionCode.mockResolvedValue();
-    codes = new AccountDeletionCodeService(redis, utils, emailQueue);
+    codes = new AccountDeletionCodeService(challenges, utils, emailQueue);
     deletions = new AccountDeletionService(
       prisma,
       auth,
@@ -163,7 +182,7 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
     // pause it while it reads a photo).
     workerImages = localImageStorage();
     const workerLogger = mock<Logger>();
-    exportProcessor = new PrivacyExportProcessor(
+    exportProcessor = new PrivacyExportJobHandler(
       prisma,
       new PrivacyExportArchiveService(
         new PrivacyExportCollectorService(
@@ -199,6 +218,7 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
   });
 
   afterAll(async () => {
+    config.jwt_refresh_secret = originalRefreshSecret;
     await client?.$disconnect();
     if (schema) await dropSchema(schema);
     if (root) await rm(root, { recursive: true, force: true });
@@ -268,6 +288,38 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
             subject: 'Verify',
             messageId: `m-${tag}`,
             emailStatus: 'sent',
+          },
+        },
+        // Authentication state: a signed-in device and an outstanding code.
+        refreshSessions: {
+          create: {
+            tokenId: `jti-${tag}`,
+            tokenHash: 'a'.repeat(64),
+            ipAddress: '203.0.113.9',
+            userAgent: 'phone',
+            expiresAt: new Date(Date.now() + 7 * 24 * 3600_000),
+          },
+        },
+        authChallenges: {
+          create: {
+            purpose: 'EMAIL_VERIFICATION',
+            codeHash: 'b'.repeat(64),
+            maxAttempts: 5,
+            expiresAt: new Date(Date.now() + 3600_000),
+          },
+        },
+        // A background job of the PostgreSQL queue driver (a failed email
+        // kept for diagnosis).
+        infrastructureJobs: {
+          create: {
+            id: randomUUID(),
+            queue: 'email',
+            name: 'send-verification',
+            payload: 'v1.encrypted',
+            status: 'FAILED',
+            attemptsMade: 3,
+            maxAttempts: 3,
+            finishedAt: new Date(),
           },
         },
       },
@@ -950,10 +1002,10 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
     const runExport = (exportId: string, authId: string) =>
       exportProcessor.process({
         data: { exportId, authId },
-        opts: { attempts: 3 },
+        maxAttempts: 3,
         attemptsMade: 0,
         discard: jest.fn(),
-      } as unknown as Job<PrivacyExportJob>);
+      } as unknown as JobExecution<PrivacyExportJob>);
 
     it('waits for a running export worker, which stops and removes its partial archive, before deleting anything', async () => {
       const victim = await seedAccount();

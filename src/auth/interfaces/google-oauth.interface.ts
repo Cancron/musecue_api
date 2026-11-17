@@ -30,7 +30,7 @@ export interface IGoogleUserInfo {
 }
 
 /**
- * Google OAuth State Data stored in Redis
+ * Google OAuth state data (stored encrypted in OAuthState)
  */
 export interface IGoogleOAuthState {
   state: string;

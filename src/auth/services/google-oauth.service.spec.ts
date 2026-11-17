@@ -1,10 +1,11 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { GoogleOAuthService } from './google-oauth.service';
 import { CustomLoggerService } from '../../common/services/custom-logger.service';
-import { RedisService } from '../../common/services/redis.service';
 import { PrismaService } from '../../common/services/prisma.service';
 import { ActivityLogService } from '../../common/services/activity-log.service';
 import { AuthUtilsService } from './auth-utils.service';
+import { OAuthStateRepository } from '../state/oauth-state.repository';
+import { RefreshSessionRepository } from '../state/refresh-session.repository';
 
 describe('GoogleOAuthService', () => {
   let service: GoogleOAuthService;
@@ -16,11 +17,13 @@ describe('GoogleOAuthService', () => {
     debug: jest.fn(),
   };
 
-  const mockRedisService = {
-    get: jest.fn(),
-    set: jest.fn(),
-    del: jest.fn(),
-    setNX: jest.fn(),
+  const mockOAuthStates = {
+    create: jest.fn(),
+    consume: jest.fn(),
+  };
+
+  const mockSessions = {
+    createForLogin: jest.fn(),
   };
 
   const mockPrismaService = {
@@ -69,8 +72,12 @@ describe('GoogleOAuthService', () => {
           useValue: mockCustomLoggerService,
         },
         {
-          provide: RedisService,
-          useValue: mockRedisService,
+          provide: OAuthStateRepository,
+          useValue: mockOAuthStates,
+        },
+        {
+          provide: RefreshSessionRepository,
+          useValue: mockSessions,
         },
         {
           provide: PrismaService,
@@ -101,7 +108,7 @@ describe('GoogleOAuthService', () => {
 
   describe('getAuthorizationUrl', () => {
     it('should generate a valid authorization URL with state', async () => {
-      mockRedisService.set.mockResolvedValue(undefined);
+      mockOAuthStates.create.mockResolvedValue(undefined);
 
       const meta = { ip: '127.0.0.1', userAgent: 'test-agent' };
       const result = await service.getAuthorizationUrl(meta);
@@ -117,11 +124,20 @@ describe('GoogleOAuthService', () => {
       expect(result.url).toContain('scope=');
       expect(result.url).toContain('code_challenge=');
       expect(result.url).toContain('code_challenge_method=S256');
-      expect(mockRedisService.set).toHaveBeenCalled();
+      // The state is stored for the Google provider with a 10 minute expiry.
+      expect(mockOAuthStates.create).toHaveBeenCalledWith(
+        'google',
+        result.state,
+        expect.objectContaining({
+          state: result.state,
+          codeVerifier: expect.any(String) as unknown,
+        }),
+        600,
+      );
     });
 
     it('should include optional redirectUrl if provided', async () => {
-      mockRedisService.set.mockResolvedValue(undefined);
+      mockOAuthStates.create.mockResolvedValue(undefined);
 
       const meta = { ip: '127.0.0.1', userAgent: 'test-agent' };
       const redirectUrl = 'http://localhost:3000/dashboard';
@@ -129,9 +145,10 @@ describe('GoogleOAuthService', () => {
 
       expect(result).toHaveProperty('url');
       expect(result).toHaveProperty('state');
-      // The redirectUrl should be stored in Redis state data
-      expect(mockRedisService.set).toHaveBeenCalledWith(
-        expect.any(String),
+      // The redirectUrl is stored with the (encrypted) state data
+      expect(mockOAuthStates.create).toHaveBeenCalledWith(
+        'google',
+        result.state,
         expect.objectContaining({ redirectUrl }),
         expect.any(Number),
       );
@@ -140,24 +157,27 @@ describe('GoogleOAuthService', () => {
 
   describe('handleCallback', () => {
     it('should throw error for invalid or expired state', async () => {
-      mockRedisService.get.mockResolvedValue(null);
+      mockOAuthStates.consume.mockResolvedValue(null);
 
       const meta = { ip: '127.0.0.1', userAgent: 'test-agent' };
 
       await expect(
         service.handleCallback('test-code', 'invalid-state', meta),
       ).rejects.toThrow('Invalid or expired OAuth state');
+      expect(mockOAuthStates.consume).toHaveBeenCalledWith(
+        'google',
+        'invalid-state',
+      );
     });
 
     it('should throw error for state mismatch', async () => {
-      mockRedisService.get.mockResolvedValue({
+      mockOAuthStates.consume.mockResolvedValue({
         state: 'different-state',
         codeVerifier: 'test-verifier',
         ip: '127.0.0.1',
         userAgent: 'test-agent',
         createdAt: new Date().toISOString(),
       });
-      mockRedisService.del.mockResolvedValue(undefined);
 
       const meta = { ip: '127.0.0.1', userAgent: 'test-agent' };
 

@@ -1,9 +1,9 @@
-import { BullModule } from '@nestjs/bullmq';
 import { Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { AuthGuard } from '../common/guards/auth.guard';
 import { QueueModule } from '../common/modules';
-import { RedisService } from '../common/services/redis.service';
+import { MAKEUP_AI_QUEUE } from '../infrastructure/jobs/job-queues';
+import { registerJobHandler } from '../infrastructure/jobs/job-handler.registry';
 import { StorageModule } from '../storage/storage.module';
 import { MockAiGateway } from './ai/mock-ai.gateway';
 import { AI_GATEWAY, type AiGateway } from './ai/ai.gateway';
@@ -12,22 +12,19 @@ import { OpenRouterProvider } from './ai/providers/openrouter.provider';
 import { STRUCTURED_AI_PROVIDER } from './ai/providers/structured-ai.provider';
 import { MakeupController } from './makeup.controller';
 import { MakeupService } from './makeup.service';
-import { MakeupProcessor } from './queues/makeup.processor';
+import { MakeupJobHandler } from './queues/makeup-job.handler';
 import { MakeupQueueService } from './queues/makeup.queue';
 import { ImageValidationService } from './services/image-validation.service';
 import { MakeupRecoveryService } from './queues/makeup-recovery.service';
 
 @Module({
-  imports: [
-    QueueModule,
-    StorageModule,
-    BullModule.registerQueue({ name: 'makeup-ai' }),
-  ],
+  imports: [QueueModule, StorageModule],
   controllers: [MakeupController],
   providers: [
     MakeupService,
     MakeupQueueService,
-    MakeupProcessor,
+    MakeupJobHandler,
+    registerJobHandler(MAKEUP_AI_QUEUE, MakeupJobHandler),
     MakeupRecoveryService,
     MockAiGateway,
     OpenRouterProvider,
@@ -53,7 +50,6 @@ import { MakeupRecoveryService } from './queues/makeup-recovery.service';
         throw new Error('AI_MODE must be either "mock" or "live"');
       },
     },
-    RedisService,
     AuthGuard,
     ImageValidationService,
   ],

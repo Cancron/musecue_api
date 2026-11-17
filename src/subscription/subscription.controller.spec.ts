@@ -17,11 +17,12 @@ import { AllExceptionsFilter } from '../common/filters/all-exception.filter';
 import { TransformInterceptor } from '../common/interceptors/transform.interceptor';
 import { CustomLoggerService } from '../common/services/custom-logger.service';
 import { PrismaService } from '../common/services/prisma.service';
-import { RedisService } from '../common/services/redis.service';
+import { RateLimitStore } from '../infrastructure/rate-limit/rate-limit.store';
+import { TokenVersionCache } from '../infrastructure/token-version/token-version.cache';
 import { SubscriptionTrialService } from './subscription-trial.service';
 import { SubscriptionModule } from './subscription.module';
 
-const redis = mock<RedisService>();
+const tokenVersions = mock<TokenVersionCache>();
 const trials = mock<SubscriptionTrialService>();
 
 @Global()
@@ -29,8 +30,9 @@ const trials = mock<SubscriptionTrialService>();
   providers: [
     { provide: PrismaService, useValue: mockDeep<PrismaService>() },
     { provide: CustomLoggerService, useValue: mock<CustomLoggerService>() },
+    { provide: TokenVersionCache, useValue: tokenVersions },
   ],
-  exports: [PrismaService, CustomLoggerService],
+  exports: [PrismaService, CustomLoggerService, TokenVersionCache],
 })
 class TestInfrastructureModule {}
 
@@ -39,7 +41,7 @@ const ROUTE = '/v1/subscription/trial';
 describe('POST /v1/subscription/trial (HTTP)', () => {
   let app: INestApplication<App>;
   let originalSecret: string;
-  const tokens = new AuthUtilsService(mock<RedisService>());
+  const tokens = new AuthUtilsService(mock<RateLimitStore>());
   const bearer = (userId: string) =>
     `Bearer ${tokens.createAccessToken({ userId, role: UserRole.USER, tokenVersion: 1 })}`;
 
@@ -58,8 +60,6 @@ describe('POST /v1/subscription/trial (HTTP)', () => {
     const moduleRef = await Test.createTestingModule({
       imports: [TestInfrastructureModule, SubscriptionModule],
     })
-      .overrideProvider(RedisService)
-      .useValue(redis)
       .overrideProvider(SubscriptionTrialService)
       .useValue(trials)
       .compile();
@@ -84,7 +84,7 @@ describe('POST /v1/subscription/trial (HTTP)', () => {
 
   beforeEach(() => {
     jest.resetAllMocks();
-    redis.get.mockResolvedValue(1 as never);
+    tokenVersions.get.mockResolvedValue(1);
     trials.activateTrial.mockResolvedValue(activation);
   });
 

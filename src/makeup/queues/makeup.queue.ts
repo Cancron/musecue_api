@@ -1,7 +1,10 @@
-import { InjectQueue } from '@nestjs/bullmq';
-import { Injectable, OnModuleInit } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Queue } from 'bullmq';
+import { MAKEUP_AI_QUEUE } from '../../infrastructure/jobs/job-queues';
+import {
+  JobDispatcher,
+  JobInspector,
+} from '../../infrastructure/jobs/job.types';
 import type { AiOperation } from '../interfaces/makeup.interface';
 
 export interface MakeupAiJob {
@@ -21,39 +24,31 @@ export class AiQueueCapacityError extends Error {
   }
 }
 
+/**
+ * Queues makeup AI runs on the selected queue driver. Global concurrency and
+ * the provider rate limit (AI_QUEUE_*) are applied by the driver.
+ */
 @Injectable()
-export class MakeupQueueService implements OnModuleInit {
+export class MakeupQueueService {
   constructor(
-    @InjectQueue('makeup-ai') private readonly queue: Queue<MakeupAiJob>,
+    private readonly jobs: JobDispatcher,
+    private readonly inspector: JobInspector,
     private readonly config: ConfigService,
   ) {}
 
-  async onModuleInit(): Promise<void> {
-    await Promise.all([
-      this.queue.setGlobalConcurrency(
-        this.positiveInteger('AI_QUEUE_GLOBAL_CONCURRENCY', 4),
-      ),
-      this.queue.setGlobalRateLimit(
-        this.positiveInteger('AI_QUEUE_RATE_LIMIT_MAX', 15),
-        this.positiveInteger('AI_QUEUE_RATE_LIMIT_DURATION_MS', 60_000),
-      ),
-    ]);
-  }
-
   async enqueue(operation: AiOperation, payload: MakeupAiJob): Promise<void> {
-    const backlog = await this.queue.getJobCountByTypes(
-      'wait',
-      'active',
-      'delayed',
-      'prioritized',
-    );
+    const backlog = await this.inspector.countBacklog(MAKEUP_AI_QUEUE);
     if (backlog >= this.positiveInteger('AI_QUEUE_MAX_BACKLOG', 1_000)) {
       throw new AiQueueCapacityError();
     }
-    await this.queue.add(operation, payload, {
+    await this.jobs.dispatch(MAKEUP_AI_QUEUE, {
+      name: operation,
+      data: payload,
+      // One job per run: a duplicate add is a no-op.
       jobId: payload.runId,
+      ownerId: payload.authId,
       attempts: 3,
-      backoff: { type: 'exponential', delay: 3_000, jitter: 0.5 },
+      backoff: { type: 'exponential', delayMs: 3_000, jitter: 0.5 },
       priority: this.priority(operation),
       removeOnComplete: 100,
       removeOnFail: 500,

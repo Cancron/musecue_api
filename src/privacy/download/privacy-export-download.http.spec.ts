@@ -26,7 +26,8 @@ import { AllExceptionsFilter } from '../../common/filters/all-exception.filter';
 import { AuthGuard } from '../../common/guards/auth.guard';
 import { TransformInterceptor } from '../../common/interceptors/transform.interceptor';
 import { PrismaService } from '../../common/services/prisma.service';
-import { RedisService } from '../../common/services/redis.service';
+import { RateLimitStore } from '../../infrastructure/rate-limit/rate-limit.store';
+import { TokenVersionCache } from '../../infrastructure/token-version/token-version.cache';
 import { redactUrl } from '../../common/utils/redact-url';
 import { PrivacyExportStorageService } from '../../storage/privacy-export-storage.service';
 import { PRIVACY_EXPORT_RETENTION_MS } from '../privacy-export.constants';
@@ -49,7 +50,7 @@ const FIFTEEN_MINUTES = 15 * MINUTE;
 const DAY_MS = 24 * 60 * MINUTE;
 
 const prisma = mockDeep<PrismaService>();
-const redis = mock<RedisService>();
+const tokenVersions = mock<TokenVersionCache>();
 const interceptorLogger = mock<Logger>();
 const filterLogger = mock<Logger>();
 
@@ -57,10 +58,10 @@ const filterLogger = mock<Logger>();
 @Module({
   providers: [
     { provide: PrismaService, useValue: prisma },
-    { provide: RedisService, useValue: redis },
+    { provide: TokenVersionCache, useValue: tokenVersions },
     { provide: WINSTON_MODULE_PROVIDER, useValue: mock<Logger>() },
   ],
-  exports: [PrismaService, RedisService, WINSTON_MODULE_PROVIDER],
+  exports: [PrismaService, TokenVersionCache, WINSTON_MODULE_PROVIDER],
 })
 class TestInfrastructureModule {}
 
@@ -87,7 +88,7 @@ describe('Privacy export downloads (HTTP, time-controlled)', () => {
   let root: string;
   let originalSecret: string;
   const originalExportDir = process.env.PRIVATE_EXPORT_DIR;
-  const tokens = new AuthUtilsService(mock<RedisService>());
+  const tokens = new AuthUtilsService(mock<RateLimitStore>());
 
   /** An access token minted at the current (frozen) time. */
   const bearer = (userId: string) =>
@@ -183,7 +184,7 @@ describe('Privacy export downloads (HTTP, time-controlled)', () => {
     jest.clearAllMocks();
     freezeTime(T0);
     table = new DataExportTable().attach(prisma);
-    redis.get.mockResolvedValue(1 as never);
+    tokenVersions.get.mockResolvedValue(1);
     delete process.env.PRIVACY_EXPORT_DOWNLOAD_TTL_SECONDS;
     delete process.env.PRIVACY_EXPORT_DOWNLOAD_SECRET;
   });
@@ -358,7 +359,7 @@ describe('Privacy export downloads (HTTP, time-controlled)', () => {
       it('rejects a revoked access token (token version changed)', async () => {
         const created = await completedExport();
         const link = linkOf(await requestLink(created.id).expect(200));
-        redis.get.mockResolvedValue(2 as never);
+        tokenVersions.get.mockResolvedValue(2);
 
         await download(link.url).expect(401);
       });

@@ -1,26 +1,21 @@
-import { BullModule } from '@nestjs/bullmq';
 import { Module } from '@nestjs/common';
-import config from '../config/app.config';
+import { EMAIL_QUEUE } from '../../infrastructure/jobs/job-queues';
+import { registerJobHandler } from '../../infrastructure/jobs/job-handler.registry';
 import { EmailService } from '../services/email.service';
 import { EmailQueueService } from '../queues/email/email.queue';
-import { EmailProcessor } from '../queues/email/email.processor';
+import { EmailJobHandler } from '../queues/email/email-job.handler';
 
+/**
+ * Transactional email queue. Jobs run on the selected queue driver
+ * (InfrastructureModule); EmailJobHandler processes them in both modes.
+ */
 @Module({
-  imports: [
-    BullModule.forRoot({
-      connection: {
-        host: process.env.REDIS_HOST || 'localhost',
-        port: parseInt(process.env.REDIS_PORT || '6379', 10),
-        password: process.env.REDIS_PASSWORD,
-        db: parseInt(process.env.REDIS_DB || '0', 10),
-      },
-      prefix: `${config.redis_cache_key_prefix}:bull`,
-    }),
-    BullModule.registerQueue({
-      name: 'email',
-    }),
+  providers: [
+    EmailQueueService,
+    EmailJobHandler,
+    EmailService,
+    registerJobHandler(EMAIL_QUEUE, EmailJobHandler),
   ],
-  providers: [EmailQueueService, EmailProcessor, EmailService],
   exports: [EmailQueueService],
 })
 export class QueueModule {}

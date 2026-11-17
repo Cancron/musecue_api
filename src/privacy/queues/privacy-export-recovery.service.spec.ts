@@ -1,9 +1,11 @@
 import { ConfigService } from '@nestjs/config';
-import type { Job, Queue } from 'bullmq';
 import { mock, mockDeep } from 'jest-mock-extended';
 import type { Logger } from 'winston';
 import type { PrismaService } from '../../common/services/prisma.service';
-import type { PrivacyExportJob } from '../interfaces/privacy-export.interface';
+import {
+  JobInspector,
+  type JobState,
+} from '../../infrastructure/jobs/job.types';
 import type { PrivacyExportLifecycleService } from './privacy-export-lifecycle.service';
 import { PrivacyExportRecoveryService } from './privacy-export-recovery.service';
 
@@ -13,18 +15,16 @@ const STALE = new Date(NOW.getTime() - 10 * 60_000);
 describe('PrivacyExportRecoveryService (privacy export recovery)', () => {
   const prisma = mockDeep<PrismaService>();
   const lifecycle = mock<PrivacyExportLifecycleService>();
-  const queue = mock<Queue<PrivacyExportJob>>();
+  const jobs = mock<JobInspector>();
   const logger = mock<Logger>();
   const service = () =>
     new PrivacyExportRecoveryService(
       prisma,
       lifecycle,
-      queue,
+      jobs,
       new ConfigService({}),
       logger,
     );
-  const jobIn = (state: string) =>
-    ({ getState: () => Promise.resolve(state) }) as unknown as Job;
 
   beforeEach(() => {
     jest.resetAllMocks();
@@ -35,16 +35,14 @@ describe('PrivacyExportRecoveryService (privacy export recovery)', () => {
       { id: 'running', updatedAt: STALE },
     ] as never);
     lifecycle.fail.mockResolvedValue(true);
-    queue.getJob.mockImplementation((id: string) =>
-      Promise.resolve(
-        id === 'lost'
-          ? undefined
-          : jobIn(
-              { 'failed-job': 'failed', waiting: 'delayed', running: 'active' }[
-                id
-              ] as string,
-            ),
-      ),
+    const states: Record<string, JobState> = {
+      lost: 'unknown',
+      'failed-job': 'failed',
+      waiting: 'delayed',
+      running: 'active',
+    };
+    jobs.getJobState.mockImplementation((queue, id) =>
+      Promise.resolve(queue === 'privacy-export' ? states[id] : 'unknown'),
     );
   });
 
@@ -64,8 +62,8 @@ describe('PrivacyExportRecoveryService (privacy export recovery)', () => {
     ]);
   });
 
-  it('treats a Redis error as "unknown", not as a missing job', async () => {
-    queue.getJob.mockRejectedValue(new Error('redis unavailable'));
+  it('treats a queue error as "unknown", not as a missing job', async () => {
+    jobs.getJobState.mockRejectedValue(new Error('redis unavailable'));
 
     await service().reconcile(NOW);
 

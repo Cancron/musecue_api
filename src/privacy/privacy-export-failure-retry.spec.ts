@@ -1,6 +1,6 @@
 import { localImageStorage } from '../../test/support/local-image-storage';
 import { ConfigService } from '@nestjs/config';
-import type { Job } from 'bullmq';
+import type { JobExecution } from '../infrastructure/jobs/job.types';
 import { mock } from 'jest-mock-extended';
 import {
   mkdir,
@@ -34,7 +34,7 @@ import { PRIVACY_EXPORT_FAILURES } from './privacy-export.constants';
 import { PrivacyExportService } from './privacy-export.service';
 import { PrivacyExportLifecycleService } from './queues/privacy-export-lifecycle.service';
 import { PrivacyExportRetentionService } from './queues/privacy-export-retention.service';
-import { PrivacyExportProcessor } from './queues/privacy-export.processor';
+import { PrivacyExportJobHandler } from './queues/privacy-export-job.handler';
 import type { PrivacyExportQueueService } from './queues/privacy-export.queue';
 
 const MAX_ATTEMPTS = 3;
@@ -55,7 +55,7 @@ describe('Privacy export failures, cleanup and retries', () => {
   let exportStorage: PrivacyExportStorageService;
   let lifecycle: PrivacyExportLifecycleService;
   let archive: PrivacyExportArchiveService;
-  let processor: PrivacyExportProcessor;
+  let processor: PrivacyExportJobHandler;
   let requests: PrivacyExportService;
   let queue: ReturnType<typeof mock<PrivacyExportQueueService>>;
   const env = {
@@ -94,7 +94,7 @@ describe('Privacy export failures, cleanup and retries', () => {
       images,
       exportStorage,
     );
-    processor = new PrivacyExportProcessor(
+    processor = new PrivacyExportJobHandler(
       prisma,
       archive,
       exportStorage,
@@ -127,10 +127,10 @@ describe('Privacy export failures, cleanup and retries', () => {
     const discard = jest.fn();
     const run = processor.process({
       data: { exportId, authId: OWNER_ID },
-      opts: { attempts: MAX_ATTEMPTS },
+      maxAttempts: MAX_ATTEMPTS,
       attemptsMade,
       discard,
-    } as unknown as Job<PrivacyExportJob>);
+    } as unknown as JobExecution<PrivacyExportJob>);
     return { run, discard };
   };
 

@@ -1,8 +1,7 @@
-import { BullModule } from '@nestjs/bullmq';
 import { Module } from '@nestjs/common';
 import { AuthGuard } from '../common/guards/auth.guard';
 import { QueueModule } from '../common/modules';
-import { RedisService } from '../common/services/redis.service';
+import { registerJobHandler } from '../infrastructure/jobs/job-handler.registry';
 import { StorageModule } from '../storage/storage.module';
 import { SubscriptionModule } from '../subscription/subscription.module';
 import { PrivacyExportDownloadService } from './download/privacy-export-download.service';
@@ -15,7 +14,7 @@ import { PrivacyExportService } from './privacy-export.service';
 import { PrivacyExportLifecycleService } from './queues/privacy-export-lifecycle.service';
 import { PrivacyExportRecoveryService } from './queues/privacy-export-recovery.service';
 import { PrivacyExportRetentionService } from './queues/privacy-export-retention.service';
-import { PrivacyExportProcessor } from './queues/privacy-export.processor';
+import { PrivacyExportJobHandler } from './queues/privacy-export-job.handler';
 import { PrivacyExportQueueService } from './queues/privacy-export.queue';
 
 @Module({
@@ -24,13 +23,13 @@ import { PrivacyExportQueueService } from './queues/privacy-export.queue';
     StorageModule,
     // Read-only use of SubscriptionAccessService for the exported status.
     SubscriptionModule,
-    BullModule.registerQueue({ name: PRIVACY_EXPORT_QUEUE }),
   ],
   controllers: [PrivacyExportController],
   providers: [
     PrivacyExportService,
     PrivacyExportQueueService,
-    PrivacyExportProcessor,
+    PrivacyExportJobHandler,
+    registerJobHandler(PRIVACY_EXPORT_QUEUE, PrivacyExportJobHandler),
     PrivacyExportRecoveryService,
     PrivacyExportRetentionService,
     PrivacyExportLifecycleService,
@@ -39,7 +38,6 @@ import { PrivacyExportQueueService } from './queues/privacy-export.queue';
     PrivacyExportCollectorService,
     PrivacyExportArchiveService,
     AuthGuard,
-    RedisService,
   ],
 })
 export class PrivacyModule {}

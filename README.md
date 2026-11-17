@@ -8,17 +8,18 @@ The companion mobile application and detailed product specifications live in `..
 
 ## Implemented
 
-- PostgreSQL/Prisma local accounts, SMTP verification through BullMQ, login auditing, account lockout, and Google OAuth foundations
-- short-lived JWT access tokens and rotating, revocable Redis-backed refresh tokens
+- PostgreSQL/Prisma local accounts, SMTP verification through the background email queue, login auditing, account lockout, and Google OAuth foundations
+- short-lived JWT access tokens and rotating, revocable refresh tokens stored as hashes in PostgreSQL
+- optional Redis: `REDIS_ENABLED=true` (default) uses BullMQ queues, Redis rate limiting and a Redis token-version cache; `REDIS_ENABLED=false` runs the same jobs and limits on PostgreSQL only (see "Infrastructure mode")
 - owner-scoped makeup sessions and the documented workflow state machine
 - validated multipart image upload, private object storage (a private Supabase Storage bucket by default, behind a provider interface), image metadata, structured preferences, face analysis, ranked recommendations, saved looks, and selection
 - generated guides, authoritative step progression, retained visual attempts, contextual questions, completion history, profile statistics, and optional private profile avatars
-- BullMQ jobs for personalization, guide generation, visual checks, and guide questions
+- background jobs (BullMQ or PostgreSQL) for personalization, guide generation, visual checks, and guide questions
 - `AiRun` audit records containing operation, provider, model, prompt version, latency, progress, result/error, and status
 - a provider-neutral AI gateway with OpenRouter live mode, multimodal private-image input, strict structured output, runtime validation, bounded retries, and deterministic mock mode
 - a single Pro subscription plan: admin-configured monthly/yearly pricing and free trial, one-time trial activation, date-based Pro access through `ProAccessGuard`, payment/lifecycle records protected by database rules, and Stripe checkout for the monthly and yearly options with webhook-verified activation, automatic renewals, failed-payment handling and recovery, cancellation at period end, and refunds made in Stripe with immediate access revocation (see "Subscriptions" and "Stripe checkout" under API); requesting refunds from MuseCue and disputes are not implemented yet
 - personal data export: an authenticated user can request an asynchronous ZIP archive of their own account, profile, makeup history, subscription records and private photos, poll its status, and download it through a signed link valid for at most 15 minutes; archives expire 24 hours after export and are deleted by a scheduled retention sweep (see "Personal data export" under API)
-- account deletion: the owner confirms their identity (password and an emailed code, or the code alone for accounts without a password), the account is blocked and every token invalidated at once (`PENDING_DELETION`), and a background sweep hard-deletes the account and all its data and files, keeping payment records detached (see "Account deletion" under API)
+- account deletion: the owner confirms their identity (password and an emailed code, or the code alone for accounts without a password), the account is blocked and every token invalidated at once (`PENDING_DELETION`), and a background sweep hard-deletes the account and all its data and files (including its refresh sessions, one-time codes and queued or retained background jobs), keeping payment records detached (see "Account deletion" under API)
 
 Migration `20260827174107_add_makeup_workflow` adds the makeup aggregate and removes the dormant job-tracker and subscription starter domains.
 
@@ -33,11 +34,14 @@ Intentionally deferred:
 ## Requirements and setup
 
 - Node.js 22+
-- PostgreSQL 17
-- Redis 7+
+- PostgreSQL 17 (always required)
+- Redis 7+ (only with `REDIS_ENABLED=true`, the default)
 - working SMTP credentials
 
 ### Check PostgreSQL and Redis on Ubuntu
+
+Redis is only needed with `REDIS_ENABLED=true` (the default); with
+`REDIS_ENABLED=false` skip the Redis checks below (see "Infrastructure mode").
 
 Check whether the commands are installed:
 
@@ -157,9 +161,171 @@ npx prisma migrate deploy
 npm run start:dev
 ```
 
+Without Redis, set `REDIS_ENABLED=false` in `.env` (and keep
+`JWT_REFRESH_SECRET` set) and start only PostgreSQL:
+
+```bash
+docker compose up -d postgres_db
+```
+
 The API defaults to `http://localhost:5000`; development Swagger is at `http://localhost:5000/docs`.
 
 Important environment variables are documented in `.env.example`. Never commit the real `.env` or log SMTP credentials, tokens, image contents, or future signed URLs.
+
+### Infrastructure mode (`REDIS_ENABLED`)
+
+One setting selects the infrastructure drivers when the API starts. PostgreSQL
+is required in both modes; Redis only with `REDIS_ENABLED=true`.
+
+| | `REDIS_ENABLED=true` (default) | `REDIS_ENABLED=false` |
+| --- | --- | --- |
+| Background jobs (email, makeup AI, privacy exports) | BullMQ on Redis | `InfrastructureJob` table, worker inside the API process |
+| Request throttling and auth rate limits | Redis | `RateLimitBucket` table |
+| Token-version cache (AuthGuard) | Redis | none: the database is read on every request |
+| Refresh sessions, email/deletion codes, OAuth states | PostgreSQL | PostgreSQL |
+| Redis connection | yes | none (no client is created; `REDIS_*` is ignored) |
+
+- An omitted or empty `REDIS_ENABLED` means `true`, so existing deployments
+  keep Redis. Any value other than `true` or `false` (surrounding whitespace
+  is ignored) stops the API at startup. The selection never changes while the API runs: there is no
+  automatic fallback from one driver to the other.
+- Startup logs the selected drivers once, for example
+  `REDIS_ENABLED=false: queue driver postgres, rate-limit driver postgres, token-version cache none (no Redis connection)`.
+  No credentials are logged.
+- HTTP routes, request DTOs and response contracts are identical in both
+  modes. Job retries, priorities, backlog limits and route rate limits are
+  the same: email 3 attempts with exponential backoff from 2 seconds; makeup
+  AI 3 attempts with the existing priorities, jittered backoff from 3 seconds,
+  `AI_QUEUE_GLOBAL_CONCURRENCY` and `AI_QUEUE_RATE_LIMIT_*`; privacy exports
+  3 attempts with backoff from 15 seconds.
+- `REDIS_ENABLED=false` supports **one API instance**: the worker runs inside
+  it, and the AI concurrency and rate limits are enforced in that process.
+  Scale out only with Redis.
+- `REDIS_ENABLED=false` requires `JWT_REFRESH_SECRET`. Job payloads are
+  encrypted with AES-256-GCM under a key derived from it (as are OAuth
+  states; one-time codes and rate-limit keys are stored as keyed hashes).
+  Rotating the secret makes pending PostgreSQL jobs, outstanding codes and
+  OAuth states unusable (interrupted jobs fail their export or AI run, which
+  the user can retry).
+- The PostgreSQL worker starts with the API in every environment, including
+  `NODE_ENV=test`, exactly like the BullMQ workers in Redis mode: queued jobs
+  are never left unprocessed because of the environment name.
+
+#### How the PostgreSQL queue works
+
+- **Polling and leases.** The worker polls every second (cycles never
+  overlap), leases due jobs (highest priority first, i.e. the lowest number)
+  with a 120-second lease renewed every 30 seconds, and runs them with the
+  same job handlers as the BullMQ processors. Concurrency and rate limits are
+  per queue: email 1, privacy exports 2, makeup AI
+  `AI_QUEUE_GLOBAL_CONCURRENCY` (at most 8) and `AI_QUEUE_RATE_LIMIT_MAX`
+  starts per `AI_QUEUE_RATE_LIMIT_DURATION_MS`.
+- **Deduplication and backpressure.** The jobs of an AI run or export are
+  keyed by its ID, so a retried request never creates a second job. Backlog
+  limits (`AI_QUEUE_MAX_BACKLOG`, `PRIVACY_EXPORT_MAX_BACKLOG`) count waiting
+  and running jobs, as with BullMQ.
+- **Retries.** A failed attempt is retried after its backoff; after the last
+  attempt the job is `FAILED` and the handler has already failed its AI run,
+  export or email record. A provider `429` postpones the makeup job without
+  using an attempt and pauses that queue for the requested delay.
+- **Interruptions.** On shutdown (SIGTERM) running jobs get five seconds to
+  finish and are then handed back without using an attempt. If the process
+  dies instead, the job's lease expires after at most 120 seconds: the
+  interrupted attempt counts, the job is retried after its backoff, and after
+  its last attempt it fails together with its AI run or export.
+- **Retention.** Completed jobs are removed after an hour (their payload is
+  cleared at once); failed jobs are kept for seven days for diagnosis, with
+  the encrypted payload and only the error class and code (never a message).
+  Jobs carrying a one-time code are deleted as soon as they finish.
+- **Ownership and account deletion.** Every job is recorded with the account
+  it belongs to (`InfrastructureJob.authId`: verification, welcome and
+  deletion-code emails, AI runs, exports). Erasing an account deletes all of
+  its jobs, waiting, running or retained, through a cascading foreign key:
+  nothing is sent to an erased address and no payload of it is kept. A job
+  that is already running when its account is erased may finish, but nothing
+  about it is recorded afterwards, and no new job can be added for an account
+  that no longer exists.
+
+#### Operating the PostgreSQL queue
+
+Jobs are rows of `InfrastructureJob` (payloads are encrypted; never try to
+read or edit them). Useful read-only queries:
+
+```sql
+-- Pending and running work per queue (the backlog)
+SELECT queue, status, count(*) FROM "InfrastructureJob"
+WHERE status IN ('WAITING', 'ACTIVE') GROUP BY queue, status;
+
+-- Recent failures (error class and code only)
+SELECT queue, name, "jobKey", "attemptsMade", "lastError", "finishedAt"
+FROM "InfrastructureJob" WHERE status = 'FAILED'
+ORDER BY "finishedAt" DESC LIMIT 50;
+```
+
+A failed AI run or export is retried by the user (a new request creates a new
+job); failed jobs are not re-run automatically. Rate-limit counters are rows of
+`RateLimitBucket` (keyed by HMAC only) and expired ones are removed every five
+minutes.
+
+#### Rollout and switching drivers
+
+Two migrations belong to this feature:
+
+- `20261120120000_optional_redis_infrastructure` moves authentication
+  security state to PostgreSQL and adds the PostgreSQL queue and rate-limit
+  tables and `AiRun.jobInput`. It increments every user's token version:
+  **every user has to sign in again**, and verification, deletion and OAuth
+  codes issued before the migration no longer work (users request new ones).
+- `20261121120000_infrastructure_job_owner` adds the job owner
+  (`InfrastructureJob.authId`, deleted with the account). Jobs queued before
+  it keep running without an owner.
+
+Neither changes payment, subscription or other existing data, and both apply
+to fresh and populated databases.
+
+1. Deploy this version with `REDIS_ENABLED=true` (or unset) and run
+   `npx prisma migrate deploy`. BullMQ keeps processing the jobs queued before
+   the deployment.
+2. Let BullMQ drain: no waiting, delayed or active jobs remain in the
+   `email`, `makeup-ai` and `privacy-export` queues.
+3. Set `REDIS_ENABLED=false` and restart the API. Redis can then be removed.
+
+Changing drivers in either direction is a maintenance operation: do not switch
+while the current queue still contains jobs, because jobs left in the other
+driver are not run. The recovery sweeps fail AI runs and exports whose jobs
+were left behind after their grace period, so clients stop polling. With
+`REDIS_ENABLED=true`, startup warns when PostgreSQL jobs from a previous
+`false` run are still pending.
+
+#### Testing both modes
+
+`npm test` needs neither PostgreSQL nor Redis. The PostgreSQL-backed e2e tests
+need `TEST_DATABASE_URL`; the Redis ones additionally need a real Redis in
+`TEST_REDIS_URL` (they are reported as skipped without it). Redis tests use a
+unique key prefix per run and remove their keys afterwards.
+
+```bash
+# PostgreSQL-only mode, with Redis stopped or unreachable
+TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test \
+  REDIS_ENABLED=false npm run test:e2e -- --runInBand
+
+# Redis mode against a real Redis, plus everything above
+TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test \
+  TEST_REDIS_URL=redis://127.0.0.1:6379 \
+  REDIS_ENABLED=true npm run test:e2e -- --runInBand
+```
+
+Each mode-specific suite sets `REDIS_ENABLED` itself, so the variable on the
+command line only documents the intent; `TEST_REDIS_URL` decides whether the
+Redis suites run. The suites for this feature:
+
+| Suite | Covers |
+| --- | --- |
+| `test/postgres-mode.e2e-spec.ts` | The whole app with `REDIS_ENABLED=false` and Redis unreachable: registration and email verification, login, refresh rotation (incl. concurrent reuse), logout-all, the makeup AI workflow, a privacy export and its download, route rate limits, account deletion over HTTP (sessions, codes and jobs removed); asserts that Redis was never contacted |
+| `test/redis-mode.e2e-spec.ts` | The same flows with `REDIS_ENABLED=true` on BullMQ and a real Redis |
+| `test/postgres-job-queue.e2e-spec.ts` | The PostgreSQL queue driver: encryption, priority, deduplication, retries and backoff, terminal failure, rate-limit deferral, lease renewal and recovery, retention, job ownership and the account-deletion cascade |
+| `test/rate-limit-contract.e2e-spec.ts` | The same rate-limit scenarios against the PostgreSQL and Redis drivers (storage, HTTP 429 response, authentication limits) |
+| `test/auth-state.e2e-spec.ts` | Refresh sessions, one-time codes and OAuth states in PostgreSQL, and both migrations on existing data |
 
 ### Private image storage
 
@@ -340,7 +506,7 @@ Migration `20260906190000_add_guide_substeps` adds `GuideStep.substeps` as a non
 
 ### Traffic and provider capacity
 
-The makeup worker processes I/O-bound AI jobs concurrently, while Redis-backed global concurrency and rate limits cap aggregate OpenRouter traffic across every running API instance. Interactive vision checks and coach questions receive higher queue priority than initial analysis and guide generation. A short provider `429` pauses the shared queue only for its requested delay and may defer a job twice. Multi-hour quota exhaustion fails immediately so jobs reach a terminal state instead of freezing the queue. Other transient failures use the three-attempt exponential backoff budget with jitter.
+The makeup worker processes I/O-bound AI jobs concurrently, while global concurrency and rate limits cap aggregate OpenRouter traffic (Redis-backed across every running API instance, or enforced in the single API process with `REDIS_ENABLED=false`). Interactive vision checks and coach questions receive higher queue priority than initial analysis and guide generation. A short provider `429` pauses the shared queue only for its requested delay and may defer a job twice. Multi-hour quota exhaustion fails immediately so jobs reach a terminal state instead of freezing the queue. Other transient failures use the three-attempt exponential backoff budget with jitter.
 
 Defaults are conservative for development:
 
@@ -353,16 +519,18 @@ AI_QUEUE_MAX_PROVIDER_PAUSE_MS=120000
 AI_QUEUE_MAX_RATE_LIMIT_DEFERRALS=2
 ```
 
-Increase these only after pinning production models and matching the limits on your OpenRouter account. Multiple backend instances can consume the same queue; the Redis limits remain global. New jobs receive a service-unavailable response once the configurable backlog ceiling is reached instead of growing an unbounded queue. `OPENROUTER_FALLBACK_MODELS` can provide comma-separated capacity fallbacks, and `OPENROUTER_PROVIDER_SORT=throughput` can favor faster providers. Large stored images are resized and JPEG-compressed in memory before provider delivery, while already-small mobile images pass through unchanged.
+Increase these only after pinning production models and matching the limits on your OpenRouter account. With Redis, multiple backend instances can consume the same queue and the limits remain global. New jobs receive a service-unavailable response once the configurable backlog ceiling is reached instead of growing an unbounded queue. `OPENROUTER_FALLBACK_MODELS` can provide comma-separated capacity fallbacks, and `OPENROUTER_PROVIDER_SORT=throughput` can favor faster providers. Large stored images are resized and JPEG-compressed in memory before provider delivery, while already-small mobile images pass through unchanged.
 
 The free router is intended for development and cannot provide bulk-production capacity. Paid models, explicit account spending caps, production observability, and load testing are required before a public launch.
 
 ### Workflow and authentication reliability
 
 - Session writes and AI result publication share a PostgreSQL row lock. Repeated completion requests do not reopen an earlier step. AI-run idempotency keys are scoped to their owner, session, operation, and step.
-- Every 30 seconds, recovery checks pending runs older than `AI_JOB_RECOVERY_GRACE_MS` (default/minimum 120000 ms), in batches of 100. Missing or terminal BullMQ jobs become terminal `FAILED` runs so clients stop polling and can retry. Healthy waiting, prioritized, delayed, or active jobs are left alone. A Redis outage postpones recovery; it is not evidence that jobs are missing.
-- Terminal runs and superseded worker attempts cannot publish late AI results. Recovery uses existing PostgreSQL/BullMQ state, not another queue. Restart the API/workers to activate it; no migration is required.
-- Refresh-token rotation compares and replaces the token hash and updates the Redis session index in one Lua operation. Temporary Redis failures return 503 instead of invalidating authentication. These scripts use the existing single Redis instance, not Redis Cluster.
+- Every 30 seconds, recovery checks pending runs older than `AI_JOB_RECOVERY_GRACE_MS` (default/minimum 120000 ms), in batches of 100. Missing or terminal jobs of the selected queue driver become terminal `FAILED` runs so clients stop polling and can retry. Healthy waiting, prioritized, delayed, or active jobs are left alone. A queue outage postpones recovery; it is not evidence that jobs are missing.
+- Terminal runs and superseded worker attempts cannot publish late AI results. Recovery uses existing PostgreSQL/queue state, not another queue.
+- Each AI run records its operation input (`AiRun.jobInput`, e.g. the photo of a visual check or the question) when it is created; it is immutable and never returned by the API, so workers do not depend on the queue payload.
+- Refresh-token rotation revokes the presented session and stores its replacement in one PostgreSQL transaction: of concurrent requests with the same token exactly one succeeds. A reused token is rejected without revoking the winner or other devices; a token whose hash does not match revokes every session of the user. Logins take a per-user advisory lock (a concurrent login of the same user gets 409) and revoke the oldest sessions beyond five devices in the same transaction. Temporary database failures return 503 instead of invalidating authentication.
+- Email verification and account deletion codes are stored as purpose-bound HMACs, allow five checks, expire and work once. OAuth states are single-use and expire after ten minutes. Expired authentication rows are removed hourly.
 - Rate-limit exemptions match documentation/metrics paths only. Query-string text cannot disable throttling.
 - `POST /v1/recommendations/:recommendationId/saved` accepts `{ "saved": true }` or `{ "saved": false }` for retry-safe state changes. A body without `saved` retains the legacy toggle behavior.
 
@@ -766,7 +934,7 @@ Migration `20261113120000_add_stripe_checkout` adds `PaymentCustomer` and `Check
 
 Not implemented yet: immediate cancellation (including canceling a past-due subscription to stop Stripe's retries), undoing a cancellation (a cancellation reversed in Stripe is not reflected), the customer portal (so users cannot update their card in-app; Stripe's own emails and hosted invoice page can be used), exposing the past-due state in `GET /v1/subscription`, requesting refunds from MuseCue, disputes (`charge.dispute.*`), canceling the Stripe subscription automatically when a payment is refunded, revoking an active free trial on refund (a trial is not a payment and keeps running), reactions to other `customer.subscription.updated` changes (e.g. `unpaid`), and automatic refunds or cancellation of duplicate payments and subscriptions. Renewal delays within Stripe's retry window (up to 3 days) are handled. If a renewal for an older period arrives after a newer one, the older period is recorded but cannot be merged into the term: the database allows one payment per term change.
 
-Database tests (`test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`, `test/privacy-export.e2e-spec.ts`, `test/account-deletion.e2e-spec.ts`, `test/account-erasure.e2e-spec.ts`, `test/stripe-checkout.e2e-spec.ts`, `test/stripe-renewal.e2e-spec.ts`, `test/stripe-payment-failure.e2e-spec.ts`, `test/stripe-cancellation.e2e-spec.ts`, `test/stripe-refund.e2e-spec.ts`, `test/subscription-billing.e2e-spec.ts`, `test/stripe-webhook-reliability.e2e-spec.ts`, `test/stripe-payment-lifecycle.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
+Database tests (`test/auth-state.e2e-spec.ts`, `test/postgres-job-queue.e2e-spec.ts`, `test/postgres-mode.e2e-spec.ts`, `test/rate-limit-contract.e2e-spec.ts` (PostgreSQL part), `test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`, `test/privacy-export.e2e-spec.ts`, `test/account-deletion.e2e-spec.ts`, `test/account-erasure.e2e-spec.ts`, `test/stripe-checkout.e2e-spec.ts`, `test/stripe-renewal.e2e-spec.ts`, `test/stripe-payment-failure.e2e-spec.ts`, `test/stripe-cancellation.e2e-spec.ts`, `test/stripe-refund.e2e-spec.ts`, `test/subscription-billing.e2e-spec.ts`, `test/stripe-webhook-reliability.e2e-spec.ts`, `test/stripe-payment-lifecycle.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
 
 ```bash
 TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json test/subscription-plan test/user-subscription test/subscription-trial test/subscription-status test/pro-access test/trial-lifecycle test/billing test/subscription-security test/privacy-export test/account-deletion test/account-erasure
@@ -796,6 +964,9 @@ npm test -- --runInBand subscription-billing
 
 ```text
 authUser
+|-- RefreshSession (hashed refresh tokens, rotation lineage)
+|-- AuthChallenge (hashed one-time codes, one per purpose)
+|-- InfrastructureJob (PostgreSQL queue driver; deleted with the account)
 |-- PaymentCustomer (0..1 per provider)
 |-- UserSubscription (0..1)
 |-- DataExport
@@ -810,6 +981,8 @@ authUser
         `-- GuideStep
             |-- StepAttempt
             `-- Question
+
+OAuthState, RateLimitBucket: short-lived, keyed by hashes, no owner
 ```
 
 Mock and live gateways implement the same application-owned operations. The live gateway delegates transport to an OpenRouter provider adapter, workers validate and normalize model-shaped output, and NestJS alone persists it transactionally and advances workflow state. No frontend or public API contract changes are required to switch modes or add another provider adapter.
@@ -821,6 +994,8 @@ npm run start:dev
 npm run build
 npm run lint
 npm test
+TEST_DATABASE_URL=... REDIS_ENABLED=false npm run test:e2e -- --runInBand   # PostgreSQL-only mode (Redis suites skipped)
+TEST_DATABASE_URL=... TEST_REDIS_URL=redis://127.0.0.1:6379 REDIS_ENABLED=true npm run test:e2e -- --runInBand   # adds Redis mode (see "Testing both modes")
 npx jest private-cloud   # private image storage unit tests
 TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json test/private-cloud   # storage workflows + cleanup ledger on PostgreSQL (mocked Supabase)
 npm run test:e2e

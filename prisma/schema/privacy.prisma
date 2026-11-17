@@ -4,9 +4,9 @@
 
 // One user-requested archive of the user's own data (account, profile,
 // makeup history, subscription and private photos). Rows are created by
-// POST /v1/privacy/exports and advanced only by the `privacy-export` BullMQ
-// worker: QUEUED -> PROCESSING -> COMPLETED | FAILED (a retrying attempt goes
-// back to QUEUED) -> EXPIRED. A COMPLETED export expires 24 hours after
+// POST /v1/privacy/exports and advanced only by the `privacy-export` queue
+// worker (BullMQ or PostgreSQL, per REDIS_ENABLED): QUEUED -> PROCESSING ->
+// COMPLETED | FAILED (a retrying attempt goes back to QUEUED) -> EXPIRED. A COMPLETED export expires 24 hours after
 // completion (`expiresAt`): reads and downloads treat it as expired from that
 // moment, and the retention sweep marks it EXPIRED, deletes its files and sets
 // `filesDeletedAt`. An EXPIRED export keeps `storageKey`, so a cleanup that

@@ -7,8 +7,8 @@ import {
 import type { Request } from 'express';
 import * as jwt from 'jsonwebtoken';
 import config from '../config/app.config';
-import { RedisService } from '../services/redis.service';
 import { PrismaService } from '../services/prisma.service';
+import { TokenVersionCache } from '../../infrastructure/token-version/token-version.cache';
 
 interface IAccessTokenPayload {
   userId: string;
@@ -19,7 +19,7 @@ interface IAccessTokenPayload {
 @Injectable()
 export class AuthGuard implements CanActivate {
   constructor(
-    private readonly redisService: RedisService,
+    private readonly tokenVersions: TokenVersionCache,
     private readonly prismaService: PrismaService,
   ) {}
 
@@ -37,7 +37,7 @@ export class AuthGuard implements CanActivate {
         config.jwt_access_secret,
       ) as IAccessTokenPayload;
 
-      // Step 2: Check tokenVersion (hybrid - Redis first, DB fallback)
+      // Step 2: Check tokenVersion (cache first when enabled, DB fallback)
       const currentVersion = await this.getTokenVersion(payload.userId);
 
       if (currentVersion !== payload.tokenVersion) {
@@ -65,15 +65,13 @@ export class AuthGuard implements CanActivate {
   }
 
   /**
-   * Get token version with Redis cache
-   * Fast path: Redis lookup (~1-2ms)
-   * Slow path: DB lookup + cache (~10-20ms, only on cache miss)
+   * Get token version, through the token-version cache when one is enabled
+   * Fast path: cache lookup (~1-2ms, REDIS_ENABLED=true)
+   * Slow path: DB lookup + cache (~10-20ms, on a cache miss or without cache)
    */
   private async getTokenVersion(userId: string): Promise<number> {
-    const cacheKey = `${config.redis_cache_key_prefix}:token_version:${userId}`;
-
-    // Try Redis first (fast path - most common)
-    const cachedVersion = await this.redisService.get<number>(cacheKey);
+    // Try the cache first (fast path - most common with Redis)
+    const cachedVersion = await this.tokenVersions.get(userId);
     if (cachedVersion !== null && cachedVersion !== undefined) {
       return cachedVersion;
     }
@@ -96,7 +94,7 @@ export class AuthGuard implements CanActivate {
     // empty cache entry: this database read may be older than a concurrent
     // security event (for example an account deletion) that already cached
     // a newer version, which must never be overwritten with a stale one.
-    await this.redisService.setNX(cacheKey, user.tokenVersion, 3600);
+    await this.tokenVersions.fill(userId, user.tokenVersion);
 
     return user.tokenVersion;
   }

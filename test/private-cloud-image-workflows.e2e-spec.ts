@@ -2,7 +2,7 @@ import { ConfigService } from '@nestjs/config';
 import { randomBytes } from 'node:crypto';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient } from '@prisma/client';
-import type { Job } from 'bullmq';
+import type { JobExecution } from '../src/infrastructure/jobs/job.types';
 import { mock } from 'jest-mock-extended';
 import sharp from 'sharp';
 import type { Logger } from 'winston';
@@ -12,7 +12,7 @@ import { LiveAiGateway } from '../src/makeup/ai/live-ai.gateway';
 import { OpenRouterProvider } from '../src/makeup/ai/providers/openrouter.provider';
 import type { StructuredGenerationRequest } from '../src/makeup/ai/providers/structured-ai.provider';
 import { MakeupService } from '../src/makeup/makeup.service';
-import { MakeupProcessor } from '../src/makeup/queues/makeup.processor';
+import { MakeupJobHandler } from '../src/makeup/queues/makeup-job.handler';
 import type {
   MakeupAiJob,
   MakeupQueueService,
@@ -91,7 +91,7 @@ describeWithDatabase(
     let lifecycle: PrivateImageLifecycleService;
     let makeup: MakeupService;
     let profile: ProfileService;
-    let processor: MakeupProcessor;
+    let processor: MakeupJobHandler;
     let owner: string;
     let intruder: string;
 
@@ -184,11 +184,11 @@ describeWithDatabase(
         job: {
           name,
           data,
-          opts: { attempts: 3 },
+          maxAttempts: 3,
           attemptsMade: 0,
           discard,
           updateData: jest.fn(),
-        } as unknown as Job<MakeupAiJob>,
+        } as unknown as JobExecution<MakeupAiJob>,
       };
     }
 
@@ -239,7 +239,7 @@ describeWithDatabase(
         ai,
       );
       profile = new ProfileService(prisma, validation, storage, lifecycle);
-      processor = new MakeupProcessor(
+      processor = new MakeupJobHandler(
         prisma,
         ai,
         storage,
@@ -1758,7 +1758,7 @@ describeWithDatabase(
             storageService,
             lifecycleService,
           ),
-          processor: new MakeupProcessor(
+          processor: new MakeupJobHandler(
             prisma,
             ai,
             storageService,
@@ -2131,7 +2131,7 @@ describeWithDatabase(
       };
       const OPENROUTER_KEY = 'sk-or-v1-fake-openrouter-key';
       let openRouter: OpenRouterProvider;
-      let liveProcessor: MakeupProcessor;
+      let liveProcessor: MakeupJobHandler;
       let spies: jest.SpyInstance[];
       let openRouterCalls: Array<{ url: string; init?: RequestInit }>;
 
@@ -2142,7 +2142,7 @@ describeWithDatabase(
             OPENROUTER_MODEL: 'vision/model',
           }),
         );
-        liveProcessor = new MakeupProcessor(
+        liveProcessor = new MakeupJobHandler(
           prisma,
           new LiveAiGateway(openRouter),
           storage,

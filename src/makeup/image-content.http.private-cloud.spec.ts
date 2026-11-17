@@ -15,7 +15,8 @@ import { AllExceptionsFilter } from '../common/filters/all-exception.filter';
 import { AuthGuard } from '../common/guards/auth.guard';
 import { TransformInterceptor } from '../common/interceptors/transform.interceptor';
 import { PrismaService } from '../common/services/prisma.service';
-import { RedisService } from '../common/services/redis.service';
+import { RateLimitStore } from '../infrastructure/rate-limit/rate-limit.store';
+import { TokenVersionCache } from '../infrastructure/token-version/token-version.cache';
 import { PrivateImageLifecycleService } from '../storage/private-image-lifecycle.service';
 import { PrivateImageStorageService } from '../storage/private-image-storage.service';
 import type { SupabaseStorageConfig } from '../storage/private-storage.config';
@@ -79,9 +80,9 @@ const json = (body: unknown, status = 200) =>
 
 describe('GET /v1/images/:imageId/content (HTTP, mocked providers)', () => {
   const prisma = mockDeep<PrismaService>();
-  const redis = mock<RedisService>();
+  const tokenVersions = mock<TokenVersionCache>();
   const logger = mock<Logger>();
-  const tokens = new AuthUtilsService(mock<RedisService>());
+  const tokens = new AuthUtilsService(mock<RateLimitStore>());
   const s3 = new FakeS3CompatibleStorage();
   const supabaseObjects = new Map<string, Buffer>();
   const supabaseRequests: string[] = [];
@@ -173,7 +174,7 @@ describe('GET /v1/images/:imageId/content (HTTP, mocked providers)', () => {
         MakeupService,
         AuthGuard,
         { provide: PrismaService, useValue: prisma },
-        { provide: RedisService, useValue: redis },
+        { provide: TokenVersionCache, useValue: tokenVersions },
         { provide: PrivateImageStorageService, useValue: storage },
         {
           provide: PrivateImageLifecycleService,
@@ -206,7 +207,7 @@ describe('GET /v1/images/:imageId/content (HTTP, mocked providers)', () => {
     supabaseObjects.clear();
     supabaseRequests.length = 0;
     respond = healthySupabase;
-    redis.get.mockResolvedValue(1 as never);
+    tokenVersions.get.mockResolvedValue(1);
     images = [
       ['jpeg-image', 'a.jpg', 'image/jpeg', 'supabase'],
       ['png-image', 'b.png', 'image/png', 'supabase'],
@@ -435,7 +436,7 @@ describe('GET /v1/images/:imageId/content (HTTP, mocked providers)', () => {
     });
 
     it('rejects a revoked token (signed out everywhere)', async () => {
-      redis.get.mockResolvedValue(2 as never);
+      tokenVersions.get.mockResolvedValue(2);
 
       await getContent('jpeg-image', OWNER).expect(401);
       expect(supabaseRequests).toHaveLength(0);

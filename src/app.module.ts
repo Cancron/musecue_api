@@ -4,8 +4,7 @@ import { AppController } from './app.controller';
 import { AppService } from './app.service';
 // import { BlogModule } from './blog/blog.module';
 import { AuthModule } from './auth/auth.module';
-import { RedisModule } from './common/modules/redis.module';
-import { RateLimitModule } from './common/modules/rate-limit.module';
+import { InfrastructureModule } from './infrastructure/infrastructure.module';
 import { MetricsModule } from './metrics/metrics.module';
 import { WinstonModule } from 'nest-winston';
 import { winstonConfig } from './common/config/winston.config';
@@ -29,10 +28,12 @@ import { AccountDeletionModule } from './privacy/account-deletion/account-deleti
     // Custom logger module (global - can be injected anywhere)
     LoggerModule,
     DatabaseModule,
-    // Redis module (global - can be injected anywhere)
-    RedisModule,
-    // Rate limiting module (global - throttles requests using Redis)
-    RateLimitModule,
+    // Queue, rate-limit and token-version cache drivers selected by
+    // REDIS_ENABLED (global): Redis + BullMQ, or PostgreSQL only. Also
+    // registers global request rate limiting. Reads the environment when
+    // this module is defined, so it must stay after ConfigModule.forRoot(),
+    // which loads the env files into process.env.
+    InfrastructureModule.forRoot(),
     // Metrics module (global - Prometheus metrics)
     MetricsModule,
     // BlogModule,

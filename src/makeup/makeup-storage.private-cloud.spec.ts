@@ -1,6 +1,5 @@
 import { ConfigService } from '@nestjs/config';
 import type { Prisma } from '@prisma/client';
-import type { Job } from 'bullmq';
 import { mock, mockDeep } from 'jest-mock-extended';
 import type { Logger } from 'winston';
 import AppError from '../common/errors/app.error';
@@ -10,7 +9,8 @@ import { PrivateImageStorageService } from '../storage/private-image-storage.ser
 import { PrivateStorageError } from '../storage/private-storage.error';
 import type { AiGateway } from './ai/ai.gateway';
 import { MakeupService } from './makeup.service';
-import { MakeupProcessor } from './queues/makeup.processor';
+import { MakeupJobHandler } from './queues/makeup-job.handler';
+import type { JobExecution } from '../infrastructure/jobs/job.types';
 import type { MakeupAiJob } from './queues/makeup.queue';
 import { MakeupQueueService } from './queues/makeup.queue';
 import { ImageValidationService } from './services/image-validation.service';
@@ -420,7 +420,7 @@ describe('MakeupService private cloud storage lifecycle', () => {
   });
 });
 
-describe('MakeupProcessor private cloud storage reads', () => {
+describe('MakeupJobHandler private cloud storage reads', () => {
   function setup(readError: PrivateStorageError) {
     const prisma = mockDeep<PrismaService>();
     const ai = mock<AiGateway>();
@@ -457,7 +457,7 @@ describe('MakeupProcessor private cloud storage reads', () => {
       mimeType: 'image/jpeg',
     } as never);
     storage.readImage.mockRejectedValue(readError);
-    const processor = new MakeupProcessor(
+    const processor = new MakeupJobHandler(
       prisma,
       ai,
       storage,
@@ -474,10 +474,10 @@ describe('MakeupProcessor private cloud storage reads', () => {
         stepId: 'step',
         imageId: 'photo',
       },
-      opts: { attempts: 3 },
+      maxAttempts: 3,
       attemptsMade: 0,
       discard,
-    } as unknown as Job<MakeupAiJob>;
+    } as unknown as JobExecution<MakeupAiJob>;
     return { prisma, ai, storage, processor, job, discard };
   }
 

@@ -1,6 +1,6 @@
 import { userRole } from '@prisma/client';
 import { mock } from 'jest-mock-extended';
-import { RedisService } from '../common/services/redis.service';
+import { RateLimitStore } from '../infrastructure/rate-limit/rate-limit.store';
 import { AUTH_CONFIG } from './config/auth.config';
 import { UserRole } from './interfaces/auth.interface';
 import { AuthUtilsService } from './services/auth-utils.service';
@@ -26,7 +26,7 @@ describe('UserRole normalization', () => {
   });
 
   describe('canModifyRole with normalized names', () => {
-    const utils = new AuthUtilsService(mock<RedisService>());
+    const utils = new AuthUtilsService(mock<RateLimitStore>());
 
     it.each([
       [UserRole.SUPERADMIN, UserRole.USER, UserRole.ADMIN, true],
