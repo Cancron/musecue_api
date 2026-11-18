@@ -17,6 +17,7 @@ The companion mobile application and detailed product specifications live in `..
 - background jobs (BullMQ or PostgreSQL) for personalization, guide generation, visual checks, and guide questions
 - `AiRun` audit records containing operation, provider, model, prompt version, latency, progress, result/error, and status
 - a provider-neutral AI gateway with OpenRouter live mode, multimodal private-image input, strict structured output, runtime validation, bounded retries, and deterministic mock mode
+- AI credit configuration: administrators can read and change the trial credit allowance, the monthly Pro allowance, the OpenRouter cost per credit and the per-session overage allowance, persisted in PostgreSQL (see "AI credit settings" under API); credits are not granted, deducted or enforced yet
 - a single Pro subscription plan: admin-configured monthly/yearly pricing and free trial, one-time trial activation, date-based Pro access through `ProAccessGuard`, payment/lifecycle records protected by database rules, and Stripe checkout for the monthly and yearly options with webhook-verified activation, automatic renewals, failed-payment handling and recovery, cancellation at period end, and refunds made in Stripe with immediate access revocation (see "Subscriptions" and "Stripe checkout" under API); requesting refunds from MuseCue and disputes are not implemented yet
 - personal data export: an authenticated user can request an asynchronous ZIP archive of their own account, profile, makeup history, subscription records and private photos, poll its status, and download it through a signed link valid for at most 15 minutes; archives expire 24 hours after export and are deleted by a scheduled retention sweep (see "Personal data export" under API)
 - account deletion: the owner confirms their identity (password and an emailed code, or the code alone for accounts without a password), the account is blocked and every token invalidated at once (`PENDING_DELETION`), and a background sweep hard-deletes the account and all its data and files (including its refresh sessions, one-time codes and queued or retained background jobs), keeping payment records detached (see "Account deletion" under API)
@@ -29,7 +30,7 @@ Intentionally deferred:
 - copying images stored on the filesystem before the Supabase migration into the bucket (they remain readable through the `local` provider while its directory is present)
 - additional S3-compatible storage providers (the provider interface is in place; see "Private image storage")
 - generated preview images (recommendation reasoning is live, while the existing curated preview-image contract remains in place)
-- production retention/deletion automation and AI cost accounting
+- production retention/deletion automation and AI cost accounting: credit balances, granting trial/Pro allowances, converting OpenRouter costs into credits, deducting credits and enforcing the session overage (only the configuration exists; see "AI credit settings")
 
 ## Requirements and setup
 
@@ -960,6 +961,48 @@ npm test -- --runInBand subscription-billing
 ```
 
 
+### AI credit settings
+
+Configuration for the future AI credit system. Only the settings exist: nothing grants, deducts or enforces credits yet, so changing them has no effect on users today. Future credit features should read them through `CreditSettingsService.getSettings()` (exported by `CreditsModule`).
+
+| Method  | Route                        | Purpose                                |
+| ------- | ---------------------------- | -------------------------------------- |
+| `GET`   | `/v1/admin/credit-settings`  | Read the credit configuration          |
+| `PATCH` | `/v1/admin/credit-settings`  | Change any subset of the configuration |
+
+Access works like the plan administration routes: a bearer token for an `ADMIN` or `SUPERADMIN` account is required. Missing, invalid or revoked tokens receive `401`, and other roles (`USER`, `MODERATOR`) receive `403` for both reading and changing.
+
+The settings are one row in the `CreditSettings` table (migration `20261122120000_add_credit_settings`), so they survive restarts. Until an administrator saves a change the table is empty and the API serves these defaults, which match the column defaults:
+
+| Field                   | Type    | Default          | Accepted values                                         |
+| ----------------------- | ------- | ---------------- | ------------------------------------------------------- |
+| `trialCredits`          | integer | `50`             | `1`–`100000` (switch the trial off on the plan instead) |
+| `proMonthlyCredits`     | integer | `1000`           | `1`–`1000000`                                           |
+| `creditCostUsdMicros`   | integer | `5000` ($0.005)  | `1`–`1000000` millionths of a US dollar ($0.000001–$1)  |
+| `sessionOverageCredits` | integer | `5`              | `0`–`1000` (`0` = no overage)                           |
+
+`creditCostUsdMicros` is the OpenRouter cost one credit covers, in millionths of a US dollar, so money is never stored as a floating-point number: `5000` is $0.005, `2500` is $0.0025. Responses also contain the read-only `creditCostUsd` (the same amount as an exact decimal string, e.g. `"0.005"`) and `updatedAt` (`null` while the defaults are in use).
+
+`PATCH` accepts any subset of the four fields; omitted fields are unchanged. Empty bodies, negative or out-of-range values, zero where not allowed, fractions (including dollar amounts such as `0.005` for `creditCostUsdMicros`), `null`, numeric strings, read-only fields and unknown fields are rejected with `400`. A request with any invalid field changes nothing. CHECK constraints additionally stop any write path from storing a second row, negative allowances or a zero credit cost. Every change is recorded in `ActivityLogEvent` (old value, new value, administrator ID) in the same transaction as the update.
+
+```json
+{
+  "trialCredits": 50,
+  "proMonthlyCredits": 1000,
+  "creditCostUsdMicros": 5000,
+  "creditCostUsd": "0.005",
+  "sessionOverageCredits": 5,
+  "updatedAt": null
+}
+```
+
+Tests: the unit and HTTP tests in `src/credits` need no database. `test/credit-settings.e2e-spec.ts` boots the complete application against a temporary, migrated PostgreSQL schema. It signs in through `POST /auth/login`, checks the stored rows and audit records, and restarts the application on the same schema. It contacts no external service (no Redis, Stripe, OpenRouter or SMTP) and is skipped without `TEST_DATABASE_URL`:
+
+```bash
+npm test -- --runInBand credit
+TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json --runInBand test/credit-settings
+```
+
 ## Domain
 
 ```text
@@ -983,6 +1026,7 @@ authUser
             `-- Question
 
 OAuthState, RateLimitBucket: short-lived, keyed by hashes, no owner
+SubscriptionPlan, CreditSettings: single-row administrator configuration, no owner
 ```
 
 Mock and live gateways implement the same application-owned operations. The live gateway delegates transport to an OpenRouter provider adapter, workers validate and normalize model-shaped output, and NestJS alone persists it transactionally and advances workflow state. No frontend or public API contract changes are required to switch modes or add another provider adapter.
@@ -997,6 +1041,8 @@ npm test
 TEST_DATABASE_URL=... REDIS_ENABLED=false npm run test:e2e -- --runInBand   # PostgreSQL-only mode (Redis suites skipped)
 TEST_DATABASE_URL=... TEST_REDIS_URL=redis://127.0.0.1:6379 REDIS_ENABLED=true npm run test:e2e -- --runInBand   # adds Redis mode (see "Testing both modes")
 npx jest private-cloud   # private image storage unit tests
+npm test -- --runInBand credit   # AI credit settings unit/HTTP tests
+TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json --runInBand test/credit-settings   # AI credit settings on PostgreSQL
 TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json test/private-cloud   # storage workflows + cleanup ledger on PostgreSQL (mocked Supabase)
 npm run test:e2e
 npx prisma generate
