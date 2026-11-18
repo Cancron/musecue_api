@@ -301,3 +301,26 @@ enum InfrastructureJobStatus {
   COMPLETED
   FAILED
 }
+
+// ================================
+// AI Credit Related Enums
+// ================================
+
+// Where an allocation of credits came from. TRIAL and SUBSCRIPTION credits
+// always expire; PURCHASE and REFERRAL credits never expire (CHECK
+// constraint on CreditAllocation).
+enum CreditSource {
+  TRIAL
+  SUBSCRIPTION
+  PURCHASE
+  REFERRAL
+}
+
+// A CreditTransaction changes the available balance: GRANT adds an
+// allocation, DEBIT consumes credits (and records any session overage),
+// EXPIRATION removes the unused rest of an expired allocation.
+enum CreditTransactionType {
+  GRANT
+  DEBIT
+  EXPIRATION
+}

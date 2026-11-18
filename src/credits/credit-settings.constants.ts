@@ -4,18 +4,6 @@ export const CREDIT_SETTINGS_ID = 1;
 /** One US dollar in the millionths used by `creditCostUsdMicros`. */
 export const USD_MICROS_PER_USD = 1_000_000;
 
-/**
- * Values used before an administrator has saved the credit settings. They
- * must match the column defaults in prisma/schema/credit.prisma.
- */
-export const CREDIT_SETTINGS_DEFAULTS = {
-  trialCredits: 50,
-  proMonthlyCredits: 1_000,
-  /** $0.005 of OpenRouter cost per credit. */
-  creditCostUsdMicros: 5_000,
-  sessionOverageCredits: 5,
-} as const;
-
 /** Request validation bounds. */
 export const CREDIT_SETTINGS_LIMITS = {
   /**

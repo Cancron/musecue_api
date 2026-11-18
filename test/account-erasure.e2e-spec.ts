@@ -97,6 +97,11 @@ const USER_DATA_TABLES = [
   'RefreshSession',
   'AuthChallenge',
   'InfrastructureJob',
+  'CreditWallet',
+  'CreditAllocation',
+  'CreditTransaction',
+  'CreditLedgerEntry',
+  'CreditSessionOverage',
 ] as const;
 
 describeWithDatabase('Account erasure (PostgreSQL)', () => {
@@ -420,6 +425,58 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
       },
     });
 
+    // AI credits: a purchased grant, then a session debit that used overage.
+    // One transaction, as the ledger's consistency checks run at commit.
+    await client.$transaction(async (tx) => {
+      const wallet = await tx.creditWallet.create({
+        data: { authId: user.id },
+      });
+      const allocation = await tx.creditAllocation.create({
+        data: {
+          walletId: wallet.id,
+          authId: user.id,
+          source: 'PURCHASE',
+          sourceReference: `pay-${tag}`,
+          amount: 10,
+          remaining: 8,
+          grantedAt: new Date(),
+        },
+      });
+      const ledger = { walletId: wallet.id, authId: user.id };
+      await tx.creditTransaction.create({
+        data: {
+          ...ledger,
+          type: 'GRANT',
+          amount: 10,
+          balanceAfter: 10,
+          idempotencyKey: `grant:PURCHASE:pay-${tag}`,
+          occurredAt: new Date(),
+          entries: { create: [{ allocationId: allocation.id, amount: 10 }] },
+        },
+      });
+      await tx.creditTransaction.create({
+        data: {
+          ...ledger,
+          type: 'DEBIT',
+          amount: -2,
+          overageAmount: '0.5',
+          balanceAfter: 8,
+          idempotencyKey: `debit:${tag}`,
+          sessionId: session.id,
+          occurredAt: new Date(),
+          entries: { create: [{ allocationId: allocation.id, amount: -2 }] },
+        },
+      });
+      await tx.creditSessionOverage.create({
+        data: {
+          ...ledger,
+          sessionId: session.id,
+          overageLimit: 5,
+          overageUsed: '0.5',
+        },
+      });
+    });
+
     const running = await client.dataExport.create({
       data: {
         authId: user.id,
@@ -525,7 +582,9 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
                   ? `"guideId" IN (SELECT g."id" FROM "Guide" g JOIN "MakeupSession" s ON s."id" = g."sessionId" WHERE s."authId" = '${authId}')`
                   : ['StepAttempt', 'Question'].includes(table)
                     ? `"stepId" IN (SELECT st."id" FROM "GuideStep" st JOIN "Guide" g ON g."id" = st."guideId" JOIN "MakeupSession" s ON s."id" = g."sessionId" WHERE s."authId" = '${authId}')`
-                    : `"authId" = '${authId}'`;
+                    : table === 'CreditLedgerEntry'
+                      ? `"walletId" IN (SELECT "id" FROM "CreditWallet" WHERE "authId" = '${authId}')`
+                      : `"authId" = '${authId}'`;
         const { rows } = await pg.query<{ count: string }>(
           `SELECT count(*)::text AS count FROM "${table}" WHERE ${where}`,
         );

@@ -1,13 +1,13 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, OnApplicationBootstrap } from '@nestjs/common';
 import { Prisma, type CreditSettings } from '@prisma/client';
 import AppError from '../common/errors/app.error';
 import {
   ActivityLogService,
   type FieldChange,
 } from '../common/services/activity-log.service';
+import { CustomLoggerService } from '../common/services/custom-logger.service';
 import { PrismaService } from '../common/services/prisma.service';
 import {
-  CREDIT_SETTINGS_DEFAULTS,
   CREDIT_SETTINGS_ID,
   formatUsdMicros,
 } from './credit-settings.constants';
@@ -26,16 +26,42 @@ const SETTING_FIELDS: readonly (keyof CreditSettingsValues)[] = [
 ];
 
 /**
- * The administrator-managed AI credit configuration. Configuration only:
- * nothing grants, deducts or enforces credits yet. Future credit features
- * should read the settings through `getSettings`.
+ * The administrator-managed AI credit configuration, stored as one row in
+ * PostgreSQL. The defaults are the table's column defaults: migration
+ * 20261123120000_seed_credit_settings stores them, and the application
+ * stores them again at startup if the row is missing. Neither ever
+ * overwrites a stored row, so administrator changes survive restarts.
  */
 @Injectable()
-export class CreditSettingsService {
+export class CreditSettingsService implements OnApplicationBootstrap {
   constructor(
     private readonly prisma: PrismaService,
     private readonly activityLog: ActivityLogService,
+    private readonly logger: CustomLoggerService,
   ) {}
+
+  async onApplicationBootstrap(): Promise<void> {
+    if (await this.ensureDefaults()) {
+      this.logger.log(
+        'Stored the default AI credit settings',
+        CreditSettingsService.name,
+      );
+    }
+  }
+
+  /**
+   * Inserts the settings row with the column defaults unless it exists
+   * (INSERT ... ON CONFLICT DO NOTHING). Returns whether a row was inserted.
+   */
+  async ensureDefaults(
+    client: Prisma.TransactionClient = this.prisma,
+  ): Promise<boolean> {
+    const { count } = await client.creditSettings.createMany({
+      data: [{ id: CREDIT_SETTINGS_ID }],
+      skipDuplicates: true,
+    });
+    return count > 0;
+  }
 
   /** Pass a transaction client to read the settings inside that transaction. */
   async getSettings(
@@ -44,13 +70,21 @@ export class CreditSettingsService {
     const stored = await client.creditSettings.findUnique({
       where: { id: CREDIT_SETTINGS_ID },
     });
-    return this.toView(stored);
+    if (stored) return this.toView(stored);
+    // Deleted since startup: store the defaults again.
+    await this.ensureDefaults(client);
+    return this.toView(
+      await client.creditSettings.findUniqueOrThrow({
+        where: { id: CREDIT_SETTINGS_ID },
+      }),
+    );
   }
 
   /**
    * Applies a partial update and records an audit event with the old and new
-   * values. The settings write and the audit record are committed together,
-   * so a change is never persisted without its audit trail.
+   * values. The row is locked for the update, so concurrent changes are
+   * applied one at a time and each audit entry has the exact old values.
+   * The settings write and the audit record are committed together.
    */
   async updateSettings(
     input: UpdateCreditSettingsInput,
@@ -64,22 +98,25 @@ export class CreditSettingsService {
     }
 
     return this.prisma.$transaction(async (tx) => {
-      const before = await tx.creditSettings.findUnique({
+      await this.ensureDefaults(tx);
+      await tx.$queryRaw`
+        SELECT "id" FROM "CreditSettings" WHERE "id" = ${CREDIT_SETTINGS_ID} FOR UPDATE
+      `;
+      const before = await tx.creditSettings.findUniqueOrThrow({
         where: { id: CREDIT_SETTINGS_ID },
       });
-      const after = await tx.creditSettings.upsert({
+      const after = await tx.creditSettings.update({
         where: { id: CREDIT_SETTINGS_ID },
-        create: { id: CREDIT_SETTINGS_ID, ...data },
-        update: data,
+        data,
       });
 
-      const changes = this.diff(before ?? CREDIT_SETTINGS_DEFAULTS, after);
+      const changes = this.diff(before, after);
       if (changes.length > 0) {
         await this.activityLog.logActivity(
           {
             tableName: 'CreditSettings',
             recordId: String(CREDIT_SETTINGS_ID),
-            action: before ? 'update' : 'create',
+            action: 'update',
             changes,
             metadata: actor,
           },
@@ -115,15 +152,14 @@ export class CreditSettingsService {
     );
   }
 
-  private toView(stored: CreditSettings | null): CreditSettingsView {
-    const settings = stored ?? CREDIT_SETTINGS_DEFAULTS;
+  private toView(stored: CreditSettings): CreditSettingsView {
     return {
-      trialCredits: settings.trialCredits,
-      proMonthlyCredits: settings.proMonthlyCredits,
-      creditCostUsdMicros: settings.creditCostUsdMicros,
-      creditCostUsd: formatUsdMicros(settings.creditCostUsdMicros),
-      sessionOverageCredits: settings.sessionOverageCredits,
-      updatedAt: stored ? stored.updatedAt.toISOString() : null,
+      trialCredits: stored.trialCredits,
+      proMonthlyCredits: stored.proMonthlyCredits,
+      creditCostUsdMicros: stored.creditCostUsdMicros,
+      creditCostUsd: formatUsdMicros(stored.creditCostUsdMicros),
+      sessionOverageCredits: stored.sessionOverageCredits,
+      updatedAt: stored.updatedAt.toISOString(),
     };
   }
 }

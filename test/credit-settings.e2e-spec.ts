@@ -5,9 +5,10 @@ import { userRole } from '@prisma/client';
 import * as bcrypt from 'bcryptjs';
 import { randomBytes } from 'node:crypto';
 import request from 'supertest';
-import { CREDIT_SETTINGS_DEFAULTS } from '../src/credits/credit-settings.constants';
+import { CreditSettingsService } from '../src/credits/credit-settings.service';
 import {
   applyMigrations,
+  connectToSchema,
   createSchema,
   describeWithDatabase,
   dropSchema,
@@ -21,6 +22,13 @@ import {
 jest.setTimeout(120_000);
 
 const ROUTE = '/v1/admin/credit-settings';
+/** The product defaults, as stored by the migrations and at startup. */
+const DEFAULTS = {
+  trialCredits: 50,
+  proMonthlyCredits: 1000,
+  creditCostUsdMicros: 5000,
+  sessionOverageCredits: 5,
+};
 const PASSWORD = 'credit settings e2e password';
 
 interface Envelope<T> {
@@ -59,6 +67,10 @@ describeWithDatabase('AI credit settings (PostgreSQL, full stack)', () => {
   let superadmin: Account;
   let user: Account;
   let moderator: Account;
+  /** The stored configuration right after the first boot, before any request. */
+  let initialRow: unknown;
+  let initialRowCount: number;
+  let initialAuditCount: number;
   let ipCounter = 0;
   /** A client address per test, so the per-IP rate limits never interfere. */
   let ip: string;
@@ -80,7 +92,7 @@ describeWithDatabase('AI credit settings (PostgreSQL, full stack)', () => {
     );
   };
 
-  /** The stored row, or null while the defaults are in use. */
+  /** The stored settings row (null only if someone deleted it). */
   const storedRow = () =>
     ctx.client.creditSettings.findUnique({ where: { id: 1 } });
   const auditEvents = () =>
@@ -136,6 +148,11 @@ describeWithDatabase('AI credit settings (PostgreSQL, full stack)', () => {
     schema = await createSchema();
     await applyMigrations(schema, migrationNames());
     ctx = await bootApplication({ schema });
+    initialRow = await storedRow();
+    initialRowCount = await ctx.client.creditSettings.count();
+    initialAuditCount = await ctx.client.activityLogEvent.count({
+      where: { tableName: 'CreditSettings' },
+    });
     admin = await signIn(userRole.ADMIN);
     superadmin = await signIn(userRole.SUPERADMIN);
     user = await signIn(userRole.USER);
@@ -147,18 +164,33 @@ describeWithDatabase('AI credit settings (PostgreSQL, full stack)', () => {
     if (schema) await dropSchema(schema);
   });
 
+  /** Back to the stored defaults, through the production startup path. */
   beforeEach(async () => {
     ip = nextIp();
     await ctx.client.creditSettings.deleteMany();
+    await ctx
+      .get<CreditSettingsService>(CreditSettingsService)
+      .ensureDefaults();
     await ctx.client.activityLogEvent.deleteMany({
       where: { tableName: 'CreditSettings' },
     });
   });
 
-  describe('default values', () => {
-    it('serves 50 trial credits, 1,000 Pro credits a month, $0.005 per credit and 5 overage credits without writing a row', async () => {
-      const response = await get(admin).expect(200);
+  describe('default values stored in PostgreSQL', () => {
+    it('has the defaults stored in PostgreSQL before any administrator change', async () => {
+      // Captured right after the first boot, before any request was made.
+      expect(initialRowCount).toBe(1);
+      expect(initialAuditCount).toBe(0);
+      expect(initialRow).toEqual({
+        id: 1,
+        ...DEFAULTS,
+        createdAt: expect.any(Date) as unknown,
+        updatedAt: expect.any(Date) as unknown,
+      });
 
+      // The API serves exactly the stored row.
+      const row = await storedRow();
+      const response = await get(admin).expect(200);
       expect(response.body).toEqual({
         statusCode: 200,
         message: 'Success',
@@ -168,37 +200,50 @@ describeWithDatabase('AI credit settings (PostgreSQL, full stack)', () => {
           creditCostUsdMicros: 5000,
           creditCostUsd: '0.005',
           sessionOverageCredits: 5,
-          updatedAt: null,
+          updatedAt: row?.updatedAt.toISOString(),
         },
       });
-      await expect(ctx.client.creditSettings.count()).resolves.toBe(0);
+      // Reading writes nothing.
+      await expect(storedRow()).resolves.toEqual(row);
     });
 
-    it('uses PostgreSQL column defaults identical to the served defaults', async () => {
-      await ctx.client.$executeRawUnsafe(
-        'INSERT INTO "CreditSettings" ("updatedAt") VALUES (CURRENT_TIMESTAMP)',
-      );
-
-      await expect(storedRow()).resolves.toMatchObject({
-        id: 1,
-        ...CREDIT_SETTINGS_DEFAULTS,
-      });
-      expect(dataOf(await get(admin).expect(200))).toMatchObject({
-        ...CREDIT_SETTINGS_DEFAULTS,
-        updatedAt: expect.any(String) as unknown,
-      });
+    it('stores the defaults with the migrations alone, before the application ever runs', async () => {
+      const fresh = await createSchema();
+      try {
+        await applyMigrations(fresh, migrationNames());
+        const pg = await connectToSchema(fresh);
+        try {
+          const { rows } = await pg.query<Record<string, unknown>>(
+            'SELECT "id", "trialCredits", "proMonthlyCredits", "creditCostUsdMicros", "sessionOverageCredits" FROM "CreditSettings"',
+          );
+          expect(rows).toEqual([{ id: 1, ...DEFAULTS }]);
+        } finally {
+          await pg.end();
+        }
+      } finally {
+        await dropSchema(fresh);
+      }
     });
 
-    it('creates the row from the defaults on the first partial save', async () => {
+    it('restores a deleted configuration with the defaults when the application starts', async () => {
+      await ctx.client.creditSettings.deleteMany();
+
+      await ctx.close();
+      ctx = await bootApplication({ schema });
+
+      await expect(ctx.client.creditSettings.count()).resolves.toBe(1);
+      await expect(storedRow()).resolves.toMatchObject({ id: 1, ...DEFAULTS });
+    });
+
+    it('changing one setting keeps the other stored defaults', async () => {
       await patch({ sessionOverageCredits: 8 }, admin).expect(200);
 
       await expect(storedRow()).resolves.toMatchObject({
         id: 1,
-        trialCredits: 50,
-        proMonthlyCredits: 1000,
-        creditCostUsdMicros: 5000,
+        ...DEFAULTS,
         sessionOverageCredits: 8,
       });
+      await expect(ctx.client.creditSettings.count()).resolves.toBe(1);
     });
   });
 
@@ -422,7 +467,7 @@ describeWithDatabase('AI credit settings (PostgreSQL, full stack)', () => {
       expect(dataOf(unchanged).updatedAt).toBe(row?.updatedAt.toISOString());
       await expect(auditEvents()).resolves.toEqual([
         {
-          action: 'create',
+          action: 'update',
           actionedBy: admin.id,
           recordId: '1',
           userAgent: 'credit-settings-e2e',
@@ -471,17 +516,28 @@ describeWithDatabase('AI credit settings (PostgreSQL, full stack)', () => {
       await expect(storedRow()).resolves.toMatchObject(maximums);
     });
 
-    it('handles concurrent first saves with a single row', async () => {
+    it('applies concurrent changes one at a time, with an exact audit chain', async () => {
+      const values = [900, 1100, 1300, 1500, 1700];
       const responses = await Promise.all(
-        [900, 1100, 1300, 1500, 1700].map((credits) =>
-          patch({ proMonthlyCredits: credits }, admin),
-        ),
+        values.map((credits) => patch({ proMonthlyCredits: credits }, admin)),
       );
-
       expect(responses.map((response) => response.status)).toEqual(
-        Array(5).fill(200),
+        Array(values.length).fill(200),
       );
       await expect(ctx.client.creditSettings.count()).resolves.toBe(1);
+
+      // Each audit entry's old value is the previous entry's new value:
+      // the changes form one chain from the default to the stored value.
+      const changes = (await auditEvents()).map((event) => event.details[0]);
+      expect(changes).toHaveLength(values.length);
+      let current = '1000';
+      for (let step = 0; step < values.length; step += 1) {
+        const next = changes.find((change) => change?.oldValue === current);
+        expect(next).toBeDefined();
+        current = next?.newValue as string;
+      }
+      const row = await storedRow();
+      expect(String(row?.proMonthlyCredits)).toBe(current);
     });
   });
 
@@ -497,10 +553,13 @@ describeWithDatabase('AI credit settings (PostgreSQL, full stack)', () => {
       const rowBefore = await storedRow();
 
       // Restart: a new application with new connections on the same database.
+      // Startup stores defaults only when no row exists, so it must not
+      // touch the administrator's values (not even updatedAt).
       await ctx.close();
       ctx = await bootApplication({ schema });
 
       await expect(storedRow()).resolves.toEqual(rowBefore);
+      await expect(ctx.client.creditSettings.count()).resolves.toBe(1);
       expect(dataOf(await get(admin).expect(200))).toEqual({
         ...saved,
         creditCostUsd: '0.0075',

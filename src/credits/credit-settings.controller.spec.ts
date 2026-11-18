@@ -44,8 +44,10 @@ const dataOf = (response: { body: unknown }) =>
 describe('Credit settings administration (HTTP)', () => {
   let app: INestApplication<App>;
   let originalSecret: string;
-  let stored: CreditSettings | null;
-  const updatedAt = new Date('2026-11-22T12:00:00.000Z');
+  let stored: CreditSettings;
+  let startupInserts: unknown[];
+  const seededAt = new Date('2026-11-23T12:00:00.000Z');
+  const updatedAt = new Date('2026-11-24T12:00:00.000Z');
   const tokens = new AuthUtilsService(mock<RateLimitStore>());
 
   /** A token minted by the unchanged production token code. */
@@ -61,7 +63,7 @@ describe('Credit settings administration (HTTP)', () => {
       .set('User-Agent', 'credit-spec')
       .send(body as object);
   const nothingWritten = () => {
-    expect(prisma.creditSettings.upsert.mock.calls).toHaveLength(0);
+    expect(prisma.creditSettings.update.mock.calls).toHaveLength(0);
     expect(prisma.activityLogEvent.create.mock.calls).toHaveLength(0);
   };
 
@@ -69,6 +71,8 @@ describe('Credit settings administration (HTTP)', () => {
     originalSecret = config.jwt_access_secret;
     config.jwt_access_secret = 'credit-settings-spec-secret';
 
+    // Application startup stores the defaults (insert unless present).
+    prisma.creditSettings.createMany.mockResolvedValue({ count: 1 });
     const moduleRef = await Test.createTestingModule({
       imports: [TestInfrastructureModule, CreditsModule],
     }).compile();
@@ -86,6 +90,9 @@ describe('Credit settings administration (HTTP)', () => {
       }),
     );
     await app.init();
+    startupInserts = prisma.creditSettings.createMany.mock.calls.map(
+      ([args]) => args,
+    );
   });
 
   afterAll(async () => {
@@ -95,30 +102,31 @@ describe('Credit settings administration (HTTP)', () => {
 
   beforeEach(() => {
     jest.resetAllMocks();
-    stored = null;
+    // An in-memory stand-in for the settings row, seeded with the column
+    // defaults as the migration and startup store them.
+    stored = {
+      id: 1,
+      trialCredits: 50,
+      proMonthlyCredits: 1000,
+      creditCostUsdMicros: 5000,
+      sessionOverageCredits: 5,
+      createdAt: seededAt,
+      updatedAt: seededAt,
+    };
     tokenVersions.get.mockResolvedValue(1); // cached tokenVersion
     prisma.$transaction.mockImplementation(((
       callback: (tx: PrismaService) => Promise<unknown>,
     ) => callback(prisma)) as never);
-    // An in-memory stand-in for the single settings row.
+    prisma.$queryRaw.mockResolvedValue([]);
+    prisma.creditSettings.createMany.mockResolvedValue({ count: 0 });
     prisma.creditSettings.findUnique.mockImplementation((() =>
       Promise.resolve(stored)) as never);
-    prisma.creditSettings.upsert.mockImplementation(((args: {
-      create: Partial<CreditSettings>;
-      update: Partial<CreditSettings>;
+    prisma.creditSettings.findUniqueOrThrow.mockImplementation((() =>
+      Promise.resolve(stored)) as never);
+    prisma.creditSettings.update.mockImplementation(((args: {
+      data: Partial<CreditSettings>;
     }) => {
-      stored = stored
-        ? { ...stored, ...args.update, updatedAt }
-        : {
-            id: 1,
-            trialCredits: 50,
-            proMonthlyCredits: 1000,
-            creditCostUsdMicros: 5000,
-            sessionOverageCredits: 5,
-            createdAt: updatedAt,
-            updatedAt,
-            ...args.create,
-          };
+      stored = { ...stored, ...args.data, updatedAt };
       return Promise.resolve(stored);
     }) as never);
   });
@@ -171,7 +179,7 @@ describe('Credit settings administration (HTTP)', () => {
       async (role) => {
         await get(bearer(role)).expect(200);
         await patch({ proMonthlyCredits: 1200 }, bearer(role)).expect(200);
-        expect(prisma.creditSettings.upsert.mock.calls).toHaveLength(1);
+        expect(prisma.creditSettings.update.mock.calls).toHaveLength(1);
       },
     );
 
@@ -192,7 +200,13 @@ describe('Credit settings administration (HTTP)', () => {
   });
 
   describe('default values', () => {
-    it('serves the defaults in the standard envelope before anything is saved', async () => {
+    it('stores the defaults in the database when the application starts', () => {
+      expect(startupInserts).toEqual([
+        { data: [{ id: 1 }], skipDuplicates: true },
+      ]);
+    });
+
+    it('serves the stored defaults in the standard envelope before any change', async () => {
       const response = await get().expect(200);
       expect(response.body).toEqual({
         statusCode: 200,
@@ -203,7 +217,7 @@ describe('Credit settings administration (HTTP)', () => {
           creditCostUsdMicros: 5000,
           creditCostUsd: '0.005',
           sessionOverageCredits: 5,
-          updatedAt: null,
+          updatedAt: seededAt.toISOString(),
         },
       });
     });
@@ -308,7 +322,7 @@ describe('Credit settings administration (HTTP)', () => {
       ],
     ])('accepts %s', async (_case, body) => {
       await patch(body).expect(200);
-      expect(prisma.creditSettings.upsert.mock.calls).toHaveLength(1);
+      expect(prisma.creditSettings.update.mock.calls).toHaveLength(1);
     });
   });
 });

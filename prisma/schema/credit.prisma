@@ -24,3 +24,139 @@ model CreditSettings {
   createdAt             DateTime @default(now())
   updatedAt             DateTime @updatedAt
 }
+
+// ================================
+// AI Credit Wallet and Ledger
+// ================================
+//
+// Amounts are NUMERIC(18, 6): fractional credits with six decimal places,
+// handled as Prisma.Decimal in the application (never floating point).
+// Every change to a user's credits runs in one transaction that first locks
+// the user's CreditWallet row (SELECT ... FOR UPDATE), so concurrent
+// operations on one wallet are serialized. Consistency rules that Prisma
+// cannot express (CHECK constraints, composite ownership keys, append-only
+// and balance-consistency triggers) are in migration
+// 20261123130000_add_credit_wallet_ledger. Deleting the user deletes the
+// wallet and its history (ON DELETE CASCADE); nothing else may delete it.
+
+// One wallet per user, created on first use.
+model CreditWallet {
+  id        String   @id @default(uuid())
+  authId    String   @unique
+  createdAt DateTime @default(now())
+
+  authUser        authUser               @relation(fields: [authId], references: [id], onDelete: Cascade)
+  allocations     CreditAllocation[]
+  transactions    CreditTransaction[]
+  sessionOverages CreditSessionOverage[]
+
+  // Target of the (walletId, authId) keys below: a row can only be attached
+  // to the wallet of the same user.
+  @@unique([id, authId])
+}
+
+// Credits granted to a user from one source. `remaining` is what is left;
+// it only decreases (debits, expiration). An allocation counts towards the
+// available balance while remaining > 0 and it has not expired
+// (expiresAt IS NULL OR expiresAt > now), even before its expiration has
+// been recorded in the ledger.
+model CreditAllocation {
+  id              String       @id @default(uuid())
+  walletId        String
+  authId          String
+  source          CreditSource
+  // What the credits were granted for, unique per wallet and source:
+  // e.g. the subscription and billing period, payment or referral ID.
+  sourceReference String       @db.VarChar(255)
+  amount          Decimal      @db.Decimal(18, 6)
+  remaining       Decimal      @db.Decimal(18, 6)
+  grantedAt       DateTime
+  // Required for TRIAL and SUBSCRIPTION, NULL for PURCHASE and REFERRAL.
+  expiresAt       DateTime?
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  wallet  CreditWallet        @relation(fields: [walletId, authId], references: [id, authId], onDelete: Cascade)
+  entries CreditLedgerEntry[]
+
+  // One allocation per source event: repeated or concurrent grants of the
+  // same event cannot add credits twice. At most one TRIAL allocation per
+  // wallet (partial unique index in the migration).
+  @@unique([walletId, source, sourceReference])
+  @@unique([walletId, id])
+  @@index([walletId, expiresAt])
+}
+
+// Append-only ledger of every change to a wallet's available balance.
+// `amount` is the signed change (GRANT > 0, DEBIT <= 0, EXPIRATION < 0) and
+// equals the sum of the transaction's ledger entries; `balanceAfter` is the
+// available balance right after the transaction. Rows are never updated or
+// deleted (database trigger).
+model CreditTransaction {
+  id             String                @id @default(uuid())
+  // Commit order within a wallet (operations on one wallet are serialized).
+  sequence       BigInt                @unique @default(autoincrement())
+  walletId       String
+  authId         String
+  type           CreditTransactionType
+  amount         Decimal               @db.Decimal(18, 6)
+  // DEBIT only: the part of the requested amount covered by the session
+  // overage allowance instead of the balance.
+  overageAmount  Decimal               @default(0) @db.Decimal(18, 6)
+  balanceAfter   Decimal               @db.Decimal(18, 6)
+  // Unique per wallet: a retried or concurrent operation is applied once.
+  idempotencyKey String                @db.VarChar(255)
+  // The makeup session a DEBIT was for. Not a foreign key: the ledger keeps
+  // it after the session is deleted.
+  sessionId      String?               @db.VarChar(64)
+  description    String?               @db.VarChar(255)
+  // When the change took effect (an EXPIRATION: the allocation's expiry).
+  occurredAt     DateTime
+  createdAt      DateTime              @default(now())
+
+  wallet  CreditWallet        @relation(fields: [walletId, authId], references: [id, authId], onDelete: Cascade)
+  entries CreditLedgerEntry[]
+
+  @@unique([walletId, idempotencyKey])
+  @@unique([walletId, id])
+  @@index([walletId, sequence])
+  @@index([sessionId])
+}
+
+// How one transaction changed one allocation (signed amount). For every
+// allocation, the sum of its entries equals `remaining`; for every
+// transaction, it equals `amount` (deferred database triggers).
+model CreditLedgerEntry {
+  id            String   @id @default(uuid())
+  walletId      String
+  transactionId String
+  allocationId  String
+  amount        Decimal  @db.Decimal(18, 6)
+  createdAt     DateTime @default(now())
+
+  transaction CreditTransaction @relation(fields: [walletId, transactionId], references: [walletId, id], onDelete: Cascade)
+  allocation  CreditAllocation  @relation(fields: [walletId, allocationId], references: [walletId, id], onDelete: Cascade)
+
+  @@unique([transactionId, allocationId])
+  @@index([walletId, allocationId])
+}
+
+// Overage used by one makeup session: credits it consumed beyond the
+// available balance. `overageLimit` is the settings' sessionOverageCredits
+// when the session first used overage; `overageUsed` never exceeds it and
+// only grows. Overage is recorded, not repaid from later grants.
+model CreditSessionOverage {
+  id           String   @id @default(uuid())
+  walletId     String
+  authId       String
+  // Not a foreign key, like CreditTransaction.sessionId.
+  sessionId    String   @db.VarChar(64)
+  overageLimit Decimal  @db.Decimal(18, 6)
+  overageUsed  Decimal  @default(0) @db.Decimal(18, 6)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  wallet CreditWallet @relation(fields: [walletId, authId], references: [id, authId], onDelete: Cascade)
+
+  @@unique([walletId, sessionId])
+}

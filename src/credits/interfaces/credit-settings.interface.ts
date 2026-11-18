@@ -15,8 +15,8 @@ export interface CreditSettingsValues {
 export interface CreditSettingsView extends CreditSettingsValues {
   /** `creditCostUsdMicros` as an exact decimal string, e.g. "0.005". Read-only. */
   creditCostUsd: string;
-  /** Null while the defaults are in use and nothing has been saved. */
-  updatedAt: string | null;
+  /** When the stored settings were last written. */
+  updatedAt: string;
 }
 
 export type UpdateCreditSettingsInput = Partial<CreditSettingsValues>;
