@@ -73,11 +73,26 @@ model CreditAllocation {
   grantedAt       DateTime
   // Required for TRIAL and SUBSCRIPTION, NULL for PURCHASE and REFERRAL.
   expiresAt       DateTime?
+  // SUBSCRIPTION only (required): the user's subscription, the successful
+  // payment that paid for these credits, and the billing period they cover
+  // ([periodStart, periodEnd), within the payment's period; the credits
+  // expire at periodEnd). A database trigger checks on insert that the
+  // payment is a successful payment of this subscription, which belongs to
+  // this user. NULL for other sources.
+  subscriptionId  String?
+  paymentId       String?
+  periodStart     DateTime?
+  periodEnd       DateTime?
   createdAt       DateTime     @default(now())
   updatedAt       DateTime     @updatedAt
 
-  wallet  CreditWallet        @relation(fields: [walletId, authId], references: [id, authId], onDelete: Cascade)
-  entries CreditLedgerEntry[]
+  wallet       CreditWallet        @relation(fields: [walletId, authId], references: [id, authId], onDelete: Cascade)
+  // A subscription is only deleted together with its user (database
+  // trigger), which deletes the wallet and its allocations too. Payments are
+  // never deleted (they are kept, detached, when the user is erased).
+  subscription UserSubscription?   @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  payment      PaymentTransaction? @relation(fields: [paymentId], references: [id], onDelete: NoAction)
+  entries      CreditLedgerEntry[]
 
   // One allocation per source event: repeated or concurrent grants of the
   // same event cannot add credits twice. At most one TRIAL allocation per
@@ -85,6 +100,8 @@ model CreditAllocation {
   @@unique([walletId, source, sourceReference])
   @@unique([walletId, id])
   @@index([walletId, expiresAt])
+  @@index([paymentId])
+  @@index([subscriptionId])
 }
 
 // Append-only ledger of every change to a wallet's available balance.

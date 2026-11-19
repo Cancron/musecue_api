@@ -40,6 +40,41 @@ export function getGrantExpiryRejection(
   return null;
 }
 
+/**
+ * Returns why a grant's paid period is invalid, or null if valid. SUBSCRIPTION
+ * credits must name the payment that paid for them and the period they cover
+ * (ending when they expire); other sources must not.
+ */
+export function getPaidPeriodRejection(
+  source: CreditSource,
+  expiresAt: Date | null | undefined,
+  paidPeriod:
+    | {
+        subscriptionId: string;
+        paymentId: string;
+        periodStart: Date;
+        periodEnd: Date;
+      }
+    | undefined,
+): string | null {
+  if (source !== CreditSource.SUBSCRIPTION) {
+    return paidPeriod ? `${source} credits have no paid period` : null;
+  }
+  if (!paidPeriod) {
+    return 'SUBSCRIPTION credits require the successful payment that paid for them';
+  }
+  if (!paidPeriod.subscriptionId || !paidPeriod.paymentId) {
+    return 'The paid period needs its subscription and payment';
+  }
+  if (paidPeriod.periodStart.getTime() >= paidPeriod.periodEnd.getTime()) {
+    return 'The paid period must end after it starts';
+  }
+  if (!expiresAt || expiresAt.getTime() !== paidPeriod.periodEnd.getTime()) {
+    return 'SUBSCRIPTION credits expire at the end of their paid period';
+  }
+  return null;
+}
+
 /** Returns why a reference or key is invalid, or null if valid. */
 export function getReferenceRejection(
   name: string,

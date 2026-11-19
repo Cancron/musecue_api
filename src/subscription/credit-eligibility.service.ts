@@ -1,22 +1,21 @@
 import { Injectable } from '@nestjs/common';
 import { CreditSource, Prisma } from '@prisma/client';
 import { CreditSettingsService } from '../credits/credit-settings.service';
-import { CreditWalletService } from '../credits/credit-wallet.service';
 import { InvalidCreditOperationError } from '../credits/credit-wallet.errors';
+import { CreditWalletService } from '../credits/credit-wallet.service';
 import {
-  dueAllowances,
+  dueTrialAllowance,
   isCreditSourceUsable,
-  type AllowanceAmounts,
-  type DueAllowance,
 } from './credit-allowance.policy';
-import type {
-  SubscriptionAccess,
-  SubscriptionRecord,
+import { CreditAllowanceService } from './credit-allowance.service';
+import {
+  isProActive,
+  type SubscriptionAccess,
+  type SubscriptionRecord,
 } from './subscription-access.policy';
 import { SubscriptionAccessService } from './subscription-access.service';
 
 const ZERO = new Prisma.Decimal(0);
-const NO_AMOUNTS: AllowanceAmounts = { trialCredits: 0, proMonthlyCredits: 0 };
 
 export interface CreditEligibility {
   /** Whether the user has usable credits. */
@@ -29,12 +28,13 @@ export interface CreditEligibility {
 }
 
 /**
- * Decides whether a user has credits to use, granting any trial or monthly
- * Pro allowance that is due first (idempotent: each allowance is granted
- * once per trial or per month of a term, however often this runs, also
- * concurrently). Free accounts have no allowance: nothing is granted at
- * sign-up or sign-in, so they have zero credits until they start a trial,
- * buy Pro, or receive purchased or referral credits.
+ * Decides whether a user has credits to use. Allowances are normally
+ * granted by the events that pay for them (trial activation, successful Pro
+ * payments); before deciding, any allowance still missing is granted here:
+ * a trial activated before trial credits existed, a later month of a yearly
+ * payment, or a payment recorded before payments granted credits. This never
+ * grants twice and never grants Pro credits without a successful payment.
+ * Free accounts have no allowance: nothing is granted at sign-up or sign-in.
  */
 @Injectable()
 export class CreditEligibilityService {
@@ -42,6 +42,7 @@ export class CreditEligibilityService {
     private readonly access: SubscriptionAccessService,
     private readonly wallet: CreditWalletService,
     private readonly settings: CreditSettingsService,
+    private readonly allowances: CreditAllowanceService,
   ) {}
 
   async getEligibility(authId: string): Promise<CreditEligibility> {
@@ -77,10 +78,7 @@ export class CreditEligibilityService {
     };
   }
 
-  /**
-   * Grants the trial and current monthly Pro allowances the user is due and
-   * has not received yet. Returns how many were newly granted.
-   */
+  /** Grants missing trial and Pro allowances; returns how many were granted. */
   async grantDueAllowances(authId: string): Promise<number> {
     const now = new Date();
     const { record } = await this.access.getAccessDetails(authId, now);
@@ -92,54 +90,52 @@ export class CreditEligibilityService {
     record: SubscriptionRecord | null,
     now: Date,
   ): Promise<number> {
-    // Which allowances are due does not depend on the amounts.
-    const due = dueAllowances(record, now, NO_AMOUNTS);
-    const missing: DueAllowance[] = [];
-    for (const allowance of due) {
-      const received = await this.wallet.hasGrant(
-        authId,
-        allowance.source,
-        allowance.sourceReference,
-      );
-      if (!received) missing.push(allowance);
-    }
-    if (missing.length === 0) return 0;
-
-    // Amounts are the settings at the time the allowance is first granted.
-    const settings = await this.settings.getSettings();
-    const toGrant = dueAllowances(record, now, settings).filter((allowance) =>
-      missing.some(
-        (gap) =>
-          gap.source === allowance.source &&
-          gap.sourceReference === allowance.sourceReference,
-      ),
-    );
     let granted = 0;
-    for (const allowance of toGrant) {
-      try {
-        const result = await this.wallet.grant({
-          authId,
-          source: allowance.source,
-          sourceReference: allowance.sourceReference,
-          amount: allowance.amount,
-          expiresAt: allowance.expiresAt,
-          description: allowance.description,
-          // A concurrent request may have granted it with older settings.
-          keepExistingGrant: true,
-        });
-        if (!result.replayed) granted += 1;
-      } catch (error) {
-        // The trial or month ended in the moment since `now`: nothing to
-        // grant any more (the wallet refuses already-expired credits).
-        if (
-          error instanceof InvalidCreditOperationError &&
-          allowance.expiresAt.getTime() <= Date.now()
-        ) {
-          continue;
-        }
-        throw error;
-      }
+    if (await this.grantMissingTrialAllowance(authId, record, now)) {
+      granted += 1;
+    }
+    if (isProActive(record, now)) {
+      const outcome = await this.allowances.grantCurrentPaidPeriod(authId, now);
+      if (outcome === 'GRANTED') granted += 1;
     }
     return granted;
+  }
+
+  private async grantMissingTrialAllowance(
+    authId: string,
+    record: SubscriptionRecord | null,
+    now: Date,
+  ): Promise<boolean> {
+    // Which trial allowance is due does not depend on the amount.
+    const due = dueTrialAllowance(record, now, 0);
+    if (!due) return false;
+    if (await this.wallet.hasGrant(authId, due.source, due.sourceReference)) {
+      return false;
+    }
+    // The amount is the setting at the time the allowance is first granted.
+    const { trialCredits } = await this.settings.getSettings();
+    try {
+      const result = await this.wallet.grant({
+        authId,
+        source: due.source,
+        sourceReference: due.sourceReference,
+        amount: trialCredits,
+        expiresAt: due.expiresAt,
+        description: due.description,
+        // A concurrent request may have granted it with older settings.
+        keepExistingGrant: true,
+      });
+      return !result.replayed;
+    } catch (error) {
+      // The trial ended in the moment since `now`: nothing to grant any
+      // more (the wallet refuses already-expired credits).
+      if (
+        error instanceof InvalidCreditOperationError &&
+        due.expiresAt.getTime() <= Date.now()
+      ) {
+        return false;
+      }
+      throw error;
+    }
   }
 }

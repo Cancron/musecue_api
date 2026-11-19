@@ -12,6 +12,7 @@ import {
 } from '../src/credits/credit-wallet.errors';
 import { CreditWalletService } from '../src/credits/credit-wallet.service';
 import { freezeTime } from './support/freeze-time';
+import { givenPaidPeriod } from './support/credit-fixtures';
 import {
   TEST_DATABASE_URL,
   applyMigrations,
@@ -145,12 +146,14 @@ describeWithDatabase('Credit wallet and ledger (PostgreSQL)', () => {
         sourceReference: 'ref_1',
         amount: '2.5',
       });
+      const bobPaid = await givenPaidPeriod(client, bob, new Date(now));
       await wallet.grant({
         authId: bob,
         source: CreditSource.SUBSCRIPTION,
         sourceReference: 'sub_1:2026-11',
         amount: 1000,
-        expiresAt: new Date(now + 30 * DAY),
+        expiresAt: bobPaid.periodEnd,
+        paidPeriod: bobPaid,
       });
 
       const wallets = await client.creditWallet.findMany({
@@ -252,7 +255,8 @@ describeWithDatabase('Credit wallet and ledger (PostgreSQL)', () => {
             sourceReference: 's',
             expiresAt: null,
           },
-          'CreditAllocation_expiry_by_source',
+          // Checked first: SUBSCRIPTION credits need a successful payment.
+          'require the successful payment that paid for them',
         ],
         [
           {
@@ -361,7 +365,7 @@ describeWithDatabase('Credit wallet and ledger (PostgreSQL)', () => {
     it('applies the same grant once when it is delivered many times concurrently', async () => {
       const userId = await createUser(client);
       // One delivery's values, computed once: every retry carries the same.
-      const expiresAt = new Date(Date.now() + 30 * DAY);
+      const paidPeriod = await givenPaidPeriod(client, userId, new Date());
       const results = await Promise.all(
         Array.from({ length: 20 }, () =>
           wallet.grant({
@@ -369,7 +373,8 @@ describeWithDatabase('Credit wallet and ledger (PostgreSQL)', () => {
             source: CreditSource.SUBSCRIPTION,
             sourceReference: 'sub_42:2026-11-01',
             amount: '1000',
-            expiresAt,
+            expiresAt: paidPeriod.periodEnd,
+            paidPeriod,
           }),
         ),
       );
@@ -517,12 +522,20 @@ describeWithDatabase('Credit wallet and ledger (PostgreSQL)', () => {
       await grantPurchase(userId, '3');
       // Expires while the operations below run (the clock is moved past it
       // halfway through), so expirations race with grants and debits.
+      // A monthly period paid from Apr 1, 01:00 that ends at t0 + 1 hour.
+      const shortLived = await givenPaidPeriod(
+        client,
+        userId,
+        new Date('2032-04-01T01:00:00.000Z'),
+      );
+      expect(shortLived.periodEnd).toEqual(new Date(t0.getTime() + HOUR));
       await wallet.grant({
         authId: userId,
         source: CreditSource.SUBSCRIPTION,
         sourceReference: 'short-lived',
         amount: '4',
-        expiresAt: new Date(t0.getTime() + HOUR),
+        expiresAt: shortLived.periodEnd,
+        paidPeriod: shortLived,
       });
 
       const operations: Promise<unknown>[] = [];
@@ -568,12 +581,15 @@ describeWithDatabase('Credit wallet and ledger (PostgreSQL)', () => {
         amount: '50',
         expiresAt: new Date(t0.getTime() + 7 * DAY),
       });
+      const january = await givenPaidPeriod(client, userId, t0);
+      expect(january.periodEnd).toEqual(new Date(t0.getTime() + 31 * DAY));
       await wallet.grant({
         authId: userId,
         source: CreditSource.SUBSCRIPTION,
         sourceReference: 'sub:2030-01',
         amount: '1000',
-        expiresAt: new Date(t0.getTime() + 31 * DAY),
+        expiresAt: january.periodEnd,
+        paidPeriod: january,
       });
       await wallet.grant({
         authId: userId,
@@ -685,12 +701,15 @@ describeWithDatabase('Credit wallet and ledger (PostgreSQL)', () => {
         amount: '50',
         expiresAt: trialEnds,
       });
+      const february = await givenPaidPeriod(client, proUser, t0);
+      expect(february.periodEnd).toEqual(monthEnds);
       await wallet.grant({
         authId: proUser,
         source: CreditSource.SUBSCRIPTION,
         sourceReference: 'pro:2033-02',
         amount: '1000',
         expiresAt: monthEnds,
+        paidPeriod: february,
       });
       await wallet.grant({
         authId: proUser,

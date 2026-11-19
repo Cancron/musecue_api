@@ -16,6 +16,12 @@ export interface GrantCreditsInput {
   amount: CreditAmountInput;
   /** Required for TRIAL and SUBSCRIPTION; must be omitted otherwise. */
   expiresAt?: Date | null;
+  /**
+   * SUBSCRIPTION only, and required: the subscription, the successful payment
+   * that paid for the credits and the billing period they cover. `expiresAt`
+   * must be `periodEnd`.
+   */
+  paidPeriod?: PaidPeriod;
   description?: string;
   /**
    * If this source event was already granted with a different amount or
@@ -24,6 +30,13 @@ export interface GrantCreditsInput {
    * first grant. Never grants twice either way.
    */
   keepExistingGrant?: boolean;
+}
+
+export interface PaidPeriod {
+  subscriptionId: string;
+  paymentId: string;
+  periodStart: Date;
+  periodEnd: Date;
 }
 
 export interface DebitCreditsInput {
@@ -47,6 +60,11 @@ export interface CreditAllocationView {
   remaining: CreditAmountString;
   grantedAt: string;
   expiresAt: string | null;
+  /** SUBSCRIPTION credits: what paid for them and the period they cover. */
+  subscriptionId: string | null;
+  paymentId: string | null;
+  periodStart: string | null;
+  periodEnd: string | null;
 }
 
 export interface CreditTransactionView {

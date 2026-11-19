@@ -1,14 +1,15 @@
 import { BillingInterval, CreditSource } from '@prisma/client';
 import {
   addMonthsClamped,
-  currentProAllowancePeriod,
-  dueAllowances,
+  dueTrialAllowance,
   isCreditSourceUsable,
+  paidAllowancePeriod,
+  paidAllowanceReference,
 } from './credit-allowance.policy';
 import type { SubscriptionRecord } from './subscription-access.policy';
 
 const iso = (value: string) => new Date(value);
-const AMOUNTS = { trialCredits: 50, proMonthlyCredits: 1000 };
+const { MONTHLY, YEARLY } = BillingInterval;
 
 const record = (
   overrides: Partial<SubscriptionRecord> = {},
@@ -31,13 +32,18 @@ const trial = (start: string, end: string) =>
 const paid = (
   start: string,
   end: string,
-  billingInterval: BillingInterval = BillingInterval.MONTHLY,
+  billingInterval: BillingInterval = MONTHLY,
 ) =>
   record({
     billingInterval,
     proStartedAt: iso(start),
     proExpiresAt: iso(end),
   });
+const payment = (
+  start: string,
+  end: string,
+  billingInterval: BillingInterval = MONTHLY,
+) => ({ periodStart: iso(start), periodEnd: iso(end), billingInterval });
 
 describe('credit allowance policy', () => {
   describe('addMonthsClamped', () => {
@@ -64,178 +70,138 @@ describe('credit allowance policy', () => {
     });
   });
 
-  describe('currentProAllowancePeriod', () => {
-    it('is the billing month of a monthly term', () => {
-      const term = paid('2026-03-15T09:00:00.000Z', '2026-04-15T09:00:00.000Z');
+  describe('paidAllowancePeriod', () => {
+    it('is exactly the paid period for monthly billing, including anchored periods', () => {
+      // Stripe bills a subscription anchored on the 31st Feb 28 -> Mar 31.
+      const anchored = payment(
+        '2026-02-28T10:00:00.000Z',
+        '2026-03-31T10:00:00.000Z',
+      );
+      for (const at of [
+        '2026-02-28T10:00:00.000Z',
+        '2026-03-29T00:00:00.000Z',
+        '2026-03-31T09:59:59.999Z',
+      ]) {
+        expect(paidAllowancePeriod(anchored, iso(at))).toEqual({
+          start: iso('2026-02-28T10:00:00.000Z'),
+          end: iso('2026-03-31T10:00:00.000Z'),
+        });
+      }
+    });
+
+    it('gives the first period to a payment confirmed before its period starts', () => {
       expect(
-        currentProAllowancePeriod(term, iso('2026-03-20T00:00:00.000Z')),
+        paidAllowancePeriod(
+          payment('2026-05-01T00:00:00.000Z', '2026-06-01T00:00:00.000Z'),
+          iso('2026-04-30T23:00:00.000Z'),
+        ),
       ).toEqual({
-        start: iso('2026-03-15T09:00:00.000Z'),
-        end: iso('2026-04-15T09:00:00.000Z'),
+        start: iso('2026-05-01T00:00:00.000Z'),
+        end: iso('2026-06-01T00:00:00.000Z'),
       });
     });
 
-    it('splits a yearly term into months from its start', () => {
-      const term = paid(
+    it('is null from the end of the paid period (the billing boundary) on', () => {
+      const p = payment('2026-05-01T00:00:00.000Z', '2026-06-01T00:00:00.000Z');
+      expect(
+        paidAllowancePeriod(p, iso('2026-06-01T00:00:00.000Z')),
+      ).toBeNull();
+      expect(
+        paidAllowancePeriod(p, iso('2026-09-01T00:00:00.000Z')),
+      ).toBeNull();
+    });
+
+    it('splits a yearly payment into months from its start', () => {
+      const yearly = payment(
         '2026-01-31T00:00:00.000Z',
         '2027-01-31T00:00:00.000Z',
-        BillingInterval.YEARLY,
+        YEARLY,
       );
       expect(
-        currentProAllowancePeriod(term, iso('2026-03-05T00:00:00.000Z')),
+        paidAllowancePeriod(yearly, iso('2026-01-31T00:00:00.000Z')),
+      ).toEqual({
+        start: iso('2026-01-31T00:00:00.000Z'),
+        end: iso('2026-02-28T00:00:00.000Z'),
+      });
+      expect(
+        paidAllowancePeriod(yearly, iso('2026-03-05T00:00:00.000Z')),
       ).toEqual({
         start: iso('2026-02-28T00:00:00.000Z'),
         end: iso('2026-03-31T00:00:00.000Z'),
       });
       expect(
-        currentProAllowancePeriod(term, iso('2026-12-31T12:00:00.000Z')),
+        paidAllowancePeriod(yearly, iso('2026-12-31T12:00:00.000Z')),
       ).toEqual({
         start: iso('2026-12-31T00:00:00.000Z'),
         end: iso('2027-01-31T00:00:00.000Z'),
       });
     });
 
-    it('switches months at the exact anchor instant', () => {
-      const term = paid(
+    it('switches yearly months at the exact anchor instant', () => {
+      const yearly = payment(
         '2026-01-10T08:00:00.000Z',
         '2027-01-10T08:00:00.000Z',
-        BillingInterval.YEARLY,
+        YEARLY,
       );
       expect(
-        currentProAllowancePeriod(term, iso('2026-02-10T07:59:59.999Z'))?.start,
+        paidAllowancePeriod(yearly, iso('2026-02-10T07:59:59.999Z'))?.start,
       ).toEqual(iso('2026-01-10T08:00:00.000Z'));
       expect(
-        currentProAllowancePeriod(term, iso('2026-02-10T08:00:00.000Z'))?.start,
+        paidAllowancePeriod(yearly, iso('2026-02-10T08:00:00.000Z'))?.start,
       ).toEqual(iso('2026-02-10T08:00:00.000Z'));
-    });
-
-    it('is null without an active paid term', () => {
-      const term = paid('2026-01-01T00:00:00.000Z', '2026-02-01T00:00:00.000Z');
-      expect(
-        currentProAllowancePeriod(null, iso('2026-01-10T00:00:00.000Z')),
-      ).toBeNull();
-      expect(
-        currentProAllowancePeriod(term, iso('2026-02-01T00:00:00.000Z')),
-      ).toBeNull();
-      expect(
-        currentProAllowancePeriod(
-          trial('2026-01-01T00:00:00.000Z', '2026-01-08T00:00:00.000Z'),
-          iso('2026-01-02T00:00:00.000Z'),
-        ),
-      ).toBeNull();
     });
   });
 
-  describe('dueAllowances', () => {
+  describe('references', () => {
+    it('names the payment and the period, so a period is granted once', () => {
+      expect(
+        paidAllowanceReference('pay-1', iso('2026-05-01T00:00:00.000Z')),
+      ).toBe('payment:pay-1:2026-05-01T00:00:00.000Z');
+    });
+  });
+
+  describe('dueTrialAllowance', () => {
     it('is nothing for a free user (no record, or never used)', () => {
       const now = iso('2026-05-01T00:00:00.000Z');
-      expect(dueAllowances(null, now, AMOUNTS)).toEqual([]);
-      expect(dueAllowances(record(), now, AMOUNTS)).toEqual([]);
+      expect(dueTrialAllowance(null, now, 50)).toBeNull();
+      expect(dueTrialAllowance(record(), now, 50)).toBeNull();
     });
 
-    it('grants the trial allowance for the trial, expiring with it', () => {
+    it('is the trial allowance during the trial, expiring with it', () => {
       const r = trial('2026-05-01T12:00:00.000Z', '2026-05-08T12:00:00.000Z');
-      expect(
-        dueAllowances(r, iso('2026-05-03T00:00:00.000Z'), AMOUNTS),
-      ).toEqual([
+      expect(dueTrialAllowance(r, iso('2026-05-03T00:00:00.000Z'), 75)).toEqual(
         {
           source: CreditSource.TRIAL,
           sourceReference: 'trial:2026-05-01T12:00:00.000Z',
-          amount: 50,
+          amount: 75,
           expiresAt: iso('2026-05-08T12:00:00.000Z'),
           description: 'Free trial credits',
         },
-      ]);
+      );
     });
 
-    it('grants nothing once the trial or term has ended', () => {
+    it('is nothing once the trial has ended', () => {
       expect(
-        dueAllowances(
+        dueTrialAllowance(
           trial('2026-05-01T00:00:00.000Z', '2026-05-08T00:00:00.000Z'),
           iso('2026-05-08T00:00:00.000Z'),
-          AMOUNTS,
+          50,
         ),
-      ).toEqual([]);
-      expect(
-        dueAllowances(
-          paid('2026-01-01T00:00:00.000Z', '2026-02-01T00:00:00.000Z'),
-          iso('2026-03-01T00:00:00.000Z'),
-          AMOUNTS,
-        ),
-      ).toEqual([]);
+      ).toBeNull();
     });
 
-    it('grants one monthly allowance per month of a term, with a stable reference', () => {
-      const term = paid(
-        '2026-01-15T00:00:00.000Z',
-        '2027-01-15T00:00:00.000Z',
-        BillingInterval.YEARLY,
-      );
-      const early = dueAllowances(
-        term,
-        iso('2026-03-16T00:00:00.000Z'),
-        AMOUNTS,
-      );
-      const late = dueAllowances(
-        term,
-        iso('2026-04-14T23:00:00.000Z'),
-        AMOUNTS,
-      );
-      const next = dueAllowances(
-        term,
-        iso('2026-04-15T00:00:00.000Z'),
-        AMOUNTS,
-      );
-
-      expect(early).toEqual([
-        {
-          source: CreditSource.SUBSCRIPTION,
-          sourceReference:
-            'pro:2026-01-15T00:00:00.000Z:2026-03-15T00:00:00.000Z',
-          amount: 1000,
-          expiresAt: iso('2026-04-15T00:00:00.000Z'),
-          description: 'Monthly Pro credits',
-        },
-      ]);
-      expect(late).toEqual(early);
-      expect(next[0]?.sourceReference).toBe(
-        'pro:2026-01-15T00:00:00.000Z:2026-04-15T00:00:00.000Z',
-      );
-    });
-
-    it('never lets monthly credits outlive the paid term', () => {
-      // A term shortened (e.g. by a refund) mid-month.
-      const term = paid('2026-01-15T00:00:00.000Z', '2026-02-01T00:00:00.000Z');
-      expect(
-        dueAllowances(term, iso('2026-01-20T00:00:00.000Z'), AMOUNTS)[0]
-          ?.expiresAt,
-      ).toEqual(iso('2026-02-01T00:00:00.000Z'));
-    });
-
-    it('grants only the Pro allowance once paid Pro is bought during the trial', () => {
+    it('is nothing once paid Pro is bought during the trial', () => {
       const r = record({
         trialUsed: true,
         trialStartedAt: iso('2026-05-01T00:00:00.000Z'),
         trialExpiresAt: iso('2026-05-08T00:00:00.000Z'),
-        billingInterval: BillingInterval.MONTHLY,
+        billingInterval: MONTHLY,
         proStartedAt: iso('2026-05-05T00:00:00.000Z'),
         proExpiresAt: iso('2026-06-05T00:00:00.000Z'),
       });
       expect(
-        dueAllowances(r, iso('2026-05-06T00:00:00.000Z'), AMOUNTS).map(
-          (a) => a.source,
-        ),
-      ).toEqual([CreditSource.SUBSCRIPTION]);
-    });
-
-    it('uses the configured amounts', () => {
-      const r = trial('2026-05-01T00:00:00.000Z', '2026-05-08T00:00:00.000Z');
-      expect(
-        dueAllowances(r, iso('2026-05-02T00:00:00.000Z'), {
-          trialCredits: 75,
-          proMonthlyCredits: 1,
-        })[0]?.amount,
-      ).toBe(75);
+        dueTrialAllowance(r, iso('2026-05-06T00:00:00.000Z'), 50),
+      ).toBeNull();
     });
   });
 
@@ -284,7 +250,7 @@ describe('credit allowance policy', () => {
       );
       const upgraded = record({
         ...activeTrial,
-        billingInterval: BillingInterval.MONTHLY,
+        billingInterval: MONTHLY,
         proStartedAt: iso('2026-06-09T00:00:00.000Z'),
         proExpiresAt: iso('2026-07-09T00:00:00.000Z'),
       });
@@ -298,9 +264,6 @@ describe('credit allowance policy', () => {
           iso('2026-06-15T00:00:00.000Z'),
         ),
       ).toBe(false);
-      expect(isCreditSourceUsable(CreditSource.TRIAL, activePro, now)).toBe(
-        false,
-      );
     });
   });
 });

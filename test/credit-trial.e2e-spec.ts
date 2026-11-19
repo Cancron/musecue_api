@@ -336,7 +336,22 @@ describeWithDatabase('Trial credits (PostgreSQL, HTTP)', () => {
           await client.creditAllocation.findMany({ where: { authId: userId } })
         ).map((a) => [a.source, a.remaining.toFixed()]),
       );
-      expect(bySource).toEqual({ TRIAL: '0', PURCHASE: '20', REFERRAL: '5' });
+      // The purchase itself granted the first month of Pro credits.
+      expect(bySource).toEqual({
+        TRIAL: '0',
+        SUBSCRIPTION: '1000',
+        PURCHASE: '20',
+        REFERRAL: '5',
+      });
+      // The trial credits ended before the Pro credits were granted.
+      expect(
+        (await transactionsOf(userId))
+          .slice(-2)
+          .map((t) => [t.type, t.amount.toFixed(), t.balanceAfter.toFixed()]),
+      ).toEqual([
+        ['EXPIRATION', '-40', '25'],
+        ['GRANT', '1000', '1025'],
+      ]);
       // The trial itself is history, unchanged.
       await expect(subscriptionOf(userId)).resolves.toMatchObject({
         trialUsed: true,
@@ -400,15 +415,23 @@ describeWithDatabase('Trial credits (PostgreSQL, HTTP)', () => {
       await expectConsistentLedger(client, userId);
     });
 
-    it('creates no credit records for a Pro purchase without a trial', async () => {
+    it('grants only the monthly Pro credits for a Pro purchase without a trial', async () => {
       const userId = await createUser(client);
       await buyPro(userId);
 
       await expect(harness.status(userId)).resolves.toMatchObject({
         status: 'PRO',
       });
+      const allocations = await client.creditAllocation.findMany({
+        where: { authId: userId },
+      });
+      expect(allocations.map((a) => [a.source, a.amount.toFixed()])).toEqual([
+        ['SUBSCRIPTION', '1000'],
+      ]);
       await expect(
-        client.creditWallet.count({ where: { authId: userId } }),
+        client.creditTransaction.count({
+          where: { authId: userId, type: 'EXPIRATION' },
+        }),
       ).resolves.toBe(0);
     });
   });

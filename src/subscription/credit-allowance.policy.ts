@@ -1,4 +1,4 @@
-import { CreditSource } from '@prisma/client';
+import { BillingInterval, CreditSource } from '@prisma/client';
 import {
   isProActive,
   isTrialActive,
@@ -6,7 +6,7 @@ import {
 } from './subscription-access.policy';
 
 /**
- * Which credits a subscription entitles a user to, and which credits are
+ * Which allowances a subscription entitles a user to, and which credits are
  * usable, derived from the same date windows as Pro access
  * (subscription-access.policy). Pure functions; no database access.
  *
@@ -14,26 +14,21 @@ import {
  *   are granted when the trial is activated (CreditAllowanceService); buying
  *   paid Pro ends them at once (a trial can only start without Pro history,
  *   so any paid term means the user upgraded).
- * - A paid Pro term comes with `proMonthlyCredits` for every month of the
- *   term (monthly and yearly billing alike), expiring at the end of that
- *   month or of the term, whichever is first. Months are counted from the
- *   term's start, on the same calendar day (clamped to the month's length,
- *   like Stripe's billing anchor: Jan 31 -> Feb 28 -> Mar 31).
- * - TRIAL credits are usable only while the trial is active (and Pro has
- *   not been bought) and
- *   SUBSCRIPTION credits only while the paid term is active, so a refund
- *   that ends the term early also ends its credits. PURCHASE and REFERRAL
- *   credits are usable with or without Pro.
+ * - Monthly Pro credits (`proMonthlyCredits`) are granted for successful
+ *   payments only (CreditAllowanceService.grantPaidPeriod): one allocation
+ *   per allowance period of a payment, expiring at the end of that period.
+ *   For monthly billing the period is the paid period itself, so credits
+ *   expire at Stripe's billing boundary; a yearly payment covers twelve
+ *   monthly periods.
+ * - TRIAL credits are usable only while the trial is active (and Pro has not
+ *   been bought) and SUBSCRIPTION credits only while the paid term is
+ *   active, so a refund that ends the term early also ends its credits.
+ *   PURCHASE and REFERRAL credits are usable with or without Pro.
  */
 
-export interface AllowanceAmounts {
-  trialCredits: number;
-  proMonthlyCredits: number;
-}
-
 export interface DueAllowance {
-  source: typeof CreditSource.TRIAL | typeof CreditSource.SUBSCRIPTION;
-  /** Stable per trial / per month of a term, so a grant is made once. */
+  source: typeof CreditSource.TRIAL;
+  /** Stable per trial, so the trial allowance is granted once. */
   sourceReference: string;
   amount: number;
   expiresAt: Date;
@@ -43,6 +38,12 @@ export interface DueAllowance {
 /** The reference of a trial's allowance: one per trial (and user). */
 export const trialAllowanceReference = (trialStartedAt: Date): string =>
   `trial:${trialStartedAt.toISOString()}`;
+
+/** The reference of a payment's allowance period: one per period. */
+export const paidAllowanceReference = (
+  paymentId: string,
+  periodStart: Date,
+): string => `payment:${paymentId}:${periodStart.toISOString()}`;
 
 /** Whether trial credits apply: an active trial, and no paid Pro bought. */
 function trialCreditsApply(
@@ -68,53 +69,60 @@ export function addMonthsClamped(anchor: Date, months: number): Date {
   return target;
 }
 
-/** The month of the paid term that contains `now`, or null without one. */
-export function currentProAllowancePeriod(
-  record: SubscriptionRecord | null,
-  now: Date,
+/** A successful payment's billing facts. */
+export interface PaidPeriodSource {
+  periodStart: Date;
+  periodEnd: Date;
+  billingInterval: BillingInterval;
+}
+
+/**
+ * The allowance period of `payment` at `at`, or null once its paid period is
+ * over. Monthly billing: the paid period itself (Stripe's billing period,
+ * including anchored ones such as Feb 28 -> Mar 31). Yearly billing: the
+ * month of the paid year containing `at`, counted from the payment's start on
+ * the same day (clamped), the last one ending with the paid period. A
+ * payment confirmed before its period starts gets its first period.
+ */
+export function paidAllowancePeriod(
+  payment: PaidPeriodSource,
+  at: Date,
 ): { start: Date; end: Date } | null {
-  if (!record || !isProActive(record, now)) return null;
-  const anchor = record.proStartedAt as Date;
+  const start = payment.periodStart;
+  const end = payment.periodEnd;
+  const t = Math.max(at.getTime(), start.getTime());
+  if (t >= end.getTime()) return null;
+  if (payment.billingInterval === BillingInterval.MONTHLY) {
+    return { start, end };
+  }
+  const moment = new Date(t);
   let months =
-    (now.getUTCFullYear() - anchor.getUTCFullYear()) * 12 +
-    (now.getUTCMonth() - anchor.getUTCMonth());
+    (moment.getUTCFullYear() - start.getUTCFullYear()) * 12 +
+    (moment.getUTCMonth() - start.getUTCMonth());
   // The estimate can be one month off either way around the anchor day.
-  while (months > 0 && addMonthsClamped(anchor, months) > now) months -= 1;
-  while (addMonthsClamped(anchor, months + 1) <= now) months += 1;
+  while (months > 0 && addMonthsClamped(start, months) > moment) months -= 1;
+  while (addMonthsClamped(start, months + 1) <= moment) months += 1;
+  const monthEnd = addMonthsClamped(start, months + 1);
   return {
-    start: addMonthsClamped(anchor, months),
-    end: addMonthsClamped(anchor, months + 1),
+    start: addMonthsClamped(start, months),
+    end: monthEnd < end ? monthEnd : end,
   };
 }
 
-/** The allowances the user should have received by `now`. */
-export function dueAllowances(
+/** The trial allowance the user should have received by `now`, if any. */
+export function dueTrialAllowance(
   record: SubscriptionRecord | null,
   now: Date,
-  amounts: AllowanceAmounts,
-): DueAllowance[] {
-  const due: DueAllowance[] = [];
-  if (record && trialCreditsApply(record, now)) {
-    due.push({
-      source: CreditSource.TRIAL,
-      sourceReference: trialAllowanceReference(record.trialStartedAt as Date),
-      amount: amounts.trialCredits,
-      expiresAt: record.trialExpiresAt as Date,
-      description: 'Free trial credits',
-    });
-  }
-  const period = currentProAllowancePeriod(record, now);
-  if (record && period) {
-    const termEnd = record.proExpiresAt as Date;
-    due.push({
-      source: CreditSource.SUBSCRIPTION,
-      sourceReference: `pro:${(record.proStartedAt as Date).toISOString()}:${period.start.toISOString()}`,
-      amount: amounts.proMonthlyCredits,
-      expiresAt: period.end < termEnd ? period.end : termEnd,
-      description: 'Monthly Pro credits',
-    });
-  }
-  return due;
+  trialCredits: number,
+): DueAllowance | null {
+  if (!record || !trialCreditsApply(record, now)) return null;
+  return {
+    source: CreditSource.TRIAL,
+    sourceReference: trialAllowanceReference(record.trialStartedAt as Date),
+    amount: trialCredits,
+    expiresAt: record.trialExpiresAt as Date,
+    description: 'Free trial credits',
+  };
 }
 
 /** Whether credits from `source` may be used at `now`. */

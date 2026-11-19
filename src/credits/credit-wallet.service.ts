@@ -19,6 +19,7 @@ import {
   compareSpendingOrder,
   decideOverage,
   getGrantExpiryRejection,
+  getPaidPeriodRejection,
   getReferenceRejection,
   isAllocationAvailable,
   planDebit,
@@ -115,6 +116,14 @@ export class CreditWalletService {
       throw new InvalidCreditOperationError('Unknown credit source');
     }
     const expiresAt = input.expiresAt ?? null;
+    const paidPeriodRejection = getPaidPeriodRejection(
+      input.source,
+      expiresAt,
+      input.paidPeriod,
+    );
+    if (paidPeriodRejection) {
+      throw new InvalidCreditOperationError(paidPeriodRejection);
+    }
     const idempotencyKey = `grant:${input.source}:${input.sourceReference}`;
 
     return this.withLockedWallet(
@@ -183,6 +192,10 @@ export class CreditWalletService {
             remaining: amount,
             grantedAt: wallet.now,
             expiresAt,
+            subscriptionId: input.paidPeriod?.subscriptionId,
+            paymentId: input.paidPeriod?.paymentId,
+            periodStart: input.paidPeriod?.periodStart,
+            periodEnd: input.paidPeriod?.periodEnd,
           },
         });
         const transaction = await tx.creditTransaction.create({
@@ -710,6 +723,10 @@ export class CreditWalletService {
       remaining: formatCredits(allocation.remaining),
       grantedAt: allocation.grantedAt.toISOString(),
       expiresAt: allocation.expiresAt?.toISOString() ?? null,
+      subscriptionId: allocation.subscriptionId,
+      paymentId: allocation.paymentId,
+      periodStart: allocation.periodStart?.toISOString() ?? null,
+      periodEnd: allocation.periodEnd?.toISOString() ?? null,
     };
   }
 

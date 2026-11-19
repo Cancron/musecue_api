@@ -440,18 +440,35 @@ describeWithDatabase('Credit-based access to makeup sessions (e2e)', () => {
       auth = await signIn(account);
       await createSession(auth).expect(201);
 
+      // Both months are paid by the one yearly payment.
+      const yearly = await ctx.client.paymentTransaction.findFirstOrThrow({
+        where: { subscription: { authId: account.id } },
+      });
       expect(
         (await allocationsOf(account.id)).map((a) => [
           a.source,
           a.sourceReference,
           a.amount.toFixed(),
+          a.paymentId,
+          a.periodStart?.toISOString(),
+          a.periodEnd?.toISOString(),
         ]),
       ).toEqual([
-        ['SUBSCRIPTION', `pro:${t0.toISOString()}:${t0.toISOString()}`, '1000'],
         [
           'SUBSCRIPTION',
-          `pro:${t0.toISOString()}:2033-06-15T00:00:00.000Z`,
+          `payment:${yearly.id}:${t0.toISOString()}`,
           '1000',
+          yearly.id,
+          t0.toISOString(),
+          '2033-06-15T00:00:00.000Z',
+        ],
+        [
+          'SUBSCRIPTION',
+          `payment:${yearly.id}:2033-06-15T00:00:00.000Z`,
+          '1000',
+          yearly.id,
+          '2033-06-15T00:00:00.000Z',
+          '2033-07-15T00:00:00.000Z',
         ],
       ]);
     });

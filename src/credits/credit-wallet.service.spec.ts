@@ -45,10 +45,20 @@ describe('CreditWalletService', () => {
     remaining: D(10),
     grantedAt: later(-24 * HOUR),
     expiresAt: null,
+    subscriptionId: null,
+    paymentId: null,
+    periodStart: null,
+    periodEnd: null,
     createdAt: later(-24 * HOUR),
     updatedAt: later(-24 * HOUR),
     ...overrides,
   });
+  const paidPeriod = {
+    subscriptionId: 'sub-1',
+    paymentId: 'pay-1',
+    periodStart: NOW,
+    periodEnd: later(30 * 24 * HOUR),
+  };
 
   const storedTransaction = (
     overrides: Partial<CreditTransaction> = {},
@@ -230,6 +240,7 @@ describe('CreditWalletService', () => {
         sourceReference: 'sub_1:2026-11-23',
         amount: '1000',
         expiresAt: later(30 * 24 * HOUR),
+        paidPeriod,
       });
 
       expect(calls.slice(0, 2)).toEqual(['ensure-wallet', 'lock']);
@@ -248,6 +259,16 @@ describe('CreditWalletService', () => {
         remaining: D(1000),
         grantedAt: NOW,
         expiresAt: later(30 * 24 * HOUR),
+        subscriptionId: 'sub-1',
+        paymentId: 'pay-1',
+        periodStart: NOW,
+        periodEnd: later(30 * 24 * HOUR),
+      });
+      expect(result.allocation).toMatchObject({
+        subscriptionId: 'sub-1',
+        paymentId: 'pay-1',
+        periodStart: NOW.toISOString(),
+        periodEnd: later(30 * 24 * HOUR).toISOString(),
       });
       expect(createdTransactions()[0]).toMatchObject({
         type: CreditTransactionType.GRANT,
@@ -363,8 +384,56 @@ describe('CreditWalletService', () => {
     });
 
     it.each([
+      [
+        'SUBSCRIPTION credits without the payment that paid for them',
+        { source: CreditSource.SUBSCRIPTION, expiresAt: later(HOUR) },
+        /require the successful payment/,
+      ],
+      [
+        'SUBSCRIPTION credits expiring before the end of their paid period',
+        {
+          source: CreditSource.SUBSCRIPTION,
+          expiresAt: later(HOUR),
+          paidPeriod,
+        },
+        /expire at the end of their paid period/,
+      ],
+      [
+        'a paid period that ends before it starts',
+        {
+          source: CreditSource.SUBSCRIPTION,
+          expiresAt: later(HOUR),
+          paidPeriod: {
+            ...paidPeriod,
+            periodStart: later(2 * HOUR),
+            periodEnd: later(HOUR),
+          },
+        },
+        /end after it starts/,
+      ],
+      [
+        'a paid period on purchased credits',
+        { source: CreditSource.PURCHASE, paidPeriod },
+        /have no paid period/,
+      ],
+    ])(
+      'rejects %s before any database access',
+      async (_case, input, message) => {
+        await expect(
+          service.grant({
+            authId: 'user-1',
+            sourceReference: 'ref',
+            amount: 1,
+            ...input,
+          }),
+        ).rejects.toThrow(message);
+        expect(prisma.$transaction.mock.calls).toHaveLength(0);
+      },
+    );
+
+    it.each([
       [CreditSource.TRIAL, null, /require an expiration date/],
-      [CreditSource.SUBSCRIPTION, later(-1), /in the future/],
+      [CreditSource.TRIAL, later(-1), /in the future/],
       [CreditSource.PURCHASE, later(HOUR), /never expire/],
       [CreditSource.REFERRAL, later(HOUR), /never expire/],
     ])(

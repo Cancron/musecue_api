@@ -66,6 +66,7 @@ describeWithDatabase('Free trial activation (PostgreSQL)', () => {
       logger,
     );
     credits = new CreditAllowanceService(
+      prisma,
       new CreditWalletService(prisma, creditSettings),
       creditSettings,
     );

@@ -14,6 +14,7 @@ import type {
   CreditBalanceView,
   GrantCreditsResult,
 } from '../credits/interfaces/credit-wallet.interface';
+import { CreditAllowanceService } from './credit-allowance.service';
 import { CreditEligibilityService } from './credit-eligibility.service';
 import { SubscriptionAccessService } from './subscription-access.service';
 import { SubscriptionPlanService } from './subscription-plan.service';
@@ -54,6 +55,10 @@ const allocation = (
   remaining,
   grantedAt: '2026-06-01T00:00:00.000Z',
   expiresAt,
+  subscriptionId: null,
+  paymentId: null,
+  periodStart: null,
+  periodEnd: null,
 });
 
 /**
@@ -64,10 +69,12 @@ describe('CreditEligibilityService', () => {
   const prisma = mockDeep<PrismaService>();
   const wallet = mock<CreditWalletService>();
   const settings = mock<CreditSettingsService>();
+  const allowances = mock<CreditAllowanceService>();
   const service = new CreditEligibilityService(
     new SubscriptionAccessService(prisma, mock<SubscriptionPlanService>()),
     wallet,
     settings,
+    allowances,
   );
   let stored: Row | null;
   let allocations: CreditAllocationView[];
@@ -111,6 +118,7 @@ describe('CreditEligibilityService', () => {
         expect(wallet.grant.mock.calls).toHaveLength(0);
         expect(wallet.hasGrant.mock.calls).toHaveLength(0);
         expect(settings.getSettings.mock.calls).toHaveLength(0);
+        expect(allowances.grantCurrentPaidPeriod.mock.calls).toHaveLength(0);
       },
     );
   });
@@ -143,29 +151,40 @@ describe('CreditEligibilityService', () => {
       ]);
     });
 
-    it("grants the current month's Pro allowance of a yearly term", async () => {
+    it("asks for the paid period's Pro credits during an active paid term (granted only for a successful payment)", async () => {
       stored = row({
         billingInterval: BillingInterval.YEARLY,
         proStartedAt: iso('2026-01-20T00:00:00.000Z'),
         proExpiresAt: iso('2027-01-20T00:00:00.000Z'),
       });
+      allowances.grantCurrentPaidPeriod.mockResolvedValue('GRANTED');
+
+      await expect(service.grantDueAllowances('user-1')).resolves.toBe(1);
+
+      expect(allowances.grantCurrentPaidPeriod.mock.calls).toEqual([
+        ['user-1', NOW],
+      ]);
+      // Pro credits never come from the wallet directly here.
+      expect(wallet.grant.mock.calls).toHaveLength(0);
+    });
+
+    it('does not ask for Pro credits outside a paid term', async () => {
+      stored = row({
+        billingInterval: BillingInterval.MONTHLY,
+        proStartedAt: iso('2026-04-01T00:00:00.000Z'),
+        proExpiresAt: iso('2026-05-01T00:00:00.000Z'),
+      });
 
       await service.getEligibility('user-1');
 
-      expect(wallet.grant.mock.calls[0]?.[0]).toMatchObject({
-        source: 'SUBSCRIPTION',
-        sourceReference:
-          'pro:2026-01-20T00:00:00.000Z:2026-05-20T00:00:00.000Z',
-        amount: 1000,
-        expiresAt: iso('2026-06-20T00:00:00.000Z'),
-      });
+      expect(allowances.grantCurrentPaidPeriod.mock.calls).toHaveLength(0);
     });
 
-    it('does not open a wallet transaction when the allowance was already granted', async () => {
+    it('does not grant the trial allowance again once it was received', async () => {
       stored = row({
-        billingInterval: BillingInterval.MONTHLY,
-        proStartedAt: iso('2026-06-01T00:00:00.000Z'),
-        proExpiresAt: iso('2026-07-01T00:00:00.000Z'),
+        trialUsed: true,
+        trialStartedAt: iso('2026-06-08T00:00:00.000Z'),
+        trialExpiresAt: iso('2026-06-15T00:00:00.000Z'),
       });
       wallet.hasGrant.mockResolvedValue(true);
 

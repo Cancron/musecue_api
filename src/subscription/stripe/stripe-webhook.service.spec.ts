@@ -594,6 +594,32 @@ describe('StripeWebhookService', () => {
       expect(paymentsOf(authId)).toHaveLength(2);
       expect(eventsOf(authId)).toEqual(['CREATED', 'RENEWED']);
       expect(recordOf(authId)).toEqual(afterFirst);
+      // Monthly Pro credits: once for the first payment, once for the
+      // renewal, never for the replays; each for its own payment.
+      expect(
+        credits.grantPaidPeriod.mock.calls.map(([client, input]) => [
+          client,
+          input.authId,
+          input.subscriptionId,
+          input.payment,
+        ]),
+      ).toEqual([
+        [
+          db,
+          authId,
+          afterFirst.id,
+          expect.objectContaining({ status: 'SUCCEEDED' }),
+        ],
+        [
+          db,
+          authId,
+          afterFirst.id,
+          expect.objectContaining({
+            providerPaymentId: invoiceId,
+            status: 'SUCCEEDED',
+          }),
+        ],
+      ]);
     });
 
     it('records a renewal once for concurrent deliveries', async () => {
@@ -809,6 +835,8 @@ describe('StripeWebhookService', () => {
 
       expect(paymentsOf(authId)).toHaveLength(2);
       expect(recordOf(authId)).toEqual(before);
+      // No credits for the second charge (first payment and renewal only).
+      expect(credits.grantPaidPeriod.mock.calls).toHaveLength(2);
       expect(logger.logWithMetadata.mock.calls).toContainEqual([
         'error',
         expect.stringContaining('already paid period'),
@@ -943,6 +971,8 @@ describe('StripeWebhookService', () => {
           accessOf(authId, new Date(FIRST_EXPIRY.getTime() - 1)).hasProAccess,
         ).toBe(true);
         expect(accessOf(authId, FIRST_EXPIRY).hasProAccess).toBe(false);
+        // Credits for the first payment only; none for the failed renewal.
+        expect(credits.grantPaidPeriod.mock.calls).toHaveLength(1);
       });
 
       it('records every failed retry once and keeps the first past-due time', async () => {
@@ -1210,6 +1240,7 @@ describe('StripeWebhookService', () => {
         expect(accessOf(authId).hasProAccess).toBe(false);
         // The customer can still pay in the same checkout.
         expect(checkoutRow(checkoutId)?.status).toBe('OPEN');
+        expect(credits.grantPaidPeriod.mock.calls).toHaveLength(0);
       });
 
       it('activates once when the customer then pays in the same checkout', async () => {
