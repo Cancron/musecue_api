@@ -4,8 +4,14 @@ import {
   Injectable,
   UnauthorizedException,
 } from '@nestjs/common';
+import { Reflector } from '@nestjs/core';
 import type { Request } from 'express';
 import AppError from '../common/errors/app.error';
+import {
+  CreditEligibilityService,
+  type CreditEligibility,
+} from './credit-eligibility.service';
+import { REQUIRE_CREDITS_KEY } from './require-credits.decorator';
 import type { SubscriptionAccess } from './subscription-access.policy';
 import { SubscriptionAccessService } from './subscription-access.service';
 
@@ -16,23 +22,45 @@ export interface ProAccessRequest extends Request {
   proAccess: SubscriptionAccess;
 }
 
+/** A request that has passed ProAccessGuard on a `@RequireCredits()` handler. */
+export interface CreditAccessRequest extends ProAccessRequest {
+  /** The credit decision made for this request; do not re-derive it. */
+  creditAccess: CreditEligibility;
+}
+
 export const PRO_ACCESS_REQUIRED_MESSAGE =
   'An active Pro subscription or free trial is required';
+
+export const INSUFFICIENT_CREDITS_MESSAGE = 'Insufficient credits';
 
 /**
  * Protects Pro feature endpoints. Use after AuthGuard:
  *
  *   @UseGuards(AuthGuard, ProAccessGuard)
  *
- * The decision is made by SubscriptionAccessService (the free trial and a
- * paid Pro term unlock the same features, each within its own date window),
- * so no feature service decides Pro access on its own. The guard fails closed:
- * a request without an authenticated user is rejected, and lookup errors are
- * not turned into access.
+ * Two modes, chosen per handler:
+ *
+ * - Credit eligibility (handlers marked `@RequireCredits()`, currently only
+ *   POST /v1/sessions): the request passes if the user has usable credits,
+ *   otherwise 403 "Insufficient credits". Due trial and monthly Pro
+ *   allowances are granted first. Purchased and referral credits count with
+ *   or without Pro; trial and subscription credits only while that trial or
+ *   paid term is active (CreditEligibilityService).
+ * - Pro access (every other handler using the guard): the request passes
+ *   during an active trial or paid term, otherwise 403 "An active Pro
+ *   subscription or free trial is required" (SubscriptionAccessService).
+ *
+ * Endpoints without the guard are not restricted by it. The guard fails
+ * closed: a request without an authenticated user is rejected, and lookup
+ * errors are not turned into access.
  */
 @Injectable()
 export class ProAccessGuard implements CanActivate {
-  constructor(private readonly access: SubscriptionAccessService) {}
+  constructor(
+    private readonly access: SubscriptionAccessService,
+    private readonly credits: CreditEligibilityService,
+    private readonly reflector: Reflector,
+  ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const request = context
@@ -41,6 +69,21 @@ export class ProAccessGuard implements CanActivate {
     const userId = request.user?.userId;
     if (typeof userId !== 'string' || userId.length === 0) {
       throw new UnauthorizedException('Authentication required');
+    }
+
+    const requireCredits = this.reflector.getAllAndOverride<
+      boolean | undefined
+    >(REQUIRE_CREDITS_KEY, [context.getHandler(), context.getClass()]);
+    if (requireCredits === true) {
+      const eligibility = await this.credits.getEligibility(userId);
+      if (!eligibility.eligible) {
+        throw AppError.forbidden(INSUFFICIENT_CREDITS_MESSAGE);
+      }
+      Object.assign(request, {
+        proAccess: eligibility.proAccess,
+        creditAccess: eligibility,
+      });
+      return true;
     }
 
     const decision = await this.access.getAccess(userId);

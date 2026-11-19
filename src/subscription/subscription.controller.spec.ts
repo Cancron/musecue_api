@@ -25,10 +25,18 @@ import { SubscriptionModule } from './subscription.module';
 const tokenVersions = mock<TokenVersionCache>();
 const trials = mock<SubscriptionTrialService>();
 
+// SubscriptionModule imports CreditsModule, which stores the default credit
+// settings at startup (insert unless present).
+const prismaWithSeededCredits = () => {
+  const prisma = mockDeep<PrismaService>();
+  prisma.creditSettings.createMany.mockResolvedValue({ count: 0 });
+  return prisma;
+};
+
 @Global()
 @Module({
   providers: [
-    { provide: PrismaService, useValue: mockDeep<PrismaService>() },
+    { provide: PrismaService, useValue: prismaWithSeededCredits() },
     { provide: CustomLoggerService, useValue: mock<CustomLoggerService>() },
     { provide: TokenVersionCache, useValue: tokenVersions },
   ],

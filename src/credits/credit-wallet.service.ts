@@ -114,7 +114,7 @@ export class CreditWalletService {
           existing.amount.eq(amount) &&
           (existing.expiresAt?.getTime() ?? null) ===
             (expiresAt?.getTime() ?? null);
-        if (!same) {
+        if (!same && !input.keepExistingGrant) {
           throw new CreditConflictError(
             'These credits were already granted with a different amount or expiration',
           );
@@ -377,10 +377,12 @@ export class CreditWalletService {
   }
 
   /**
-   * Records expirations for up to `limit` wallets that have expired credits.
-   * Safe to run concurrently and repeatedly (for a future scheduled sweep):
-   * every expiration is written once, under the wallet's lock. Balances
-   * never depend on it, because reads exclude expired credits anyway.
+   * Records expirations for up to `limit` wallets that have expired credits,
+   * oldest expiry first, whether or not the wallet is otherwise active. Safe
+   * to run concurrently and repeatedly (CreditExpirationSweepService runs it
+   * periodically): every expiration is written once, under the wallet's lock.
+   * A wallet that fails is counted and skipped; it is retried next time.
+   * Balances never depend on it, because reads exclude expired credits.
    */
   async expireDueCredits(
     options: { limit?: number } = {},
@@ -390,13 +392,37 @@ export class CreditWalletService {
       where: { remaining: { gt: 0 }, expiresAt: { lte: new Date() } },
       select: { authId: true },
       distinct: ['authId'],
+      orderBy: { expiresAt: 'asc' },
       take: limit,
     });
-    let expirations = 0;
+    const result: ExpireDueCreditsResult = {
+      wallets: due.length,
+      expirations: 0,
+      failed: 0,
+    };
     for (const { authId } of due) {
-      expirations += await this.expireCredits(authId);
+      try {
+        result.expirations += await this.expireCredits(authId);
+      } catch {
+        // For example, the account was deleted meanwhile (its credits went
+        // with it). Other wallets are still processed.
+        result.failed += 1;
+      }
     }
-    return { wallets: due.length, expirations };
+    return result;
+  }
+
+  /** Whether the user already received credits for this source event. */
+  async hasGrant(
+    authId: string,
+    source: CreditSource,
+    sourceReference: string,
+  ): Promise<boolean> {
+    const found = await this.prisma.creditAllocation.findFirst({
+      where: { authId, source, sourceReference },
+      select: { id: true },
+    });
+    return found !== null;
   }
 
   /**

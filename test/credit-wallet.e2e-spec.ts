@@ -4,6 +4,7 @@ import { mock } from 'jest-mock-extended';
 import { ActivityLogService } from '../src/common/services/activity-log.service';
 import type { CustomLoggerService } from '../src/common/services/custom-logger.service';
 import type { PrismaService } from '../src/common/services/prisma.service';
+import { CreditExpirationSweepService } from '../src/credits/credit-expiration-sweep.service';
 import { CreditSettingsService } from '../src/credits/credit-settings.service';
 import {
   CreditConflictError,
@@ -660,6 +661,86 @@ describeWithDatabase('Credit wallet and ledger (PostgreSQL)', () => {
         ['DEBIT', '-21', '4'],
       ]);
       await expectConsistentLedger(userId);
+    });
+
+    it('records expirations in the history of wallets nobody uses any more (scheduled sweep)', async () => {
+      const sweeper = new CreditExpirationSweepService(
+        wallet,
+        mock<CustomLoggerService>(),
+      );
+      const t0 = new Date('2033-02-01T00:00:00.000Z');
+      freezeTime(t0);
+      const trialUser = await createUser(client);
+      const proUser = await createUser(client);
+      const trialEnds = new Date(t0.getTime() + 7 * DAY);
+      const monthEnds = new Date(t0.getTime() + 28 * DAY);
+      await wallet.grant({
+        authId: trialUser,
+        source: CreditSource.TRIAL,
+        sourceReference: 'trial',
+        amount: '50',
+        expiresAt: trialEnds,
+      });
+      await wallet.grant({
+        authId: proUser,
+        source: CreditSource.SUBSCRIPTION,
+        sourceReference: 'pro:2033-02',
+        amount: '1000',
+        expiresAt: monthEnds,
+      });
+      await wallet.grant({
+        authId: proUser,
+        source: CreditSource.PURCHASE,
+        sourceReference: 'pay_keep',
+        amount: '3.5',
+      });
+      await wallet.debit({
+        authId: proUser,
+        amount: '0.25',
+        idempotencyKey: 'u',
+      });
+      // From here on, neither wallet is used again.
+
+      freezeTime(new Date(t0.getTime() + 60 * DAY));
+      const result = await sweeper.sweep();
+      expect(result?.expirations).toBeGreaterThanOrEqual(2);
+      // A second sweep finds nothing more for these wallets.
+      await sweeper.sweep();
+
+      const expirations = await client.creditTransaction.findMany({
+        where: { authId: { in: [trialUser, proUser] }, type: 'EXPIRATION' },
+        orderBy: { sequence: 'asc' },
+      });
+      expect(
+        expirations.map((t) => [
+          t.authId,
+          t.amount.toFixed(),
+          t.balanceAfter.toFixed(),
+          t.occurredAt.toISOString(),
+          t.description,
+        ]),
+      ).toEqual([
+        [
+          trialUser,
+          '-50',
+          '0',
+          trialEnds.toISOString(),
+          'TRIAL credits expired',
+        ],
+        [
+          proUser,
+          '-999.75',
+          '3.5',
+          monthEnds.toISOString(),
+          'SUBSCRIPTION credits expired',
+        ],
+      ]);
+      // Purchased credits never expire; the traced history is consistent.
+      await expect(wallet.getBalance(proUser)).resolves.toMatchObject({
+        available: '3.5',
+      });
+      await expectConsistentLedger(trialUser);
+      await expectConsistentLedger(proUser);
     });
 
     it('recognizes a retried grant after its credits have expired', async () => {

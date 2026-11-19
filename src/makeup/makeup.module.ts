@@ -5,6 +5,7 @@ import { QueueModule } from '../common/modules';
 import { MAKEUP_AI_QUEUE } from '../infrastructure/jobs/job-queues';
 import { registerJobHandler } from '../infrastructure/jobs/job-handler.registry';
 import { StorageModule } from '../storage/storage.module';
+import { SubscriptionModule } from '../subscription/subscription.module';
 import { MockAiGateway } from './ai/mock-ai.gateway';
 import { AI_GATEWAY, type AiGateway } from './ai/ai.gateway';
 import { LiveAiGateway } from './ai/live-ai.gateway';
@@ -18,7 +19,8 @@ import { ImageValidationService } from './services/image-validation.service';
 import { MakeupRecoveryService } from './queues/makeup-recovery.service';
 
 @Module({
-  imports: [QueueModule, StorageModule],
+  // SubscriptionModule: ProAccessGuard (credit eligibility for POST /v1/sessions).
+  imports: [QueueModule, StorageModule, SubscriptionModule],
   controllers: [MakeupController],
   providers: [
     MakeupService,

@@ -315,6 +315,36 @@ describe('CreditWalletService', () => {
       expectNothingWritten();
     });
 
+    it('keeps the existing grant for a repeat with other values when asked to (settings changed since)', async () => {
+      prisma.creditAllocation.findUnique.mockResolvedValue(
+        allocation({
+          id: 'alloc-trial',
+          source: CreditSource.TRIAL,
+          sourceReference: 'trial:1',
+          amount: D(50),
+          expiresAt: later(HOUR),
+        }),
+      );
+      prisma.creditTransaction.findUniqueOrThrow.mockResolvedValue(
+        storedTransaction({ type: CreditTransactionType.GRANT }) as never,
+      );
+
+      const result = await service.grant({
+        authId: 'user-1',
+        source: CreditSource.TRIAL,
+        sourceReference: 'trial:1',
+        amount: 75,
+        expiresAt: later(HOUR),
+        keepExistingGrant: true,
+      });
+
+      expect(result).toMatchObject({
+        replayed: true,
+        allocation: { id: 'alloc-trial', amount: '50' },
+      });
+      expectNothingWritten();
+    });
+
     it('grants trial credits only once per user', async () => {
       prisma.creditAllocation.findFirst.mockResolvedValue({
         id: 'trial-1',
@@ -604,6 +634,51 @@ describe('CreditWalletService', () => {
       expect(calls.indexOf('lock')).toBeLessThan(
         calls.indexOf('create-EXPIRATION'),
       );
+    });
+  });
+
+  describe('expireDueCredits', () => {
+    it('processes every due wallet, oldest expiry first, and skips wallets that fail', async () => {
+      prisma.creditAllocation.findMany.mockResolvedValueOnce([
+        { authId: 'gone' },
+        { authId: 'user-1' },
+      ] as never);
+      const expireCredits = jest
+        .spyOn(service, 'expireCredits')
+        .mockRejectedValueOnce(new CreditOwnerNotFoundError())
+        .mockResolvedValueOnce(2);
+
+      await expect(service.expireDueCredits({ limit: 10 })).resolves.toEqual({
+        wallets: 2,
+        expirations: 2,
+        failed: 1,
+      });
+      expect(prisma.creditAllocation.findMany.mock.calls[0]?.[0]).toEqual({
+        where: { remaining: { gt: 0 }, expiresAt: { lte: NOW } },
+        select: { authId: true },
+        distinct: ['authId'],
+        orderBy: { expiresAt: 'asc' },
+        take: 10,
+      });
+      expect(expireCredits.mock.calls).toEqual([['gone'], ['user-1']]);
+      expireCredits.mockRestore();
+    });
+  });
+
+  describe('hasGrant', () => {
+    it('looks up the source event for the user only', async () => {
+      prisma.creditAllocation.findFirst.mockResolvedValue(null);
+      await expect(
+        service.hasGrant('user-1', CreditSource.SUBSCRIPTION, 'pro:1'),
+      ).resolves.toBe(false);
+      expect(prisma.creditAllocation.findFirst.mock.calls[0]?.[0]).toEqual({
+        where: {
+          authId: 'user-1',
+          source: CreditSource.SUBSCRIPTION,
+          sourceReference: 'pro:1',
+        },
+        select: { id: true },
+      });
     });
   });
 

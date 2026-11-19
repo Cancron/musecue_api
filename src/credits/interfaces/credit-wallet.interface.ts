@@ -17,6 +17,13 @@ export interface GrantCreditsInput {
   /** Required for TRIAL and SUBSCRIPTION; must be omitted otherwise. */
   expiresAt?: Date | null;
   description?: string;
+  /**
+   * If this source event was already granted with a different amount or
+   * expiry, return the existing grant instead of rejecting the repeat. For
+   * allowances whose amount comes from settings that may change after the
+   * first grant. Never grants twice either way.
+   */
+  keepExistingGrant?: boolean;
 }
 
 export interface DebitCreditsInput {
@@ -83,6 +90,9 @@ export interface CreditBalanceView {
 }
 
 export interface ExpireDueCreditsResult {
+  /** Wallets with due expirations that were processed (or attempted). */
   wallets: number;
   expirations: number;
+  /** Wallets whose expirations could not be recorded; retried next time. */
+  failed: number;
 }

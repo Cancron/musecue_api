@@ -3,6 +3,8 @@ import Stripe from 'stripe';
 import { AuthGuard } from '../common/guards/auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { ActivityLogService } from '../common/services/activity-log.service';
+import { CreditsModule } from '../credits/credits.module';
+import { CreditEligibilityService } from './credit-eligibility.service';
 import { ProAccessGuard } from './pro-access.guard';
 import { SubscriptionAccessService } from './subscription-access.service';
 import { SubscriptionBillingService } from './subscription-billing.service';
@@ -23,6 +25,8 @@ import {
 import { STRIPE_CLIENT, StripeGateway } from './stripe/stripe.gateway';
 
 @Module({
+  // Credit wallet and settings: allowances and POST /v1/sessions eligibility.
+  imports: [CreditsModule],
   controllers: [
     SubscriptionPlanController,
     SubscriptionController,
@@ -33,6 +37,7 @@ import { STRIPE_CLIENT, StripeGateway } from './stripe/stripe.gateway';
     SubscriptionAccessService,
     SubscriptionBillingService,
     SubscriptionTrialService,
+    CreditEligibilityService,
     ActivityLogService,
     AuthGuard,
     RolesGuard,
@@ -61,7 +66,12 @@ import { STRIPE_CLIENT, StripeGateway } from './stripe/stripe.gateway';
     StripeWebhookService,
   ],
   // Modules with Pro feature endpoints import SubscriptionModule and use
-  // @UseGuards(AuthGuard, ProAccessGuard).
-  exports: [SubscriptionAccessService, ProAccessGuard],
+  // @UseGuards(AuthGuard, ProAccessGuard), adding @RequireCredits() where
+  // credits (rather than Pro) are required.
+  exports: [
+    SubscriptionAccessService,
+    CreditEligibilityService,
+    ProAccessGuard,
+  ],
 })
 export class SubscriptionModule {}

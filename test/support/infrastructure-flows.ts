@@ -17,6 +17,7 @@ import { TransformInterceptor } from '../../src/common/interceptors/transform.in
 import { EmailService } from '../../src/common/services/email.service';
 import { PrismaService } from '../../src/common/services/prisma.service';
 import { AccountDeletionRecoveryService } from '../../src/privacy/account-deletion/account-deletion-recovery.service';
+import { givenCreditsInPostgres } from './credit-fixtures';
 import {
   TEST_DATABASE_URL,
   applyMigrations,
@@ -401,6 +402,9 @@ export async function makeupFlow(
     );
   const runIds: string[] = [];
 
+  // Creating a session requires credits; free sign-ups have none. Purchased
+  // credits are set up directly in PostgreSQL (not issued by the API yet).
+  await givenCreditsInPostgres(ctx.client, user.id, 'PURCHASE', '100');
   const session = data<{ id: string }>(
     await http().post('/v1/sessions').set('Authorization', auth).expect(201),
   );

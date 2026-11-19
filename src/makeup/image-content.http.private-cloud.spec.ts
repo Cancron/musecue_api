@@ -23,6 +23,7 @@ import type { SupabaseStorageConfig } from '../storage/private-storage.config';
 import { SupabaseStorageProvider } from '../storage/providers/supabase-storage.provider';
 import { AI_GATEWAY, type AiGateway } from './ai/ai.gateway';
 import { MakeupController } from './makeup.controller';
+import { ProAccessGuard } from '../subscription/pro-access.guard';
 import { MakeupService } from './makeup.service';
 import { MakeupQueueService } from './queues/makeup.queue';
 import { ImageValidationService } from './services/image-validation.service';
@@ -187,7 +188,11 @@ describe('GET /v1/images/:imageId/content (HTTP, mocked providers)', () => {
         },
         { provide: AI_GATEWAY, useValue: mock<AiGateway>() },
       ],
-    }).compile();
+    })
+      // POST /v1/sessions' credit check is not under test here.
+      .overrideGuard(ProAccessGuard)
+      .useValue({ canActivate: () => true })
+      .compile();
     app = moduleRef.createNestApplication();
     // Same CORS setup as main.ts, so header interplay is tested for real.
     app.enableCors(createCorsOptions(CORS_ORIGINS));

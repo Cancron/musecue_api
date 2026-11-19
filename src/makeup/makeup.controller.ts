@@ -23,6 +23,8 @@ import type { Response } from 'express';
 import { memoryStorage } from 'multer';
 import { THROTTLER_CONFIG } from '../common/config/throttler.config';
 import { AuthGuard } from '../common/guards/auth.guard';
+import { ProAccessGuard } from '../subscription/pro-access.guard';
+import { RequireCredits } from '../subscription/require-credits.decorator';
 import {
   AskQuestionDto,
   CompleteStepDto,
@@ -62,7 +64,10 @@ function setPrivateNoStoreHeaders(response: Response): void {
 export class MakeupController {
   constructor(private readonly makeup: MakeupService) {}
 
+  /** Requires usable credits (403 "Insufficient credits" otherwise). */
   @Post('sessions')
+  @UseGuards(ProAccessGuard)
+  @RequireCredits()
   createSession(@Req() req: AuthenticatedRequest) {
     return this.makeup.createSession(req.user.userId);
   }
