@@ -3,7 +3,7 @@
 // the mode that matters; HTTP contracts are the same with Redis.
 import './support/env-postgres-mode';
 import request from 'supertest';
-import { decryptMfaSecret } from '../src/auth/mfa/mfa-secret.cipher';
+import { MfaSecretCipher } from '../src/auth/mfa/mfa-secret.cipher';
 import { totpCode, totpStep } from '../src/auth/mfa/mfa-totp';
 import type {
   MfaEnrollmentStartView,
@@ -119,9 +119,10 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
       new Date(kit.clock.getTime() + 10 * MIN),
     );
     // The pending secret is encrypted and bound to this user.
-    expect(pending!.secret).toMatch(/^v1\./);
     expect(pending!.secret).not.toContain(started.secret);
-    expect(decryptMfaSecret('enrollment', user.id, pending!.secret!)).toBe(
+    const cipher = ctx.get<MfaSecretCipher>(MfaSecretCipher);
+    expect(pending!.secret).toMatch(/^mfa2\./);
+    expect(cipher.decrypt('enrollment', user.id, pending!.secret!)).toBe(
       started.secret,
     );
     expect(dataOf<MfaStatusView>(await getStatus(user)).enrollment).toEqual({
@@ -152,13 +153,15 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
       mfaMethod: 'totp',
       mfaLastUsedStep: totpStep(kit.clock),
     });
-    expect(security.mfaSecret).toMatch(/^v1\.[\w-]+\.[\w-]+\.[\w-]+$/);
+    expect(security.mfaSecret).toMatch(
+      /^mfa2\.[0-9a-f]{16}\.[\w-]+\.[\w-]+\.[\w-]+$/,
+    );
     const raw = security.mfaSecret!;
     expect(raw).not.toContain(started.secret);
     expect(raw.toLowerCase()).not.toContain(started.secret.toLowerCase());
-    expect(decryptMfaSecret('confirmed', user.id, raw)).toBe(started.secret);
+    expect(cipher.decrypt('confirmed', user.id, raw)).toBe(started.secret);
     // Bound to this account: it cannot be decrypted for any other.
-    expect(() => decryptMfaSecret('confirmed', 'someone-else', raw)).toThrow();
+    expect(() => cipher.decrypt('confirmed', 'someone-else', raw)).toThrow();
     // No plaintext copy is left in the enrollment table.
     expect(await enrollmentOf(user)).toBeNull();
     // Checked at the SQL level too: no column of the user's MFA rows holds

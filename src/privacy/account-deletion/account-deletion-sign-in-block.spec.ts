@@ -15,6 +15,7 @@ import type { EmailQueueService } from '../../common/queues/email/email.queue';
 import type { ActivityLogService } from '../../common/services/activity-log.service';
 import type { CustomLoggerService } from '../../common/services/custom-logger.service';
 import type { OAuthStateRepository } from '../../auth/state/oauth-state.repository';
+import { mfaNotRequired } from '../../../test/support/mfa-not-required';
 
 const PASSWORD = 'correct horse battery staple';
 const META = { ip: '203.0.113.1', userAgent: 'spec' };
@@ -55,6 +56,7 @@ describe('Accounts pending deletion cannot sign in again (privacy)', () => {
       new FakeTokenVersionCache(),
       mock<EmailQueueService>(),
       mock<CustomLoggerService>(),
+      mfaNotRequired(),
     );
   });
 
@@ -73,7 +75,10 @@ describe('Accounts pending deletion cannot sign in again (privacy)', () => {
       META,
     );
 
-    expect(session.accessToken).toEqual(expect.any(String));
+    expect(session).toMatchObject({
+      mfaRequired: false,
+      accessToken: expect.any(String) as string,
+    });
   });
 
   it('refuses a password login with the generic invalid-credentials error', async () => {
@@ -122,6 +127,7 @@ describe('Accounts pending deletion cannot sign in again (privacy)', () => {
       store.prisma,
       mock<ActivityLogService>(),
       utils,
+      mfaNotRequired(),
     );
     const createAccessToken = jest.spyOn(utils, 'createAccessToken');
     const findOrCreateUser = (

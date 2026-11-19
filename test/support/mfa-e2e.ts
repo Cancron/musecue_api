@@ -2,6 +2,7 @@ import * as bcrypt from 'bcryptjs';
 import { randomBytes } from 'node:crypto';
 import request from 'supertest';
 import { totpCode } from '../../src/auth/mfa/mfa-totp';
+import { MFA_LOGIN } from '../../src/auth/mfa/mfa.constants';
 import type { TestApplication } from './infrastructure-flows';
 
 /**
@@ -33,6 +34,10 @@ export interface TestUser {
   email: string;
   ip: string;
   accessToken: string;
+  /** Known once MFA was enabled through enableMfa(). */
+  totpSecret?: string;
+  /** Sent as X-MFA-Trusted-Device on sign-in when set. */
+  trustedDeviceToken?: string;
 }
 
 export class MfaTestKit {
@@ -91,14 +96,45 @@ export class MfaTestKit {
     return testUser;
   }
 
-  /** (Re-)signs in at the current time: access tokens live 15 minutes. */
+  /** POST /auth/login with the user's password (and trusted device). */
+  login(user: TestUser) {
+    const req = this.http().post('/auth/login').set('X-Forwarded-For', user.ip);
+    if (user.trustedDeviceToken) {
+      req.set(MFA_LOGIN.TRUSTED_DEVICE_HEADER, user.trustedDeviceToken);
+    }
+    return req.send({ email: user.email, password: PASSWORD });
+  }
+
+  /**
+   * (Re-)signs in at the current time (access tokens live 15 minutes), like
+   * the app: password, then, for a user with MFA enabled, the challenge
+   * with the authenticator's code. The clock moves to the next 30-second
+   * step first, so the code was never used before.
+   */
   async signIn(user: TestUser) {
-    const response = await this.http()
-      .post('/auth/login')
+    const response = await this.login(user).expect(201);
+    const body = dataOf<{
+      mfaRequired: boolean;
+      accessToken?: string;
+      challengeToken?: string;
+    }>(response);
+    if (!body.mfaRequired) {
+      user.accessToken = body.accessToken as string;
+      return;
+    }
+    if (!user.totpSecret) {
+      throw new Error('MFA challenge for a user whose secret is unknown');
+    }
+    this.nextStepStart();
+    const completed = await this.http()
+      .post('/auth/login/mfa')
       .set('X-Forwarded-For', user.ip)
-      .send({ email: user.email, password: PASSWORD })
-      .expect(201);
-    user.accessToken = dataOf<{ accessToken: string }>(response).accessToken;
+      .send({
+        challengeToken: body.challengeToken,
+        code: totpCode(user.totpSecret, this.clock),
+      })
+      .expect(200);
+    user.accessToken = dataOf<{ accessToken: string }>(completed).accessToken;
   }
 
   as(user: TestUser) {
@@ -146,6 +182,7 @@ export class MfaTestKit {
       user,
       totpCode(started.secret, this.clock),
     ).expect(200);
+    user.totpSecret = started.secret;
     return {
       secret: started.secret,
       response,

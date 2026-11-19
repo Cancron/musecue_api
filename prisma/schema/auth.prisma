@@ -33,6 +33,8 @@ model authUser {
   infrastructureJobs InfrastructureJob[]
   mfaEnrollment      MfaEnrollment?
   mfaRecoveryCodes   MfaRecoveryCode[]
+  mfaLoginChallenges MfaLoginChallenge[]
+  mfaTrustedDevices  MfaTrustedDevice[]
 
   @@index([email, id, providerId])
   @@index([username])
@@ -50,8 +52,9 @@ model authSecurity {
   lockExpiresAt       DateTime?
   mfaEnabled          Boolean    @default(false)
   mfaMethod           mfaMethod?
-  // Confirmed TOTP secret, encrypted with AES-256-GCM and bound to the user
-  // (never stored in plaintext). Set only when MFA is enabled.
+  // Confirmed TOTP secret, encrypted with AES-256-GCM under the dedicated
+  // MFA_ENCRYPTION_KEY and bound to the user (never stored in plaintext, never
+  // dependent on a JWT secret). Set only when MFA is enabled.
   mfaSecret           String?
   // TOTP time step (Unix time / 30 s) of the last accepted authenticator
   // code: a code of this or an earlier step is never accepted again.
@@ -104,19 +107,78 @@ model MfaEnrollment {
 // One single-use recovery code of a user with MFA enabled, usable instead of
 // an authenticator code. Ten are issued when MFA is enabled (and when the
 // user regenerates them, which deletes all previous ones). The code itself is
-// shown once and never stored: `codeHash` is an HMAC-SHA-256 under a server
-// key, bound to the user, so another user's code never matches. `usedAt`
-// records the consumption; a database trigger makes a used code permanent.
+// shown once and never stored: `codeHash` is a salted scrypt hash (one-way,
+// no key involved) bound to the user, so another user's code never matches.
+// `usedAt` records the consumption; a database trigger makes a used code
+// permanent.
 model MfaRecoveryCode {
   id        String    @id @default(uuid())
   authId    String
-  codeHash  String    @unique @db.Char(64)
+  codeHash  String
   usedAt    DateTime?
   createdAt DateTime  @default(now())
 
   authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
 
   @@index([authId, usedAt])
+}
+
+// ================================
+// MFA Login Challenge Model
+// ================================
+
+// The second step of a sign-in of a user with MFA enabled: after the password
+// (or Google) step succeeds, the client receives an opaque challenge token
+// instead of access and refresh tokens, and exchanges it, together with an
+// authenticator or recovery code, at POST /auth/login/mfa. Only the SHA-256
+// of the token is stored. A challenge expires after five minutes and is
+// consumed by the first successful verification; it never authorizes
+// anything else.
+model MfaLoginChallenge {
+  id         String    @id @default(uuid())
+  authId     String
+  tokenHash  String    @unique @db.Char(64)
+  // The first factor that passed: local (password) or google.
+  provider   String    @db.VarChar(32)
+  ipAddress  String?
+  userAgent  String?
+  device     String?
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
+
+  @@index([authId])
+  @@index([expiresAt])
+}
+
+// ================================
+// MFA Trusted Device Model
+// ================================
+
+// A device the user chose to trust after completing MFA: for 30 days, a
+// sign-in from it that presents its token (X-MFA-Trusted-Device) skips the
+// MFA challenge. Only the SHA-256 of the token is stored. A device only ever
+// counts for its own user, and stops counting when it expires or is revoked
+// (a database trigger keeps owner, token and expiry unchangeable and a
+// revocation permanent).
+model MfaTrustedDevice {
+  id         String    @id @default(uuid())
+  authId     String
+  tokenHash  String    @unique @db.Char(64)
+  name       String    @db.VarChar(100)
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime  @default(now())
+  lastUsedAt DateTime?
+  expiresAt  DateTime
+  revokedAt  DateTime?
+
+  authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
+
+  @@index([authId, revokedAt, expiresAt])
+  @@index([expiresAt])
 }
 
 // ================================

@@ -22,6 +22,15 @@ import { MfaController } from './mfa.controller';
 import type { MfaEnrollmentStartView, MfaStatusView } from './mfa.service';
 import { MfaService } from './mfa.service';
 import { MfaVerificationService } from './mfa-verification.service';
+import { MfaLoginService } from './mfa-login.service';
+import { MFA_KEYRING, MfaSecretCipher } from './mfa-secret.cipher';
+import { testKeyring } from '../../../test/support/mfa-test-keys';
+import { randomBytes } from 'node:crypto';
+
+// Recovery codes use salted scrypt (deliberately slow, ~50-80 ms each), so
+// tests that issue and verify many codes need more than the 5 s default
+// when run alongside other suites.
+jest.setTimeout(30_000);
 
 const ALICE = 'alice-id';
 const BOB = 'bob-id';
@@ -49,7 +58,8 @@ describe('MFA enrollment (HTTP)', () => {
 
   beforeAll(async () => {
     config.jwt_access_secret = 'mfa-http-spec-access-secret-0123456789abcdef';
-    config.jwt_refresh_secret = 'mfa-http-spec-refresh-secret-0123456789abcd';
+    // MFA must not depend on the JWT refresh secret: run without one.
+    config.jwt_refresh_secret = '';
     const tokenVersions = mock<TokenVersionCache>();
     tokenVersions.get.mockImplementation((userId) =>
       Promise.resolve(versions.get(userId) ?? null),
@@ -61,6 +71,9 @@ describe('MFA enrollment (HTTP)', () => {
       providers: [
         MfaService,
         MfaVerificationService,
+        MfaLoginService,
+        MfaSecretCipher,
+        { provide: MFA_KEYRING, useValue: testKeyring(randomBytes(32)) },
         AuthGuard,
         { provide: MfaRepository, useValue: repo.asRepository() },
         { provide: TokenVersionCache, useValue: tokenVersions },

@@ -1,10 +1,13 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Header,
   HttpCode,
   HttpStatus,
+  Param,
+  ParseUUIDPipe,
   Post,
   Req,
   UseGuards,
@@ -17,7 +20,9 @@ import { AuthGuard } from '../../common/guards/auth.guard';
 import { EmptyBodyPipe } from '../../privacy/dto/privacy-export.dto';
 import { requestMetadata } from '../../subscription/request-metadata';
 import type { IAccessTokenPayload } from '../interfaces/auth.interface';
+import { MfaLoginService } from './mfa-login.service';
 import { MfaVerificationService } from './mfa-verification.service';
+import { MFA_LOGIN } from './mfa.constants';
 import {
   ConfirmMfaEnrollmentDto,
   MfaVerificationDto,
@@ -42,6 +47,7 @@ export class MfaController {
   constructor(
     private readonly mfa: MfaService,
     private readonly verification: MfaVerificationService,
+    private readonly login: MfaLoginService,
   ) {}
 
   /** Whether MFA is enabled, and the state of an enrollment in progress. */
@@ -124,5 +130,30 @@ export class MfaController {
       toMfaFactor(dto),
       requestMetadata(req),
     );
+  }
+
+  /**
+   * The devices trusted to skip MFA at sign-in (never their tokens). The
+   * device sending the request (its X-MFA-Trusted-Device header) is marked
+   * `current`.
+   */
+  @Get('trusted-devices')
+  @Header('Cache-Control', 'no-store')
+  listTrustedDevices(@Req() req: AuthenticatedRequest) {
+    const header = req.headers[MFA_LOGIN.TRUSTED_DEVICE_HEADER];
+    return this.login.listTrustedDevices(
+      req.user.userId,
+      typeof header === 'string' ? header : null,
+    );
+  }
+
+  /** Revokes one of the user's trusted devices (404 for any other). */
+  @Delete('trusted-devices/:deviceId')
+  @Throttle({ default: THROTTLER_CONFIG.STRICT })
+  revokeTrustedDevice(
+    @Param('deviceId', new ParseUUIDPipe()) deviceId: string,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    return this.login.revokeTrustedDevice(req.user.userId, deviceId);
   }
 }

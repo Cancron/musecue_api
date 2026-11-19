@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type {
   ActivityLogMetadata,
   FieldChange,
@@ -7,6 +8,8 @@ import type {
   MfaEnrollmentState,
   MfaRepository,
   MfaUnitOfWork,
+  TrustedDeviceInput,
+  TrustedDeviceView,
 } from '../../src/auth/mfa/mfa.repository';
 
 export interface FakeMfaAccount extends MfaAccountState {
@@ -17,8 +20,26 @@ export interface FakeMfaAccount extends MfaAccountState {
 }
 
 export interface FakeRecoveryCode {
+  id: string;
   codeHash: string;
   usedAt: Date | null;
+}
+
+export interface FakeLoginChallenge {
+  id: string;
+  authId: string;
+  tokenHash: string;
+  provider: string;
+  expiresAt: Date;
+  consumedAt: Date | null;
+  createdAt: Date;
+}
+
+export interface FakeTrustedDevice extends TrustedDeviceInput {
+  id: string;
+  authId: string;
+  lastUsedAt: Date | null;
+  revokedAt: Date | null;
 }
 
 export interface FakeMfaAudit {
@@ -35,20 +56,25 @@ const cloneAccount = (account: FakeMfaAccount): FakeMfaAccount => ({
   ...account,
   mfaFailedAttemptsAt: [...account.mfaFailedAttemptsAt],
 });
-const cloneCodes = (codes: FakeRecoveryCode[]) =>
-  codes.map((code) => ({ ...code }));
+const cloneAll = <T extends object>(items: T[]) =>
+  items.map((item) => ({ ...item }));
+
+const SCRYPT_HASH =
+  /^scrypt\$[0-9]{1,2}\$[0-9]{1,2}\$[0-9]\$[A-Za-z0-9_-]{22,}\$[A-Za-z0-9_-]{43}$/;
 
 /**
  * In-memory stand-in for MfaRepository with the same transaction semantics:
  * work on one user runs strictly one at a time (the advisory lock), and its
  * writes are committed only when the work resolves (a throw rolls everything
- * back). Mirrors the database rules that matter (hash format, a used
+ * back). Mirrors the database rules that matter (hash formats, a used
  * recovery code never changes, the CHECK constraints).
  */
 export class FakeMfaRepository {
   readonly accounts = new Map<string, FakeMfaAccount>();
   readonly enrollments = new Map<string, MfaEnrollmentState>();
   readonly recoveryCodes = new Map<string, FakeRecoveryCode[]>();
+  readonly challenges: FakeLoginChallenge[] = [];
+  readonly devices: FakeTrustedDevice[] = [];
   readonly audits: FakeMfaAudit[] = [];
   /** Set to make the next call fail like an unreachable database. */
   failWith: Error | null = null;
@@ -89,6 +115,79 @@ export class FakeMfaRepository {
     });
   }
 
+  // ---- Sign-in (outside the lock) ----
+
+  mfaEnabled(authId: string) {
+    this.throwIfFailing();
+    return Promise.resolve(this.accounts.get(authId)?.mfaEnabled ?? false);
+  }
+
+  createLoginChallenge(input: Omit<FakeLoginChallenge, 'id' | 'consumedAt'>) {
+    this.throwIfFailing();
+    this.challenges.push({ ...input, id: randomUUID(), consumedAt: null });
+    return Promise.resolve();
+  }
+
+  loginChallengeOwner(tokenHash: string) {
+    this.throwIfFailing();
+    return Promise.resolve(
+      this.challenges.find((c) => c.tokenHash === tokenHash)?.authId ?? null,
+    );
+  }
+
+  useTrustedDevice(authId: string, tokenHash: string, now: Date) {
+    this.throwIfFailing();
+    const device = this.devices.find(
+      (d) =>
+        d.authId === authId &&
+        d.tokenHash === tokenHash &&
+        !d.revokedAt &&
+        d.expiresAt.getTime() > now.getTime(),
+    );
+    if (!device) return Promise.resolve(null);
+    device.lastUsedAt = now;
+    return Promise.resolve({ id: device.id });
+  }
+
+  listTrustedDevices(authId: string, now: Date): Promise<TrustedDeviceView[]> {
+    return Promise.resolve(
+      this.devices
+        .filter(
+          (d) =>
+            d.authId === authId &&
+            !d.revokedAt &&
+            d.expiresAt.getTime() > now.getTime(),
+        )
+        .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+        .map((d) => ({
+          id: d.id,
+          name: d.name,
+          ipAddress: d.ipAddress,
+          createdAt: d.createdAt,
+          lastUsedAt: d.lastUsedAt,
+          expiresAt: d.expiresAt,
+        })),
+    );
+  }
+
+  trustedDeviceIdByToken(authId: string, tokenHash: string) {
+    return Promise.resolve(
+      this.devices.find((d) => d.authId === authId && d.tokenHash === tokenHash)
+        ?.id ?? null,
+    );
+  }
+
+  revokeTrustedDevice(authId: string, deviceId: string, now: Date) {
+    const device = this.devices.find(
+      (d) => d.id === deviceId && d.authId === authId,
+    );
+    if (!device) return Promise.resolve(false);
+    device.revokedAt ??= now;
+    return Promise.resolve(true);
+  }
+
+  // ---- Locked transactions ----
+
   withLock<T>(
     authId: string,
     work: (uow: MfaUnitOfWork) => Promise<T>,
@@ -112,7 +211,9 @@ export class FakeMfaRepository {
     let enrollment: MfaEnrollmentState | undefined = storedEnrollment
       ? cloneEnrollment(storedEnrollment)
       : undefined;
-    let codes = cloneCodes(this.recoveryCodes.get(authId) ?? []);
+    let codes = cloneAll(this.recoveryCodes.get(authId) ?? []);
+    const challenges = cloneAll(this.challenges);
+    const devices = cloneAll(this.devices);
     const audits: FakeMfaAudit[] = [];
     const reject = (message: string) => Promise.reject(new Error(message));
 
@@ -189,20 +290,32 @@ export class FakeMfaRepository {
         account = { ...account, mfaLastUsedStep: step };
         return Promise.resolve(true);
       },
-      consumeRecoveryCode: (codeHash, now) => {
-        const code = codes.find((c) => c.codeHash === codeHash && !c.usedAt);
+      unusedRecoveryCodes: () =>
+        Promise.resolve(
+          codes
+            .filter((c) => !c.usedAt)
+            .map(({ id, codeHash }) => ({ id, codeHash })),
+        ),
+      markRecoveryCodeUsed: (id, now) => {
+        const code = codes.find((c) => c.id === id && !c.usedAt);
         if (!code) return Promise.resolve(false);
         code.usedAt = now;
         return Promise.resolve(true);
       },
+      updateMfaSecret: (encryptedSecret) => {
+        if (!account) return reject('no account');
+        account = { ...account, mfaSecret: encryptedSecret };
+        return Promise.resolve();
+      },
       replaceRecoveryCodes: (codeHashes) => {
-        if (codeHashes.some((hash) => !/^[0-9a-f]{64}$/.test(hash))) {
+        if (codeHashes.some((hash) => !SCRYPT_HASH.test(hash))) {
           return reject('MfaRecoveryCode_codeHash_check');
         }
-        if (new Set(codeHashes).size !== codeHashes.length) {
-          return reject('MfaRecoveryCode_codeHash_key');
-        }
-        codes = codeHashes.map((codeHash) => ({ codeHash, usedAt: null }));
+        codes = codeHashes.map((codeHash) => ({
+          id: randomUUID(),
+          codeHash,
+          usedAt: null,
+        }));
         return Promise.resolve();
       },
       countRecoveryCodes: () =>
@@ -210,6 +323,56 @@ export class FakeMfaRepository {
       audit: (changes, metadata) => {
         audits.push({ authId, changes, metadata });
         return Promise.resolve();
+      },
+      loginChallenge: (tokenHash) => {
+        const c = challenges.find(
+          (x) => x.tokenHash === tokenHash && x.authId === authId,
+        );
+        return Promise.resolve(
+          c
+            ? {
+                id: c.id,
+                authId: c.authId,
+                provider: c.provider,
+                expiresAt: c.expiresAt,
+                consumedAt: c.consumedAt,
+              }
+            : null,
+        );
+      },
+      consumeLoginChallenge: (id, now) => {
+        const c = challenges.find(
+          (x) =>
+            x.id === id &&
+            x.authId === authId &&
+            !x.consumedAt &&
+            x.expiresAt.getTime() > now.getTime(),
+        );
+        if (!c) return Promise.resolve(false);
+        c.consumedAt = now;
+        return Promise.resolve(true);
+      },
+      createTrustedDevice: (input, maxActive) => {
+        const device: FakeTrustedDevice = {
+          ...input,
+          id: randomUUID(),
+          authId,
+          lastUsedAt: null,
+          revokedAt: null,
+        };
+        devices.push(device);
+        const active = devices
+          .filter(
+            (d) =>
+              d.authId === authId &&
+              !d.revokedAt &&
+              d.expiresAt.getTime() > input.createdAt.getTime(),
+          )
+          .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+        for (const surplus of active.slice(maxActive)) {
+          surplus.revokedAt = input.createdAt;
+        }
+        return Promise.resolve({ id: device.id });
       },
     };
 
@@ -219,6 +382,8 @@ export class FakeMfaRepository {
     if (enrollment) this.enrollments.set(authId, enrollment);
     else this.enrollments.delete(authId);
     this.recoveryCodes.set(authId, codes);
+    this.challenges.splice(0, this.challenges.length, ...challenges);
+    this.devices.splice(0, this.devices.length, ...devices);
     this.audits.push(...audits);
     return result;
   }

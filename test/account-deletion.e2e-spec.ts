@@ -26,6 +26,7 @@ import {
   dropSchema,
   migrationNames,
 } from './support/migrated-schema';
+import { mfaNotRequired } from './support/mfa-not-required';
 
 jest.setTimeout(60_000);
 
@@ -80,6 +81,7 @@ describeWithDatabase('Account deletion requests (PostgreSQL)', () => {
       new NoopTokenVersionCache(),
       mock<EmailQueueService>(),
       mock<CustomLoggerService>(),
+      mfaNotRequired(),
     );
     emailQueue.sendAccountDeletionCode.mockResolvedValue();
     deletions = new AccountDeletionService(

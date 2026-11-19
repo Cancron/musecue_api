@@ -51,3 +51,18 @@ export const MFA_AUDIT_FIELDS = {
   METHOD: 'mfaMethod',
   RECOVERY_CODES_REMAINING: 'mfaRecoveryCodesRemaining',
 } as const;
+
+/** MFA at sign-in. */
+export const MFA_LOGIN = {
+  /** A login challenge must be completed within 5 minutes. */
+  CHALLENGE_TTL_MS: 5 * 60_000,
+  /** A trusted device skips the challenge for 30 days (never extended). */
+  TRUSTED_DEVICE_TTL_MS: 30 * 24 * 60 * 60_000,
+  /** Active trusted devices per user; the oldest beyond it are revoked. */
+  MAX_TRUSTED_DEVICES: 10,
+  /** Header carrying a trusted-device token on sign-in requests. */
+  TRUSTED_DEVICE_HEADER: 'x-mfa-trusted-device',
+  /** Opaque token formats (prefix + 32 random bytes, base64url). */
+  CHALLENGE_TOKEN_PATTERN: /^mfac_[A-Za-z0-9_-]{43}$/,
+  TRUSTED_DEVICE_TOKEN_PATTERN: /^mfatd_[A-Za-z0-9_-]{43}$/,
+} as const;

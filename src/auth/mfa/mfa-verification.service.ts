@@ -10,11 +10,11 @@ import {
 } from './mfa-errors';
 import { activeBlock, registerFailure } from './mfa-lockout.policy';
 import {
-  hashRecoveryCode,
   issueRecoveryCodes,
   normalizeRecoveryCode,
+  verifyRecoveryCode,
 } from './mfa-recovery-codes';
-import { decryptMfaSecret } from './mfa-secret.cipher';
+import { MfaSecretCipher } from './mfa-secret.cipher';
 import { verifyTotp } from './mfa-totp';
 import { MFA_AUDIT_FIELDS } from './mfa.constants';
 import {
@@ -43,7 +43,7 @@ export interface MfaRecoveryCodesView {
   recoveryCodesRemaining: number;
 }
 
-type CheckOutcome =
+export type CheckOutcome =
   | { kind: 'VERIFIED'; method: MfaMethodUsed }
   | { kind: 'NOT_ENABLED' }
   | { kind: 'BLOCKED'; until: Date }
@@ -74,6 +74,7 @@ const CONTEXT = 'MfaVerificationService';
 export class MfaVerificationService {
   constructor(
     private readonly repository: MfaRepository,
+    private readonly cipher: MfaSecretCipher,
     @Inject(WINSTON_MODULE_PROVIDER) private readonly logger: Logger,
   ) {}
 
@@ -98,7 +99,7 @@ export class MfaVerificationService {
       }),
     );
     const { outcome } = result;
-    if (outcome.kind !== 'VERIFIED') throw this.declined(authId, outcome);
+    if (outcome.kind !== 'VERIFIED') throw this.declinedError(authId, outcome);
     this.logger.info('MFA verified', {
       context: CONTEXT,
       authId,
@@ -150,7 +151,7 @@ export class MfaVerificationService {
       }),
     );
     const { outcome } = result;
-    if (outcome.kind !== 'VERIFIED') throw this.declined(authId, outcome);
+    if (outcome.kind !== 'VERIFIED') throw this.declinedError(authId, outcome);
     this.logger.info('MFA recovery codes regenerated', {
       context: CONTEXT,
       authId,
@@ -163,10 +164,11 @@ export class MfaVerificationService {
   }
 
   /**
-   * Checks the factor under the user's lock. Outcomes are returned (not
-   * thrown) so a counted failure commits.
+   * Checks the factor under the user's lock (the caller's `withLock`
+   * transaction; also used by the MFA step of sign-in). Outcomes are
+   * returned (not thrown) so a counted failure commits.
    */
-  private async checkFactor(
+  async checkFactor(
     uow: MfaUnitOfWork,
     authId: string,
     factor: MfaFactor,
@@ -218,12 +220,20 @@ export class MfaVerificationService {
     if (!state.mfaSecret) {
       throw new Error('MFA is enabled without a stored secret');
     }
-    // A secret that cannot be decrypted (e.g. the key changed) throws and
-    // becomes a 503: it is not the user's mistake.
-    const secret = decryptMfaSecret('confirmed', authId, state.mfaSecret);
+    // A secret that cannot be decrypted (missing key, legacy format) throws
+    // and becomes a 503: it is not the user's mistake.
+    const secret = this.cipher.decrypt('confirmed', authId, state.mfaSecret);
     const check = verifyTotp(secret, code, now, state.mfaLastUsedStep);
     if (check.result !== 'VALID') return false;
-    return uow.recordTotpStep(check.step);
+    if (!(await uow.recordTotpStep(check.step))) return false;
+    // Completes a key rotation: secrets under a previous key move to the
+    // current one.
+    if (this.cipher.needsReencryption(state.mfaSecret)) {
+      await uow.updateMfaSecret(
+        this.cipher.encrypt('confirmed', authId, secret),
+      );
+    }
+    return true;
   }
 
   private async acceptRecoveryCode(
@@ -234,11 +244,18 @@ export class MfaVerificationService {
     metadata: ActivityLogMetadata,
   ): Promise<boolean> {
     if (!normalizeRecoveryCode(code)) return false;
-    const consumed = await uow.consumeRecoveryCode(
-      hashRecoveryCode(authId, code),
-      now,
+    // Compare with every unused code (no early exit), then consume the match
+    // with a conditional UPDATE: of concurrent uses exactly one wins.
+    const candidates = await uow.unusedRecoveryCodes();
+    const matches = await Promise.all(
+      candidates.map((candidate) =>
+        verifyRecoveryCode(authId, code, candidate.codeHash),
+      ),
     );
-    if (!consumed) return false;
+    const match = candidates.find((_, i) => matches[i]);
+    if (!match || !(await uow.markRecoveryCodeUsed(match.id, now))) {
+      return false;
+    }
     const remaining = await uow.countRecoveryCodes();
     await uow.audit(
       [
@@ -253,7 +270,8 @@ export class MfaVerificationService {
     return true;
   }
 
-  private declined(
+  /** The HTTP error of a declined check (400, 409 or 429). */
+  declinedError(
     authId: string,
     outcome: Exclude<CheckOutcome, { kind: 'VERIFIED' }>,
   ): AppError {

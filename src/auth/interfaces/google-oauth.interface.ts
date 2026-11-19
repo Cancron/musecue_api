@@ -36,6 +36,9 @@ export interface IGoogleOAuthState {
   state: string;
   codeVerifier: string; // For PKCE
   redirectUrl?: string; // Where to redirect after successful auth
+  // SHA-256 of the trusted-device token sent when the flow started (never
+  // the token itself): lets an MFA user's trusted device skip the challenge.
+  trustedDeviceTokenHash?: string;
   ip: string;
   userAgent: string;
   createdAt: string;
@@ -75,6 +78,7 @@ export interface IGoogleOAuthCallback {
  * Google OAuth Login Response
  */
 export interface IGoogleOAuthLoginResponse {
+  mfaRequired: false;
   accessToken: string;
   refreshToken: string;
   user: {
@@ -88,6 +92,19 @@ export interface IGoogleOAuthLoginResponse {
   };
   expiresIn: number;
   isNewUser: boolean;
+  redirectUrl?: string;
+}
+
+/**
+ * Google sign-in of a user with MFA enabled: no tokens yet, only the MFA
+ * challenge to complete at POST /auth/login/mfa.
+ */
+export interface IGoogleOAuthMfaChallengeResponse {
+  mfaRequired: true;
+  challengeToken: string;
+  expiresAt: Date;
+  methods: string[];
+  isNewUser: false;
   redirectUrl?: string;
 }
 

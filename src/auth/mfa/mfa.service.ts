@@ -4,7 +4,6 @@ import { WINSTON_MODULE_PROVIDER } from 'nest-winston';
 import type { Logger } from 'winston';
 import AppError from '../../common/errors/app.error';
 import type { ActivityLogMetadata } from '../../common/services/activity-log.service';
-import { SecretDecryptionError } from '../../common/security/derived-secrets';
 import {
   activeBlock,
   recentFailures,
@@ -22,7 +21,7 @@ import {
   type MfaAccountState,
   type MfaEnrollmentState,
 } from './mfa.repository';
-import { decryptMfaSecret, encryptMfaSecret } from './mfa-secret.cipher';
+import { MfaSecretCipher, MfaSecretDecryptionError } from './mfa-secret.cipher';
 import { buildOtpAuthUri, generateTotpSecret, verifyTotp } from './mfa-totp';
 import { MFA_ENROLLMENT, MFA_TOTP } from './mfa.constants';
 
@@ -102,6 +101,7 @@ const CONTEXT = 'MfaService';
 export class MfaService {
   constructor(
     private readonly repository: MfaRepository,
+    private readonly cipher: MfaSecretCipher,
     @Inject(WINSTON_MODULE_PROVIDER) private readonly logger: Logger,
   ) {}
 
@@ -138,7 +138,7 @@ export class MfaService {
         // A restart replaces the secret and its expiry, but keeps the
         // failures that still count: restarting never resets the lockout.
         await uow.saveEnrollment({
-          secret: encryptMfaSecret('enrollment', authId, secret),
+          secret: this.cipher.encrypt('enrollment', authId, secret),
           expiresAt,
           failedAttemptsAt: recentFailures(
             enrollment?.failedAttemptsAt ?? [],
@@ -209,9 +209,11 @@ export class MfaService {
 
         let secret: string;
         try {
-          secret = decryptMfaSecret('enrollment', authId, enrollment.secret);
+          secret = this.cipher.decrypt('enrollment', authId, enrollment.secret);
         } catch (error) {
-          if (!(error instanceof SecretDecryptionError)) throw error;
+          // A missing key is an outage (503); an unreadable secret (e.g. a
+          // key that was removed) means the user starts again.
+          if (!(error instanceof MfaSecretDecryptionError)) throw error;
           // Unreadable (e.g. the key changed): the user starts again.
           this.logger.warn('Pending MFA secret could not be decrypted', {
             context: CONTEXT,
@@ -249,12 +251,12 @@ export class MfaService {
         // The confirmed secret is re-encrypted for its new role; the
         // enrollment (with its pending copy) is removed in the same commit.
         await uow.enableMfa({
-          encryptedSecret: encryptMfaSecret('confirmed', authId, secret),
+          encryptedSecret: this.cipher.encrypt('confirmed', authId, secret),
           usedStep: check.step,
           metadata: { ...metadata, actionedBy: authId },
         });
         await uow.deleteEnrollment();
-        // Ten single-use recovery codes, stored only as keyed hashes, in the
+        // Ten single-use recovery codes, stored only as salted scrypt hashes, in the
         // same commit; the plaintext leaves only in this response.
         const recoveryCodes = await issueRecoveryCodes(uow, authId);
         return { kind: 'ENABLED', recoveryCodes };

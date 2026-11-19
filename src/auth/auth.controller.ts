@@ -1,6 +1,9 @@
 import {
   Controller,
   Get,
+  Header,
+  HttpCode,
+  HttpStatus,
   Post,
   Body,
   Req,
@@ -24,11 +27,19 @@ import { CustomLoggerService } from '../common/services/custom-logger.service';
 import { THROTTLER_CONFIG } from '../common/config/throttler.config';
 import { AuthGuard } from '../common/guards/auth.guard';
 import { LoginDto } from './dto/login.dto';
+import { MFA_LOGIN } from './mfa/mfa.constants';
+import { CompleteMfaLoginDto, toMfaFactor } from './mfa/mfa.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
 import {
   ResendVerificationEmailDto,
   VerifyEmailDto,
 } from './dto/verify-email.dto';
+
+/** The trusted-device token a client sends to skip MFA (or null). */
+function trustedDeviceHeader(req: Request): string | null {
+  const value = req.headers[MFA_LOGIN.TRUSTED_DEVICE_HEADER];
+  return typeof value === 'string' ? value : null;
+}
 
 interface AuthenticatedRequest extends Request {
   user: {
@@ -127,9 +138,12 @@ export class AuthController {
       userAgent: req.headers['user-agent'] || 'unknown',
     };
 
+    // A trusted-device header here lets the browser redirect flow (whose
+    // callback carries no app headers) skip MFA; only its hash is kept.
     const { url, state } = await this.googleOAuthService.getAuthorizationUrl(
       meta,
       query.redirectUrl,
+      trustedDeviceHeader(req),
     );
 
     return {
@@ -208,6 +222,29 @@ export class AuthController {
       meta,
     );
 
+    // MFA users: no tokens yet, only the challenge to complete at
+    // POST /auth/login/mfa.
+    if (result.mfaRequired) {
+      if (result.redirectUrl) {
+        const redirectUrl = new URL(result.redirectUrl);
+        redirectUrl.searchParams.set('mfa_required', 'true');
+        redirectUrl.searchParams.set(
+          'mfa_challenge_token',
+          result.challengeToken,
+        );
+        redirectUrl.searchParams.set(
+          'mfa_challenge_expires_at',
+          result.expiresAt.toISOString(),
+        );
+        return res.redirect(redirectUrl.toString());
+      }
+      return {
+        success: true,
+        message: 'MFA verification required',
+        data: result,
+      };
+    }
+
     // If redirectUrl is provided, redirect to it with tokens as query params
     if (result.redirectUrl) {
       const redirectUrl = new URL(result.redirectUrl);
@@ -263,7 +300,16 @@ export class AuthController {
       body.code,
       body.state,
       meta,
+      trustedDeviceHeader(req),
     );
+
+    if (result.mfaRequired) {
+      return {
+        success: true,
+        message: 'MFA verification required',
+        data: result,
+      };
+    }
 
     return {
       success: true,
@@ -305,7 +351,47 @@ export class AuthController {
           : req.headers['sec-ch-ua-platform']),
     };
 
-    return this.authService.login(payload, meta);
+    return this.authService.login(payload, meta, trustedDeviceHeader(req));
+  }
+
+  /**
+   * The MFA step of sign-in: the challenge token returned by login (or the
+   * Google callback) and the authenticator `code` or a `recoveryCode`.
+   * Returns the same tokens as a regular login; with `trustDevice: true`
+   * also a device token (shown once) that skips MFA for 30 days when sent
+   * as the X-MFA-Trusted-Device header.
+   */
+  @Throttle({ default: THROTTLER_CONFIG.STRICT })
+  @Post('login/mfa')
+  @HttpCode(HttpStatus.OK)
+  @Header('Cache-Control', 'no-store')
+  async completeMfaLogin(
+    @Body() payload: CompleteMfaLoginDto,
+    @Req() req: Request,
+  ) {
+    const meta = {
+      ip: req.ip || 'unknown',
+      userAgent: req.headers['user-agent'] || 'unknown',
+      device:
+        (Array.isArray(req.headers['x-device'])
+          ? req.headers['x-device'][0]
+          : req.headers['x-device']) ||
+        (Array.isArray(req.headers['x-device-id'])
+          ? req.headers['x-device-id'][0]
+          : req.headers['x-device-id']) ||
+        (Array.isArray(req.headers['sec-ch-ua-platform'])
+          ? req.headers['sec-ch-ua-platform'][0]
+          : req.headers['sec-ch-ua-platform']),
+    };
+    return this.authService.completeMfaLogin(
+      {
+        challengeToken: payload.challengeToken,
+        factor: toMfaFactor(payload),
+        trustDevice: payload.trustDevice ?? false,
+        deviceName: payload.deviceName,
+      },
+      meta,
+    );
   }
 
   /**

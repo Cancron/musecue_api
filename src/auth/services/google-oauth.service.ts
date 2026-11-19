@@ -23,6 +23,11 @@ import {
 } from '../interfaces/google-oauth.interface';
 import { UserRole } from '../interfaces/auth.interface';
 import AppError from '../../common/errors/app.error';
+import {
+  MfaLoginService,
+  trustedDeviceTokenHash,
+} from '../mfa/mfa-login.service';
+import type { IGoogleOAuthMfaChallengeResponse } from '../interfaces/google-oauth.interface';
 
 /* eslint-disable @typescript-eslint/no-unsafe-assignment */
 
@@ -42,6 +47,7 @@ export class GoogleOAuthService {
     private readonly prismaService: PrismaService,
     private readonly activityLogService: ActivityLogService,
     private readonly authUtilsService: AuthUtilsService,
+    private readonly mfaLogin: MfaLoginService,
   ) {
     // Initialize JWKS client for Google public key retrieval
     // Keys are cached and automatically rotated
@@ -182,6 +188,7 @@ export class GoogleOAuthService {
   async getAuthorizationUrl(
     meta: { ip: string; userAgent: string },
     redirectUrl?: string,
+    trustedDeviceToken?: string | null,
   ): Promise<{ url: string; state: string }> {
     const { clientId, redirectUri } = getGoogleOAuthCredentials();
 
@@ -195,6 +202,8 @@ export class GoogleOAuthService {
       state,
       codeVerifier,
       redirectUrl,
+      trustedDeviceTokenHash:
+        trustedDeviceTokenHash(trustedDeviceToken) ?? undefined,
       ip: meta.ip,
       userAgent: meta.userAgent,
       createdAt: new Date().toISOString(),
@@ -301,7 +310,8 @@ export class GoogleOAuthService {
     code: string,
     state: string,
     meta: { ip: string; userAgent: string; device?: string },
-  ): Promise<IGoogleOAuthLoginResponse> {
+    trustedDeviceToken?: string | null,
+  ): Promise<IGoogleOAuthLoginResponse | IGoogleOAuthMfaChallengeResponse> {
     const { ip, userAgent, device } = meta;
 
     // Validate and consume the state parameter (single-use, atomic)
@@ -377,11 +387,46 @@ export class GoogleOAuthService {
     }
 
     // Find or create user
-    const result = await this.findOrCreateUser(googleUser, {
+    const { user, isNewUser } = await this.findOrCreateUser(googleUser, {
       ip,
       userAgent,
       device,
     });
+
+    // Second factor: a user with MFA enabled gets a challenge instead of
+    // tokens, unless the device is one of their trusted devices (header of
+    // this request, or sent when the flow started).
+    const gate = await this.mfaLogin.gate({
+      authId: user.id,
+      provider: 'google',
+      meta: { ip, userAgent, device },
+      trustedDeviceToken,
+      trustedDeviceTokenHash: trustedDeviceToken
+        ? undefined
+        : stateData.trustedDeviceTokenHash,
+    });
+    if (gate.kind === 'CHALLENGE') {
+      void this.logLoginAttempt({
+        authId: user.id,
+        ip,
+        userAgent,
+        device,
+        success: false,
+        failureReason: 'mfa_required',
+        provider: 'google',
+      });
+      return {
+        ...gate.challenge,
+        isNewUser: false,
+        redirectUrl: stateData.redirectUrl,
+      };
+    }
+
+    const result = await this.generateTokensForUser(
+      user,
+      { ip, userAgent, device },
+      isNewUser,
+    );
 
     this.customLogger.log(
       `Google OAuth ${result.isNewUser ? 'sign-up' : 'sign-in'} successful for: ${googleUser.email}`,
@@ -401,7 +446,19 @@ export class GoogleOAuthService {
   private async findOrCreateUser(
     googleUser: IGoogleUserInfo,
     meta: { ip: string; userAgent: string; device?: string },
-  ): Promise<IGoogleOAuthLoginResponse> {
+  ): Promise<{
+    user: {
+      id: string;
+      email: string;
+      username: string;
+      role: string;
+      tokenVersion: number;
+      verified: boolean;
+      provider: string;
+      providerId: string | null;
+    };
+    isNewUser: boolean;
+  }> {
     const { ip, userAgent, device } = meta;
 
     // Check if user exists by provider ID (Google's sub)
@@ -538,12 +595,7 @@ export class GoogleOAuthService {
       }
     }
 
-    // Generate tokens
-    return this.generateTokensForUser(
-      user,
-      { ip, userAgent, device },
-      isNewUser,
-    );
+    return { user, isNewUser };
   }
 
   /**
@@ -603,6 +655,7 @@ export class GoogleOAuthService {
     });
 
     return {
+      mfaRequired: false,
       accessToken,
       refreshToken,
       user: {

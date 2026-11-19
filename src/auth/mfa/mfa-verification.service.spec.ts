@@ -3,13 +3,22 @@ import { mock } from 'jest-mock-extended';
 import type { Logger } from 'winston';
 import { FakeMfaRepository } from '../../../test/support/fake-mfa-repository';
 import config from '../../common/config/app.config';
-import { hashRecoveryCode } from './mfa-recovery-codes';
+import {
+  hashesMatchCodes,
+  testCipher,
+} from '../../../test/support/mfa-test-keys';
+import { verifyRecoveryCode } from './mfa-recovery-codes';
 import { totpCode, totpStep } from './mfa-totp';
 import {
   MfaVerificationService,
   type MfaFactor,
 } from './mfa-verification.service';
 import { MfaService } from './mfa.service';
+
+// Recovery codes use salted scrypt (deliberately slow, ~50-80 ms each), so
+// tests that issue and verify many codes need more than the 5 s default
+// when run alongside other suites.
+jest.setTimeout(30_000);
 
 const ALICE = 'alice';
 const BOB = 'bob';
@@ -43,7 +52,8 @@ describe('MfaVerificationService', () => {
   let service: MfaVerificationService;
 
   beforeAll(() => {
-    config.jwt_refresh_secret = 'mfa-verification-unit-test-secret-0123456';
+    // MFA must not depend on the JWT refresh secret: run without one.
+    config.jwt_refresh_secret = '';
   });
   afterAll(() => {
     config.jwt_refresh_secret = originalSecret;
@@ -54,8 +64,9 @@ describe('MfaVerificationService', () => {
     repo.addAccount(ALICE);
     repo.addAccount(BOB);
     logger = mock<Logger>();
-    enrollment = new MfaService(repo.asRepository(), logger);
-    service = new MfaVerificationService(repo.asRepository(), logger);
+    const cipher = testCipher();
+    enrollment = new MfaService(repo.asRepository(), cipher, logger);
+    service = new MfaVerificationService(repo.asRepository(), cipher, logger);
   });
 
   /** Enables MFA at T0 and returns the TOTP secret and recovery codes. */
@@ -85,12 +96,11 @@ describe('MfaVerificationService', () => {
 
       const stored = repo.recoveryCodes.get(ALICE)!;
       const used = stored.filter((c) => c.usedAt);
-      expect(used).toEqual([
-        {
-          codeHash: hashRecoveryCode(ALICE, recoveryCodes[3]),
-          usedAt: plus(MIN),
-        },
-      ]);
+      expect(used).toHaveLength(1);
+      expect(used[0].usedAt).toEqual(plus(MIN));
+      await expect(
+        verifyRecoveryCode(ALICE, recoveryCodes[3], used[0].codeHash),
+      ).resolves.toBe(true);
     });
 
     it('accepts the code typed in lower case or without the hyphen', async () => {
@@ -283,14 +293,13 @@ describe('MfaVerificationService', () => {
       expect(view.recoveryCodes).toHaveLength(10);
       expect(view.recoveryCodesRemaining).toBe(10);
       expect(view.recoveryCodes.some((code) => old.includes(code))).toBe(false);
-      expect(
-        repo.recoveryCodes
-          .get(ALICE)!
-          .map((c) => c.codeHash)
-          .sort(),
-      ).toEqual(
-        view.recoveryCodes.map((c) => hashRecoveryCode(ALICE, c)).sort(),
-      );
+      await expect(
+        hashesMatchCodes(
+          ALICE,
+          view.recoveryCodes,
+          repo.recoveryCodes.get(ALICE)!.map((c) => c.codeHash),
+        ),
+      ).resolves.toBe(true);
       // Previously unused codes are declined like any invalid code.
       for (const code of old.slice(1, 4)) {
         await expect(

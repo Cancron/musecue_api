@@ -33,6 +33,37 @@ export interface MfaVerificationState {
   blockedUntil: Date | null;
 }
 
+export interface StoredRecoveryCode {
+  id: string;
+  codeHash: string;
+}
+
+export interface StoredLoginChallenge {
+  id: string;
+  authId: string;
+  provider: string;
+  expiresAt: Date;
+  consumedAt: Date | null;
+}
+
+export interface TrustedDeviceInput {
+  tokenHash: string;
+  name: string;
+  ipAddress: string | null;
+  userAgent: string | null;
+  createdAt: Date;
+  expiresAt: Date;
+}
+
+export interface TrustedDeviceView {
+  id: string;
+  name: string;
+  ipAddress: string | null;
+  createdAt: Date;
+  lastUsedAt: Date | null;
+  expiresAt: Date;
+}
+
 /** Reads and writes of one user's MFA state inside a locked transaction. */
 export interface MfaUnitOfWork {
   account(): Promise<MfaAccountState | null>;
@@ -59,11 +90,27 @@ export interface MfaUnitOfWork {
    * a later one) was already used.
    */
   recordTotpStep(step: number): Promise<boolean>;
+  /** The user's unused recovery codes (hashes only). */
+  unusedRecoveryCodes(): Promise<StoredRecoveryCode[]>;
   /**
-   * Marks the user's unused code with this hash as used; false when there is
-   * none (wrong, already used, replaced, or another user's code).
+   * Marks one of the user's codes as used; false when it is not (or no
+   * longer) an unused code of this user.
    */
-  consumeRecoveryCode(codeHash: string, now: Date): Promise<boolean>;
+  markRecoveryCodeUsed(id: string, now: Date): Promise<boolean>;
+  /** Replaces the confirmed secret (re-encryption with the current key). */
+  updateMfaSecret(encryptedSecret: string): Promise<void>;
+  /** The user's login challenge with this token hash, if any. */
+  loginChallenge(tokenHash: string): Promise<StoredLoginChallenge | null>;
+  /** Consumes an unexpired, unconsumed challenge; false otherwise. */
+  consumeLoginChallenge(id: string, now: Date): Promise<boolean>;
+  /**
+   * Trusts a device for the user; the oldest active devices beyond
+   * `maxActive` are revoked.
+   */
+  createTrustedDevice(
+    input: TrustedDeviceInput,
+    maxActive: number,
+  ): Promise<{ id: string }>;
   /** Deletes every recovery code of the user and stores the new hashes. */
   replaceRecoveryCodes(codeHashes: string[]): Promise<void>;
   /** Unused recovery codes left. */
@@ -123,14 +170,27 @@ export class MfaRepository {
   }
 
   /**
-   * Cleanup sweep: forgets pending secrets whose enrollment expired, then
-   * removes rows that no longer hold anything (no pending secret, no active
-   * block, no failure inside the 15-minute window).
+   * Cleanup sweep: removes expired or consumed login challenges and expired
+   * or revoked trusted devices, forgets pending secrets whose enrollment
+   * expired, then removes enrollment rows that no longer hold anything (no
+   * pending secret, no active block, no failure inside the 15-minute
+   * window).
    */
   async deleteExpired(now: Date): Promise<number> {
     await this.prisma.mfaEnrollment.updateMany({
       where: { expiresAt: { lte: now } },
       data: { secret: null, expiresAt: null },
+    });
+    // Challenges and trusted devices that can no longer be used.
+    await this.prisma.mfaLoginChallenge.deleteMany({
+      where: {
+        OR: [{ expiresAt: { lte: now } }, { consumedAt: { not: null } }],
+      },
+    });
+    await this.prisma.mfaTrustedDevice.deleteMany({
+      where: {
+        OR: [{ expiresAt: { lte: now } }, { revokedAt: { not: null } }],
+      },
     });
     const windowStart = new Date(now.getTime() - MFA_LOCKOUT.FAILURE_WINDOW_MS);
     return this.prisma.$executeRaw`
@@ -142,6 +202,108 @@ export class MfaRepository {
           WHERE failed."at" > ${windowStart}
         )
     `;
+  }
+
+  /** Whether the user has MFA enabled (decides whether sign-in needs it). */
+  async mfaEnabled(authId: string): Promise<boolean> {
+    const security = await this.prisma.authSecurity.findUnique({
+      where: { authId },
+      select: { mfaEnabled: true },
+    });
+    return security?.mfaEnabled ?? false;
+  }
+
+  async createLoginChallenge(input: {
+    authId: string;
+    tokenHash: string;
+    provider: 'local' | 'google';
+    ipAddress: string | null;
+    userAgent: string | null;
+    device: string | null;
+    createdAt: Date;
+    expiresAt: Date;
+  }): Promise<void> {
+    await this.prisma.mfaLoginChallenge.create({ data: input });
+  }
+
+  /** The owner of a challenge token, to take the owner's lock. */
+  async loginChallengeOwner(tokenHash: string): Promise<string | null> {
+    const challenge = await this.prisma.mfaLoginChallenge.findUnique({
+      where: { tokenHash },
+      select: { authId: true },
+    });
+    return challenge?.authId ?? null;
+  }
+
+  /**
+   * The user's device with this token hash if it is still trusted at `now`
+   * (not revoked, not expired); its last use is recorded. A token of
+   * another user's device never matches.
+   */
+  async useTrustedDevice(
+    authId: string,
+    tokenHash: string,
+    now: Date,
+  ): Promise<{ id: string } | null> {
+    const { count } = await this.prisma.mfaTrustedDevice.updateMany({
+      where: { authId, tokenHash, revokedAt: null, expiresAt: { gt: now } },
+      data: { lastUsedAt: now },
+    });
+    if (count !== 1) return null;
+    return this.prisma.mfaTrustedDevice.findUnique({
+      where: { tokenHash },
+      select: { id: true },
+    });
+  }
+
+  /** The user's trusted devices at `now`, newest first. */
+  listTrustedDevices(authId: string, now: Date): Promise<TrustedDeviceView[]> {
+    return this.prisma.mfaTrustedDevice.findMany({
+      where: { authId, revokedAt: null, expiresAt: { gt: now } },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      select: {
+        id: true,
+        name: true,
+        ipAddress: true,
+        createdAt: true,
+        lastUsedAt: true,
+        expiresAt: true,
+      },
+    });
+  }
+
+  /** The ID of the user's device with this token hash, if any. */
+  async trustedDeviceIdByToken(
+    authId: string,
+    tokenHash: string,
+  ): Promise<string | null> {
+    const device = await this.prisma.mfaTrustedDevice.findFirst({
+      where: { authId, tokenHash },
+      select: { id: true },
+    });
+    return device?.id ?? null;
+  }
+
+  /**
+   * Revokes one of the user's devices. Returns false when the user has no
+   * such device (including another user's device); revoking an already
+   * revoked or expired device of the user succeeds without a change.
+   */
+  async revokeTrustedDevice(
+    authId: string,
+    deviceId: string,
+    now: Date,
+  ): Promise<boolean> {
+    const device = await this.prisma.mfaTrustedDevice.findFirst({
+      where: { id: deviceId, authId },
+      select: { id: true },
+    });
+    if (!device) return false;
+    await this.prisma.mfaTrustedDevice.updateMany({
+      where: { id: deviceId, authId, revokedAt: null },
+      data: { revokedAt: now },
+    });
+    return true;
   }
 
   private unitOfWork(
@@ -248,12 +410,65 @@ export class MfaRepository {
         });
         return count === 1;
       },
-      consumeRecoveryCode: async (codeHash, now) => {
+      unusedRecoveryCodes: () =>
+        tx.mfaRecoveryCode.findMany({
+          where: { authId, usedAt: null },
+          select: { id: true, codeHash: true },
+        }),
+      markRecoveryCodeUsed: async (id, now) => {
+        // Conditional: of concurrent uses of one code, only one updates it.
         const { count } = await tx.mfaRecoveryCode.updateMany({
-          where: { authId, codeHash, usedAt: null },
+          where: { id, authId, usedAt: null },
           data: { usedAt: now },
         });
         return count === 1;
+      },
+      updateMfaSecret: async (encryptedSecret) => {
+        await tx.authSecurity.update({
+          where: { authId },
+          data: { mfaSecret: encryptedSecret },
+        });
+      },
+      loginChallenge: (tokenHash) =>
+        tx.mfaLoginChallenge.findFirst({
+          where: { tokenHash, authId },
+          select: {
+            id: true,
+            authId: true,
+            provider: true,
+            expiresAt: true,
+            consumedAt: true,
+          },
+        }),
+      consumeLoginChallenge: async (id, now) => {
+        const { count } = await tx.mfaLoginChallenge.updateMany({
+          where: { id, authId, consumedAt: null, expiresAt: { gt: now } },
+          data: { consumedAt: now },
+        });
+        return count === 1;
+      },
+      createTrustedDevice: async (input, maxActive) => {
+        const device = await tx.mfaTrustedDevice.create({
+          data: { authId, ...input },
+          select: { id: true },
+        });
+        const surplus = await tx.mfaTrustedDevice.findMany({
+          where: {
+            authId,
+            revokedAt: null,
+            expiresAt: { gt: input.createdAt },
+          },
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+          skip: maxActive,
+          select: { id: true },
+        });
+        if (surplus.length > 0) {
+          await tx.mfaTrustedDevice.updateMany({
+            where: { id: { in: surplus.map((d) => d.id) }, revokedAt: null },
+            data: { revokedAt: input.createdAt },
+          });
+        }
+        return device;
       },
       replaceRecoveryCodes: async (codeHashes) => {
         await tx.mfaRecoveryCode.deleteMany({ where: { authId } });

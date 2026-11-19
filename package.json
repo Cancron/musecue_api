@@ -20,6 +20,7 @@
     "test:e2e": "jest --config ./test/jest-e2e.json",
     "test:stripe": "jest --runInBand stripe",
     "test:e2e:payments": "jest --config ./test/jest-e2e.json --maxWorkers=4 stripe subscription-billing",
+    "mfa:rekey": "node dist/src/auth/mfa/cli/mfa-rekey.cli.js",
     "postinstall": "prisma generate",
     "docker:dev": "docker compose -f docker-compose.yaml up -d",
     "setup:services": "bash scripts/setup-services.sh",

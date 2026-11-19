@@ -2,9 +2,12 @@
 // any application module reads it. MFA state is PostgreSQL-only.
 import './support/env-postgres-mode';
 import { WINSTON_MODULE_PROVIDER } from 'nest-winston';
-import { createHash } from 'node:crypto';
 import type { Logger } from 'winston';
-import { hashRecoveryCode } from '../src/auth/mfa/mfa-recovery-codes';
+import {
+  hashRecoveryCode,
+  verifyRecoveryCode,
+} from '../src/auth/mfa/mfa-recovery-codes';
+import { hashesMatchCodes } from './support/mfa-test-keys';
 import { totpCode, totpStep } from '../src/auth/mfa/mfa-totp';
 import type {
   MfaRecoveryCodesView,
@@ -38,7 +41,7 @@ const DISPLAY_FORM =
 /**
  * MFA recovery codes through the real endpoints of the whole application on
  * a temporary, freshly migrated PostgreSQL schema: generation when MFA is
- * enabled, storage as keyed hashes, one-time display, verification with a
+ * enabled, storage as salted scrypt hashes, one-time display, verification with a
  * recovery code instead of the authenticator code, consumption recorded in
  * PostgreSQL (including concurrent use), regeneration, and ownership.
  */
@@ -99,13 +102,21 @@ describeWithDatabase('MFA recovery codes (e2e, PostgreSQL)', () => {
       where: { authId: user.id },
       orderBy: { codeHash: 'asc' },
     });
-  const hashOf = (user: TestUser, code: string) =>
-    hashRecoveryCode(user.id, code);
+  /** The stored row of one of the user's codes (found by verifying it). */
+  async function rowOf(user: TestUser, code: string) {
+    const rows = await codesOf(user);
+    const matches = await Promise.all(
+      rows.map((row) => verifyRecoveryCode(user.id, code, row.codeHash)),
+    );
+    const found = rows.filter((_, i) => matches[i]);
+    expect(found).toHaveLength(1);
+    return found[0];
+  }
   const useRecovery = (user: TestUser, recoveryCode: string) =>
     kit.verify(user, { recoveryCode });
 
   describe('generation and secure storage', () => {
-    it('issues ten unique codes when MFA is enabled, stored only as keyed hashes', async () => {
+    it('issues ten unique codes when MFA is enabled, stored only as salted scrypt hashes', async () => {
       const user = await kit.createUser();
       expect(await codesOf(user)).toEqual([]);
 
@@ -123,25 +134,27 @@ describeWithDatabase('MFA recovery codes (e2e, PostgreSQL)', () => {
       expect(new Set(recoveryCodes).size).toBe(10);
       for (const code of recoveryCodes) expect(code).toMatch(DISPLAY_FORM);
 
-      // PostgreSQL holds exactly ten unused rows: the keyed hash of each code.
+      // PostgreSQL holds exactly ten unused rows: one salted scrypt hash per
+      // code (each code verifies against exactly one row).
       const stored = await codesOf(user);
       expect(stored).toHaveLength(10);
       expect(stored.every((row) => row.usedAt === null)).toBe(true);
-      expect(stored.map((row) => row.codeHash).sort()).toEqual(
-        recoveryCodes.map((code) => hashOf(user, code)).sort(),
-      );
+      await expect(
+        hashesMatchCodes(
+          user.id,
+          recoveryCodes,
+          stored.map((row) => row.codeHash),
+        ),
+      ).resolves.toBe(true);
+      const salts = new Set<string>();
       for (const { codeHash } of stored) {
-        expect(codeHash).toMatch(/^[0-9a-f]{64}$/);
+        expect(codeHash).toMatch(
+          /^scrypt\$14\$8\$1\$[A-Za-z0-9_-]{22}\$[A-Za-z0-9_-]{43}$/,
+        );
+        salts.add(codeHash.split('$')[4]);
       }
-      // Not an unkeyed hash either: without the server key nothing can be
-      // matched offline.
-      for (const code of recoveryCodes) {
-        for (const form of [code, code.replace('-', '')]) {
-          expect(stored.map((row) => row.codeHash)).not.toContain(
-            createHash('sha256').update(form).digest('hex'),
-          );
-        }
-      }
+      // Every code has its own salt.
+      expect(salts.size).toBe(10);
       // No plaintext in any MFA table or audit entry of the user (SQL level).
       const { rows } = {
         rows: await ctx.client.$queryRaw<{ row: string }[]>`
@@ -209,13 +222,10 @@ describeWithDatabase('MFA recovery codes (e2e, PostgreSQL)', () => {
         recoveryCodesRemaining: 9,
       });
       // PostgreSQL records exactly this code as used, at this time.
-      const stored = await codesOf(user);
-      expect(stored.filter((row) => row.usedAt)).toEqual([
-        expect.objectContaining({
-          codeHash: hashOf(user, recoveryCodes[4]),
-          usedAt,
-        }),
-      ]);
+      const used = (await codesOf(user)).filter((row) => row.usedAt);
+      expect(used).toHaveLength(1);
+      expect(used[0].usedAt).toEqual(usedAt);
+      expect((await rowOf(user, recoveryCodes[4])).id).toBe(used[0].id);
       // Audited as a count, never the code.
       const audit = await ctx.client.activityLogEventDetail.findFirstOrThrow({
         where: {
@@ -302,7 +312,7 @@ describeWithDatabase('MFA recovery codes (e2e, PostgreSQL)', () => {
       ]);
       const used = (await codesOf(user)).filter((row) => row.usedAt);
       expect(used).toHaveLength(1);
-      expect(used[0].codeHash).toBe(hashOf(user, recoveryCodes[0]));
+      expect((await rowOf(user, recoveryCodes[0])).id).toBe(used[0].id);
       expect(
         await ctx.client.activityLogEventDetail.count({
           where: {
@@ -426,9 +436,13 @@ describeWithDatabase('MFA recovery codes (e2e, PostgreSQL)', () => {
       // PostgreSQL holds exactly the ten new hashes; every old row is gone,
       // used or not.
       const stored = await codesOf(user);
-      expect(stored.map((row) => row.codeHash).sort()).toEqual(
-        view.recoveryCodes.map((code) => hashOf(user, code)).sort(),
-      );
+      await expect(
+        hashesMatchCodes(
+          user.id,
+          view.recoveryCodes,
+          stored.map((row) => row.codeHash),
+        ),
+      ).resolves.toBe(true);
       expect(stored.every((row) => row.usedAt === null)).toBe(true);
       const oldIds = new Set(oldRows.map((row) => row.id));
       expect(stored.some((row) => oldIds.has(row.id))).toBe(false);
@@ -507,7 +521,10 @@ describeWithDatabase('MFA recovery codes (e2e, PostgreSQL)', () => {
       expect((await codesOf(alice)).every((row) => !row.usedAt)).toBe(true);
       expect((await codesOf(bob)).every((row) => !row.usedAt)).toBe(true);
       // The hash of a code is bound to its owner.
-      expect(hashOf(alice, aliceCodes[0])).not.toBe(hashOf(bob, aliceCodes[0]));
+      const aliceRow = await rowOf(alice, aliceCodes[0]);
+      await expect(
+        verifyRecoveryCode(bob.id, aliceCodes[0], aliceRow.codeHash),
+      ).resolves.toBe(false);
       await useRecovery(alice, aliceCodes[0]).expect(200);
     });
 
@@ -540,31 +557,35 @@ describeWithDatabase('MFA recovery codes (e2e, PostgreSQL)', () => {
       const bob = await kit.createUser();
       const { recoveryCodes } = await enable(alice);
       await useRecovery(alice, recoveryCodes[0]).expect(200);
-      const hash = hashOf(alice, recoveryCodes[0]);
+      const used = await rowOf(alice, recoveryCodes[0]);
+      const unused = await rowOf(alice, recoveryCodes[1]);
 
       await expect(
         ctx.client.mfaRecoveryCode.update({
-          where: { codeHash: hash },
+          where: { id: used.id },
           data: { usedAt: null },
         }),
       ).rejects.toThrow(/A used MfaRecoveryCode cannot change/);
       await expect(
         ctx.client.mfaRecoveryCode.update({
-          where: { codeHash: hashOf(alice, recoveryCodes[1]) },
+          where: { id: unused.id },
           data: { authId: bob.id },
         }),
       ).rejects.toThrow(/owner, hash and creation time cannot change/);
       await useRecovery(alice, recoveryCodes[0]).expect(400);
     });
 
-    it('stores only hex digests, issued unused, each once', async () => {
+    it('stores only scrypt hashes, issued unused', async () => {
       const user = await kit.createUser();
-      await expect(
-        ctx.client.mfaRecoveryCode.create({
-          data: { authId: user.id, codeHash: 'ABCDE-FGHJK'.padEnd(64, 'x') },
-        }),
-      ).rejects.toThrow();
-      const codeHash = 'a'.repeat(64);
+      // Plaintext, and the previous build's keyed HMAC format, are refused.
+      for (const codeHash of ['ABCDE-FGHJK', 'a'.repeat(64)]) {
+        await expect(
+          ctx.client.mfaRecoveryCode.create({
+            data: { authId: user.id, codeHash },
+          }),
+        ).rejects.toThrow();
+      }
+      const codeHash = await hashRecoveryCode(user.id, 'ABCDE-FGHJK');
       await expect(
         ctx.client.mfaRecoveryCode.create({
           data: { authId: user.id, codeHash, usedAt: kit.clock },
@@ -573,11 +594,6 @@ describeWithDatabase('MFA recovery codes (e2e, PostgreSQL)', () => {
       await ctx.client.mfaRecoveryCode.create({
         data: { authId: user.id, codeHash },
       });
-      await expect(
-        ctx.client.mfaRecoveryCode.create({
-          data: { authId: user.id, codeHash },
-        }),
-      ).rejects.toThrow();
     });
 
     it('deletes the codes with the account', async () => {

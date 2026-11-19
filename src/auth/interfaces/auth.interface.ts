@@ -50,6 +50,8 @@ export interface ITokenPayload {
  * Login response structure
  */
 export interface ILoginResponse {
+  /** Always false here; an MFA challenge response has `mfaRequired: true`. */
+  mfaRequired: false;
   accessToken: string;
   refreshToken: string;
   user: {
@@ -60,4 +62,16 @@ export interface ILoginResponse {
     verified: boolean;
   };
   expiresIn: number;
+}
+
+/** Tokens of a sign-in completed with MFA (POST /auth/login/mfa). */
+export interface IMfaLoginResponse extends ILoginResponse {
+  mfaMethod: 'totp' | 'recovery_code';
+  /** Set when the device was trusted: the token is shown only here. */
+  trustedDevice: {
+    id: string;
+    token: string;
+    name: string;
+    expiresAt: Date;
+  } | null;
 }

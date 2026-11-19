@@ -27,6 +27,8 @@ import {
 } from '../../../test/support/account-deletion-fakes';
 import { freezeTime } from '../../../test/support/freeze-time';
 import { AuthService } from '../../auth/auth.service';
+import { MfaLoginService } from '../../auth/mfa/mfa-login.service';
+import { mfaNotRequired } from '../../../test/support/mfa-not-required';
 import { UserRole } from '../../auth/interfaces/auth.interface';
 import { AuthUtilsService } from '../../auth/services/auth-utils.service';
 import { AuthChallengeRepository } from '../../auth/state/auth-challenge.repository';
@@ -179,6 +181,8 @@ describe('Account deletion requests (HTTP)', () => {
         // Erasure has its own unit and database tests.
         { provide: AccountErasureService, useValue: erasure },
         AuthService,
+        // Sign-in without MFA (this suite is about account deletion).
+        { provide: MfaLoginService, useValue: mfaNotRequired() },
         AuthUtilsService,
         AuthGuard,
         { provide: ActivityLogService, useValue: mock<ActivityLogService>() },

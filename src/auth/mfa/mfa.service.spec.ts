@@ -3,10 +3,18 @@ import { mock } from 'jest-mock-extended';
 import type { Logger } from 'winston';
 import { FakeMfaRepository } from '../../../test/support/fake-mfa-repository';
 import config from '../../common/config/app.config';
-import { hashRecoveryCode } from './mfa-recovery-codes';
-import { decryptMfaSecret } from './mfa-secret.cipher';
+import {
+  hashesMatchCodes,
+  testCipher,
+} from '../../../test/support/mfa-test-keys';
+import { MfaSecretCipher } from './mfa-secret.cipher';
 import { totpCode, totpStep } from './mfa-totp';
 import { MfaService } from './mfa.service';
+
+// Recovery codes use salted scrypt (deliberately slow, ~50-80 ms each), so
+// tests that issue and verify many codes need more than the 5 s default
+// when run alongside other suites.
+jest.setTimeout(30_000);
 
 const USER = 'user-owner';
 const OTHER = 'user-other';
@@ -35,9 +43,11 @@ describe('MfaService', () => {
   let repo: FakeMfaRepository;
   let logger: ReturnType<typeof mock<Logger>>;
   let service: MfaService;
+  let cipher: MfaSecretCipher;
 
   beforeAll(() => {
-    config.jwt_refresh_secret = 'mfa-service-unit-test-refresh-secret-0123';
+    // MFA must not depend on the JWT refresh secret: run without one.
+    config.jwt_refresh_secret = '';
   });
   afterAll(() => {
     config.jwt_refresh_secret = originalSecret;
@@ -48,7 +58,8 @@ describe('MfaService', () => {
     repo.addAccount(USER, { email: 'owner@example.com' });
     repo.addAccount(OTHER);
     logger = mock<Logger>();
-    service = new MfaService(repo.asRepository(), logger);
+    cipher = testCipher();
+    service = new MfaService(repo.asRepository(), cipher, logger);
   });
 
   const start = (now = T0, authId = USER) =>
@@ -131,7 +142,7 @@ describe('MfaService', () => {
       const stored = repo.enrollments.get(USER)!;
 
       expect(stored.secret).not.toContain(secret);
-      expect(decryptMfaSecret('enrollment', USER, stored.secret!)).toBe(secret);
+      expect(cipher.decrypt('enrollment', USER, stored.secret!)).toBe(secret);
       expect(stored.expiresAt).toEqual(plus(10 * MIN));
       // Nothing is enabled until the code is confirmed.
       expect(repo.accounts.get(USER)).toMatchObject({
@@ -192,7 +203,7 @@ describe('MfaService', () => {
       const account = repo.accounts.get(USER)!;
       expect(account).toMatchObject({ mfaEnabled: true, mfaMethod: 'totp' });
       expect(account.mfaSecret).not.toContain(secret);
-      expect(decryptMfaSecret('confirmed', USER, account.mfaSecret!)).toBe(
+      expect(cipher.decrypt('confirmed', USER, account.mfaSecret!)).toBe(
         secret,
       );
       expect(account.mfaLastUsedStep).toBe(totpStep(plus(20_000)));
@@ -207,7 +218,7 @@ describe('MfaService', () => {
       ]);
     });
 
-    it('issues ten unique recovery codes, stored only as keyed hashes', async () => {
+    it('issues ten unique recovery codes, stored only as salted scrypt hashes', async () => {
       const { secret } = await start();
 
       const { recoveryCodes } = await confirm(totpCode(secret, T0));
@@ -218,12 +229,16 @@ describe('MfaService', () => {
         expect(code).toMatch(/^[A-HJKMNP-Z2-9]{5}-[A-HJKMNP-Z2-9]{5}$/);
       }
       const stored = repo.recoveryCodes.get(USER)!;
-      expect(stored.map((c) => c.codeHash).sort()).toEqual(
-        recoveryCodes.map((code) => hashRecoveryCode(USER, code)).sort(),
-      );
+      await expect(
+        hashesMatchCodes(
+          USER,
+          recoveryCodes,
+          stored.map((c) => c.codeHash),
+        ),
+      ).resolves.toBe(true);
       expect(stored.every((c) => c.usedAt === null)).toBe(true);
       for (const { codeHash } of stored) {
-        expect(codeHash).toMatch(/^[0-9a-f]{64}$/);
+        expect(codeHash).toMatch(/^scrypt\$/);
       }
       // Never again: the status only reports how many are left.
       expect(JSON.stringify(await service.getStatus(USER, T0))).not.toContain(
@@ -498,16 +513,20 @@ describe('MfaService', () => {
       );
     });
 
-    it('rolls back a start whose secret cannot be encrypted', async () => {
-      config.jwt_refresh_secret = '';
-      try {
-        await expect(rejection(start())).resolves.toMatchObject({
-          status: 503,
-        });
-      } finally {
-        config.jwt_refresh_secret = 'mfa-service-unit-test-refresh-secret-0123';
-      }
+    it('answers 503 and stores nothing without MFA_ENCRYPTION_KEY', async () => {
+      service = new MfaService(
+        repo.asRepository(),
+        new MfaSecretCipher({ currentKeyId: null, keys: new Map() }),
+        logger,
+      );
+      await expect(rejection(start())).resolves.toMatchObject({
+        status: 503,
+      });
       expect(repo.enrollments.has(USER)).toBe(false);
+      expect(logger.error).toHaveBeenCalledWith(
+        'MFA state could not be read or written',
+        expect.objectContaining({ errorName: 'MfaKeyUnavailableError' }),
+      );
     });
   });
 

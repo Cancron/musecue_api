@@ -20,7 +20,7 @@ The companion mobile application and detailed product specifications live in `..
 - a single Pro subscription plan: admin-configured monthly/yearly pricing and free trial, one-time trial activation, date-based Pro access through `ProAccessGuard`, payment/lifecycle records protected by database rules, and Stripe checkout for the monthly and yearly options with webhook-verified activation, automatic renewals, failed-payment handling and recovery, cancellation at period end, and refunds made in Stripe with immediate access revocation (see "Subscriptions" and "Stripe checkout" under API); requesting refunds from MuseCue and disputes are not implemented yet
 - personal data export: an authenticated user can request an asynchronous ZIP archive of their own account, profile, makeup history, subscription records and private photos, poll its status, and download it through a signed link valid for at most 15 minutes; archives expire 24 hours after export and are deleted by a scheduled retention sweep (see "Personal data export" under API)
 - account deletion: the owner confirms their identity (password and an emailed code, or the code alone for accounts without a password), the account is blocked and every token invalidated at once (`PENDING_DELETION`), and a background sweep hard-deletes the account and all its data and files (including its refresh sessions, one-time codes and queued or retained background jobs), keeping payment records detached (see "Account deletion" under API)
-- optional MFA with an authenticator app (TOTP): the signed-in owner starts an enrollment, confirms it with the app's current six-digit code within 10 minutes, and reads whether MFA is enabled; secrets are stored only encrypted, codes work only in their own 30 seconds and only once, and five incorrect codes within 15 minutes block enrollment for 15 minutes. Enabling MFA issues ten single-use recovery codes (shown once, stored only as keyed hashes) that verify instead of the app's code, and can be regenerated with a second factor (see "Multi-factor authentication" under API). Requiring the second factor at sign-in is not implemented yet
+- optional MFA with an authenticator app (TOTP): the signed-in owner starts an enrollment, confirms it with the app's current six-digit code within 10 minutes, and reads whether MFA is enabled; secrets are stored only encrypted, codes work only in their own 30 seconds and only once, and five incorrect codes within 15 minutes block enrollment for 15 minutes. Enabling MFA issues ten single-use recovery codes (shown once, stored only as salted scrypt hashes) that verify instead of the app's code, and can be regenerated with a second factor. Password and Google sign-in of an MFA user returns an MFA challenge instead of tokens, completed with the app's code or a recovery code; the device can then be trusted for 30 days (listed and revocable). MFA credentials use their own key (`MFA_ENCRYPTION_KEY`) and never depend on a JWT secret (see "Multi-factor authentication" under API)
 
 Migration `20260827174107_add_makeup_workflow` adds the makeup aggregate and removes the dormant job-tracker and subscription starter domains.
 
@@ -207,11 +207,9 @@ is required in both modes; Redis only with `REDIS_ENABLED=true`.
   states; one-time codes and rate-limit keys are stored as keyed hashes).
   Rotating the secret makes pending PostgreSQL jobs, outstanding codes and
   OAuth states unusable (interrupted jobs fail their export or AI run, which
-  the user can retry). In both modes it also keys the encryption of MFA
-  authenticator secrets and of the MFA recovery-code hashes: after a
-  rotation, stored secrets can no longer be decrypted, every recovery code
-  stops working, and users with MFA enabled have to enroll again (see
-  "Multi-factor authentication").
+  the user can retry). MFA credentials do not depend on it: authenticator
+  secrets use `MFA_ENCRYPTION_KEY` and recovery codes are keyless scrypt
+  hashes (see "Multi-factor authentication").
 - The PostgreSQL worker starts with the API in every environment, including
   `NODE_ENV=test`, exactly like the BullMQ workers in Redis mode: queued jobs
   are never left unprocessed because of the environment name.
@@ -548,7 +546,8 @@ Authentication routes:
 | `POST` | `/auth`                           | Register and queue a verification email      |
 | `POST` | `/auth/verify-email`              | Verify the six-character code                |
 | `POST` | `/auth/resend-verification-email` | Queue a replacement code                     |
-| `POST` | `/auth/login`                     | Return access token, refresh token, and user |
+| `POST` | `/auth/login`                     | Return access token, refresh token, and user; an MFA challenge instead for users with MFA |
+| `POST` | `/auth/login/mfa`                 | Complete the MFA challenge (app code or recovery code); optionally trust the device |
 | `POST` | `/auth/refresh-token`             | Rotate the refresh token                     |
 | `POST` | `/auth/logout`                    | Revoke the current session                   |
 | `POST` | `/auth/logout-all`                | Revoke all user sessions                     |
@@ -557,6 +556,8 @@ Authentication routes:
 | `POST` | `/auth/mfa/enrollment/confirm`    | Confirm it with a six-digit code and enable MFA; shows the recovery codes once (bearer token) |
 | `POST` | `/auth/mfa/verify`                | Verify a second factor: app code or recovery code (bearer token) |
 | `POST` | `/auth/mfa/recovery-codes`        | Replace all recovery codes after a second factor; shows them once (bearer token) |
+| `GET`  | `/auth/mfa/trusted-devices`       | List the devices trusted to skip MFA (bearer token) |
+| `DELETE` | `/auth/mfa/trusted-devices/:deviceId` | Revoke one of them (bearer token) |
 
 Makeup routes require a bearer token:
 
@@ -653,7 +654,7 @@ Rules:
 - **Codes:** a code is accepted only during its own 30-second period (no tolerance for a phone clock that is off; see below) and only once. A code for an earlier period (expired), a later period or another secret is rejected. Malformed codes (not exactly six digits) fail validation with `400` and are not counted.
 - **Responses:** invalid or expired code: `400 Invalid or expired authenticator code. N attempt(s) remaining.`; enrollment older than 10 minutes: `410` (its secret is discarded); no enrollment in progress: `409`; MFA already enabled (including a replay of the code that enabled it): `409`; blocked: `429` with the end of the block in the message; database or key failure: `503`, never reported as a wrong code.
 - **Lockout:** five incorrect codes within any 15 minutes (a sliding window) block the enrollment for 15 minutes from the fifth. While it is blocked, starting and confirming both answer `429`, even with a correct code, and nothing extends the block. The pending secret is discarded. Restarting an enrollment never resets the count. The lockout is per account and only affects MFA enrollment, not sign-in.
-- **Storage:** the pending secret (`MfaEnrollment.secret`) and the confirmed secret (`authSecurity.mfaSecret`) are encrypted with AES-256-GCM. The key is derived (HKDF) from `JWT_REFRESH_SECRET` for MFA only, and each ciphertext is bound to its user and role, so it cannot be copied to another account. Confirming sets `authSecurity.mfaEnabled = true`, `mfaMethod = totp`, re-encrypts the secret into `mfaSecret`, records the accepted period in `mfaLastUsedStep` (replay protection for later checks) and deletes the enrollment, in one transaction. Starting and confirming take a per-user advisory lock, so of concurrent confirmations with the same code exactly one succeeds. The change is written to `ActivityLogEvent` (never the secret). Secrets and codes are never logged.
+- **Storage:** the pending secret (`MfaEnrollment.secret`) and the confirmed secret (`authSecurity.mfaSecret`) are encrypted with AES-256-GCM under the dedicated `MFA_ENCRYPTION_KEY` (see "MFA keys"; never a JWT secret). Each ciphertext names its key and is bound to its user and role, so it cannot be copied to another account. Confirming sets `authSecurity.mfaEnabled = true`, `mfaMethod = totp`, re-encrypts the secret into `mfaSecret`, records the accepted period in `mfaLastUsedStep` (replay protection for later checks) and deletes the enrollment, in one transaction. Starting and confirming take a per-user advisory lock, so of concurrent confirmations with the same code exactly one succeeds. The change is written to `ActivityLogEvent` (never the secret). Secrets and codes are never logged.
 - **Cleanup:** the hourly authentication sweep discards expired pending secrets and removes enrollment rows once their failures and block are over. Account erasure deletes the enrollment with the account.
 
 #### Recovery codes and MFA verification
@@ -666,8 +667,8 @@ Enabling MFA issues ten recovery codes such as `K7MPQ-3XWNR`: 10 characters from
 Rules:
 
 - **Shown once, never logged:** codes appear only in the response that issues them (enrollment confirmation or regeneration). Status, verification and every other response carry only a count. Codes, like secrets, are never logged or written to the audit log.
-- **Storage:** only `MfaRecoveryCode.codeHash` is stored: HMAC-SHA-256 under a server key derived (HKDF) from `JWT_REFRESH_SECRET` for recovery codes only, over the user ID and the normalized code. A stolen table is useless without the server key, and a code never matches for another user. A keyed hash is used rather than bcrypt because the codes are random and high-entropy, and because it allows an indexed, single-statement consumption (below). The database accepts only 64-hex-character hashes (CHECK), so plaintext can never be stored.
-- **One use, recorded in PostgreSQL:** a code is consumed by one conditional `UPDATE ... SET "usedAt" = now WHERE "authId" = user AND "codeHash" = hash AND "usedAt" IS NULL`. Of concurrent requests with the same code exactly one succeeds, and using one code never touches the others. A trigger makes consumption permanent: a used code can never be reset, and no code can move to another user. Each use is audited as a count (`mfaRecoveryCodesRemaining`: 10 → 9).
+- **Storage:** only `MfaRecoveryCode.codeHash` is stored: a salted scrypt hash (`scrypt$14$8$1$<salt>$<hash>`: N = 2^14, r = 8, p = 1, a 16-byte random salt per code) over the user ID and the normalized code. It is one-way and uses no key, so no configuration change (JWT or MFA key rotation) can ever affect recovery codes; equal codes never give equal hashes, and a hash only verifies for its own user. The database accepts only this format (CHECK), so plaintext can never be stored. Verifying compares the input with each of the user's unused codes (at most ten, asynchronously, without stopping at the first match).
+- **One use, recorded in PostgreSQL:** the matching code is consumed by one conditional `UPDATE ... SET "usedAt" = now WHERE "id" = code AND "authId" = user AND "usedAt" IS NULL`. Of concurrent requests with the same code exactly one succeeds, and using one code never touches the others. A trigger makes consumption permanent: a used code can never be reset, and no code can move to another user. Each use is audited as a count (`mfaRecoveryCodesRemaining`: 10 → 9).
 - **Declined alike:** wrong, already used, replaced (after regeneration) and other users' codes, as well as used or expired app codes, all answer `400 Invalid MFA code. N attempt(s) remaining.` App codes are checked like at enrollment (their own 30 seconds only) and each is accepted once (`mfaLastUsedStep`, including the code that enabled MFA).
 - **Lockout:** five declined codes within any 15 minutes block verification and regeneration for 15 minutes (`429`). During the block a valid code is refused and not consumed. A success clears the count. This is separate from the enrollment lockout. Note that duplicate submissions of one code count: the first succeeds, and each repeat is declined and counted.
 - **Concurrency:** verification takes the same per-user advisory lock as enrollment. Single use would hold without it (the conditional `UPDATE`), but the lock keeps the failure count exact when wrong codes arrive in parallel, so the lockout cannot be raced.
@@ -675,17 +676,54 @@ Rules:
 
 Tests:
 
-```bash
-# Unit tests (no database or Redis): TOTP against the RFC 6238 vectors, lockout
-# rules, encryption, recovery codes, the services and the HTTP contract
-npm test -- --runInBand mfa
-# Real endpoints of the whole application on a temporary PostgreSQL schema
-TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json test/mfa-enrollment test/mfa-recovery
+#### MFA at sign-in
+
+Users without MFA sign in exactly as before (`POST /auth/login` and the Google callbacks return tokens; responses now also carry `"mfaRequired": false`). For a user with MFA enabled, a correct first factor (password, or Google) returns **no tokens**, only a challenge:
+
+```json
+{ "mfaRequired": true, "challengeToken": "mfac_...", "expiresAt": "2026-11-24T09:05:00.000Z", "methods": ["totp", "recovery_code"] }
 ```
 
-Migration `20261122120000_mfa_totp_enrollment` adds `MfaEnrollment` (with CHECK constraints: a pending secret always has an expiry; at most five stored failures) and `authSecurity.mfaLastUsedStep`. Migration `20261123120000_mfa_recovery_codes` adds `MfaRecoveryCode` (hash-format CHECK, unique hash, protecting trigger) and the verification lockout (`authSecurity.mfaFailedAttemptsAt`, `mfaBlockedUntil`). Both are additive: existing users keep MFA disabled.
+`POST /auth/login/mfa` completes it (`200`, `Cache-Control: no-store`):
 
-Not implemented yet: requiring the second factor at sign-in (login still returns tokens after the password alone; `POST /auth/mfa/verify` is the check a sign-in step would use), disabling MFA or resetting a lost authenticator, re-entering the password before enrolling, and a dedicated, rotatable key for MFA secrets and recovery-code hashes.
+```json
+{ "challengeToken": "mfac_...", "code": "123456", "trustDevice": true, "deviceName": "Ann's iPhone" }
+```
+
+with exactly one of `code` (the app's current code) or `recoveryCode`; `trustDevice` and `deviceName` (1-100 characters) are optional. The response is a regular login response (`accessToken`, `refreshToken`, `user`, `expiresIn`, `mfaRequired: false`) plus `mfaMethod` and `trustedDevice` (`null`, or `{ id, token, name, expiresAt }` when the device was trusted; the token is shown only here).
+
+- **No access before MFA:** the challenge token is an opaque random value (`mfac_` + 256 bits), not a JWT. It is refused as a bearer token (`401`), as a refresh token (`400`, not a JWT) and everywhere except `POST /auth/login/mfa`. No refresh session exists until MFA succeeds.
+- **Challenge rules:** stored only as a SHA-256 hash (`MfaLoginChallenge`), valid for 5 minutes, consumed by the first successful completion in the same transaction as the code (a per-user advisory lock serializes completions: of concurrent completions exactly one succeeds, and the others' codes are not consumed). An unknown, used or expired challenge answers `401 The MFA challenge is invalid or has expired. Please sign in again.` A wrong code answers `400` and leaves the challenge usable. Codes are checked exactly like `POST /auth/mfa/verify`, with the same replay protection and the same 5-in-15-minutes lockout (`429`), and only against the challenge owner's credentials: another user's app or recovery code never completes it.
+- **Google:** the callbacks return the same challenge (`message: "MFA verification required"`). The browser redirect flow redirects to `redirectUrl` with `mfa_required=true`, `mfa_challenge_token` and `mfa_challenge_expires_at` instead of tokens. The challenge records `provider: google`.
+- **Trusted devices:** with `trustDevice: true`, the device gets a token (`mfatd_` + 256 bits) that skips the challenge for **30 days** (fixed; never extended). Send it as the `X-MFA-Trusted-Device` header on `POST /auth/login`, `POST /auth/google/callback`, or `GET /auth/google` (for the browser flow: only its SHA-256 travels in the encrypted OAuth state). It skips only the second factor, never the password or Google, and only for the user it was issued to: an expired, revoked, unknown or other user's token is ignored and the challenge is issued. Devices are stored in PostgreSQL (`MfaTrustedDevice`: SHA-256 of the token, owner, name, IP, user agent, creation, last use, expiry, revocation); a user has at most 10 active ones (the oldest is revoked). A database CHECK limits trust to 30 days and a trigger keeps owner, token and expiry unchangeable and makes a revocation permanent.
+- `GET /auth/mfa/trusted-devices` lists the caller's active devices (`id`, `name`, `ipAddress`, `createdAt`, `lastUsedAt`, `expiresAt`, `current`: the device whose `X-MFA-Trusted-Device` header came with the request). Tokens are never returned again. `DELETE /auth/mfa/trusted-devices/:deviceId` revokes one (`{ "id": ..., "revoked": true }`); another user's device, or an unknown one, answers `404`.
+- Expired or consumed challenges and expired or revoked devices are removed by the hourly authentication sweep; everything is deleted with the account.
+
+#### MFA keys and upgrading
+
+MFA never depends on `JWT_ACCESS_SECRET` or `JWT_REFRESH_SECRET`, so rotating them never locks anyone out of MFA.
+
+- `MFA_ENCRYPTION_KEY` (required for MFA): 32 random bytes as base64 or 64 hex characters (`openssl rand -base64 32`). It encrypts authenticator secrets. The API refuses to start with an invalid value or one equal to a JWT secret. Without it, enrolling and authenticator codes answer `503`, while recovery codes, challenges and trusted devices keep working. Treat it like the database credentials: losing it makes every authenticator secret unreadable.
+- Rotating it: set the new key in `MFA_ENCRYPTION_KEY` and move the old one to `MFA_ENCRYPTION_PREVIOUS_KEYS` (comma-separated). Each ciphertext names its key (`mfa2.<keyId>...`), so both keep working, and a secret is re-encrypted with the new key the next time it verifies an app code. Keep old keys until no secret uses them.
+- Recovery codes are keyless scrypt hashes: no key, no rotation.
+- **Upgrading from the first MFA build** (whose secrets were derived from `JWT_REFRESH_SECRET`): run `npx prisma migrate deploy`, set `MFA_ENCRYPTION_KEY`, then `npm run build && npm run mfa:rekey` before serving MFA users. The command re-encrypts every old (`v1.`) authenticator secret with `MFA_ENCRYPTION_KEY`, keeping its value, so users' apps keep working. It needs the `JWT_REFRESH_SECRET` value those secrets were written with (`MFA_LEGACY_JWT_REFRESH_SECRET`, default `JWT_REFRESH_SECRET`), is idempotent, prints counts only, and exits `1` if a secret cannot be read. Until it has run, those users get `503` for app codes. Migration `20261124120000_mfa_login_and_independent_keys` deletes the old recovery codes (keyed with the JWT-derived key, they cannot be converted: only users know the codes) and clears old pending enrollments; the command reports how many MFA users have no recovery codes, and they create new ones with `POST /auth/mfa/recovery-codes` (signing in with their app).
+
+Tests:
+
+```bash
+# Unit tests (no database or Redis), run with an empty JWT refresh secret:
+# TOTP (RFC 6238 vectors), keys and encryption, scrypt recovery codes, lockout,
+# the services (enrollment, verification, sign-in, trusted devices), HTTP contract
+npm test -- --runInBand mfa
+# Real endpoints of the whole application on a temporary PostgreSQL schema
+TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json test/mfa-
+```
+
+`test/mfa-login.e2e-spec.ts` covers sign-in with and without MFA (password and Google, with Google's servers simulated), challenges, token issuance, trusted-device validity, expiry, revocation and ownership; `test/mfa-rekey.e2e-spec.ts` the upgrade command.
+
+Migrations: `20261122120000_mfa_totp_enrollment` adds `MfaEnrollment` (CHECK: a pending secret always has an expiry; at most five stored failures) and `authSecurity.mfaLastUsedStep`. `20261123120000_mfa_recovery_codes` adds `MfaRecoveryCode` (protecting trigger) and the verification lockout (`authSecurity.mfaFailedAttemptsAt`, `mfaBlockedUntil`). `20261124120000_mfa_login_and_independent_keys` adds `MfaLoginChallenge` and `MfaTrustedDevice` (CHECKs and trigger above) and switches recovery codes to scrypt (see "Upgrading"). Existing users keep MFA disabled.
+
+Not implemented yet: disabling MFA or resetting a lost authenticator (an administrator procedure is needed for users who lose both the app and their recovery codes), re-entering the password before enrolling, revoking all trusted devices at once or on a security event (for example `logout-all`), and re-encrypting secrets under a previous key without waiting for their next use.
 
 ### Subscriptions
 
@@ -1013,7 +1051,7 @@ Migration `20261113120000_add_stripe_checkout` adds `PaymentCustomer` and `Check
 
 Not implemented yet: immediate cancellation (including canceling a past-due subscription to stop Stripe's retries), undoing a cancellation (a cancellation reversed in Stripe is not reflected), the customer portal (so users cannot update their card in-app; Stripe's own emails and hosted invoice page can be used), exposing the past-due state in `GET /v1/subscription`, requesting refunds from MuseCue, disputes (`charge.dispute.*`), canceling the Stripe subscription automatically when a payment is refunded, revoking an active free trial on refund (a trial is not a payment and keeps running), reactions to other `customer.subscription.updated` changes (e.g. `unpaid`), and automatic refunds or cancellation of duplicate payments and subscriptions. Renewal delays within Stripe's retry window (up to 3 days) are handled. If a renewal for an older period arrives after a newer one, the older period is recorded but cannot be merged into the term: the database allows one payment per term change.
 
-Database tests (`test/auth-state.e2e-spec.ts`, `test/mfa-enrollment.e2e-spec.ts`, `test/mfa-recovery.e2e-spec.ts`, `test/postgres-job-queue.e2e-spec.ts`, `test/postgres-mode.e2e-spec.ts`, `test/rate-limit-contract.e2e-spec.ts` (PostgreSQL part), `test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`, `test/privacy-export.e2e-spec.ts`, `test/account-deletion.e2e-spec.ts`, `test/account-erasure.e2e-spec.ts`, `test/stripe-checkout.e2e-spec.ts`, `test/stripe-renewal.e2e-spec.ts`, `test/stripe-payment-failure.e2e-spec.ts`, `test/stripe-cancellation.e2e-spec.ts`, `test/stripe-refund.e2e-spec.ts`, `test/subscription-billing.e2e-spec.ts`, `test/stripe-webhook-reliability.e2e-spec.ts`, `test/stripe-payment-lifecycle.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
+Database tests (`test/auth-state.e2e-spec.ts`, `test/mfa-enrollment.e2e-spec.ts`, `test/mfa-recovery.e2e-spec.ts`, `test/mfa-login.e2e-spec.ts`, `test/mfa-rekey.e2e-spec.ts`, `test/postgres-job-queue.e2e-spec.ts`, `test/postgres-mode.e2e-spec.ts`, `test/rate-limit-contract.e2e-spec.ts` (PostgreSQL part), `test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`, `test/privacy-export.e2e-spec.ts`, `test/account-deletion.e2e-spec.ts`, `test/account-erasure.e2e-spec.ts`, `test/stripe-checkout.e2e-spec.ts`, `test/stripe-renewal.e2e-spec.ts`, `test/stripe-payment-failure.e2e-spec.ts`, `test/stripe-cancellation.e2e-spec.ts`, `test/stripe-refund.e2e-spec.ts`, `test/subscription-billing.e2e-spec.ts`, `test/stripe-webhook-reliability.e2e-spec.ts`, `test/stripe-payment-lifecycle.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
 
 ```bash
 TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json test/subscription-plan test/user-subscription test/subscription-trial test/subscription-status test/pro-access test/trial-lifecycle test/billing test/subscription-security test/privacy-export test/account-deletion test/account-erasure
@@ -1046,7 +1084,9 @@ authUser
 |-- RefreshSession (hashed refresh tokens, rotation lineage)
 |-- AuthChallenge (hashed one-time codes, one per purpose)
 |-- MfaEnrollment (0..1: encrypted pending TOTP secret, failed codes)
-|-- MfaRecoveryCode (keyed hashes of single-use recovery codes)
+|-- MfaRecoveryCode (salted scrypt hashes of single-use recovery codes)
+|-- MfaLoginChallenge (SHA-256 of pending sign-in challenges)
+|-- MfaTrustedDevice (SHA-256 of 30-day trusted-device tokens)
 |-- InfrastructureJob (PostgreSQL queue driver; deleted with the account)
 |-- PaymentCustomer (0..1 per provider)
 |-- UserSubscription (0..1)

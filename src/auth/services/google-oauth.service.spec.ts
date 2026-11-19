@@ -1,5 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { GoogleOAuthService } from './google-oauth.service';
+import { MfaLoginService } from '../mfa/mfa-login.service';
+import { mfaNotRequired } from '../../../test/support/mfa-not-required';
 import { CustomLoggerService } from '../../common/services/custom-logger.service';
 import { PrismaService } from '../../common/services/prisma.service';
 import { ActivityLogService } from '../../common/services/activity-log.service';
@@ -92,6 +94,7 @@ describe('GoogleOAuthService', () => {
           provide: AuthUtilsService,
           useValue: mockAuthUtilsService,
         },
+        { provide: MfaLoginService, useValue: mfaNotRequired() },
       ],
     }).compile();
 

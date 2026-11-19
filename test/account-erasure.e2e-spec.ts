@@ -66,6 +66,7 @@ import {
   migrationNames,
 } from './support/migrated-schema';
 import { daysFrom, givenProPurchased } from './support/subscription-fixtures';
+import { mfaNotRequired } from './support/mfa-not-required';
 
 jest.setTimeout(120_000);
 
@@ -98,6 +99,8 @@ const USER_DATA_TABLES = [
   'AuthChallenge',
   'MfaEnrollment',
   'MfaRecoveryCode',
+  'MfaLoginChallenge',
+  'MfaTrustedDevice',
   'InfrastructureJob',
 ] as const;
 
@@ -160,6 +163,7 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
       new NoopTokenVersionCache(),
       mock<EmailQueueService>(),
       mock<CustomLoggerService>(),
+      mfaNotRequired(),
     );
     emailQueue.sendAccountDeletionCode.mockResolvedValue();
     codes = new AccountDeletionCodeService(challenges, utils, emailQueue);
@@ -319,12 +323,30 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
             failedAttemptsAt: [new Date()],
           },
         },
-        // MFA recovery codes (stored as keyed hashes).
+        // MFA recovery codes (salted scrypt hashes), an open sign-in
+        // challenge and a trusted device.
         mfaRecoveryCodes: {
           create: [
-            { codeHash: randomBytes(32).toString('hex') },
-            { codeHash: randomBytes(32).toString('hex') },
+            {
+              codeHash: `scrypt$14$8$1$${randomBytes(16).toString('base64url')}$${randomBytes(32).toString('base64url')}`,
+            },
           ],
+        },
+        mfaLoginChallenges: {
+          create: {
+            tokenHash: randomBytes(32).toString('hex'),
+            provider: 'local',
+            createdAt: new Date(),
+            expiresAt: new Date(Date.now() + 5 * 60_000),
+          },
+        },
+        mfaTrustedDevices: {
+          create: {
+            tokenHash: randomBytes(32).toString('hex'),
+            name: 'phone',
+            createdAt: new Date(),
+            expiresAt: new Date(Date.now() + 30 * 24 * 3600_000),
+          },
         },
         // A background job of the PostgreSQL queue driver (a failed email
         // kept for diagnosis).
