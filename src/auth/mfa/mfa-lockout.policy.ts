@@ -1,14 +1,15 @@
-import { MFA_ENROLLMENT } from './mfa.constants';
+import { MFA_LOCKOUT } from './mfa.constants';
 
 /**
- * Rules of the enrollment lockout: five incorrect confirmation codes within
- * any 15 minutes (a sliding window) block enrollment for 15 minutes. Pure
- * functions over the stored failure times; the caller supplies the time.
+ * Rules of the MFA lockouts (enrollment confirmation and MFA verification,
+ * counted separately): five incorrect codes within any 15 minutes (a sliding
+ * window) block for 15 minutes. Pure functions over the stored failure
+ * times; the caller supplies the time.
  */
 
 /** The failures that still count at `now` (the last 15 minutes). */
 export function recentFailures(failures: readonly Date[], now: Date): Date[] {
-  const windowStart = now.getTime() - MFA_ENROLLMENT.FAILURE_WINDOW_MS;
+  const windowStart = now.getTime() - MFA_LOCKOUT.FAILURE_WINDOW_MS;
   return failures
     .filter((at) => at.getTime() > windowStart && at.getTime() <= now.getTime())
     .sort((a, b) => a.getTime() - b.getTime());
@@ -21,7 +22,7 @@ export function remainingAttempts(
 ): number {
   return Math.max(
     0,
-    MFA_ENROLLMENT.MAX_FAILED_ATTEMPTS - recentFailures(failures, now).length,
+    MFA_LOCKOUT.MAX_FAILED_ATTEMPTS - recentFailures(failures, now).length,
   );
 }
 
@@ -53,16 +54,16 @@ export function registerFailure(
   now: Date,
 ): FailureOutcome {
   const counted = [...recentFailures(failures, now), now];
-  if (counted.length >= MFA_ENROLLMENT.MAX_FAILED_ATTEMPTS) {
+  if (counted.length >= MFA_LOCKOUT.MAX_FAILED_ATTEMPTS) {
     return {
       failedAttemptsAt: [],
-      blockedUntil: new Date(now.getTime() + MFA_ENROLLMENT.BLOCK_DURATION_MS),
+      blockedUntil: new Date(now.getTime() + MFA_LOCKOUT.BLOCK_DURATION_MS),
       remainingAttempts: 0,
     };
   }
   return {
     failedAttemptsAt: counted,
     blockedUntil: null,
-    remainingAttempts: MFA_ENROLLMENT.MAX_FAILED_ATTEMPTS - counted.length,
+    remainingAttempts: MFA_LOCKOUT.MAX_FAILED_ATTEMPTS - counted.length,
   };
 }

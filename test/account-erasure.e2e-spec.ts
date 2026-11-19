@@ -97,6 +97,7 @@ const USER_DATA_TABLES = [
   'RefreshSession',
   'AuthChallenge',
   'MfaEnrollment',
+  'MfaRecoveryCode',
   'InfrastructureJob',
 ] as const;
 
@@ -317,6 +318,13 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
             expiresAt: new Date(Date.now() + 10 * 60_000),
             failedAttemptsAt: [new Date()],
           },
+        },
+        // MFA recovery codes (stored as keyed hashes).
+        mfaRecoveryCodes: {
+          create: [
+            { codeHash: randomBytes(32).toString('hex') },
+            { codeHash: randomBytes(32).toString('hex') },
+          ],
         },
         // A background job of the PostgreSQL queue driver (a failed email
         // kept for diagnosis).

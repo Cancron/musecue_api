@@ -3,9 +3,10 @@ import type { mfaMethod, Prisma, userStatus } from '@prisma/client';
 import {
   ActivityLogService,
   type ActivityLogMetadata,
+  type FieldChange,
 } from '../../common/services/activity-log.service';
 import { PrismaService } from '../../common/services/prisma.service';
-import { MFA_AUDIT_FIELDS, MFA_ENROLLMENT } from './mfa.constants';
+import { MFA_AUDIT_FIELDS, MFA_LOCKOUT } from './mfa.constants';
 
 /** The account fields MFA decisions depend on. */
 export interface MfaAccountState {
@@ -19,6 +20,15 @@ export interface MfaAccountState {
 export interface MfaEnrollmentState {
   secret: string | null;
   expiresAt: Date | null;
+  failedAttemptsAt: Date[];
+  blockedUntil: Date | null;
+}
+
+/** What verifying a second factor needs: the secret and the lockout. */
+export interface MfaVerificationState {
+  /** The confirmed TOTP secret, encrypted. */
+  mfaSecret: string | null;
+  mfaLastUsedStep: number | null;
   failedAttemptsAt: Date[];
   blockedUntil: Date | null;
 }
@@ -39,19 +49,39 @@ export interface MfaUnitOfWork {
     usedStep: number;
     metadata: ActivityLogMetadata;
   }): Promise<void>;
+  verificationState(): Promise<MfaVerificationState | null>;
+  saveVerificationLockout(state: {
+    failedAttemptsAt: Date[];
+    blockedUntil: Date | null;
+  }): Promise<void>;
+  /**
+   * Records an accepted authenticator code's step; false when that step (or
+   * a later one) was already used.
+   */
+  recordTotpStep(step: number): Promise<boolean>;
+  /**
+   * Marks the user's unused code with this hash as used; false when there is
+   * none (wrong, already used, replaced, or another user's code).
+   */
+  consumeRecoveryCode(codeHash: string, now: Date): Promise<boolean>;
+  /** Deletes every recovery code of the user and stores the new hashes. */
+  replaceRecoveryCodes(codeHashes: string[]): Promise<void>;
+  /** Unused recovery codes left. */
+  countRecoveryCodes(): Promise<number>;
+  audit(changes: FieldChange[], metadata: ActivityLogMetadata): Promise<void>;
 }
 
-const LOCK_NAMESPACE = 'musecue:mfa-enrollment:';
+const LOCK_NAMESPACE = 'musecue:mfa:';
 
 /**
- * PostgreSQL persistence of MFA enrollment (both infrastructure modes).
- * Every change of a user's MFA state runs in one transaction holding a
- * per-user advisory lock, so concurrent starts and confirmations of the same
- * user are serialized: a code is accepted at most once, and every incorrect
- * code is counted.
+ * PostgreSQL persistence of MFA (both infrastructure modes). Every change of
+ * a user's MFA state runs in one transaction holding a per-user advisory
+ * lock, so starts, confirmations and verifications of the same user are
+ * serialized: a code is accepted at most once, and every incorrect code is
+ * counted. Consumption is also atomic on its own (conditional UPDATE).
  */
 @Injectable()
-export class MfaEnrollmentRepository {
+export class MfaRepository {
   constructor(
     private readonly prisma: PrismaService,
     private readonly activityLog: ActivityLogService,
@@ -61,12 +91,14 @@ export class MfaEnrollmentRepository {
   async read(authId: string): Promise<{
     account: MfaAccountState | null;
     enrollment: MfaEnrollmentState | null;
+    recoveryCodesRemaining: number;
   }> {
-    const [account, enrollment] = await Promise.all([
+    const [account, enrollment, recoveryCodesRemaining] = await Promise.all([
       this.readAccount(this.prisma, authId),
       this.readEnrollment(this.prisma, authId),
+      this.countUnused(this.prisma, authId),
     ]);
-    return { account, enrollment };
+    return { account, enrollment, recoveryCodesRemaining };
   }
 
   /**
@@ -100,9 +132,7 @@ export class MfaEnrollmentRepository {
       where: { expiresAt: { lte: now } },
       data: { secret: null, expiresAt: null },
     });
-    const windowStart = new Date(
-      now.getTime() - MFA_ENROLLMENT.FAILURE_WINDOW_MS,
-    );
+    const windowStart = new Date(now.getTime() - MFA_LOCKOUT.FAILURE_WINDOW_MS);
     return this.prisma.$executeRaw`
       DELETE FROM "MfaEnrollment"
       WHERE "secret" IS NULL
@@ -118,6 +148,25 @@ export class MfaEnrollmentRepository {
     tx: Prisma.TransactionClient,
     authId: string,
   ): MfaUnitOfWork {
+    const audit = async (
+      changes: FieldChange[],
+      metadata: ActivityLogMetadata,
+    ) => {
+      // About the account itself, so account erasure removes it. Never
+      // includes a secret or a code.
+      await this.activityLog.logActivity(
+        {
+          tableName: 'authUser',
+          recordId: authId,
+          action: 'update',
+          eventType: 'update',
+          changes,
+          metadata,
+        },
+        tx,
+      );
+    };
+
     return {
       account: () => this.readAccount(tx, authId),
       enrollment: () => this.readEnrollment(tx, authId),
@@ -137,6 +186,8 @@ export class MfaEnrollmentRepository {
           mfaMethod: 'totp' as const,
           mfaSecret: encryptedSecret,
           mfaLastUsedStep: usedStep,
+          mfaFailedAttemptsAt: [],
+          mfaBlockedUntil: null,
         };
         // Accounts created before authSecurity rows existed get one now.
         await tx.authSecurity.upsert({
@@ -144,32 +195,82 @@ export class MfaEnrollmentRepository {
           create: { authId, ...data },
           update: data,
         });
-        // About the account itself, so account erasure removes it. Never
-        // includes the secret.
-        await this.activityLog.logActivity(
-          {
-            tableName: 'authUser',
-            recordId: authId,
-            action: 'update',
-            eventType: 'update',
-            changes: [
-              {
-                fieldName: MFA_AUDIT_FIELDS.ENABLED,
-                oldValue: 'false',
-                newValue: 'true',
-              },
-              {
-                fieldName: MFA_AUDIT_FIELDS.METHOD,
-                oldValue: null,
-                newValue: 'totp',
-              },
-            ],
-            metadata,
-          },
-          tx,
+        await audit(
+          [
+            {
+              fieldName: MFA_AUDIT_FIELDS.ENABLED,
+              oldValue: 'false',
+              newValue: 'true',
+            },
+            {
+              fieldName: MFA_AUDIT_FIELDS.METHOD,
+              oldValue: null,
+              newValue: 'totp',
+            },
+          ],
+          metadata,
         );
       },
+      verificationState: async () => {
+        const security = await tx.authSecurity.findUnique({
+          where: { authId },
+          select: {
+            mfaSecret: true,
+            mfaLastUsedStep: true,
+            mfaFailedAttemptsAt: true,
+            mfaBlockedUntil: true,
+          },
+        });
+        if (!security) return null;
+        return {
+          mfaSecret: security.mfaSecret,
+          mfaLastUsedStep: security.mfaLastUsedStep,
+          failedAttemptsAt: security.mfaFailedAttemptsAt,
+          blockedUntil: security.mfaBlockedUntil,
+        };
+      },
+      saveVerificationLockout: async ({ failedAttemptsAt, blockedUntil }) => {
+        await tx.authSecurity.update({
+          where: { authId },
+          data: {
+            mfaFailedAttemptsAt: failedAttemptsAt,
+            mfaBlockedUntil: blockedUntil,
+          },
+        });
+      },
+      recordTotpStep: async (step) => {
+        const { count } = await tx.authSecurity.updateMany({
+          where: {
+            authId,
+            OR: [{ mfaLastUsedStep: null }, { mfaLastUsedStep: { lt: step } }],
+          },
+          data: { mfaLastUsedStep: step },
+        });
+        return count === 1;
+      },
+      consumeRecoveryCode: async (codeHash, now) => {
+        const { count } = await tx.mfaRecoveryCode.updateMany({
+          where: { authId, codeHash, usedAt: null },
+          data: { usedAt: now },
+        });
+        return count === 1;
+      },
+      replaceRecoveryCodes: async (codeHashes) => {
+        await tx.mfaRecoveryCode.deleteMany({ where: { authId } });
+        await tx.mfaRecoveryCode.createMany({
+          data: codeHashes.map((codeHash) => ({ authId, codeHash })),
+        });
+      },
+      countRecoveryCodes: () => this.countUnused(tx, authId),
+      audit,
     };
+  }
+
+  private countUnused(
+    client: Prisma.TransactionClient | PrismaService,
+    authId: string,
+  ): Promise<number> {
+    return client.mfaRecoveryCode.count({ where: { authId, usedAt: null } });
   }
 
   private async readAccount(

@@ -16,8 +16,9 @@ import config from '../config/app.config';
  * key reveals the refresh-token signing secret. Rotating JWT_REFRESH_SECRET
  * invalidates everything derived from it: outstanding codes, OAuth states,
  * rate-limit buckets and queued PostgreSQL job payloads, and it makes the
- * stored MFA authenticator secrets undecryptable (users with MFA enabled
- * would have to enroll again), so it must not be rotated casually.
+ * stored MFA authenticator secrets undecryptable and every MFA recovery
+ * code unusable (users with MFA enabled would have to enroll again), so it
+ * must not be rotated casually.
  */
 export const SECRET_PURPOSES = {
   AUTH_CHALLENGE: 'musecue/auth-challenge-code/v1',
@@ -25,6 +26,7 @@ export const SECRET_PURPOSES = {
   JOB_PAYLOAD: 'musecue/infrastructure-job-payload/v1',
   RATE_LIMIT_KEY: 'musecue/rate-limit-key/v1',
   MFA_TOTP_SECRET: 'musecue/mfa-totp-secret/v1',
+  MFA_RECOVERY_CODE: 'musecue/mfa-recovery-code/v1',
 } as const;
 
 export type SecretPurpose =

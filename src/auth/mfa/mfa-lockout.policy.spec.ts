@@ -3,7 +3,7 @@ import {
   recentFailures,
   registerFailure,
   remainingAttempts,
-} from './mfa-enrollment.policy';
+} from './mfa-lockout.policy';
 
 const T0 = new Date('2026-11-22T12:00:00.000Z');
 const plus = (ms: number) => new Date(T0.getTime() + ms);
@@ -19,7 +19,7 @@ function failAt(offsets: number[]) {
   });
 }
 
-describe('MFA enrollment lockout policy', () => {
+describe('MFA lockout policy', () => {
   it('allows four incorrect codes and blocks on the fifth within 15 minutes', () => {
     const outcomes = failAt([0, 1 * MIN, 2 * MIN, 3 * MIN, 4 * MIN]);
 

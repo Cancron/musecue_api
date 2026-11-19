@@ -2,8 +2,6 @@
 // any application module reads it. MFA state is PostgreSQL-only, so this is
 // the mode that matters; HTTP contracts are the same with Redis.
 import './support/env-postgres-mode';
-import * as bcrypt from 'bcryptjs';
-import { randomBytes } from 'node:crypto';
 import request from 'supertest';
 import { decryptMfaSecret } from '../src/auth/mfa/mfa-secret.cipher';
 import { totpCode, totpStep } from '../src/auth/mfa/mfa-totp';
@@ -17,34 +15,18 @@ import {
   bootApplication,
   type TestApplication,
 } from './support/infrastructure-flows';
+import {
+  dataOf,
+  messageOf,
+  MfaTestKit,
+  MIN,
+  SECOND,
+  type TestUser,
+  wrongCode,
+} from './support/mfa-e2e';
 import { describeWithDatabase } from './support/migrated-schema';
 
 jest.setTimeout(120_000);
-
-const PASSWORD = 'correct horse battery staple';
-const SECOND = 1000;
-const MIN = 60 * SECOND;
-
-interface Envelope<T> {
-  statusCode: number;
-  message: string;
-  data: T;
-}
-const dataOf = <T>(response: { body: unknown }) =>
-  (response.body as Envelope<T>).data;
-const messageOf = (response: { body: unknown }) =>
-  (response.body as { message: string }).message;
-
-/** A six-digit code that is certainly not `code`. */
-const wrongCode = (code: string) =>
-  String((Number(code) + 1) % 1_000_000).padStart(6, '0');
-
-interface TestUser {
-  id: string;
-  email: string;
-  ip: string;
-  accessToken: string;
-}
 
 /**
  * Optional MFA (authenticator app) through the real endpoints of the whole
@@ -56,30 +38,24 @@ interface TestUser {
  */
 describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
   let ctx: TestApplication;
-  let passwordHash: string;
-  /** The frozen application time; only ever moves forward. */
-  let clock: Date;
-  let ipCounter = 0;
+  let kit: MfaTestKit;
 
-  const http = () => request(ctx.app.getHttpServer());
-  const setClock = (to: Date) => {
-    clock = to;
-    jest.setSystemTime(clock);
-  };
-  const advance = (ms: number) => setClock(new Date(clock.getTime() + ms));
-  /** Moves to the start of a later 30-second TOTP step. */
-  const nextStepStart = (afterMs = 0) =>
-    setClock(
-      new Date((Math.floor((clock.getTime() + afterMs) / 30_000) + 1) * 30_000),
-    );
+  const http = () => kit.http();
+  const setClock = (to: Date) => kit.setClock(to);
+  const advance = (ms: number) => kit.advance(ms);
+  const createUser = () => kit.createUser();
+  const signIn = (user: TestUser) => kit.signIn(user);
+  const as = (user: TestUser) => kit.as(user);
+  const getStatus = (user: TestUser) => kit.getStatus(user);
+  const start = (user: TestUser) => kit.start(user);
+  const confirm = (user: TestUser, code: string) => kit.confirm(user, code);
 
   beforeAll(async () => {
     ctx = await bootApplication();
-    passwordHash = await bcrypt.hash(PASSWORD, 4);
-    clock = new Date();
-    freezeTime(clock);
+    kit = new MfaTestKit(ctx, '198.18');
+    freezeTime(kit.clock);
     // Start on a step boundary, so every test controls the position in it.
-    nextStepStart();
+    kit.nextStepStart();
   });
 
   afterAll(async () => {
@@ -90,47 +66,9 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
   beforeEach(() => {
     // Every test runs well after the previous one (throttling windows,
     // enrollments and blocks of earlier tests are over).
-    nextStepStart(60 * MIN);
+    kit.nextStepStart(60 * MIN);
   });
 
-  /** A verified local account (temporary row) signed in through the API. */
-  async function createUser(): Promise<TestUser> {
-    const tag = randomBytes(5).toString('hex');
-    const email = `mfa_${tag}@example.com`;
-    const user = await ctx.client.authUser.create({
-      data: {
-        email,
-        username: `mfa_${tag}`,
-        password: passwordHash,
-        verified: true,
-        authSecurity: { create: { mfaEnabled: false } },
-      },
-    });
-    const ip = `198.18.${Math.floor(++ipCounter / 250)}.${(ipCounter % 250) + 1}`;
-    const testUser = { id: user.id, email, ip, accessToken: '' };
-    await signIn(testUser);
-    return testUser;
-  }
-
-  /** (Re-)signs in at the current time: access tokens live 15 minutes. */
-  async function signIn(user: TestUser) {
-    const response = await http()
-      .post('/auth/login')
-      .set('X-Forwarded-For', user.ip)
-      .send({ email: user.email, password: PASSWORD })
-      .expect(201);
-    user.accessToken = dataOf<{ accessToken: string }>(response).accessToken;
-  }
-
-  const as = (user: TestUser) => ({
-    Authorization: `Bearer ${user.accessToken}`,
-    'X-Forwarded-For': user.ip,
-  });
-  const getStatus = (user: TestUser) => http().get('/auth/mfa').set(as(user));
-  const start = (user: TestUser) =>
-    http().post('/auth/mfa/enrollment').set(as(user));
-  const confirm = (user: TestUser, code: string) =>
-    http().post('/auth/mfa/enrollment/confirm').set(as(user)).send({ code });
   const startOk = async (user: TestUser) =>
     dataOf<MfaEnrollmentStartView>(await start(user).expect(201));
 
@@ -152,6 +90,7 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
     expect(dataOf<MfaStatusView>(await getStatus(user).expect(200))).toEqual({
       enabled: false,
       method: null,
+      recoveryCodesRemaining: null,
       enrollment: {
         status: 'NONE',
         expiresAt: null,
@@ -173,10 +112,12 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
       algorithm: 'SHA1',
       digits: 6,
       period: 30,
-      expiresAt: new Date(clock.getTime() + 10 * MIN).toISOString(),
+      expiresAt: new Date(kit.clock.getTime() + 10 * MIN).toISOString(),
     });
     const pending = await enrollmentOf(user);
-    expect(pending!.expiresAt).toEqual(new Date(clock.getTime() + 10 * MIN));
+    expect(pending!.expiresAt).toEqual(
+      new Date(kit.clock.getTime() + 10 * MIN),
+    );
     // The pending secret is encrypted and bound to this user.
     expect(pending!.secret).toMatch(/^v1\./);
     expect(pending!.secret).not.toContain(started.secret);
@@ -197,7 +138,7 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
 
     // Confirm with the app's current code, 20 seconds into its step.
     advance(20 * SECOND);
-    const code = totpCode(started.secret, clock);
+    const code = totpCode(started.secret, kit.clock);
     const confirmed = await confirm(user, code).expect(200);
     expect(dataOf<MfaStatusView>(confirmed)).toMatchObject({
       enabled: true,
@@ -209,7 +150,7 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
     expect(security).toMatchObject({
       mfaEnabled: true,
       mfaMethod: 'totp',
-      mfaLastUsedStep: totpStep(clock),
+      mfaLastUsedStep: totpStep(kit.clock),
     });
     expect(security.mfaSecret).toMatch(/^v1\.[\w-]+\.[\w-]+\.[\w-]+$/);
     const raw = security.mfaSecret!;
@@ -255,6 +196,7 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
     expect(dataOf<MfaStatusView>(await getStatus(user).expect(200))).toEqual({
       enabled: true,
       method: 'totp',
+      recoveryCodesRemaining: 10,
       enrollment: {
         status: 'NONE',
         expiresAt: null,
@@ -267,7 +209,7 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
   it('never accepts an already used code again', async () => {
     const user = await createUser();
     const { secret } = await startOk(user);
-    const code = totpCode(secret, clock);
+    const code = totpCode(secret, kit.clock);
     await confirm(user, code).expect(200);
     const enabled = await securityOf(user);
 
@@ -293,7 +235,7 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
   it('accepts exactly one of concurrent confirmations with the same code', async () => {
     const user = await createUser();
     const { secret } = await startOk(user);
-    const code = totpCode(secret, clock);
+    const code = totpCode(secret, kit.clock);
 
     const responses = await Promise.all(
       Array.from({ length: 5 }, () => confirm(user, code)),
@@ -318,7 +260,7 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
     it('accepts a code until the last second of its 30-second step', async () => {
       const user = await createUser();
       const { secret } = await startOk(user);
-      const code = totpCode(secret, clock);
+      const code = totpCode(secret, kit.clock);
 
       advance(29 * SECOND + 999);
       await confirm(user, code).expect(200);
@@ -328,7 +270,7 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
     it('rejects an expired code (after its 30 seconds) and counts it', async () => {
       const user = await createUser();
       const { secret } = await startOk(user);
-      const code = totpCode(secret, clock);
+      const code = totpCode(secret, kit.clock);
 
       advance(30 * SECOND);
       const response = await confirm(user, code).expect(400);
@@ -344,14 +286,14 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
       });
       expect((await enrollmentOf(user))!.failedAttemptsAt).toHaveLength(2);
       // The app's current code still works.
-      await confirm(user, totpCode(secret, clock)).expect(200);
+      await confirm(user, totpCode(secret, kit.clock)).expect(200);
     });
 
     it('rejects an invalid code and keeps the enrollment pending', async () => {
       const user = await createUser();
       const { secret } = await startOk(user);
 
-      await confirm(user, wrongCode(totpCode(secret, clock))).expect(400);
+      await confirm(user, wrongCode(totpCode(secret, kit.clock))).expect(400);
 
       expect((await securityOf(user)).mfaEnabled).toBe(false);
       expect(dataOf<MfaStatusView>(await getStatus(user)).enrollment).toEqual(
@@ -388,7 +330,7 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
 
       advance(10 * MIN - 5 * SECOND);
       await signIn(user); // the 15-minute access token is still fine; renew anyway
-      await confirm(user, totpCode(secret, clock)).expect(200);
+      await confirm(user, totpCode(secret, kit.clock)).expect(200);
       expect((await securityOf(user)).mfaEnabled).toBe(true);
     });
 
@@ -400,7 +342,9 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
       expect(
         dataOf<MfaStatusView>(await getStatus(user)).enrollment.status,
       ).toBe('EXPIRED');
-      const response = await confirm(user, totpCode(secret, clock)).expect(410);
+      const response = await confirm(user, totpCode(secret, kit.clock)).expect(
+        410,
+      );
       expect(messageOf(response)).toBe(
         'The MFA enrollment has expired. Start a new enrollment.',
       );
@@ -413,12 +357,12 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
         secret: null,
         expiresAt: null,
       });
-      await confirm(user, totpCode(secret, clock)).expect(409);
+      await confirm(user, totpCode(secret, kit.clock)).expect(409);
 
       // A new enrollment, with a new secret, works.
       const restarted = await startOk(user);
       expect(restarted.secret).not.toBe(secret);
-      await confirm(user, totpCode(restarted.secret, clock)).expect(200);
+      await confirm(user, totpCode(restarted.secret, kit.clock)).expect(200);
     });
 
     it('is replaced by a restart: only the newest secret works', async () => {
@@ -427,8 +371,8 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
       advance(2 * MIN);
       const second = await startOk(user);
 
-      await confirm(user, totpCode(first.secret, clock)).expect(400);
-      await confirm(user, totpCode(second.secret, clock)).expect(200);
+      await confirm(user, totpCode(first.secret, kit.clock)).expect(400);
+      await confirm(user, totpCode(second.secret, kit.clock)).expect(200);
     });
 
     it('is cleaned up by the expiry sweep', async () => {
@@ -439,7 +383,7 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
       const failedStart = await startOk(failed);
       await confirm(
         failed,
-        wrongCode(totpCode(failedStart.secret, clock)),
+        wrongCode(totpCode(failedStart.secret, kit.clock)),
       ).expect(400);
       advance(5 * MIN);
       await startOk(active);
@@ -448,7 +392,7 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
       // but the failure of `failed` still counts for another 5 minutes.
       advance(5 * MIN);
       const sweeper = ctx.get<AuthStateCleanupService>(AuthStateCleanupService);
-      await sweeper.sweep(clock);
+      await sweeper.sweep(kit.clock);
 
       expect(await enrollmentOf(expired)).toBeNull();
       expect(await enrollmentOf(failed)).toMatchObject({
@@ -460,10 +404,10 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
 
       // Once the failure is older than 15 minutes, the row goes too.
       advance(5 * MIN + SECOND);
-      await sweeper.sweep(clock);
+      await sweeper.sweep(kit.clock);
       expect(await enrollmentOf(failed)).toBeNull();
       await signIn(expired);
-      await confirm(expired, totpCode(secret, clock)).expect(409);
+      await confirm(expired, totpCode(secret, kit.clock)).expect(409);
     });
   });
 
@@ -474,7 +418,9 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
 
       const responses: request.Response[] = [];
       for (let i = 0; i < 5; i++) {
-        responses.push(await confirm(user, wrongCode(totpCode(secret, clock))));
+        responses.push(
+          await confirm(user, wrongCode(totpCode(secret, kit.clock))),
+        );
         advance(MIN);
       }
 
@@ -485,9 +431,9 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
         'Invalid or expired authenticator code. 2 attempt(s) remaining.',
         'Invalid or expired authenticator code. 1 attempt(s) remaining.',
       ]);
-      // The fifth failure happened 4 minutes after the first (the clock has
+      // The fifth failure happened 4 minutes after the first (the kit.clock has
       // since moved one more minute): blocked for 15 minutes from then.
-      const blockedUntil = new Date(clock.getTime() - MIN + 15 * MIN);
+      const blockedUntil = new Date(kit.clock.getTime() - MIN + 15 * MIN);
       expect(messageOf(responses[4])).toBe(
         `Too many incorrect codes. MFA enrollment is blocked until ${blockedUntil.toISOString()}.`,
       );
@@ -506,7 +452,7 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
 
       // While blocked: even the correct code and a restart are refused, and
       // nothing extends the block.
-      await confirm(user, totpCode(secret, clock)).expect(429);
+      await confirm(user, totpCode(secret, kit.clock)).expect(429);
       await start(user).expect(429);
       expect((await enrollmentOf(user))!.blockedUntil).toEqual(blockedUntil);
       expect((await securityOf(user)).mfaEnabled).toBe(false);
@@ -516,7 +462,7 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
       await signIn(user);
       const fresh = await startOk(user);
       expect(fresh.secret).not.toBe(secret);
-      await confirm(user, totpCode(fresh.secret, clock)).expect(200);
+      await confirm(user, totpCode(fresh.secret, kit.clock)).expect(200);
       expect(await securityOf(user)).toMatchObject({
         mfaEnabled: true,
         mfaMethod: 'totp',
@@ -527,15 +473,16 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
       const user = await createUser();
       const first = await startOk(user);
       for (let i = 0; i < 3; i++) {
-        await confirm(user, wrongCode(totpCode(first.secret, clock))).expect(
-          400,
-        );
+        await confirm(
+          user,
+          wrongCode(totpCode(first.secret, kit.clock)),
+        ).expect(400);
       }
       const second = await startOk(user);
-      await confirm(user, wrongCode(totpCode(second.secret, clock))).expect(
+      await confirm(user, wrongCode(totpCode(second.secret, kit.clock))).expect(
         400,
       );
-      await confirm(user, wrongCode(totpCode(second.secret, clock))).expect(
+      await confirm(user, wrongCode(totpCode(second.secret, kit.clock))).expect(
         429,
       );
     });
@@ -544,7 +491,7 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
       const user = await createUser();
       const { secret } = await startOk(user);
       for (let i = 0; i < 4; i++) {
-        await confirm(user, wrongCode(totpCode(secret, clock))).expect(400);
+        await confirm(user, wrongCode(totpCode(secret, kit.clock))).expect(400);
       }
 
       advance(15 * MIN);
@@ -552,7 +499,7 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
       const restarted = await startOk(user);
       const response = await confirm(
         user,
-        wrongCode(totpCode(restarted.secret, clock)),
+        wrongCode(totpCode(restarted.secret, kit.clock)),
       ).expect(400);
       expect(messageOf(response)).toContain('4 attempt(s) remaining');
     });
@@ -587,7 +534,7 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
       await http()
         .post('/auth/mfa/enrollment/confirm')
         .set(as(bob))
-        .send({ code: totpCode(secret, clock), userId: alice.id })
+        .send({ code: totpCode(secret, kit.clock), userId: alice.id })
         .expect(400);
       // ...and query parameters are ignored: Bob only ever sees himself.
       const bobStatus = await http()
@@ -597,9 +544,9 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
       expect(dataOf<MfaStatusView>(bobStatus).enrollment.status).toBe('NONE');
 
       // Alice's code confirms nothing for Bob.
-      await confirm(bob, totpCode(secret, clock)).expect(409);
+      await confirm(bob, totpCode(secret, kit.clock)).expect(409);
       await startOk(bob);
-      await confirm(bob, totpCode(secret, clock)).expect(400);
+      await confirm(bob, totpCode(secret, kit.clock)).expect(400);
 
       expect(await securityOf(bob)).toMatchObject({
         mfaEnabled: false,
@@ -612,7 +559,7 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
       expect(await enrollmentOf(alice)).toEqual(aliceBefore);
 
       // Alice herself still can.
-      await confirm(alice, totpCode(secret, clock)).expect(200);
+      await confirm(alice, totpCode(secret, kit.clock)).expect(200);
       expect((await securityOf(alice)).mfaEnabled).toBe(true);
       expect((await securityOf(bob)).mfaEnabled).toBe(false);
     });
@@ -622,14 +569,15 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
       const bob = await createUser();
       const bobStart = await startOk(bob);
       for (let i = 0; i < 5; i++) {
-        await confirm(bob, wrongCode(totpCode(bobStart.secret, clock))).expect(
-          i < 4 ? 400 : 429,
-        );
+        await confirm(
+          bob,
+          wrongCode(totpCode(bobStart.secret, kit.clock)),
+        ).expect(i < 4 ? 400 : 429);
       }
       await start(bob).expect(429);
 
       const { secret } = await startOk(alice);
-      await confirm(alice, totpCode(secret, clock)).expect(200);
+      await confirm(alice, totpCode(secret, kit.clock)).expect(200);
     });
 
     it('stops working for tokens revoked by logout-all', async () => {
@@ -664,7 +612,7 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
       ctx.client.mfaEnrollment.create({
         data: {
           authId: user.id,
-          failedAttemptsAt: Array.from({ length: 6 }, () => clock),
+          failedAttemptsAt: Array.from({ length: 6 }, () => kit.clock),
         },
       }),
     ).rejects.toThrow();

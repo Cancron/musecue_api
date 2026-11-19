@@ -1,8 +1,9 @@
 import { HttpException } from '@nestjs/common';
 import { mock } from 'jest-mock-extended';
 import type { Logger } from 'winston';
-import { FakeMfaEnrollmentRepository } from '../../../test/support/fake-mfa-enrollment-repository';
+import { FakeMfaRepository } from '../../../test/support/fake-mfa-repository';
 import config from '../../common/config/app.config';
+import { hashRecoveryCode } from './mfa-recovery-codes';
 import { decryptMfaSecret } from './mfa-secret.cipher';
 import { totpCode, totpStep } from './mfa-totp';
 import { MfaService } from './mfa.service';
@@ -31,7 +32,7 @@ async function rejection(promise: Promise<unknown>) {
 
 describe('MfaService', () => {
   const originalSecret = config.jwt_refresh_secret;
-  let repo: FakeMfaEnrollmentRepository;
+  let repo: FakeMfaRepository;
   let logger: ReturnType<typeof mock<Logger>>;
   let service: MfaService;
 
@@ -43,7 +44,7 @@ describe('MfaService', () => {
   });
 
   beforeEach(() => {
-    repo = new FakeMfaEnrollmentRepository();
+    repo = new FakeMfaRepository();
     repo.addAccount(USER, { email: 'owner@example.com' });
     repo.addAccount(OTHER);
     logger = mock<Logger>();
@@ -60,6 +61,7 @@ describe('MfaService', () => {
       await expect(service.getStatus(USER, T0)).resolves.toEqual({
         enabled: false,
         method: null,
+        recoveryCodesRemaining: null,
         enrollment: {
           status: 'NONE',
           expiresAt: null,
@@ -88,6 +90,7 @@ describe('MfaService', () => {
       await expect(service.getStatus(USER, T0)).resolves.toMatchObject({
         enabled: true,
         method: 'totp',
+        recoveryCodesRemaining: 10,
         enrollment: { status: 'NONE' },
       });
     });
@@ -177,12 +180,14 @@ describe('MfaService', () => {
       expect(view).toEqual({
         enabled: true,
         method: 'totp',
+        recoveryCodesRemaining: 10,
         enrollment: {
           status: 'NONE',
           expiresAt: null,
           blockedUntil: null,
           remainingAttempts: 5,
         },
+        recoveryCodes: expect.any(Array) as string[],
       });
       const account = repo.accounts.get(USER)!;
       expect(account).toMatchObject({ mfaEnabled: true, mfaMethod: 'totp' });
@@ -194,8 +199,42 @@ describe('MfaService', () => {
       // The pending enrollment (and its copy of the secret) is gone.
       expect(repo.enrollments.has(USER)).toBe(false);
       expect(repo.audits).toEqual([
-        { authId: USER, metadata: { ...META, actionedBy: USER } },
+        {
+          authId: USER,
+          changes: expect.any(Array) as unknown[],
+          metadata: { ...META, actionedBy: USER },
+        },
       ]);
+    });
+
+    it('issues ten unique recovery codes, stored only as keyed hashes', async () => {
+      const { secret } = await start();
+
+      const { recoveryCodes } = await confirm(totpCode(secret, T0));
+
+      expect(recoveryCodes).toHaveLength(10);
+      expect(new Set(recoveryCodes).size).toBe(10);
+      for (const code of recoveryCodes) {
+        expect(code).toMatch(/^[A-HJKMNP-Z2-9]{5}-[A-HJKMNP-Z2-9]{5}$/);
+      }
+      const stored = repo.recoveryCodes.get(USER)!;
+      expect(stored.map((c) => c.codeHash).sort()).toEqual(
+        recoveryCodes.map((code) => hashRecoveryCode(USER, code)).sort(),
+      );
+      expect(stored.every((c) => c.usedAt === null)).toBe(true);
+      for (const { codeHash } of stored) {
+        expect(codeHash).toMatch(/^[0-9a-f]{64}$/);
+      }
+      // Never again: the status only reports how many are left.
+      expect(JSON.stringify(await service.getStatus(USER, T0))).not.toContain(
+        recoveryCodes[0],
+      );
+    });
+
+    it('issues no recovery codes when the confirmation fails', async () => {
+      const { secret } = await start();
+      await rejection(confirm(wrongCode(totpCode(secret, T0))));
+      expect(repo.recoveryCodes.get(USER) ?? []).toEqual([]);
     });
 
     it('accepts a code until the last millisecond of its 30-second step', async () => {

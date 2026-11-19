@@ -5,7 +5,7 @@ import { WINSTON_MODULE_PROVIDER } from 'nest-winston';
 import request from 'supertest';
 import type { App } from 'supertest/types';
 import type { Logger } from 'winston';
-import { FakeMfaEnrollmentRepository } from '../../../test/support/fake-mfa-enrollment-repository';
+import { FakeMfaRepository } from '../../../test/support/fake-mfa-repository';
 import { freezeTime } from '../../../test/support/freeze-time';
 import config from '../../common/config/app.config';
 import { AllExceptionsFilter } from '../../common/filters/all-exception.filter';
@@ -16,11 +16,12 @@ import { TokenVersionCache } from '../../infrastructure/token-version/token-vers
 import { UserRole } from '../interfaces/auth.interface';
 import { AuthUtilsService } from '../services/auth-utils.service';
 import { RateLimitStore } from '../../infrastructure/rate-limit/rate-limit.store';
-import { MfaEnrollmentRepository } from './mfa-enrollment.repository';
+import { MfaRepository } from './mfa.repository';
 import { totpCode } from './mfa-totp';
 import { MfaController } from './mfa.controller';
 import type { MfaEnrollmentStartView, MfaStatusView } from './mfa.service';
 import { MfaService } from './mfa.service';
+import { MfaVerificationService } from './mfa-verification.service';
 
 const ALICE = 'alice-id';
 const BOB = 'bob-id';
@@ -34,7 +35,7 @@ const messageOf = (response: { body: unknown }) =>
 
 describe('MFA enrollment (HTTP)', () => {
   let app: INestApplication<App>;
-  let repo: FakeMfaEnrollmentRepository;
+  let repo: FakeMfaRepository;
   const versions = new Map<string, number>();
   const originalSecrets = {
     access: config.jwt_access_secret,
@@ -53,14 +54,15 @@ describe('MFA enrollment (HTTP)', () => {
     tokenVersions.get.mockImplementation((userId) =>
       Promise.resolve(versions.get(userId) ?? null),
     );
-    repo = new FakeMfaEnrollmentRepository();
+    repo = new FakeMfaRepository();
 
     const moduleRef = await Test.createTestingModule({
       controllers: [MfaController],
       providers: [
         MfaService,
+        MfaVerificationService,
         AuthGuard,
-        { provide: MfaEnrollmentRepository, useValue: repo.asRepository() },
+        { provide: MfaRepository, useValue: repo.asRepository() },
         { provide: TokenVersionCache, useValue: tokenVersions },
         { provide: PrismaService, useValue: {} },
         { provide: WINSTON_MODULE_PROVIDER, useValue: mock<Logger>() },
@@ -113,6 +115,8 @@ describe('MFA enrollment (HTTP)', () => {
       ['GET', '/auth/mfa'],
       ['POST', '/auth/mfa/enrollment'],
       ['POST', '/auth/mfa/enrollment/confirm'],
+      ['POST', '/auth/mfa/verify'],
+      ['POST', '/auth/mfa/recovery-codes'],
     ])('%s %s requires a bearer token', async (method, path) => {
       const req =
         method === 'GET' ? http().get(path) : http().post(path).send({});
@@ -147,6 +151,7 @@ describe('MFA enrollment (HTTP)', () => {
       data: {
         enabled: false,
         method: null,
+        recoveryCodesRemaining: null,
         enrollment: {
           status: 'NONE',
           expiresAt: null,
@@ -284,5 +289,115 @@ describe('MFA enrollment (HTTP)', () => {
       .post('/auth/mfa/enrollment')
       .set(auth(tokenFor(ALICE)))
       .expect(429);
+  });
+
+  describe('recovery codes and verification', () => {
+    /** Enables MFA for the user over HTTP; returns the one-time response. */
+    async function enable(userId: string) {
+      const { secret } = await startFor(userId);
+      const response = await http()
+        .post('/auth/mfa/enrollment/confirm')
+        .set(auth(tokenFor(userId)))
+        .send({ code: totpCode(secret, T0) })
+        .expect(200);
+      return { secret, response };
+    }
+    const verify = (userId: string, body: object) =>
+      http()
+        .post('/auth/mfa/verify')
+        .set(auth(tokenFor(userId)))
+        .send(body);
+
+    it('shows the ten codes once, in an uncacheable response', async () => {
+      const { response } = await enable(ALICE);
+      expect(response.headers['cache-control']).toBe('no-store');
+      expect(response.headers['pragma']).toBe('no-cache');
+      const { recoveryCodes } = dataOf<{ recoveryCodes: string[] }>(response);
+      expect(recoveryCodes).toHaveLength(10);
+
+      // No later response contains them.
+      const later = [
+        await http()
+          .get('/auth/mfa')
+          .set(auth(tokenFor(ALICE))),
+        await verify(ALICE, { recoveryCode: recoveryCodes[0] }),
+        await verify(ALICE, { recoveryCode: recoveryCodes[0] }),
+        await http()
+          .post('/auth/mfa/enrollment/confirm')
+          .set(auth(tokenFor(ALICE)))
+          .send({ code: '123456' }),
+      ];
+      expect(later.map((r) => r.status)).toEqual([200, 200, 400, 409]);
+      for (const r of later) {
+        for (const code of recoveryCodes) {
+          expect(JSON.stringify(r.body)).not.toContain(code);
+        }
+      }
+      // Read before the verification below used one.
+      expect(dataOf<MfaStatusView>(later[0]).recoveryCodesRemaining).toBe(10);
+      expect(dataOf(later[1])).toEqual({
+        verified: true,
+        method: 'recovery_code',
+        recoveryCodesRemaining: 9,
+      });
+    });
+
+    it.each([
+      [{}, 'Provide exactly one of code or recoveryCode'],
+      [
+        { code: '123456', recoveryCode: 'ABCDE-FGHJK' },
+        'Provide exactly one of code or recoveryCode',
+      ],
+      [
+        { recoveryCode: 'ABCD-EFGHJK' },
+        'recoveryCode must look like ABCDE-FGHJK',
+      ],
+      [{ recoveryCode: 12345 }, 'recoveryCode must be a string'],
+      [{ code: '12345' }, 'code must be exactly 6 digits'],
+      [
+        { recoveryCode: 'ABCDE-FGHJK', userId: BOB },
+        'property userId should not exist',
+      ],
+    ])('rejects %j before checking anything', async (body, message) => {
+      await enable(ALICE);
+
+      const response = await verify(ALICE, body).expect(400);
+
+      expect(messageOf(response)).toContain(message);
+      expect(repo.accounts.get(ALICE)!.mfaFailedAttemptsAt).toEqual([]);
+      expect(repo.unusedCodes(ALICE)).toHaveLength(10);
+    });
+
+    it("declines another user's recovery code", async () => {
+      const alice = dataOf<{ recoveryCodes: string[] }>(
+        (await enable(ALICE)).response,
+      );
+      await enable(BOB);
+
+      await verify(BOB, { recoveryCode: alice.recoveryCodes[0] }).expect(400);
+      await verify(ALICE, { recoveryCode: alice.recoveryCodes[0] }).expect(200);
+    });
+
+    it('regenerates codes after a second factor, shown once', async () => {
+      const { secret } = await enable(ALICE);
+      const code = totpCode(secret, new Date(T0.getTime() + 30_000));
+      jest.setSystemTime(new Date(T0.getTime() + 30_000));
+
+      const response = await http()
+        .post('/auth/mfa/recovery-codes')
+        .set(auth(tokenFor(ALICE)))
+        .send({ code })
+        .expect(201);
+
+      expect(response.headers['cache-control']).toBe('no-store');
+      expect(
+        dataOf<{ recoveryCodes: string[] }>(response).recoveryCodes,
+      ).toHaveLength(10);
+      await http()
+        .post('/auth/mfa/recovery-codes')
+        .set(auth(tokenFor(ALICE)))
+        .send({})
+        .expect(400);
+    });
   });
 });

@@ -7,7 +7,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { WINSTON_MODULE_PROVIDER } from 'nest-winston';
 import type { Logger } from 'winston';
-import { MfaEnrollmentRepository } from '../mfa/mfa-enrollment.repository';
+import { MfaRepository } from '../mfa/mfa.repository';
 import { AuthChallengeRepository } from './auth-challenge.repository';
 import { OAuthStateRepository } from './oauth-state.repository';
 import { RefreshSessionRepository } from './refresh-session.repository';
@@ -28,7 +28,7 @@ export class AuthStateCleanupService implements OnModuleInit, OnModuleDestroy {
     private readonly sessions: RefreshSessionRepository,
     private readonly challenges: AuthChallengeRepository,
     private readonly oauthStates: OAuthStateRepository,
-    private readonly mfaEnrollments: MfaEnrollmentRepository,
+    private readonly mfaEnrollments: MfaRepository,
     private readonly config: ConfigService,
     @Inject(WINSTON_MODULE_PROVIDER) private readonly logger: Logger,
   ) {}

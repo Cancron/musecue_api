@@ -1,4 +1,4 @@
-import { HttpException, Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable } from '@nestjs/common';
 import type { mfaMethod } from '@prisma/client';
 import { WINSTON_MODULE_PROVIDER } from 'nest-winston';
 import type { Logger } from 'winston';
@@ -10,12 +10,18 @@ import {
   recentFailures,
   registerFailure,
   remainingAttempts,
-} from './mfa-enrollment.policy';
+} from './mfa-lockout.policy';
 import {
-  MfaEnrollmentRepository,
+  guardMfaStorage,
+  mfaBlockedError,
+  requireActiveAccount,
+} from './mfa-errors';
+import { issueRecoveryCodes } from './mfa-recovery-codes';
+import {
+  MfaRepository,
   type MfaAccountState,
   type MfaEnrollmentState,
-} from './mfa-enrollment.repository';
+} from './mfa.repository';
 import { decryptMfaSecret, encryptMfaSecret } from './mfa-secret.cipher';
 import { buildOtpAuthUri, generateTotpSecret, verifyTotp } from './mfa-totp';
 import { MFA_ENROLLMENT, MFA_TOTP } from './mfa.constants';
@@ -32,6 +38,8 @@ export type MfaEnrollmentStatus = 'NONE' | 'PENDING' | 'EXPIRED' | 'BLOCKED';
 export interface MfaStatusView {
   enabled: boolean;
   method: mfaMethod | null;
+  /** Unused recovery codes (never the codes); null while MFA is disabled. */
+  recoveryCodesRemaining: number | null;
   enrollment: {
     status: MfaEnrollmentStatus;
     expiresAt: Date | null;
@@ -39,6 +47,15 @@ export interface MfaStatusView {
     /** Incorrect codes still allowed before the block. */
     remainingAttempts: number;
   };
+}
+
+/**
+ * Returned once, when the enrollment is confirmed: the status and the new
+ * recovery codes, which are never shown again and never stored in
+ * plaintext.
+ */
+export interface MfaEnabledView extends MfaStatusView {
+  recoveryCodes: string[];
 }
 
 /** Returned once, when an enrollment starts; never stored in plaintext. */
@@ -60,7 +77,7 @@ type StartOutcome =
   | { kind: 'BLOCKED'; until: Date };
 
 type ConfirmOutcome =
-  | { kind: 'ENABLED' }
+  | { kind: 'ENABLED'; recoveryCodes: string[] }
   | { kind: 'ALREADY_ENABLED' }
   | { kind: 'BLOCKED'; until: Date }
   | { kind: 'NO_ENROLLMENT' }
@@ -73,7 +90,8 @@ const CONTEXT = 'MfaService';
 /**
  * Optional MFA with an authenticator app (TOTP) for the signed-in owner:
  * start an enrollment (a new secret, valid for 10 minutes), confirm it with
- * the app's current six-digit code, and read whether MFA is enabled.
+ * the app's current six-digit code (which also issues the recovery codes),
+ * and read whether MFA is enabled.
  *
  * The owner is always the access token's user; no operation accepts another
  * user's ID. Secrets are stored only encrypted. A code is accepted only
@@ -83,7 +101,7 @@ const CONTEXT = 'MfaService';
 @Injectable()
 export class MfaService {
   constructor(
-    private readonly repository: MfaEnrollmentRepository,
+    private readonly repository: MfaRepository,
     @Inject(WINSTON_MODULE_PROVIDER) private readonly logger: Logger,
   ) {}
 
@@ -91,10 +109,15 @@ export class MfaService {
     authId: string,
     now: Date = new Date(),
   ): Promise<MfaStatusView> {
-    const { account, enrollment } = await this.guard(() =>
-      this.repository.read(authId),
+    const { account, enrollment, recoveryCodesRemaining } = await this.guard(
+      () => this.repository.read(authId),
     );
-    return this.statusView(this.requireActive(account), enrollment, now);
+    return this.statusView(
+      requireActiveAccount(account),
+      enrollment,
+      recoveryCodesRemaining,
+      now,
+    );
   }
 
   async startEnrollment(
@@ -103,7 +126,7 @@ export class MfaService {
   ): Promise<MfaEnrollmentStartView> {
     const outcome = await this.guard(() =>
       this.repository.withLock<StartOutcome>(authId, async (uow) => {
-        const account = this.requireActive(await uow.account());
+        const account = requireActiveAccount(await uow.account());
         if (account.mfaEnabled) return { kind: 'ALREADY_ENABLED' };
 
         const enrollment = await uow.enrollment();
@@ -157,10 +180,10 @@ export class MfaService {
     code: string,
     metadata: ActivityLogMetadata,
     now: Date = new Date(),
-  ): Promise<MfaStatusView> {
+  ): Promise<MfaEnabledView> {
     const outcome = await this.guard(() =>
       this.repository.withLock<ConfirmOutcome>(authId, async (uow) => {
-        const account = this.requireActive(await uow.account());
+        const account = requireActiveAccount(await uow.account());
         // Also answers a replay of the code that enabled MFA.
         if (account.mfaEnabled) return { kind: 'ALREADY_ENABLED' };
 
@@ -231,7 +254,10 @@ export class MfaService {
           metadata: { ...metadata, actionedBy: authId },
         });
         await uow.deleteEnrollment();
-        return { kind: 'ENABLED' };
+        // Ten single-use recovery codes, stored only as keyed hashes, in the
+        // same commit; the plaintext leaves only in this response.
+        const recoveryCodes = await issueRecoveryCodes(uow, authId);
+        return { kind: 'ENABLED', recoveryCodes };
       }),
     );
 
@@ -241,7 +267,9 @@ export class MfaService {
         return {
           enabled: true,
           method: 'totp',
+          recoveryCodesRemaining: outcome.recoveryCodes.length,
           enrollment: this.noEnrollment(),
+          recoveryCodes: outcome.recoveryCodes,
         };
       case 'ALREADY_ENABLED':
         throw this.alreadyEnabled();
@@ -276,12 +304,14 @@ export class MfaService {
   private statusView(
     account: MfaAccountState,
     enrollment: MfaEnrollmentState | null,
+    recoveryCodesRemaining: number,
     now: Date,
   ): MfaStatusView {
     if (account.mfaEnabled) {
       return {
         enabled: true,
         method: account.mfaMethod,
+        recoveryCodesRemaining,
         enrollment: this.noEnrollment(),
       };
     }
@@ -296,6 +326,7 @@ export class MfaService {
     return {
       enabled: false,
       method: null,
+      recoveryCodesRemaining: null,
       enrollment: {
         status,
         expiresAt:
@@ -317,32 +348,8 @@ export class MfaService {
     };
   }
 
-  /** The token's user must still exist and be active. */
-  private requireActive(account: MfaAccountState | null): MfaAccountState {
-    if (!account) throw AppError.unauthorized('User not found');
-    if (account.status !== 'ACTIVE') {
-      throw AppError.forbidden('User account is not active');
-    }
-    return account;
-  }
-
-  /**
-   * Storage or key failures become a 503, never a wrong-code answer; HTTP
-   * errors raised inside the transaction pass through.
-   */
-  private async guard<T>(operation: () => Promise<T>): Promise<T> {
-    try {
-      return await operation();
-    } catch (error) {
-      if (error instanceof HttpException) throw error;
-      this.logger.error('MFA state could not be read or written', {
-        context: CONTEXT,
-        errorName: error instanceof Error ? error.name : typeof error,
-      });
-      throw AppError.serviceUnavailable(
-        'MFA is temporarily unavailable. Please try again.',
-      );
-    }
+  private guard<T>(operation: () => Promise<T>): Promise<T> {
+    return guardMfaStorage(this.logger, CONTEXT, operation);
   }
 
   private alreadyEnabled(): AppError {
@@ -350,8 +357,6 @@ export class MfaService {
   }
 
   private blocked(until: Date): AppError {
-    return AppError.tooManyRequests(
-      `Too many incorrect codes. MFA enrollment is blocked until ${until.toISOString()}.`,
-    );
+    return mfaBlockedError('MFA enrollment', until);
   }
 }
