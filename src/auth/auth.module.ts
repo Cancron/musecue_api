@@ -11,9 +11,10 @@ import { AuthChallengeRepository } from './state/auth-challenge.repository';
 import { AuthStateCleanupService } from './state/auth-state-cleanup.service';
 import { OAuthStateRepository } from './state/oauth-state.repository';
 import { RefreshSessionRepository } from './state/refresh-session.repository';
+import { MfaModule } from './mfa/mfa.module';
 
 @Module({
-  imports: [QueueModule],
+  imports: [QueueModule, MfaModule],
   controllers: [AuthController],
   providers: [
     AuthService,
