@@ -1,5 +1,6 @@
 import { BillingInterval } from '@prisma/client';
 import { mock } from 'jest-mock-extended';
+import { CreditAllowanceService } from './credit-allowance.service';
 import {
   FAKE_WEBHOOK_SECRET,
   FakeStripeApi,
@@ -34,6 +35,8 @@ describe('SubscriptionBillingService', () => {
   const plans = mock<SubscriptionPlanService>();
   const activityLog = mock<ActivityLogService>();
   const logger = mock<CustomLoggerService>();
+  // Trial credits are covered by the credit tests.
+  const credits = mock<CreditAllowanceService>();
   const meta = { ip: '192.0.2.4', userAgent: 'billing-spec' };
   let api: FakeStripeApi;
   let db: InMemoryBillingPrisma;
@@ -84,6 +87,7 @@ describe('SubscriptionBillingService', () => {
       logger,
       cancellation,
       new StripeRefundService(prisma, gateway, activityLog, logger),
+      credits,
     );
     billing = new SubscriptionBillingService(prisma);
   });

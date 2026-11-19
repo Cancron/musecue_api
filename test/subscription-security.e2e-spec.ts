@@ -108,7 +108,12 @@ describeWithDatabase('Subscription security (PostgreSQL, full stack)', () => {
     await applyMigrations(schema, migrationNames());
     client = new PrismaClient({
       adapter: new PrismaPg(
-        { connectionString: TEST_DATABASE_URL as string },
+        {
+          connectionString: TEST_DATABASE_URL as string,
+          // Raw SQL (e.g. the credit wallet's FOR UPDATE lock, taken when a
+          // trial starts) resolves tables via search_path.
+          options: `-c search_path=${schema}`,
+        },
         { schema },
       ),
     });

@@ -10,13 +10,17 @@ import {
  * usable, derived from the same date windows as Pro access
  * (subscription-access.policy). Pure functions; no database access.
  *
- * - The free trial comes with `trialCredits`, expiring with the trial.
+ * - The free trial comes with `trialCredits`, expiring with the trial. They
+ *   are granted when the trial is activated (CreditAllowanceService); buying
+ *   paid Pro ends them at once (a trial can only start without Pro history,
+ *   so any paid term means the user upgraded).
  * - A paid Pro term comes with `proMonthlyCredits` for every month of the
  *   term (monthly and yearly billing alike), expiring at the end of that
  *   month or of the term, whichever is first. Months are counted from the
  *   term's start, on the same calendar day (clamped to the month's length,
  *   like Stripe's billing anchor: Jan 31 -> Feb 28 -> Mar 31).
- * - TRIAL credits are usable only while the trial is active and
+ * - TRIAL credits are usable only while the trial is active (and Pro has
+ *   not been bought) and
  *   SUBSCRIPTION credits only while the paid term is active, so a refund
  *   that ends the term early also ends its credits. PURCHASE and REFERRAL
  *   credits are usable with or without Pro.
@@ -34,6 +38,22 @@ export interface DueAllowance {
   amount: number;
   expiresAt: Date;
   description: string;
+}
+
+/** The reference of a trial's allowance: one per trial (and user). */
+export const trialAllowanceReference = (trialStartedAt: Date): string =>
+  `trial:${trialStartedAt.toISOString()}`;
+
+/** Whether trial credits apply: an active trial, and no paid Pro bought. */
+function trialCreditsApply(
+  record: SubscriptionRecord | null,
+  now: Date,
+): boolean {
+  return (
+    record !== null &&
+    isTrialActive(record, now) &&
+    record.proStartedAt === null
+  );
 }
 
 /** `anchor` plus `months` calendar months, on the anchor's day (clamped). */
@@ -74,10 +94,10 @@ export function dueAllowances(
   amounts: AllowanceAmounts,
 ): DueAllowance[] {
   const due: DueAllowance[] = [];
-  if (record && isTrialActive(record, now)) {
+  if (record && trialCreditsApply(record, now)) {
     due.push({
       source: CreditSource.TRIAL,
-      sourceReference: `trial:${(record.trialStartedAt as Date).toISOString()}`,
+      sourceReference: trialAllowanceReference(record.trialStartedAt as Date),
       amount: amounts.trialCredits,
       expiresAt: record.trialExpiresAt as Date,
       description: 'Free trial credits',
@@ -108,7 +128,7 @@ export function isCreditSourceUsable(
     case CreditSource.REFERRAL:
       return true;
     case CreditSource.TRIAL:
-      return isTrialActive(record, now);
+      return trialCreditsApply(record, now);
     case CreditSource.SUBSCRIPTION:
       return isProActive(record, now);
     default:

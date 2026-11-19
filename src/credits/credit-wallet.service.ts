@@ -56,6 +56,21 @@ interface LockedWallet {
   expired: number;
 }
 
+export interface WalletOperationOptions {
+  /**
+   * Run inside this (caller's) transaction instead of a new one, so the
+   * credit change commits or rolls back together with the caller's writes.
+   * The wallet stays locked until that transaction ends.
+   */
+  tx?: Prisma.TransactionClient;
+  /**
+   * When the change takes effect (grant time, expiry checks, occurredAt),
+   * for a change that belongs to an event with its own time, such as a
+   * trial starting. Defaults to the time the wallet lock was acquired.
+   */
+  at?: Date;
+}
+
 /**
  * Waiting for another operation's wallet lock counts towards the
  * transaction timeout; operations on one wallet are short.
@@ -90,7 +105,10 @@ export class CreditWalletService {
    * existing grant (`replayed: true`) without adding credits; with different
    * values it is rejected. A user can receive TRIAL credits only once.
    */
-  async grant(input: GrantCreditsInput): Promise<GrantCreditsResult> {
+  async grant(
+    input: GrantCreditsInput,
+    options: WalletOperationOptions = {},
+  ): Promise<GrantCreditsResult> {
     const amount = this.parseAmount(input.amount);
     this.assertReference('sourceReference', input.sourceReference);
     if (!Object.values(CreditSource).includes(input.source)) {
@@ -99,94 +117,141 @@ export class CreditWalletService {
     const expiresAt = input.expiresAt ?? null;
     const idempotencyKey = `grant:${input.source}:${input.sourceReference}`;
 
-    return this.withLockedWallet(input.authId, async (tx, wallet) => {
-      const existing = await tx.creditAllocation.findUnique({
-        where: {
-          walletId_source_sourceReference: {
+    return this.withLockedWallet(
+      input.authId,
+      async (tx, wallet) => {
+        const existing = await tx.creditAllocation.findUnique({
+          where: {
+            walletId_source_sourceReference: {
+              walletId: wallet.id,
+              source: input.source,
+              sourceReference: input.sourceReference,
+            },
+          },
+        });
+        if (existing) {
+          const same =
+            existing.amount.eq(amount) &&
+            (existing.expiresAt?.getTime() ?? null) ===
+              (expiresAt?.getTime() ?? null);
+          if (!same && !input.keepExistingGrant) {
+            throw new CreditConflictError(
+              'These credits were already granted with a different amount or expiration',
+            );
+          }
+          const transaction = await this.findTransaction(
+            tx,
+            wallet.id,
+            idempotencyKey,
+          );
+          return {
+            allocation: this.toAllocationView(existing),
+            transaction: this.toTransactionView(transaction),
+            replayed: true,
+          };
+        }
+
+        // Checked after the replay lookup, so a retried grant is still
+        // recognized once its credits have expired.
+        const expiryRejection = getGrantExpiryRejection(
+          input.source,
+          expiresAt,
+          wallet.now,
+        );
+        if (expiryRejection) {
+          throw new InvalidCreditOperationError(expiryRejection);
+        }
+
+        if (input.source === CreditSource.TRIAL) {
+          const trial = await tx.creditAllocation.findFirst({
+            where: { walletId: wallet.id, source: CreditSource.TRIAL },
+            select: { id: true },
+          });
+          if (trial) {
+            throw new CreditConflictError('Trial credits were already granted');
+          }
+        }
+
+        const balanceBefore = await this.remainingCredits(tx, wallet.id);
+        const allocation = await tx.creditAllocation.create({
+          data: {
             walletId: wallet.id,
+            authId: wallet.authId,
             source: input.source,
             sourceReference: input.sourceReference,
+            amount,
+            remaining: amount,
+            grantedAt: wallet.now,
+            expiresAt,
           },
-        },
-      });
-      if (existing) {
-        const same =
-          existing.amount.eq(amount) &&
-          (existing.expiresAt?.getTime() ?? null) ===
-            (expiresAt?.getTime() ?? null);
-        if (!same && !input.keepExistingGrant) {
-          throw new CreditConflictError(
-            'These credits were already granted with a different amount or expiration',
-          );
-        }
-        const transaction = await this.findTransaction(
-          tx,
-          wallet.id,
-          idempotencyKey,
-        );
-        return {
-          allocation: this.toAllocationView(existing),
-          transaction: this.toTransactionView(transaction),
-          replayed: true,
-        };
-      }
-
-      // Checked after the replay lookup, so a retried grant is still
-      // recognized once its credits have expired.
-      const expiryRejection = getGrantExpiryRejection(
-        input.source,
-        expiresAt,
-        wallet.now,
-      );
-      if (expiryRejection) {
-        throw new InvalidCreditOperationError(expiryRejection);
-      }
-
-      if (input.source === CreditSource.TRIAL) {
-        const trial = await tx.creditAllocation.findFirst({
-          where: { walletId: wallet.id, source: CreditSource.TRIAL },
-          select: { id: true },
         });
-        if (trial) {
-          throw new CreditConflictError('Trial credits were already granted');
-        }
-      }
-
-      const balanceBefore = await this.remainingCredits(tx, wallet.id);
-      const allocation = await tx.creditAllocation.create({
-        data: {
-          walletId: wallet.id,
-          authId: wallet.authId,
-          source: input.source,
-          sourceReference: input.sourceReference,
-          amount,
-          remaining: amount,
-          grantedAt: wallet.now,
-          expiresAt,
-        },
-      });
-      const transaction = await tx.creditTransaction.create({
-        data: {
-          walletId: wallet.id,
-          authId: wallet.authId,
-          type: CreditTransactionType.GRANT,
-          amount,
-          balanceAfter: balanceBefore.plus(amount),
-          idempotencyKey,
-          description: input.description,
-          occurredAt: wallet.now,
-          entries: {
-            create: [{ allocationId: allocation.id, amount }],
+        const transaction = await tx.creditTransaction.create({
+          data: {
+            walletId: wallet.id,
+            authId: wallet.authId,
+            type: CreditTransactionType.GRANT,
+            amount,
+            balanceAfter: balanceBefore.plus(amount),
+            idempotencyKey,
+            description: input.description,
+            occurredAt: wallet.now,
+            entries: {
+              create: [{ allocationId: allocation.id, amount }],
+            },
           },
-        },
-        include: { entries: true },
-      });
-      return {
-        allocation: this.toAllocationView(allocation),
-        transaction: this.toTransactionView(transaction),
-        replayed: false,
-      };
+          include: { entries: true },
+        });
+        return {
+          allocation: this.toAllocationView(allocation),
+          transaction: this.toTransactionView(transaction),
+          replayed: false,
+        };
+      },
+      options,
+    );
+  }
+
+  /**
+   * Expires all unused credits of `source` now, before their expiry date
+   * (for example trial credits when paid Pro starts): one EXPIRATION
+   * transaction per allocation, effective now, with `description`. Credits
+   * of other sources are never touched. Returns how many allocations were
+   * closed. Creates no wallet: a user without one has nothing to expire.
+   * Pass the caller's transaction to commit it together with the event that
+   * ends the credits.
+   */
+  async expireSourceNow(
+    authId: string,
+    source: CreditSource,
+    description: string,
+    options: WalletOperationOptions = {},
+  ): Promise<number> {
+    const client = options.tx ?? this.prisma;
+    const hasWallet = await client.creditWallet.findUnique({
+      where: { authId },
+      select: { id: true },
     });
+    if (!hasWallet) return 0;
+    return this.withLockedWallet(
+      authId,
+      async (tx, wallet) => {
+        const open = await tx.creditAllocation.findMany({
+          where: { walletId: wallet.id, source, remaining: { gt: 0 } },
+          orderBy: [{ grantedAt: 'asc' }, { id: 'asc' }],
+        });
+        let balance = await this.remainingCredits(tx, wallet.id);
+        for (const allocation of open) {
+          balance = balance.minus(allocation.remaining);
+          await this.closeAllocation(tx, wallet, allocation, {
+            balanceAfter: balance,
+            occurredAt: wallet.now,
+            description,
+          });
+        }
+        return open.length;
+      },
+      options,
+    );
   }
 
   /**
@@ -432,9 +497,10 @@ export class CreditWalletService {
   private withLockedWallet<T>(
     authId: string,
     work: (tx: Tx, wallet: LockedWallet) => Promise<T>,
+    options: WalletOperationOptions = {},
   ): Promise<T> {
     this.assertReference('authId', authId);
-    return this.prisma.$transaction(async (tx) => {
+    const run = async (tx: Tx) => {
       const owner = await tx.authUser.findUnique({
         where: { id: authId },
         select: { id: true },
@@ -450,7 +516,7 @@ export class CreditWalletService {
       `;
       if (!locked) throw new CreditOwnerNotFoundError();
 
-      const now = new Date();
+      const now = options.at ?? new Date();
       const expired = await this.recordDueExpirations(
         tx,
         locked.id,
@@ -458,7 +524,11 @@ export class CreditWalletService {
         now,
       );
       return work(tx, { id: locked.id, authId, now, expired });
-    }, WALLET_TRANSACTION_OPTIONS);
+    };
+    // Inside the caller's transaction the lock is held until it commits.
+    return options.tx
+      ? run(options.tx)
+      : this.prisma.$transaction(run, WALLET_TRANSACTION_OPTIONS);
   }
 
   /**
@@ -480,37 +550,56 @@ export class CreditWalletService {
 
     let balance = await this.remainingCredits(tx, walletId);
     for (const allocation of due) {
-      const expiredCredits = allocation.remaining;
-      balance = balance.minus(expiredCredits);
-      const { count } = await tx.creditAllocation.updateMany({
-        where: { id: allocation.id, remaining: expiredCredits },
-        data: { remaining: 0 },
-      });
-      if (count !== 1) {
-        throw new Error('Credit allocation changed during a locked expiration');
-      }
-      await tx.creditTransaction.create({
-        data: {
-          walletId,
-          authId,
-          type: CreditTransactionType.EXPIRATION,
-          amount: expiredCredits.negated(),
-          balanceAfter: balance,
-          idempotencyKey: `expire:${allocation.id}`,
-          description: `${allocation.source} credits expired`,
-          occurredAt: allocation.expiresAt as Date,
-          entries: {
-            create: [
-              {
-                allocationId: allocation.id,
-                amount: expiredCredits.negated(),
-              },
-            ],
-          },
-        },
+      balance = balance.minus(allocation.remaining);
+      await this.closeAllocation(tx, { id: walletId, authId }, allocation, {
+        balanceAfter: balance,
+        occurredAt: allocation.expiresAt as Date,
+        description: `${allocation.source} credits expired`,
       });
     }
     return due.length;
+  }
+
+  /**
+   * Removes an allocation's unused credits with an EXPIRATION transaction.
+   * The idempotency key is per allocation, so an allocation is expired at
+   * most once, whether at its expiry or earlier. Runs under the wallet lock.
+   */
+  private async closeAllocation(
+    tx: Tx,
+    wallet: { id: string; authId: string },
+    allocation: CreditAllocation,
+    expiration: {
+      balanceAfter: Prisma.Decimal;
+      occurredAt: Date;
+      description: string;
+    },
+  ): Promise<void> {
+    const expiredCredits = allocation.remaining;
+    const { count } = await tx.creditAllocation.updateMany({
+      where: { id: allocation.id, remaining: expiredCredits },
+      data: { remaining: 0 },
+    });
+    if (count !== 1) {
+      throw new Error('Credit allocation changed during a locked expiration');
+    }
+    await tx.creditTransaction.create({
+      data: {
+        walletId: wallet.id,
+        authId: wallet.authId,
+        type: CreditTransactionType.EXPIRATION,
+        amount: expiredCredits.negated(),
+        balanceAfter: expiration.balanceAfter,
+        idempotencyKey: `expire:${allocation.id}`,
+        description: expiration.description,
+        occurredAt: expiration.occurredAt,
+        entries: {
+          create: [
+            { allocationId: allocation.id, amount: expiredCredits.negated() },
+          ],
+        },
+      },
+    });
   }
 
   /** Records overage for a session, or rejects the debit. */

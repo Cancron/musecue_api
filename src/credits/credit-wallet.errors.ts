@@ -48,16 +48,23 @@ export class CreditConflictError extends CreditWalletError {
   }
 }
 
-/** The balance (and any session overage) cannot cover a debit. Nothing was written. */
+export const INSUFFICIENT_CREDITS_MESSAGE = 'Insufficient credits';
+
+/**
+ * The user's credits cannot cover what was asked: a debit beyond the balance
+ * and any session overage, or creating a makeup session without usable
+ * credits (ProAccessGuard). Always 403 "Insufficient credits", so clients see
+ * one response for both. Nothing was written.
+ */
 export class InsufficientCreditsError extends CreditWalletError {
   constructor(details: {
-    requested: string;
+    requested?: string;
     available: string;
-    overageRemaining: string;
+    overageRemaining?: string;
   }) {
     super(
-      HttpStatus.PAYMENT_REQUIRED,
-      'Not enough credits',
+      HttpStatus.FORBIDDEN,
+      INSUFFICIENT_CREDITS_MESSAGE,
       'INSUFFICIENT_CREDITS',
       details,
     );

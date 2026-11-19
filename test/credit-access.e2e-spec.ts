@@ -6,6 +6,7 @@ import * as bcrypt from 'bcryptjs';
 import { randomBytes } from 'node:crypto';
 import request from 'supertest';
 import { CreditExpirationSweepService } from '../src/credits/credit-expiration-sweep.service';
+import { InsufficientCreditsError } from '../src/credits/credit-wallet.errors';
 import { CreditWalletService } from '../src/credits/credit-wallet.service';
 import { addBillingInterval } from '../src/subscription/billing.validation';
 import { givenCreditsInPostgres } from './support/credit-fixtures';
@@ -470,5 +471,18 @@ describeWithDatabase('Credit-based access to makeup sessions (e2e)', () => {
 
     const response = await createSession(auth).expect(403);
     expect(response.body).toMatchObject(INSUFFICIENT);
+
+    // A debit beyond the balance fails with the same status and message.
+    const debit = await ctx
+      .get<CreditWalletService>(CreditWalletService)
+      .debit({ authId: account.id, amount: '0.5', idempotencyKey: 'more' })
+      .catch((error: unknown) => error);
+    expect(debit).toBeInstanceOf(InsufficientCreditsError);
+    expect((debit as InsufficientCreditsError).getStatus()).toBe(
+      INSUFFICIENT.statusCode,
+    );
+    expect((debit as InsufficientCreditsError).message).toBe(
+      INSUFFICIENT.message,
+    );
   });
 });

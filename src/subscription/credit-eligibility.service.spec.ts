@@ -262,7 +262,25 @@ describe('CreditEligibilityService', () => {
       });
     });
 
-    it('counts trial and subscription credits while their windows are active, exactly', async () => {
+    it('counts trial credits during the trial, exactly', async () => {
+      stored = row({
+        trialUsed: true,
+        trialStartedAt: iso('2026-06-08T00:00:00.000Z'),
+        trialExpiresAt: iso('2026-06-15T00:00:00.000Z'),
+      });
+      allocations = [
+        allocation(CreditSource.TRIAL, '0.1', '2026-06-15T00:00:00.000Z'),
+        allocation(CreditSource.PURCHASE, '0.2'),
+      ];
+
+      await expect(service.getEligibility('user-1')).resolves.toMatchObject({
+        eligible: true,
+        usableCredits: '0.3',
+        proAccess: { accessSource: 'TRIAL' },
+      });
+    });
+
+    it('stops counting trial credits once paid Pro is bought during the trial', async () => {
       stored = row({
         trialUsed: true,
         trialStartedAt: iso('2026-06-08T00:00:00.000Z'),
@@ -271,6 +289,7 @@ describe('CreditEligibilityService', () => {
         proStartedAt: iso('2026-06-09T00:00:00.000Z'),
         proExpiresAt: iso('2026-07-09T00:00:00.000Z'),
       });
+      wallet.hasGrant.mockResolvedValue(true);
       allocations = [
         allocation(CreditSource.TRIAL, '0.1', '2026-06-15T00:00:00.000Z'),
         allocation(
@@ -282,9 +301,14 @@ describe('CreditEligibilityService', () => {
 
       await expect(service.getEligibility('user-1')).resolves.toMatchObject({
         eligible: true,
-        usableCredits: '0.3',
+        usableCredits: '0.2',
+        usableBySource: { TRIAL: '0', SUBSCRIPTION: '0.2' },
         proAccess: { accessSource: 'PRO' },
       });
+      // No trial allowance is granted after the upgrade.
+      expect(
+        wallet.grant.mock.calls.filter(([input]) => input.source === 'TRIAL'),
+      ).toEqual([]);
     });
   });
 });

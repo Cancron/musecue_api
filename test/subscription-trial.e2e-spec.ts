@@ -4,6 +4,9 @@ import { mock } from 'jest-mock-extended';
 import { ActivityLogService } from '../src/common/services/activity-log.service';
 import type { CustomLoggerService } from '../src/common/services/custom-logger.service';
 import type { PrismaService } from '../src/common/services/prisma.service';
+import { CreditSettingsService } from '../src/credits/credit-settings.service';
+import { CreditWalletService } from '../src/credits/credit-wallet.service';
+import { CreditAllowanceService } from '../src/subscription/credit-allowance.service';
 import { SubscriptionAccessService } from '../src/subscription/subscription-access.service';
 import { SubscriptionPlanService } from '../src/subscription/subscription-plan.service';
 import { SubscriptionTrialService } from '../src/subscription/subscription-trial.service';
@@ -30,6 +33,7 @@ describeWithDatabase('Free trial activation (PostgreSQL)', () => {
   let prisma: PrismaService;
   let plans: SubscriptionPlanService;
   let trials: SubscriptionTrialService;
+  let credits: CreditAllowanceService;
   let access: SubscriptionAccessService;
   let adminId: string;
 
@@ -43,17 +47,29 @@ describeWithDatabase('Free trial activation (PostgreSQL)', () => {
     await applyMigrations(schema, migrationNames());
     client = new PrismaClient({
       adapter: new PrismaPg(
-        { connectionString: TEST_DATABASE_URL as string },
+        {
+          connectionString: TEST_DATABASE_URL as string,
+          // The credit wallet's row lock (raw SQL) resolves via search_path.
+          options: `-c search_path=${schema}`,
+        },
         { schema },
       ),
     });
     prisma = client as unknown as PrismaService;
-    const activityLog = new ActivityLogService(
-      prisma,
-      mock<CustomLoggerService>(),
-    );
+    const logger = mock<CustomLoggerService>();
+    const activityLog = new ActivityLogService(prisma, logger);
     plans = new SubscriptionPlanService(prisma, activityLog);
-    trials = new SubscriptionTrialService(prisma, plans, activityLog);
+    // Real trial credits: activation grants them in its transaction.
+    const creditSettings = new CreditSettingsService(
+      prisma,
+      activityLog,
+      logger,
+    );
+    credits = new CreditAllowanceService(
+      new CreditWalletService(prisma, creditSettings),
+      creditSettings,
+    );
+    trials = new SubscriptionTrialService(prisma, plans, activityLog, credits);
     access = new SubscriptionAccessService(prisma, plans);
     adminId = await createUser(client);
   });
@@ -303,7 +319,12 @@ describeWithDatabase('Free trial activation (PostgreSQL)', () => {
 
         const failingLog = mock<ActivityLogService>();
         failingLog.logActivity.mockRejectedValue(new Error('audit store down'));
-        const failing = new SubscriptionTrialService(prisma, plans, failingLog);
+        const failing = new SubscriptionTrialService(
+          prisma,
+          plans,
+          failingLog,
+          credits,
+        );
 
         await expect(failing.activateTrial(userId, meta, now)).rejects.toThrow(
           'audit store down',

@@ -445,7 +445,11 @@ describe('CreditWalletService', () => {
         .catch((caught: unknown) => caught);
 
       expect(error).toBeInstanceOf(InsufficientCreditsError);
-      expect((error as InsufficientCreditsError).getStatus()).toBe(402);
+      // Same response as ProAccessGuard on POST /v1/sessions.
+      expect((error as InsufficientCreditsError).getStatus()).toBe(403);
+      expect((error as InsufficientCreditsError).message).toBe(
+        'Insufficient credits',
+      );
       expectNothingWritten();
     });
 
@@ -634,6 +638,102 @@ describe('CreditWalletService', () => {
       expect(calls.indexOf('lock')).toBeLessThan(
         calls.indexOf('create-EXPIRATION'),
       );
+    });
+  });
+
+  describe("in the caller's transaction", () => {
+    it('grants inside the given transaction without opening another', async () => {
+      const outer = mockDeep<PrismaService>();
+      outer.authUser.findUnique.mockResolvedValue({ id: 'user-1' } as never);
+      outer.creditWallet.createMany.mockResolvedValue({ count: 1 });
+      outer.$queryRaw.mockResolvedValue([{ id: 'wallet-1' }] as never);
+      outer.creditAllocation.findMany.mockResolvedValue([]);
+      outer.creditAllocation.findUnique.mockResolvedValue(null);
+      outer.creditAllocation.findFirst.mockResolvedValue(null);
+      outer.creditAllocation.aggregate.mockResolvedValue({
+        _sum: { remaining: null },
+      } as never);
+      outer.creditAllocation.create.mockResolvedValue(
+        allocation({ id: 'alloc-trial', source: CreditSource.TRIAL }),
+      );
+      outer.creditTransaction.create.mockResolvedValue(
+        storedTransaction({ type: CreditTransactionType.GRANT }) as never,
+      );
+
+      await service.grant(
+        {
+          authId: 'user-1',
+          source: CreditSource.TRIAL,
+          sourceReference: 'trial:1',
+          amount: 50,
+          expiresAt: later(7 * 24 * HOUR),
+        },
+        { tx: outer },
+      );
+
+      expect(prisma.$transaction.mock.calls).toHaveLength(0);
+      expect(outer.$queryRaw.mock.calls).toHaveLength(1);
+      expect(outer.creditAllocation.create.mock.calls).toHaveLength(1);
+      expect(prisma.creditAllocation.create.mock.calls).toHaveLength(0);
+    });
+  });
+
+  describe('expireSourceNow', () => {
+    it('closes every open allocation of the source, now, with the given description', async () => {
+      prisma.creditWallet.findUnique.mockResolvedValue({
+        id: 'wallet-1',
+      } as never);
+      allocations = [
+        allocation({
+          id: 'trial',
+          source: CreditSource.TRIAL,
+          remaining: D('37.5'),
+          expiresAt: later(5 * 24 * HOUR),
+        }),
+        allocation({ id: 'purchase', remaining: D('20') }),
+      ];
+      prisma.creditAllocation.findMany.mockImplementation(((args: {
+        where: { source?: CreditSource; expiresAt?: unknown };
+      }) =>
+        Promise.resolve(
+          args.where.expiresAt
+            ? []
+            : allocations.filter((a) => a.source === args.where.source),
+        )) as never);
+
+      await expect(
+        service.expireSourceNow('user-1', CreditSource.TRIAL, 'upgraded'),
+      ).resolves.toBe(1);
+
+      expect(createdTransactions()).toEqual([
+        expect.objectContaining({
+          type: CreditTransactionType.EXPIRATION,
+          amount: D('-37.5'),
+          balanceAfter: D('20'),
+          idempotencyKey: 'expire:trial',
+          description: 'upgraded',
+          occurredAt: NOW,
+          entries: { create: [{ allocationId: 'trial', amount: D('-37.5') }] },
+        }),
+      ]);
+      expect(prisma.creditAllocation.updateMany.mock.calls).toEqual([
+        [
+          {
+            where: { id: 'trial', remaining: D('37.5') },
+            data: { remaining: 0 },
+          },
+        ],
+      ]);
+    });
+
+    it('creates no wallet for a user who has none', async () => {
+      prisma.creditWallet.findUnique.mockResolvedValue(null);
+
+      await expect(
+        service.expireSourceNow('user-1', CreditSource.TRIAL, 'upgraded'),
+      ).resolves.toBe(0);
+      expect(prisma.creditWallet.createMany.mock.calls).toHaveLength(0);
+      expect(prisma.$transaction.mock.calls).toHaveLength(0);
     });
   });
 

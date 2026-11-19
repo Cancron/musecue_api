@@ -1,4 +1,4 @@
-import type { PrismaClient } from '@prisma/client';
+import { Prisma, type PrismaClient } from '@prisma/client';
 
 /**
  * Purchased and referral credits are not issued by the application yet; they
@@ -62,4 +62,43 @@ export async function givenCreditsInPostgres(
   await client.$executeRawUnsafe(
     manualCreditGrantSql({ authId, source, sourceReference, amount }),
   );
+}
+
+/**
+ * Re-checks a user's ledger from the stored rows: entries add up to each
+ * allocation's remaining credits and each transaction's amount, and every
+ * balanceAfter continues the previous one, ending at what the allocations
+ * hold. Returns the rows for further assertions.
+ */
+export async function expectConsistentLedger(
+  client: PrismaClient,
+  authId: string,
+) {
+  const allocations = await client.creditAllocation.findMany({
+    where: { authId },
+    include: { entries: true },
+  });
+  for (const allocation of allocations) {
+    const total = allocation.entries.reduce(
+      (sum, entry) => sum.plus(entry.amount),
+      new Prisma.Decimal(0),
+    );
+    expect(allocation.remaining.toFixed()).toBe(total.toFixed());
+  }
+  const transactions = await client.creditTransaction.findMany({
+    where: { authId },
+    orderBy: { sequence: 'asc' },
+    include: { entries: true },
+  });
+  let balance = new Prisma.Decimal(0);
+  for (const transaction of transactions) {
+    balance = balance.plus(transaction.amount);
+    expect(transaction.balanceAfter.toFixed()).toBe(balance.toFixed());
+  }
+  const remaining = allocations.reduce(
+    (sum, allocation) => sum.plus(allocation.remaining),
+    new Prisma.Decimal(0),
+  );
+  expect(balance.toFixed()).toBe(remaining.toFixed());
+  return { allocations, transactions };
 }

@@ -435,6 +435,10 @@ describeWithDatabase('Credit wallet and ledger (PostgreSQL)', () => {
       expect(rejected).toHaveLength(10);
       for (const result of rejected) {
         expect(result.reason).toBeInstanceOf(InsufficientCreditsError);
+        expect(result.reason).toMatchObject({
+          status: 403,
+          message: 'Insufficient credits',
+        });
       }
       await expect(wallet.getBalance(userId)).resolves.toMatchObject({
         available: '0',

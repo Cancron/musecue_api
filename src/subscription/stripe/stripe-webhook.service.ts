@@ -18,6 +18,7 @@ import {
 } from '../../common/services/activity-log.service';
 import { CustomLoggerService } from '../../common/services/custom-logger.service';
 import { PrismaService } from '../../common/services/prisma.service';
+import { CreditAllowanceService } from '../credit-allowance.service';
 import { isProActive } from '../subscription-access.policy';
 import { StripeCancellationService } from './stripe-cancellation.service';
 import { StripeRefundService } from './stripe-refund.service';
@@ -154,6 +155,7 @@ export class StripeWebhookService {
     private readonly logger: CustomLoggerService,
     private readonly cancellation: StripeCancellationService,
     private readonly refunds: StripeRefundService,
+    private readonly credits: CreditAllowanceService,
   ) {}
 
   /**
@@ -513,6 +515,9 @@ export class StripeWebhookService {
         },
       });
       await this.audit(tx, record, next, metadata);
+      // Buying Pro ends any unused trial credits, in the same transaction
+      // (purchased and referral credits are kept).
+      await this.credits.expireTrialCreditsOnUpgrade(tx, record.authId, now);
       return 'ACTIVATED';
     });
   }

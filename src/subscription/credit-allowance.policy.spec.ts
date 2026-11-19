@@ -212,7 +212,7 @@ describe('credit allowance policy', () => {
       ).toEqual(iso('2026-02-01T00:00:00.000Z'));
     });
 
-    it('grants both during a trial-to-paid overlap', () => {
+    it('grants only the Pro allowance once paid Pro is bought during the trial', () => {
       const r = record({
         trialUsed: true,
         trialStartedAt: iso('2026-05-01T00:00:00.000Z'),
@@ -225,7 +225,7 @@ describe('credit allowance policy', () => {
         dueAllowances(r, iso('2026-05-06T00:00:00.000Z'), AMOUNTS).map(
           (a) => a.source,
         ),
-      ).toEqual([CreditSource.TRIAL, CreditSource.SUBSCRIPTION]);
+      ).toEqual([CreditSource.SUBSCRIPTION]);
     });
 
     it('uses the configured amounts', () => {
@@ -278,9 +278,18 @@ describe('credit allowance policy', () => {
       );
     });
 
-    it('trial credits are usable only while the trial is active', () => {
+    it('trial credits are usable only while the trial is active and Pro has not been bought', () => {
       expect(isCreditSourceUsable(CreditSource.TRIAL, activeTrial, now)).toBe(
         true,
+      );
+      const upgraded = record({
+        ...activeTrial,
+        billingInterval: BillingInterval.MONTHLY,
+        proStartedAt: iso('2026-06-09T00:00:00.000Z'),
+        proExpiresAt: iso('2026-07-09T00:00:00.000Z'),
+      });
+      expect(isCreditSourceUsable(CreditSource.TRIAL, upgraded, now)).toBe(
+        false,
       );
       expect(
         isCreditSourceUsable(

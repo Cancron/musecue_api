@@ -8,6 +8,10 @@ import { Reflector } from '@nestjs/core';
 import type { Request } from 'express';
 import AppError from '../common/errors/app.error';
 import {
+  INSUFFICIENT_CREDITS_MESSAGE,
+  InsufficientCreditsError,
+} from '../credits/credit-wallet.errors';
+import {
   CreditEligibilityService,
   type CreditEligibility,
 } from './credit-eligibility.service';
@@ -31,7 +35,7 @@ export interface CreditAccessRequest extends ProAccessRequest {
 export const PRO_ACCESS_REQUIRED_MESSAGE =
   'An active Pro subscription or free trial is required';
 
-export const INSUFFICIENT_CREDITS_MESSAGE = 'Insufficient credits';
+export { INSUFFICIENT_CREDITS_MESSAGE };
 
 /**
  * Protects Pro feature endpoints. Use after AuthGuard:
@@ -77,7 +81,11 @@ export class ProAccessGuard implements CanActivate {
     if (requireCredits === true) {
       const eligibility = await this.credits.getEligibility(userId);
       if (!eligibility.eligible) {
-        throw AppError.forbidden(INSUFFICIENT_CREDITS_MESSAGE);
+        // The same error (403 "Insufficient credits") as a wallet debit the
+        // balance cannot cover.
+        throw new InsufficientCreditsError({
+          available: eligibility.usableCredits,
+        });
       }
       Object.assign(request, {
         proAccess: eligibility.proAccess,

@@ -18,6 +18,7 @@ import {
   ProAccessGuard,
 } from './pro-access.guard';
 import { RequireCredits } from './require-credits.decorator';
+import { InsufficientCreditsError } from '../credits/credit-wallet.errors';
 import { SubscriptionAccessService } from './subscription-access.service';
 import { SubscriptionPlanService } from './subscription-plan.service';
 
@@ -309,9 +310,12 @@ describe('ProAccessGuard', () => {
     it('rejects a user without usable credits with 403 "Insufficient credits", even with Pro', async () => {
       credits.getEligibility.mockResolvedValue(decision(false, true));
 
-      await expect(
-        checkCredits({ user: { userId: 'user-1' } }),
-      ).rejects.toMatchObject({
+      const error = await checkCredits({ user: { userId: 'user-1' } }).catch(
+        (caught: unknown) => caught,
+      );
+      // The same error a wallet debit throws beyond the balance and overage.
+      expect(error).toBeInstanceOf(InsufficientCreditsError);
+      expect(error).toMatchObject({
         status: 403,
         message: INSUFFICIENT_CREDITS_MESSAGE,
       });
