@@ -66,6 +66,11 @@ export interface TrustedDeviceView {
 
 /** Reads and writes of one user's MFA state inside a locked transaction. */
 export interface MfaUnitOfWork {
+  /**
+   * The transaction itself, for writes that must commit or roll back
+   * together with the MFA state (e.g. the refresh session of a sign-in).
+   */
+  readonly tx: Prisma.TransactionClient;
   account(): Promise<MfaAccountState | null>;
   enrollment(): Promise<MfaEnrollmentState | null>;
   /** Creates or replaces the user's enrollment row. */
@@ -330,6 +335,7 @@ export class MfaRepository {
     };
 
     return {
+      tx,
       account: () => this.readAccount(tx, authId),
       enrollment: () => this.readEnrollment(tx, authId),
       saveEnrollment: async (state) => {

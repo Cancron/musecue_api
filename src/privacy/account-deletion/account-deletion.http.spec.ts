@@ -49,6 +49,8 @@ import { AccountDeletionController } from './account-deletion.controller';
 import type { AccountDeletionView } from './account-deletion.interface';
 import { AccountDeletionService } from './account-deletion.service';
 import { AccountErasureService } from './account-erasure.service';
+import { StepUpGuard } from '../../auth/step-up/step-up.guard';
+import { stepUpSatisfied } from '../../../test/support/step-up-satisfied';
 
 const PASSWORD = 'correct horse battery staple';
 const PASSWORD_HASH = bcrypt.hashSync(PASSWORD, 4);
@@ -192,7 +194,10 @@ describe('Account deletion requests (HTTP)', () => {
           useValue: new ConfigService({ NODE_ENV: 'test' }),
         },
       ],
-    }).compile();
+    })
+      .overrideGuard(StepUpGuard)
+      .useValue(stepUpSatisfied)
+      .compile();
     app = moduleRef.createNestApplication();
     const logger = mock<Logger>();
     app.useGlobalFilters(new AllExceptionsFilter(logger));

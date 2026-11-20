@@ -35,6 +35,7 @@ model authUser {
   mfaRecoveryCodes   MfaRecoveryCode[]
   mfaLoginChallenges MfaLoginChallenge[]
   mfaTrustedDevices  MfaTrustedDevice[]
+  stepUpApprovals    StepUpApproval[]
 
   @@index([email, id, providerId])
   @@index([username])
@@ -194,6 +195,10 @@ model MfaTrustedDevice {
 model RefreshSession {
   id            String                    @id @default(uuid())
   authId        String
+  // The sign-in session this token belongs to: set at sign-in and kept by
+  // every rotation, so it identifies the session for its whole life. Access
+  // tokens carry it as their `sid` claim (step-up approvals are bound to it).
+  familyId      String                    @default(uuid())
   // The refresh token's JWT ID (`jti`).
   tokenId       String                    @unique @db.VarChar(128)
   // SHA-256 (hex) of the complete refresh token.
@@ -212,6 +217,34 @@ model RefreshSession {
   rotatedTo   RefreshSession? @relation("RefreshSessionRotation")
 
   @@index([authId, revokedAt, expiresAt])
+  @@index([familyId])
+  @@index([expiresAt])
+}
+
+// ================================
+// Step-up Approval Model
+// ================================
+
+// A fresh re-verification (step-up) of the signed-in user for one sensitive
+// action: MFA users prove it with an authenticator or recovery code, users
+// without MFA with their password, Google-only users by signing in with
+// Google again. An approval authorizes that action, for that user, in that
+// sign-in session (RefreshSession.familyId, the access token's `sid`), for
+// ten minutes. Only the SHA-256 of the approval token is stored. Trusted
+// devices never replace a step-up.
+model StepUpApproval {
+  id        String       @id @default(uuid())
+  authId    String
+  sessionId String       @db.VarChar(64)
+  action    StepUpAction
+  method    StepUpMethod
+  tokenHash String       @unique @db.Char(64)
+  createdAt DateTime     @default(now())
+  expiresAt DateTime
+
+  authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
+
+  @@index([authId, sessionId, action])
   @@index([expiresAt])
 }
 

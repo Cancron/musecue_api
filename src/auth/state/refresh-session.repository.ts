@@ -20,11 +20,17 @@ export interface NewRefreshSession {
   userAgent?: string;
   device?: string;
   expiresAt: Date;
+  /**
+   * The sign-in session (access tokens' `sid`). Set at sign-in; a rotation
+   * always keeps the presented session's value.
+   */
+  familyId?: string;
 }
 
 export interface StoredRefreshSession {
   id: string;
   authId: string;
+  familyId: string;
   tokenHash: string;
   expiresAt: Date;
   revokedAt: Date | null;
@@ -49,14 +55,18 @@ export class RefreshSessionRepository {
 
   /**
    * Stores a new login's session and revokes the oldest active sessions
-   * beyond `maxDevices`, in one transaction.
+   * beyond `maxDevices`, in one transaction. With `client` (an open
+   * transaction, e.g. the MFA step of sign-in) everything happens inside
+   * it, so the session commits or rolls back together with the caller's
+   * writes.
    */
   async createForLogin(
     session: NewRefreshSession,
     maxDevices: number,
     now: Date = new Date(),
+    client?: Prisma.TransactionClient,
   ): Promise<void> {
-    await this.prisma.$transaction(async (tx) => {
+    const work = async (tx: Prisma.TransactionClient) => {
       const [lock] = await tx.$queryRaw<Array<{ acquired: boolean }>>`
         SELECT pg_try_advisory_xact_lock(
           hashtextextended(${LOGIN_LOCK + session.authId}, 0)
@@ -68,7 +78,9 @@ export class RefreshSessionRepository {
         data: { ...session, createdAt: now },
       });
       await this.enforceDeviceLimit(tx, session.authId, maxDevices, now);
-    });
+    };
+    if (client) await work(client);
+    else await this.prisma.$transaction(work);
   }
 
   find(tokenId: string): Promise<StoredRefreshSession | null> {
@@ -77,11 +89,28 @@ export class RefreshSessionRepository {
       select: {
         id: true,
         authId: true,
+        familyId: true,
         tokenHash: true,
         expiresAt: true,
         revokedAt: true,
       },
     });
+  }
+
+  /**
+   * Whether the sign-in session `familyId` of the user is still active: one
+   * of its tokens is neither revoked nor expired (logout, logout-all and
+   * security events end it).
+   */
+  async isSessionActive(
+    authId: string,
+    familyId: string,
+    now: Date = new Date(),
+  ): Promise<boolean> {
+    const active = await this.prisma.refreshSession.count({
+      where: { authId, familyId, revokedAt: null, expiresAt: { gt: now } },
+    });
+    return active > 0;
   }
 
   /**
@@ -99,7 +128,7 @@ export class RefreshSessionRepository {
       await this.lockSessions(tx, current.authId);
       const session = await tx.refreshSession.findUnique({
         where: { tokenId: current.tokenId },
-        select: { id: true, authId: true, tokenHash: true },
+        select: { id: true, authId: true, tokenHash: true, familyId: true },
       });
       if (
         !session ||
@@ -116,7 +145,13 @@ export class RefreshSessionRepository {
       });
       if (revoked.count !== 1) return false;
       await tx.refreshSession.create({
-        data: { ...next, rotatedFromId: session.id, createdAt: now },
+        data: {
+          ...next,
+          // Same sign-in session, whatever the caller passed.
+          familyId: session.familyId,
+          rotatedFromId: session.id,
+          createdAt: now,
+        },
       });
       return true;
     });
@@ -149,6 +184,17 @@ export class RefreshSessionRepository {
       });
       return count;
     });
+  }
+
+  /**
+   * Removes step-up approvals that expired before `before` (cleanup sweep;
+   * they never authorize anything once expired).
+   */
+  async deleteExpiredStepUpApprovals(before: Date): Promise<number> {
+    const { count } = await this.prisma.stepUpApproval.deleteMany({
+      where: { expiresAt: { lt: before } },
+    });
+    return count;
   }
 
   /** Removes sessions that expired before `before` (cleanup sweep). */

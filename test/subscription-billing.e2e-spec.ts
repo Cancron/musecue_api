@@ -120,7 +120,7 @@ describeWithDatabase(
         const canceled = dataOf(
           await request(harness.app.getHttpServer())
             .post('/v1/subscription/cancel')
-            .set('Authorization', harness.bearer(authId))
+            .set(await harness.stepUp(authId, 'SUBSCRIPTION_CANCEL'))
             .expect(200),
         );
         const stored = await storedOf(authId);
@@ -361,7 +361,7 @@ describeWithDatabase(
         const canceled = await subscriber(10, 'YEARLY');
         await request(harness.app.getHttpServer())
           .post('/v1/subscription/cancel')
-          .set('Authorization', harness.bearer(canceled.authId))
+          .set(await harness.stepUp(canceled.authId, 'SUBSCRIPTION_CANCEL'))
           .expect(200);
         const refunded = await subscriber(10);
         api.refundInvoice(refunded.invoiceId, { amount: 900 });

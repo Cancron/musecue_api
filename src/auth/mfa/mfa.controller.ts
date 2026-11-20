@@ -23,6 +23,7 @@ import type { IAccessTokenPayload } from '../interfaces/auth.interface';
 import { MfaLoginService } from './mfa-login.service';
 import { MfaVerificationService } from './mfa-verification.service';
 import { MFA_LOGIN } from './mfa.constants';
+import { RequireStepUp } from '../step-up/step-up.decorator';
 import {
   ConfirmMfaEnrollmentDto,
   MfaVerificationDto,
@@ -60,9 +61,11 @@ export class MfaController {
   /**
    * Starts (or restarts) an enrollment: returns a new authenticator secret
    * and its otpauth:// URI, confirmable for 10 minutes. Takes no body. The
-   * secret is shown only in this response.
+   * secret is shown only in this response. Needs a step-up approval
+   * (MFA_ENROLLMENT).
    */
   @Post('enrollment')
+  @RequireStepUp('MFA_ENROLLMENT')
   @HttpCode(HttpStatus.CREATED)
   @Header('Cache-Control', 'no-store')
   @Header('Pragma', 'no-cache')
@@ -112,22 +115,23 @@ export class MfaController {
   }
 
   /**
-   * Replaces all recovery codes with ten new ones, after verifying a second
-   * factor (same body as verify). The new codes are shown only in this
-   * response; every previous code stops working.
+   * Replaces all recovery codes with ten new ones. Needs a step-up approval
+   * (MFA_RECOVERY_CODES), which is the second-factor proof; takes no body.
+   * The new codes are shown only in this response; every previous code
+   * stops working.
    */
   @Post('recovery-codes')
+  @RequireStepUp('MFA_RECOVERY_CODES')
   @HttpCode(HttpStatus.CREATED)
   @Header('Cache-Control', 'no-store')
   @Header('Pragma', 'no-cache')
   @Throttle({ default: THROTTLER_CONFIG.STRICT })
   regenerateRecoveryCodes(
-    @Body() dto: MfaVerificationDto,
+    @Body(EmptyBodyPipe) _body: unknown,
     @Req() req: AuthenticatedRequest,
   ) {
     return this.verification.regenerateRecoveryCodes(
       req.user.userId,
-      toMfaFactor(dto),
       requestMetadata(req),
     );
   }

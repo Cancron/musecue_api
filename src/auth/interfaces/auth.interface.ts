@@ -20,6 +20,12 @@ export interface IAccessTokenPayload {
   userId: string;
   role: UserRole;
   tokenVersion: number; // Incremented on security events (block, password change, etc.)
+  /**
+   * The sign-in session (RefreshSession.familyId), stable across refreshes.
+   * Step-up approvals are bound to it. Absent in tokens issued before
+   * sessions were identified.
+   */
+  sid?: string;
   iat?: number;
   exp?: number;
 }

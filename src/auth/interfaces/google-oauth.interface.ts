@@ -60,6 +60,8 @@ export interface IGoogleIdTokenClaims {
   given_name?: string;
   family_name?: string;
   locale?: string;
+  nonce?: string; // Echo of the authorization request's nonce
+  auth_time?: number; // When the user last authenticated (if Google sends it)
   iat: number; // Issued at
   exp: number; // Expiration time
 }

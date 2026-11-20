@@ -1,4 +1,6 @@
 import { Injectable } from '@nestjs/common';
+import type { Prisma } from '@prisma/client';
+import { randomUUID } from 'node:crypto';
 import { CreateAuthDto } from './dto/create-auth.dto';
 import { AuthUtilsService } from './services/auth-utils.service';
 import { AUTH_CONFIG } from './config/auth.config';
@@ -625,7 +627,15 @@ export class AuthService {
       return gate.challenge;
     }
 
-    return this.issueLoginTokens(user, { ip, userAgent, device });
+    const tokens = await this.issueLoginTokens(user, { ip, userAgent, device });
+    void this.logLoginAttempt({
+      authId: user.id,
+      ip,
+      userAgent,
+      device,
+      success: true,
+    });
+    return tokens;
   }
 
   /**
@@ -643,25 +653,38 @@ export class AuthService {
     },
     meta: { ip: string; userAgent: string; device?: string },
   ): Promise<IMfaLoginResponse> {
-    const completion = await this.mfaLogin.complete({ ...input, meta });
-
-    const user = await this.prismaService.authUser.findUnique({
-      where: { id: completion.authId },
-      select: {
-        id: true,
-        email: true,
-        username: true,
-        role: true,
-        verified: true,
-        status: true,
-        tokenVersion: true,
+    // The refresh session is created inside the MFA transaction: if it
+    // cannot be stored, the challenge and the code are not consumed either.
+    const { completion, result: tokens } = await this.mfaLogin.complete(
+      { ...input, meta },
+      async (tx, { authId }) => {
+        const user = await tx.authUser.findUnique({
+          where: { id: authId },
+          select: {
+            id: true,
+            email: true,
+            username: true,
+            role: true,
+            verified: true,
+            status: true,
+            tokenVersion: true,
+          },
+        });
+        if (!user || user.status !== 'ACTIVE' || !user.verified) {
+          throw AppError.unauthorized('User account is not active');
+        }
+        return this.issueLoginTokens(user, meta, tx);
       },
-    });
-    if (!user || user.status !== 'ACTIVE' || !user.verified) {
-      throw AppError.unauthorized('User account is not active');
-    }
+    );
 
-    const tokens = await this.issueLoginTokens(user, meta);
+    // Recorded only once the sign-in has committed.
+    void this.logLoginAttempt({
+      authId: completion.authId,
+      ip: meta.ip,
+      userAgent: meta.userAgent,
+      device: meta.device,
+      success: true,
+    });
     return {
       ...tokens,
       mfaMethod: completion.method,
@@ -671,7 +694,9 @@ export class AuthService {
 
   /**
    * Issues the access token and a rotating refresh token of a completed
-   * sign-in (password, trusted device or MFA).
+   * sign-in (password, trusted device or MFA). With `tx`, the refresh
+   * session is stored inside that transaction. Does not write the login
+   * history: callers do, once the sign-in has committed.
    */
   private async issueLoginTokens(
     user: {
@@ -683,17 +708,21 @@ export class AuthService {
       tokenVersion: number;
     },
     meta: { ip: string; userAgent: string; device?: string },
+    tx?: Prisma.TransactionClient,
   ): Promise<ILoginResponse> {
     const { ip, userAgent, device } = meta;
 
     // Generate JTI FIRST (cryptographically secure)
     const jti: string = this.authUtilsService.generateSecureId();
+    // A new sign-in session: its ID stays the same across refreshes.
+    const familyId = randomUUID();
 
     // Create access token (stateless, minimal payload - no email)
     const accessToken: string = this.authUtilsService.createAccessToken({
       userId: user.id,
       role: user.role as unknown as UserRole,
       tokenVersion: user.tokenVersion, // Include tokenVersion for hybrid JWT validation
+      sid: familyId,
     });
 
     // Create refresh token with JTI embedded
@@ -713,16 +742,8 @@ export class AuthService {
       jti,
       refreshToken,
       { ip, userAgent, device },
+      { tx, familyId },
     );
-
-    // NON-CRITICAL: login history (fire-and-forget)
-    void this.logLoginAttempt({
-      authId: user.id,
-      ip,
-      userAgent,
-      device,
-      success: true,
-    });
 
     return {
       mfaRequired: false,
@@ -822,6 +843,7 @@ export class AuthService {
       userId: user.id,
       role: user.role as unknown as UserRole,
       tokenVersion: user.tokenVersion, // Include tokenVersion for hybrid JWT validation
+      sid: storedData.familyId, // the same sign-in session
     });
 
     const newRefreshToken: string = this.authUtilsService.createRefreshToken(

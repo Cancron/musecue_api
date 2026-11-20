@@ -35,6 +35,8 @@ import { MfaModule } from './mfa/mfa.module';
     AuthUtilsService,
     GoogleOAuthService,
     AuthChallengeRepository,
+    OAuthStateRepository,
+    RefreshSessionRepository,
   ],
 })
 export class AuthModule {}

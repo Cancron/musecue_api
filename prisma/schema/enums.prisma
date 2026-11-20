@@ -42,6 +42,24 @@ enum RefreshSessionRevocation {
   SECURITY_EVENT
 }
 
+// Sensitive actions that need a step-up approval (see StepUpApproval).
+enum StepUpAction {
+  MFA_ENROLLMENT
+  MFA_RECOVERY_CODES
+  SUBSCRIPTION_CANCEL
+  DATA_EXPORT
+  DATA_EXPORT_DOWNLOAD
+  ACCOUNT_DELETION
+}
+
+// How a step-up was proven.
+enum StepUpMethod {
+  TOTP
+  RECOVERY_CODE
+  PASSWORD
+  GOOGLE
+}
+
 enum AuthChallengePurpose {
   EMAIL_VERIFICATION
   ACCOUNT_DELETION

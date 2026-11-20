@@ -33,6 +33,8 @@ import { PrivacyExportController } from './privacy-export.controller';
 import { PrivacyExportService } from './privacy-export.service';
 import { PrivacyExportLifecycleService } from './queues/privacy-export-lifecycle.service';
 import { PrivacyExportQueueService } from './queues/privacy-export.queue';
+import { StepUpGuard } from '../auth/step-up/step-up.guard';
+import { stepUpSatisfied } from '../../test/support/step-up-satisfied';
 
 const USER_A = '0a0a0a0a-0000-4000-8000-00000000000a';
 const USER_B = '0b0b0b0b-0000-4000-8000-00000000000b';
@@ -108,7 +110,10 @@ describe('Privacy export endpoints (HTTP)', () => {
         },
         { provide: PrivacyExportStorageService, useValue: storage },
       ],
-    }).compile();
+    })
+      .overrideGuard(StepUpGuard)
+      .useValue(stepUpSatisfied)
+      .compile();
     app = moduleRef.createNestApplication();
     const logger = mock<Logger>();
     app.useGlobalFilters(new AllExceptionsFilter(logger));

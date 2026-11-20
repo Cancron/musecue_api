@@ -78,6 +78,8 @@ export class FakeMfaRepository {
   readonly audits: FakeMfaAudit[] = [];
   /** Set to make the next call fail like an unreachable database. */
   failWith: Error | null = null;
+  /** What `uow.tx` is inside withLock (e.g. an in-memory Prisma stand-in). */
+  txClient: unknown = {};
   private readonly locks = new Map<string, Promise<unknown>>();
 
   addAccount(authId: string, overrides: Partial<FakeMfaAccount> = {}) {
@@ -218,6 +220,8 @@ export class FakeMfaRepository {
     const reject = (message: string) => Promise.reject(new Error(message));
 
     const uow: MfaUnitOfWork = {
+      // Writes through `tx` go to `txClient` (set it to observe them).
+      tx: this.txClient as MfaUnitOfWork['tx'],
       account: () =>
         Promise.resolve(account ? this.publicAccount(account) : null),
       enrollment: () =>

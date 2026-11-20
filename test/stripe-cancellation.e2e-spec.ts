@@ -79,11 +79,15 @@ describeWithDatabase(
       return { authId, subscriptionId: session.subscription as string };
     }
 
-    const cancel = (userId: string) =>
-      request(harness.app.getHttpServer())
+    // Cancelling is a sensitive action: every request carries a step-up
+    // approval (support/step-up-fixtures.ts); mfa-step-up covers step-up.
+    // (Wrapped, so awaiting the approval does not also send the request.)
+    const cancel = async (userId: string) => ({
+      request: request(harness.app.getHttpServer())
         .post('/v1/subscription/cancel')
-        .set('Authorization', harness.bearer(userId))
-        .set('User-Agent', 'cancel-e2e');
+        .set(await harness.stepUp(userId, 'SUBSCRIPTION_CANCEL'))
+        .set('User-Agent', 'cancel-e2e'),
+    });
 
     const recordOf = (authId: string) =>
       client.userSubscription.findUniqueOrThrow({
@@ -110,7 +114,7 @@ describeWithDatabase(
         });
         const endsAt = before.proExpiresAt as Date;
 
-        const response = await cancel(authId).expect(200);
+        const response = await (await cancel(authId)).request.expect(200);
 
         const canceledAt = stripeCanceledAt(subscriptionId);
         expect(dataOf(response)).toEqual({
@@ -182,7 +186,7 @@ describeWithDatabase(
 
       it('keeps the period and adds no event when Stripe ends the subscription at period end', async () => {
         const { authId, subscriptionId } = await subscriber(10, 'YEARLY');
-        await cancel(authId).expect(200);
+        await (await cancel(authId)).request.expect(200);
         const afterCancel = await client.userSubscription.findUniqueOrThrow({
           where: { authId },
         });
@@ -210,7 +214,7 @@ describeWithDatabase(
       it('cannot cancel a term that has already ended', async () => {
         const { authId, subscriptionId } = await subscriber(45);
 
-        await cancel(authId).expect(409);
+        await (await cancel(authId)).request.expect(409);
 
         expect(
           api.subscriptions.get(subscriptionId)?.cancel_at_period_end,
@@ -220,7 +224,7 @@ describeWithDatabase(
 
       it('still blocks a new checkout while the canceled term runs', async () => {
         const { authId } = await subscriber(10);
-        await cancel(authId).expect(200);
+        await (await cancel(authId)).request.expect(200);
         const response = await harness.startCheckout(authId, 'YEARLY');
         expect(response.status).toBe(409);
         expect(response.body).toMatchObject({
@@ -242,11 +246,11 @@ describeWithDatabase(
         const mallory = await createUser(client);
 
         // Mallory has no subscription; naming Alice's changes nothing.
-        await cancel(mallory)
+        await (await cancel(mallory)).request
           .send({ userId: alice.authId, subscriptionId: alice.subscriptionId })
           .expect(409);
         // Bob cancels his own, even when naming Alice's.
-        await cancel(bob.authId)
+        await (await cancel(bob.authId)).request
           .send({ userId: alice.authId, subscriptionId: alice.subscriptionId })
           .expect(200);
 
@@ -272,11 +276,11 @@ describeWithDatabase(
         const { authId, subscriptionId } = await subscriber(10);
 
         const responses = await Promise.all(
-          Array.from({ length: 6 }, () => cancel(authId)),
+          Array.from({ length: 6 }, async () => (await cancel(authId)).request),
         );
         const updated = subscriptionUpdated(subscriptionId);
         await Promise.all([send(updated), send(updated), send(updated)]);
-        const again = await cancel(authId).expect(200);
+        const again = await (await cancel(authId)).request.expect(200);
 
         expect(responses.map((response) => response.status)).toEqual(
           Array(6).fill(200),
@@ -302,7 +306,7 @@ describeWithDatabase(
 
       it('refuses a second CANCELED event for the same cancellation at the database', async () => {
         const { authId } = await subscriber(10);
-        await cancel(authId).expect(200);
+        await (await cancel(authId)).request.expect(200);
         const record = await recordOf(authId);
 
         await expect(
@@ -328,7 +332,7 @@ describeWithDatabase(
           api.failNext('POST /v1/subscriptions/:id', failure);
 
           // Without Stripe's positive response nothing is saved.
-          const unconfirmed = await cancel(authId).expect(503);
+          const unconfirmed = await (await cancel(authId)).request.expect(503);
           expect(unconfirmed.body).toMatchObject({
             message:
               'Cancellation could not be confirmed; please retry or check subscription status',
@@ -345,7 +349,7 @@ describeWithDatabase(
             api.subscriptions.get(subscriptionId)?.cancel_at_period_end,
           ).toBe(false);
 
-          await cancel(authId).expect(200);
+          await (await cancel(authId)).request.expect(200);
           await expect(eventTypes(authId)).resolves.toEqual([
             'CREATED',
             'CANCELED',
@@ -358,7 +362,7 @@ describeWithDatabase(
         api.failNext('POST /v1/subscriptions/:id', 'lost');
 
         // Without Stripe's positive response nothing is saved.
-        const unconfirmed = await cancel(authId).expect(503);
+        const unconfirmed = await (await cancel(authId)).request.expect(503);
         expect(unconfirmed.body).toMatchObject({
           message:
             'Cancellation could not be confirmed; please retry or check subscription status',
@@ -368,7 +372,7 @@ describeWithDatabase(
         });
 
         await send(subscriptionUpdated(subscriptionId));
-        const retried = await cancel(authId).expect(200);
+        const retried = await (await cancel(authId)).request.expect(200);
 
         expect(dataOf(retried)).toMatchObject({
           alreadyCanceled: true,

@@ -24,7 +24,10 @@ export class FakeGoogle {
     publicKeyEncoding: { type: 'spki', format: 'pem' },
     privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
   });
-  private readonly codes = new Map<string, FakeGoogleUser>();
+  private readonly codes = new Map<
+    string,
+    { user: FakeGoogleUser; claims: Record<string, unknown> }
+  >();
   private spies: jest.SpyInstance[] = [];
 
   install() {
@@ -51,8 +54,8 @@ export class FakeGoogle {
           const body = new URLSearchParams(
             typeof init?.body === 'string' ? init.body : '',
           );
-          const user = this.codes.get(body.get('code') ?? '');
-          if (!user || !body.get('code_verifier')) {
+          const issued = this.codes.get(body.get('code') ?? '');
+          if (!issued || !body.get('code_verifier')) {
             return Promise.resolve(
               Response.json({ error: 'invalid_grant' }, { status: 400 }),
             );
@@ -64,7 +67,7 @@ export class FakeGoogle {
               expires_in: 3599,
               token_type: 'Bearer',
               scope: 'openid email profile',
-              id_token: this.idToken(user),
+              id_token: this.idToken(issued.user, issued.claims),
             }),
           );
         }),
@@ -90,16 +93,24 @@ export class FakeGoogle {
     this.spies = [];
   }
 
-  /** The authorization code Google would send back for `user`. */
-  codeFor(user: FakeGoogleUser): string {
+  /**
+   * The authorization code Google would send back for `user`. `claims` are
+   * added to its ID token (e.g. the `nonce` of the authorization request,
+   * `auth_time`).
+   */
+  codeFor(user: FakeGoogleUser, claims: Record<string, unknown> = {}): string {
     const code = `4/${randomBytes(12).toString('hex')}`;
-    this.codes.set(code, user);
+    this.codes.set(code, { user, claims });
     return code;
   }
 
-  private idToken(user: FakeGoogleUser): string {
+  private idToken(
+    user: FakeGoogleUser,
+    claims: Record<string, unknown>,
+  ): string {
     return jwt.sign(
       {
+        ...claims,
         sub: user.sub,
         email: user.email,
         email_verified: true,

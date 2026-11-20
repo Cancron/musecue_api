@@ -26,6 +26,8 @@ import { MfaLoginService } from './mfa-login.service';
 import { MFA_KEYRING, MfaSecretCipher } from './mfa-secret.cipher';
 import { testKeyring } from '../../../test/support/mfa-test-keys';
 import { randomBytes } from 'node:crypto';
+import { StepUpGuard } from '../step-up/step-up.guard';
+import { stepUpSatisfied } from '../../../test/support/step-up-satisfied';
 
 // Recovery codes use salted scrypt (deliberately slow, ~50-80 ms each), so
 // tests that issue and verify many codes need more than the 5 s default
@@ -80,7 +82,11 @@ describe('MFA enrollment (HTTP)', () => {
         { provide: PrismaService, useValue: {} },
         { provide: WINSTON_MODULE_PROVIDER, useValue: mock<Logger>() },
       ],
-    }).compile();
+    })
+      // Step-up itself is covered by src/auth/step-up and mfa-step-up e2e.
+      .overrideGuard(StepUpGuard)
+      .useValue(stepUpSatisfied)
+      .compile();
     app = moduleRef.createNestApplication();
     const logger = mock<Logger>();
     app.useGlobalFilters(new AllExceptionsFilter(logger));
@@ -391,25 +397,23 @@ describe('MFA enrollment (HTTP)', () => {
       await verify(ALICE, { recoveryCode: alice.recoveryCodes[0] }).expect(200);
     });
 
-    it('regenerates codes after a second factor, shown once', async () => {
-      const { secret } = await enable(ALICE);
-      const code = totpCode(secret, new Date(T0.getTime() + 30_000));
-      jest.setSystemTime(new Date(T0.getTime() + 30_000));
+    it('regenerates codes (step-up approved), shown once; takes no body', async () => {
+      await enable(ALICE);
 
       const response = await http()
         .post('/auth/mfa/recovery-codes')
         .set(auth(tokenFor(ALICE)))
-        .send({ code })
         .expect(201);
 
       expect(response.headers['cache-control']).toBe('no-store');
       expect(
         dataOf<{ recoveryCodes: string[] }>(response).recoveryCodes,
       ).toHaveLength(10);
+      // The proof is the step-up approval, never a code in the body.
       await http()
         .post('/auth/mfa/recovery-codes')
         .set(auth(tokenFor(ALICE)))
-        .send({})
+        .send({ code: '123456' })
         .expect(400);
     });
   });

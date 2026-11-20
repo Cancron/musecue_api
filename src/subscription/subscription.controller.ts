@@ -21,6 +21,7 @@ import { StripeCheckoutService } from './stripe/stripe-checkout.service';
 import { SubscriptionAccessService } from './subscription-access.service';
 import { SubscriptionBillingService } from './subscription-billing.service';
 import { SubscriptionTrialService } from './subscription-trial.service';
+import { RequireStepUp } from '../auth/step-up/step-up.decorator';
 
 interface AuthenticatedRequest extends Request {
   user: IAccessTokenPayload;
@@ -94,8 +95,10 @@ export class SubscriptionController {
    * auto-renewal is turned off through Stripe and Pro access continues until
    * the paid period ends. Takes no request body; the subscription is always
    * the token user's. Repeating the request returns the same cancellation.
+   * Needs a step-up approval (SUBSCRIPTION_CANCEL).
    */
   @Post('cancel')
+  @RequireStepUp('SUBSCRIPTION_CANCEL')
   @HttpCode(HttpStatus.OK)
   cancelSubscription(@Req() req: AuthenticatedRequest) {
     return this.cancellation.cancelAtPeriodEnd(

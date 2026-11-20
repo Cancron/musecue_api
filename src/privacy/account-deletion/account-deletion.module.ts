@@ -8,6 +8,7 @@ import { AccountDeletionRecoveryService } from './account-deletion-recovery.serv
 import { AccountDeletionController } from './account-deletion.controller';
 import { AccountDeletionService } from './account-deletion.service';
 import { AccountErasureService } from './account-erasure.service';
+import { StepUpGuard } from '../../auth/step-up/step-up.guard';
 
 @Module({
   imports: [AuthModule, QueueModule, StorageModule],
@@ -18,6 +19,7 @@ import { AccountErasureService } from './account-erasure.service';
     AccountDeletionRecoveryService,
     AccountErasureService,
     AuthGuard,
+    StepUpGuard,
   ],
 })
 export class AccountDeletionModule {}

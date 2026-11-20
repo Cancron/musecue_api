@@ -16,6 +16,7 @@ import { PrivacyExportRecoveryService } from './queues/privacy-export-recovery.s
 import { PrivacyExportRetentionService } from './queues/privacy-export-retention.service';
 import { PrivacyExportJobHandler } from './queues/privacy-export-job.handler';
 import { PrivacyExportQueueService } from './queues/privacy-export.queue';
+import { StepUpGuard } from '../auth/step-up/step-up.guard';
 
 @Module({
   imports: [
@@ -38,6 +39,7 @@ import { PrivacyExportQueueService } from './queues/privacy-export.queue';
     PrivacyExportCollectorService,
     PrivacyExportArchiveService,
     AuthGuard,
+    StepUpGuard,
   ],
 })
 export class PrivacyModule {}

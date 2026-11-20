@@ -1,4 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
+import type { Prisma } from '@prisma/client';
 import { createHash, randomBytes } from 'node:crypto';
 import { WINSTON_MODULE_PROVIDER } from 'nest-winston';
 import type { Logger } from 'winston';
@@ -54,15 +55,10 @@ export interface TrustedDeviceListItem extends TrustedDeviceView {
   current: boolean;
 }
 
-type CompleteOutcome =
+type CompleteOutcome<T> =
   | { kind: 'CHALLENGE_INVALID' }
   | { kind: 'DECLINED'; outcome: Exclude<CheckOutcome, { kind: 'VERIFIED' }> }
-  | {
-      kind: 'VERIFIED';
-      provider: FirstFactorProvider;
-      method: MfaMethodUsed;
-      trustedDevice: NewTrustedDevice | null;
-    };
+  | { kind: 'VERIFIED'; completion: MfaLoginCompletion; result: T };
 
 const CONTEXT = 'MfaLoginService';
 
@@ -164,12 +160,15 @@ export class MfaLoginService {
   }
 
   /**
-   * Completes a challenge with a second factor. On success the challenge is
-   * consumed (in the same transaction as the code), and the caller issues
-   * the tokens. Declines: 401 for an unknown, expired or used challenge;
-   * otherwise the verification errors (400, 409, 429).
+   * Completes a challenge with a second factor. `issue` creates the sign-in
+   * (the refresh session) inside the same transaction that consumes the
+   * challenge and the code and trusts the device: if it fails, everything
+   * rolls back, so the challenge, the recovery code (or authenticator step)
+   * stay usable and no device is trusted. Declines: 401 for an unknown,
+   * expired or used challenge; otherwise the verification errors (400, 409,
+   * 429).
    */
-  async complete(
+  async complete<T>(
     input: {
       challengeToken: string;
       factor: MfaFactor;
@@ -177,8 +176,12 @@ export class MfaLoginService {
       deviceName?: string;
       meta: MfaLoginMeta;
     },
+    issue: (
+      tx: Prisma.TransactionClient,
+      completion: MfaLoginCompletion,
+    ) => Promise<T>,
     now: Date = new Date(),
-  ): Promise<MfaLoginCompletion> {
+  ): Promise<{ completion: MfaLoginCompletion; result: T }> {
     if (!MFA_LOGIN.CHALLENGE_TOKEN_PATTERN.test(input.challengeToken)) {
       throw this.invalidChallenge();
     }
@@ -189,7 +192,7 @@ export class MfaLoginService {
     if (!authId) throw this.invalidChallenge();
 
     const outcome = await this.guard(() =>
-      this.repository.withLock<CompleteOutcome>(authId, async (uow) => {
+      this.repository.withLock<CompleteOutcome<T>>(authId, async (uow) => {
         // Under the owner's lock: concurrent completions are serialized, so
         // a challenge is used at most once.
         const challenge = await uow.loginChallenge(tokenHash);
@@ -239,12 +242,15 @@ export class MfaLoginService {
           );
           trustedDevice = { id, token, name, expiresAt };
         }
-        return {
-          kind: 'VERIFIED',
+        const completion: MfaLoginCompletion = {
+          authId,
           provider: challenge.provider === 'google' ? 'google' : 'local',
           method: checked.method,
           trustedDevice,
         };
+        // Same transaction: a failure here undoes everything above.
+        const result = await issue(uow.tx, completion);
+        return { kind: 'VERIFIED', completion, result };
       }),
     );
 
@@ -255,15 +261,10 @@ export class MfaLoginService {
     this.logger.info('MFA sign-in completed', {
       context: CONTEXT,
       authId,
-      method: outcome.method,
-      trustedDevice: outcome.trustedDevice?.id ?? null,
+      method: outcome.completion.method,
+      trustedDevice: outcome.completion.trustedDevice?.id ?? null,
     });
-    return {
-      authId,
-      provider: outcome.provider,
-      method: outcome.method,
-      trustedDevice: outcome.trustedDevice,
-    };
+    return { completion: outcome.completion, result: outcome.result };
   }
 
   /** The user's trusted devices (never their tokens). */

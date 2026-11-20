@@ -626,10 +626,10 @@ describeWithDatabase('Stripe payment lifecycle (PostgreSQL)', () => {
       travel(CANCELED_AT);
       const before = await storedState(alice.authId);
       const responses = await Promise.all(
-        Array.from({ length: 5 }, () =>
+        Array.from({ length: 5 }, async () =>
           http()
             .post('/v1/subscription/cancel')
-            .set('Authorization', harness.bearer(alice.authId)),
+            .set(await harness.stepUp(alice.authId, 'SUBSCRIPTION_CANCEL')),
         ),
       );
       expect(responses.map((r) => r.status)).toEqual([200, 200, 200, 200, 200]);
@@ -1295,7 +1295,7 @@ describeWithDatabase('Stripe payment lifecycle (PostgreSQL)', () => {
       travel(canceledAt);
       await http()
         .post('/v1/subscription/cancel')
-        .set('Authorization', harness.bearer(authId))
+        .set(await harness.stepUp(authId, 'SUBSCRIPTION_CANCEL'))
         .expect(200);
       expect((await trialOf(authId)).fields).toEqual(trial.fields);
       await expect(statusOf(authId)).resolves.toMatchObject({

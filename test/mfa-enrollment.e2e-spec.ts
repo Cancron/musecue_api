@@ -214,6 +214,7 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
     const { secret } = await startOk(user);
     const code = totpCode(secret, kit.clock);
     await confirm(user, code).expect(200);
+    user.totpSecret = secret;
     const enabled = await securityOf(user);
 
     // Replayed within the same 30 seconds, and later.
@@ -221,9 +222,17 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
     expect(messageOf(await confirm(user, code).expect(409))).toBe(
       'MFA is already enabled for this account',
     );
-    // A new enrollment cannot be started to reuse it either.
+    // A new enrollment cannot be started to reuse it either (even after a
+    // step-up, which for an MFA user takes a fresh authenticator code).
     await start(user).expect(409);
-    expect(await securityOf(user)).toEqual(enabled);
+    const after = await securityOf(user);
+    expect(after).toMatchObject({
+      mfaEnabled: true,
+      mfaMethod: enabled.mfaMethod,
+      mfaSecret: enabled.mfaSecret,
+    });
+    // Only the step-up's own, newer code was recorded as used.
+    expect(after.mfaLastUsedStep).toBeGreaterThan(enabled.mfaLastUsedStep!);
     expect(
       await ctx.client.activityLogEvent.count({
         where: {
@@ -528,10 +537,17 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
       const { secret } = await startOk(alice);
       const aliceBefore = await enrollmentOf(alice);
 
-      // Nothing can name Alice: bodies with a user ID are rejected...
+      // Nothing can name Alice: without a step-up the request is refused,
+      // and with Bob's own step-up, a body with a user ID is rejected...
       await http()
         .post('/auth/mfa/enrollment')
         .set(as(bob))
+        .send({ userId: alice.id })
+        .expect(403);
+      await http()
+        .post('/auth/mfa/enrollment')
+        .set(as(bob))
+        .set('X-Step-Up-Token', await kit.approve(bob, 'MFA_ENROLLMENT'))
         .send({ userId: alice.id })
         .expect(400);
       await http()
@@ -588,7 +604,13 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
       const revoked = { ...user };
       await http().post('/auth/logout-all').set(as(user)).expect(201);
 
-      await start(revoked).expect(401);
+      await http().post('/auth/mfa/enrollment').set(as(revoked)).expect(401);
+      // A revoked token cannot step up either.
+      await http()
+        .post('/auth/step-up')
+        .set(as(revoked))
+        .send({ action: 'MFA_ENROLLMENT', password: 'x' })
+        .expect(401);
       expect(await enrollmentOf(user)).toBeNull();
     });
   });

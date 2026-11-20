@@ -29,6 +29,7 @@ describe('refresh-token failure and rotation boundaries', () => {
   const active = {
     id: 'session-old',
     authId: 'owner',
+    familyId: 'sign-in-session-1',
     tokenHash: 'hash',
     expiresAt: new Date(Date.now() + 3_600_000),
     revokedAt: null,

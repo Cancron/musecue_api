@@ -277,18 +277,12 @@ describe('MfaVerificationService', () => {
     });
   });
 
-  describe('regeneration', () => {
-    it('replaces all codes after a second factor; previous codes stop working', async () => {
-      const { recoveryCodes: old, secret } = await enable();
+  describe('regeneration (the route requires a step-up approval)', () => {
+    it('replaces all codes; previous codes stop working', async () => {
+      const { recoveryCodes: old } = await enable();
       await verify(recovery(old[0]));
-      const now = plus(2 * MIN);
 
-      const view = await service.regenerateRecoveryCodes(
-        ALICE,
-        totp(totpCode(secret, now)),
-        META,
-        now,
-      );
+      const view = await service.regenerateRecoveryCodes(ALICE, META);
 
       expect(view.recoveryCodes).toHaveLength(10);
       expect(view.recoveryCodesRemaining).toBe(10);
@@ -310,41 +304,22 @@ describe('MfaVerificationService', () => {
       await expect(
         verify(recovery(view.recoveryCodes[0]), plus(3 * MIN)),
       ).resolves.toMatchObject({ verified: true, recoveryCodesRemaining: 9 });
-    });
-
-    it('can be proven with a recovery code, which is consumed', async () => {
-      const { recoveryCodes } = await enable();
-
-      const view = await service.regenerateRecoveryCodes(
-        ALICE,
-        recovery(recoveryCodes[0]),
-        META,
-        plus(MIN),
-      );
-
-      expect(view.recoveryCodes).toHaveLength(10);
-      expect(repo.unusedCodes(ALICE)).toHaveLength(10);
-    });
-
-    it('changes nothing without a valid second factor', async () => {
-      const { recoveryCodes } = await enable();
-      const before = repo.recoveryCodes.get(ALICE);
-
-      await expect(
-        rejection(
-          service.regenerateRecoveryCodes(
-            ALICE,
-            recovery('AAAAA-AAAAA'),
-            META,
-            plus(MIN),
-          ),
-        ),
-      ).resolves.toMatchObject({ status: 400 });
-
-      expect(repo.recoveryCodes.get(ALICE)).toEqual(before);
-      await expect(verify(recovery(recoveryCodes[0]))).resolves.toMatchObject({
-        verified: true,
+      // The regeneration is audited as a count (9 left -> 10 new).
+      expect(repo.audits.map((a) => a.changes[0])).toContainEqual({
+        fieldName: 'mfaRecoveryCodesRemaining',
+        oldValue: '9',
+        newValue: '10',
       });
+    });
+
+    it('is refused while MFA is not enabled, and creates nothing', async () => {
+      await expect(
+        rejection(service.regenerateRecoveryCodes(ALICE, META)),
+      ).resolves.toEqual({
+        status: 409,
+        message: 'MFA is not enabled for this account',
+      });
+      expect(repo.recoveryCodes.get(ALICE) ?? []).toEqual([]);
     });
   });
 
@@ -375,9 +350,7 @@ describe('MfaVerificationService', () => {
     await verify(totp(code), now);
     const { recoveryCodes: fresh } = await service.regenerateRecoveryCodes(
       ALICE,
-      recovery(recoveryCodes[1]),
       META,
-      now,
     );
 
     const logged = JSON.stringify([

@@ -41,6 +41,8 @@ import {
   PrivacyExportDownloadService,
 } from './privacy-export-download.service';
 import { PrivacyExportLinkSigner } from './privacy-export-link.signer';
+import { StepUpGuard } from '../../auth/step-up/step-up.guard';
+import { stepUpSatisfied } from '../../../test/support/step-up-satisfied';
 
 const OWNER = '0a0a0a0a-0000-4000-8000-00000000000a';
 const OTHER = '0b0b0b0b-0000-4000-8000-00000000000b';
@@ -158,7 +160,10 @@ describe('Privacy export downloads (HTTP, time-controlled)', () => {
           useValue: mock<PrivacyExportLifecycleService>(),
         },
       ],
-    }).compile();
+    })
+      .overrideGuard(StepUpGuard)
+      .useValue(stepUpSatisfied)
+      .compile();
     app = moduleRef.createNestApplication();
     app.useGlobalFilters(new AllExceptionsFilter(filterLogger));
     app.useGlobalInterceptors(new TransformInterceptor(interceptorLogger));

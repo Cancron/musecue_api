@@ -35,6 +35,8 @@ import {
   dropSchema,
   migrationNames,
 } from './migrated-schema';
+import type { StepUpAction } from '@prisma/client';
+import { grantStepUp } from './step-up-fixtures';
 
 /**
  * The real Nest HTTP stack with SubscriptionModule, its services and Prisma
@@ -46,7 +48,15 @@ export interface StripeTestApp {
   app: INestApplication<App>;
   client: PrismaClient;
   stripe: { api: FakeStripeApi };
-  bearer(userId: string): string;
+  bearer(userId: string, sid?: string): string;
+  /**
+   * Headers of a step-up-approved request of `userId` for `action` (a
+   * recorded session and approval; see support/step-up-fixtures.ts).
+   */
+  stepUp(
+    userId: string,
+    action: StepUpAction,
+  ): Promise<{ Authorization: string; 'X-Step-Up-Token': string }>;
   /** POST /v1/subscription/checkout as `userId`. */
   startCheckout(userId: string, billingInterval: string): request.Test;
   /** GET /v1/subscription as `userId`; resolves the response data. */
@@ -74,8 +84,8 @@ export async function createStripeTestApp(): Promise<StripeTestApp> {
   const originalSecret = config.jwt_access_secret;
   config.jwt_access_secret = `stripe-e2e-${schema}`;
   const tokens = new AuthUtilsService(mock<RateLimitStore>());
-  const bearer = (userId: string) =>
-    `Bearer ${tokens.createAccessToken({ userId, role: UserRole.USER, tokenVersion: 1 })}`;
+  const bearer = (userId: string, sid?: string) =>
+    `Bearer ${tokens.createAccessToken({ userId, role: UserRole.USER, tokenVersion: 1, sid })}`;
 
   let booted = await boot(schema, stripe);
   const harness: StripeTestApp = {
@@ -83,6 +93,17 @@ export async function createStripeTestApp(): Promise<StripeTestApp> {
     client: booted.client,
     stripe,
     bearer,
+    stepUp: async (userId, action) => {
+      const { sessionId, stepUpToken } = await grantStepUp(
+        harness.client,
+        userId,
+        action,
+      );
+      return {
+        Authorization: bearer(userId, sessionId),
+        'X-Step-Up-Token': stepUpToken,
+      };
+    },
     startCheckout: (userId, billingInterval) =>
       request(harness.app.getHttpServer())
         .post('/v1/subscription/checkout')

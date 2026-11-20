@@ -125,7 +125,7 @@ export class GoogleOAuthService {
    * 4. The token hasn't expired
    * 5. The token is from the correct issuer (Google)
    */
-  private async verifyIdToken(idToken: string): Promise<IGoogleIdTokenClaims> {
+  async verifyIdToken(idToken: string): Promise<IGoogleIdTokenClaims> {
     try {
       const { clientId } = getGoogleOAuthCredentials();
 
@@ -241,13 +241,17 @@ export class GoogleOAuthService {
 
   /**
    * Exchange authorization code for tokens
-   * Uses PKCE code verifier for validation
+   * Uses PKCE code verifier for validation. `redirectUri` must be the one
+   * the authorization request used (sign-in: GOOGLE_REDIRECT_URI).
    */
-  private async exchangeCodeForTokens(
+  async exchangeCodeForTokens(
     code: string,
     codeVerifier: string,
+    redirectUriOverride?: string,
   ): Promise<IGoogleTokenResponse> {
-    const { clientId, clientSecret, redirectUri } = getGoogleOAuthCredentials();
+    const credentials = getGoogleOAuthCredentials();
+    const { clientId, clientSecret } = credentials;
+    const redirectUri = redirectUriOverride ?? credentials.redirectUri;
 
     const params = new URLSearchParams({
       client_id: clientId,
@@ -619,12 +623,15 @@ export class GoogleOAuthService {
 
     // Generate JTI
     const jti = this.authUtilsService.generateSecureId();
+    // A new sign-in session (the access token's `sid`).
+    const familyId = crypto.randomUUID();
 
     // Create access token
     const accessToken = this.authUtilsService.createAccessToken({
       userId: user.id,
       role: user.role as unknown as UserRole,
       tokenVersion: user.tokenVersion, // Include tokenVersion for hybrid JWT validation
+      sid: familyId,
     });
 
     // Create refresh token with JTI
@@ -642,6 +649,7 @@ export class GoogleOAuthService {
       jti,
       refreshToken,
       { ip, userAgent, device },
+      { familyId },
     );
 
     // Log login attempt (fire-and-forget)

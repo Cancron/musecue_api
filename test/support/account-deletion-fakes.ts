@@ -117,10 +117,12 @@ export class FakeRefreshSessions {
     tokenId: string,
     tokenHash = 'hash',
     expiresAt = new Date(Date.now() + 7 * 24 * 3600_000),
+    familyId: string = randomUUID(),
   ): void {
     this.sessions.set(tokenId, {
       id: randomUUID(),
       authId,
+      familyId,
       tokenId,
       tokenHash,
       expiresAt,
@@ -181,6 +183,7 @@ export class FakeRefreshSessions {
           session.tokenId,
           session.tokenHash,
           session.expiresAt,
+          session.familyId,
         );
         const keep = maxDevicesOverride ?? maxDevices;
         const surplus = this.activeOf(session.authId)
@@ -208,10 +211,27 @@ export class FakeRefreshSessions {
         }
         session.revokedAt = new Date();
         session.revokedReason = 'ROTATED';
-        this.add(next.authId, next.tokenId, next.tokenHash, next.expiresAt);
+        // A rotation keeps the sign-in session.
+        this.add(
+          next.authId,
+          next.tokenId,
+          next.tokenHash,
+          next.expiresAt,
+          session.familyId,
+        );
         this.sessions.get(next.tokenId)!.rotatedFromId = session.id;
         return true;
       },
+      isSessionActive: (authId: string, familyId: string) =>
+        Promise.resolve(
+          [...this.sessions.values()].some(
+            (s) =>
+              s.authId === authId &&
+              s.familyId === familyId &&
+              !s.revokedAt &&
+              s.expiresAt.getTime() > Date.now(),
+          ),
+        ),
       revoke: async (
         authId: string,
         tokenId: string,

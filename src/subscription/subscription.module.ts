@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import Stripe from 'stripe';
 import { AuthGuard } from '../common/guards/auth.guard';
+import { StepUpGuard } from '../auth/step-up/step-up.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { ActivityLogService } from '../common/services/activity-log.service';
 import { ProAccessGuard } from './pro-access.guard';
@@ -35,6 +36,7 @@ import { STRIPE_CLIENT, StripeGateway } from './stripe/stripe.gateway';
     SubscriptionTrialService,
     ActivityLogService,
     AuthGuard,
+    StepUpGuard,
     RolesGuard,
     ProAccessGuard,
     // Stripe checkout and webhooks (see src/subscription/stripe).

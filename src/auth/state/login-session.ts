@@ -1,3 +1,4 @@
+import type { Prisma } from '@prisma/client';
 import AppError from '../../common/errors/app.error';
 import { AUTH_CONFIG } from '../config/auth.config';
 import type { AuthUtilsService } from '../services/auth-utils.service';
@@ -18,7 +19,9 @@ export function refreshTokenLifetimeMs(): number {
  * Stores the refresh session of a new login (password or Google sign-in):
  * only the token's hash is kept, a concurrent login of the same user is
  * rejected (409), and the oldest sessions beyond the device limit are
- * revoked. Fails with 503 when the session cannot be stored.
+ * revoked. Fails with 503 when the session cannot be stored. With `tx`, the
+ * session is written inside that transaction (all-or-nothing with it).
+ * `familyId` identifies the new sign-in session (the access token's `sid`).
  */
 export async function storeLoginSession(
   sessions: RefreshSessionRepository,
@@ -27,6 +30,7 @@ export async function storeLoginSession(
   jti: string,
   refreshToken: string,
   meta: { ip: string; userAgent: string; device?: string },
+  options: { tx?: Prisma.TransactionClient; familyId?: string } = {},
 ): Promise<void> {
   try {
     await sessions.createForLogin(
@@ -38,8 +42,11 @@ export async function storeLoginSession(
         userAgent: meta.userAgent,
         device: meta.device,
         expiresAt: new Date(Date.now() + refreshTokenLifetimeMs()),
+        familyId: options.familyId,
       },
       AUTH_CONFIG.SESSION.MAX_DEVICES_PER_USER,
+      undefined,
+      options.tx,
     );
   } catch (error) {
     if (error instanceof LoginInProgressError) {

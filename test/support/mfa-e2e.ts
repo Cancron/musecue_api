@@ -29,6 +29,28 @@ export const messageOf = (response: { body: unknown }) =>
 export const wrongCode = (code: string) =>
   String((Number(code) + 1) % 1_000_000).padStart(6, '0');
 
+/**
+ * A request prepared asynchronously (e.g. after a step-up) that reads like
+ * a supertest request: `await x` or `await x.expect(status)`. (A plain async
+ * function cannot return a supertest request: awaiting it would send it.)
+ */
+export interface LazyRequest extends PromiseLike<request.Response> {
+  expect(status: number): Promise<request.Response>;
+}
+
+function lazyRequest(make: () => Promise<{ test: request.Test }>): LazyRequest {
+  // `make` wraps the request in an object, so resolving the promise does not
+  // send it (a supertest request is thenable).
+  const prepared = make;
+  return {
+    expect: (status) => prepared().then(({ test }) => test.expect(status)),
+    then: (onFulfilled, onRejected) =>
+      prepared()
+        .then(({ test }) => test.then((response) => response))
+        .then(onFulfilled, onRejected),
+  };
+}
+
 export interface TestUser {
   id: string;
   email: string;
@@ -148,8 +170,40 @@ export class MfaTestKit {
     return this.http().get('/auth/mfa').set(this.as(user));
   }
 
-  start(user: TestUser) {
-    return this.http().post('/auth/mfa/enrollment').set(this.as(user));
+  /**
+   * A step-up approval of `action` for the user's session, the way the app
+   * gets one: a fresh authenticator code for MFA users (the clock moves to
+   * the next 30-second step), the password otherwise. `proof` overrides.
+   */
+  async approve(
+    user: TestUser,
+    action: string,
+    proof?: Record<string, unknown>,
+  ): Promise<string> {
+    let body = proof;
+    if (!body && user.totpSecret) {
+      this.nextStepStart();
+      body = { code: totpCode(user.totpSecret, this.clock) };
+    }
+    const response = await this.http()
+      .post('/auth/step-up')
+      .set(this.as(user))
+      .send({ action, ...(body ?? { password: PASSWORD }) })
+      .expect(201);
+    return dataOf<{ stepUpToken: string }>(response).stepUpToken;
+  }
+
+  /** POST /auth/mfa/enrollment, with a step-up approval (MFA_ENROLLMENT). */
+  start(user: TestUser, stepUpToken?: string): LazyRequest {
+    return lazyRequest(async () => ({
+      test: this.http()
+        .post('/auth/mfa/enrollment')
+        .set(this.as(user))
+        .set(
+          'X-Step-Up-Token',
+          stepUpToken ?? (await this.approve(user, 'MFA_ENROLLMENT')),
+        ),
+    }));
   }
 
   confirm(user: TestUser, code: string) {
@@ -163,20 +217,30 @@ export class MfaTestKit {
     return this.http().post('/auth/mfa/verify').set(this.as(user)).send(body);
   }
 
-  regenerate(user: TestUser, body: object) {
-    return this.http()
-      .post('/auth/mfa/recovery-codes')
-      .set(this.as(user))
-      .send(body);
+  /**
+   * POST /auth/mfa/recovery-codes with a step-up approval
+   * (MFA_RECOVERY_CODES): by default a fresh authenticator code; pass
+   * `proof` (e.g. `{ recoveryCode }`) to approve otherwise.
+   */
+  regenerate(user: TestUser, proof?: Record<string, unknown>): LazyRequest {
+    return lazyRequest(async () => ({
+      test: this.http()
+        .post('/auth/mfa/recovery-codes')
+        .set(this.as(user))
+        .set(
+          'X-Step-Up-Token',
+          await this.approve(user, 'MFA_RECOVERY_CODES', proof),
+        ),
+    }));
   }
 
   /**
    * Enables MFA for `user` over HTTP at the current time; returns the TOTP
    * secret and the response that showed the recovery codes.
    */
-  async enableMfa(user: TestUser) {
+  async enableMfa(user: TestUser, stepUpToken?: string) {
     const started = dataOf<{ secret: string }>(
-      await this.start(user).expect(201),
+      await this.start(user, stepUpToken).expect(201),
     );
     const response = await this.confirm(
       user,

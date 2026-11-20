@@ -16,7 +16,8 @@ export const AUTH_STATE_CLEANUP_INTERVAL_MS = 60 * 60_000;
 
 /**
  * Removes expired authentication state (refresh sessions, one-time codes,
- * OAuth states, expired MFA enrollment secrets) every hour. Expired rows never authenticate anything; the
+ * OAuth states, expired MFA enrollment secrets, step-up approvals) every
+ * hour. Expired rows never authenticate anything; the
  * sweep only keeps the tables small.
  */
 @Injectable()
@@ -50,6 +51,7 @@ export class AuthStateCleanupService implements OnModuleInit, OnModuleDestroy {
     this.running = true;
     try {
       await this.sessions.deleteExpired(now);
+      await this.sessions.deleteExpiredStepUpApprovals(now);
       await this.challenges.deleteExpired(now);
       await this.oauthStates.deleteExpired(now);
       await this.mfaEnrollments.deleteExpired(now);

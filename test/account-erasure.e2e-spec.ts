@@ -101,6 +101,7 @@ const USER_DATA_TABLES = [
   'MfaRecoveryCode',
   'MfaLoginChallenge',
   'MfaTrustedDevice',
+  'StepUpApproval',
   'InfrastructureJob',
 ] as const;
 
@@ -338,6 +339,16 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
             provider: 'local',
             createdAt: new Date(),
             expiresAt: new Date(Date.now() + 5 * 60_000),
+          },
+        },
+        stepUpApprovals: {
+          create: {
+            sessionId: randomUUID(),
+            action: 'ACCOUNT_DELETION',
+            method: 'PASSWORD',
+            tokenHash: randomBytes(32).toString('hex'),
+            createdAt: new Date(),
+            expiresAt: new Date(Date.now() + 10 * 60_000),
           },
         },
         mfaTrustedDevices: {

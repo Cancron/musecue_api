@@ -509,6 +509,24 @@ export async function makeupFlow(
   return { runIds };
 }
 
+/**
+ * A step-up approval for `action` in the user's session, with the password
+ * (the users of these flows have no MFA). Sent as X-Step-Up-Token.
+ */
+export async function stepUpWithPassword(
+  ctx: TestApplication,
+  user: SignedInUser,
+  action: string,
+): Promise<string> {
+  const response = await request(ctx.app.getHttpServer())
+    .post('/auth/step-up')
+    .set('Authorization', `Bearer ${user.accessToken}`)
+    .set('X-Forwarded-For', user.ip)
+    .send({ action, password: 'correct horse battery staple' })
+    .expect(201);
+  return data<{ stepUpToken: string }>(response).stepUpToken;
+}
+
 /** A personal data export built by the export worker and downloaded. */
 export async function privacyExportFlow(
   ctx: TestApplication,
@@ -517,10 +535,20 @@ export async function privacyExportFlow(
   const auth = `Bearer ${user.accessToken}`;
   const http = () => request(ctx.app.getHttpServer());
 
+  // A sensitive action: refused (and nothing queued) without a step-up.
+  await http()
+    .post('/v1/privacy/exports')
+    .set('Authorization', auth)
+    .expect(403);
+  expect(
+    await ctx.client.dataExport.count({ where: { authId: user.id } }),
+  ).toBe(0);
+  const exportApproval = await stepUpWithPassword(ctx, user, 'DATA_EXPORT');
   const requested = data<{ id: string; status: string }>(
     await http()
       .post('/v1/privacy/exports')
       .set('Authorization', auth)
+      .set('X-Step-Up-Token', exportApproval)
       .set('Idempotency-Key', `export-${user.id}`)
       .expect(202),
   );
@@ -542,15 +570,26 @@ export async function privacyExportFlow(
   );
   expect(completed.sizeBytes).toBeGreaterThan(0);
 
+  await http()
+    .get(`/v1/privacy/exports/${requested.id}/download`)
+    .set('Authorization', auth)
+    .expect(403);
+  const downloadApproval = await stepUpWithPassword(
+    ctx,
+    user,
+    'DATA_EXPORT_DOWNLOAD',
+  );
   const link = data<{ url: string }>(
     await http()
       .get(`/v1/privacy/exports/${requested.id}/download`)
       .set('Authorization', auth)
+      .set('X-Step-Up-Token', downloadApproval)
       .expect(200),
   );
   const archive = await http()
     .get(link.url)
     .set('Authorization', auth)
+    .set('X-Step-Up-Token', downloadApproval)
     .buffer(true)
     .parse((response, callback) => {
       const chunks: Buffer[] = [];
@@ -595,10 +634,22 @@ export async function accountDeletionFlow(
   });
   expect(challenge.codeHash).not.toContain(sent.code as string);
 
+  // Refused without a step-up; the account stays as it is.
+  await http()
+    .post('/v1/privacy/account-deletion')
+    .set('Authorization', auth)
+    .send({ password: 'correct horse battery staple', code: sent.code })
+    .expect(403);
+  expect(
+    (await ctx.client.authUser.findUniqueOrThrow({ where: { id: user.id } }))
+      .status,
+  ).toBe('ACTIVE');
+  const approval = await stepUpWithPassword(ctx, user, 'ACCOUNT_DELETION');
   const accepted = data<{ status: string; sessionsRevoked: boolean }>(
     await http()
       .post('/v1/privacy/account-deletion')
       .set('Authorization', auth)
+      .set('X-Step-Up-Token', approval)
       .send({ password: 'correct horse battery staple', code: sent.code })
       .expect(202),
   );

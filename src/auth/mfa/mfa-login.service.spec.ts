@@ -1,4 +1,4 @@
-import { HttpException } from '@nestjs/common';
+import { ConflictException, HttpException } from '@nestjs/common';
 import { mock } from 'jest-mock-extended';
 import type { Logger } from 'winston';
 import { FakeMfaRepository } from '../../../test/support/fake-mfa-repository';
@@ -101,22 +101,36 @@ describe('MfaLoginService', () => {
     return result.challenge;
   }
 
+  /** Stands in for AuthService: "creates the session" inside the lock. */
+  const issued: string[] = [];
+  const issueSession = (_tx: unknown, completion: { authId: string }) => {
+    issued.push(completion.authId);
+    return Promise.resolve('session');
+  };
+
   const complete = (
     challenge: MfaChallengeView,
     factor: MfaFactor,
     now = plus(MIN),
-    extra: { trustDevice?: boolean; deviceName?: string } = {},
+    extra: {
+      trustDevice?: boolean;
+      deviceName?: string;
+      issue?: (tx: unknown, completion: { authId: string }) => Promise<string>;
+    } = {},
   ) =>
-    service.complete(
-      {
-        challengeToken: challenge.challengeToken,
-        factor,
-        trustDevice: extra.trustDevice ?? false,
-        deviceName: extra.deviceName,
-        meta: META,
-      },
-      now,
-    );
+    service
+      .complete(
+        {
+          challengeToken: challenge.challengeToken,
+          factor,
+          trustDevice: extra.trustDevice ?? false,
+          deviceName: extra.deviceName,
+          meta: META,
+        },
+        extra.issue ?? issueSession,
+        now,
+      )
+      .then(({ completion }) => completion);
 
   describe('gate', () => {
     it('lets users without MFA sign in as before', async () => {
@@ -195,6 +209,100 @@ describe('MfaLoginService', () => {
           }),
         ),
       ).resolves.toMatchObject({ status: 400 });
+    });
+
+    describe('when the sign-in cannot be created', () => {
+      const failingIssue = () =>
+        Promise.reject(new Error('refresh session could not be stored'));
+
+      it('keeps the recovery code, the challenge and the device untouched', async () => {
+        const { recoveryCodes } = await enable();
+        const challenge = await challengeFor();
+        const factor: MfaFactor = {
+          method: 'recovery_code',
+          code: recoveryCodes[0],
+        };
+
+        await expect(
+          rejection(
+            complete(challenge, factor, plus(MIN), {
+              trustDevice: true,
+              issue: failingIssue,
+            }),
+          ),
+        ).resolves.toMatchObject({ status: 503 });
+
+        expect(repo.unusedCodes(ALICE)).toHaveLength(10);
+        expect(repo.challenges[0].consumedAt).toBeNull();
+        expect(repo.devices).toEqual([]);
+        expect(
+          repo.audits.filter(
+            (a) => a.changes[0]?.fieldName === 'mfaRecoveryCodesRemaining',
+          ),
+        ).toEqual([]);
+        // The same challenge with the same code then succeeds.
+        await expect(complete(challenge, factor)).resolves.toMatchObject({
+          method: 'recovery_code',
+        });
+        expect(repo.unusedCodes(ALICE)).toHaveLength(9);
+      });
+
+      it('keeps the authenticator step usable', async () => {
+        const { secret } = await enable();
+        const challenge = await challengeFor();
+        const now = plus(MIN);
+        const factor: MfaFactor = {
+          method: 'totp',
+          code: totpCode(secret, now),
+        };
+        const stepBefore = repo.accounts.get(ALICE)!.mfaLastUsedStep;
+
+        await rejection(
+          complete(challenge, factor, now, { issue: failingIssue }),
+        );
+
+        expect(repo.accounts.get(ALICE)!.mfaLastUsedStep).toBe(stepBefore);
+        await expect(complete(challenge, factor, now)).resolves.toMatchObject({
+          method: 'totp',
+        });
+      });
+
+      it('passes HTTP errors of the sign-in through (e.g. 409 login in progress)', async () => {
+        const { recoveryCodes } = await enable();
+        const challenge = await challengeFor();
+
+        await expect(
+          rejection(
+            complete(
+              challenge,
+              { method: 'recovery_code', code: recoveryCodes[0] },
+              plus(MIN),
+              {
+                issue: () =>
+                  Promise.reject(
+                    new ConflictException('Another login is in progress'),
+                  ),
+              },
+            ),
+          ),
+        ).resolves.toMatchObject({ status: 409 });
+        expect(repo.unusedCodes(ALICE)).toHaveLength(10);
+      });
+    });
+
+    it('creates the sign-in only after a valid code', async () => {
+      const { recoveryCodes } = await enable();
+      const challenge = await challengeFor();
+      issued.length = 0;
+      await rejection(
+        complete(challenge, { method: 'recovery_code', code: 'AAAAA-AAAAA' }),
+      );
+      expect(issued).toEqual([]);
+      await complete(challenge, {
+        method: 'recovery_code',
+        code: recoveryCodes[0],
+      });
+      expect(issued).toEqual([ALICE]);
     });
 
     it('uses a challenge only once', async () => {
@@ -311,12 +419,15 @@ describe('MfaLoginService', () => {
       await enable();
       await expect(
         rejection(
-          service.complete({
-            challengeToken: token,
-            factor: { method: 'recovery_code', code: 'AAAAA-AAAAA' },
-            trustDevice: false,
-            meta: META,
-          }),
+          service.complete(
+            {
+              challengeToken: token,
+              factor: { method: 'recovery_code', code: 'AAAAA-AAAAA' },
+              trustDevice: false,
+              meta: META,
+            },
+            issueSession,
+          ),
         ),
       ).resolves.toMatchObject({ status: 401 });
       // Never counted against anyone.
@@ -501,15 +612,9 @@ describe('MfaLoginService', () => {
       ).resolves.toMatchObject({ kind: 'CHALLENGE' });
     });
 
-    /** A new set of recovery codes for Alice (proven with her app). */
+    /** A new set of recovery codes for Alice. */
     async function regenerateCodes(): Promise<string[]> {
-      const now = plus(MIN + 15_000);
-      const view = await verification.regenerateRecoveryCodes(
-        ALICE,
-        { method: 'totp', code: totpCode(fixtures.get(ALICE)!.secret, now) },
-        META,
-        now,
-      );
+      const view = await verification.regenerateRecoveryCodes(ALICE, META);
       return view.recoveryCodes;
     }
   });

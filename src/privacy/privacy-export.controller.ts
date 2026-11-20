@@ -28,6 +28,7 @@ import {
   IdempotencyKeyPipe,
 } from './dto/privacy-export.dto';
 import { PrivacyExportService } from './privacy-export.service';
+import { RequireStepUp } from '../auth/step-up/step-up.decorator';
 
 interface AuthenticatedRequest extends Request {
   user: IAccessTokenPayload;
@@ -47,9 +48,11 @@ export class PrivacyExportController {
   /**
    * Queues a ZIP archive of the caller's data and returns its status with
    * 202. Takes no body. While an export is waiting or running, the same
-   * export is returned instead of a new one.
+   * export is returned instead of a new one. Needs a step-up approval
+   * (DATA_EXPORT).
    */
   @Post()
+  @RequireStepUp('DATA_EXPORT')
   @HttpCode(HttpStatus.ACCEPTED)
   @Throttle({ default: THROTTLER_CONFIG.STRICT })
   @ApiHeader({
@@ -84,8 +87,10 @@ export class PrivacyExportController {
   /**
    * A temporary signed link (at most 15 minutes) to the caller's completed
    * export. Pending or failed exports return 409, expired exports 410.
+   * Needs a step-up approval (DATA_EXPORT_DOWNLOAD).
    */
   @Get(':exportId/download')
+  @RequireStepUp('DATA_EXPORT_DOWNLOAD')
   @Header('Cache-Control', 'private, no-store')
   createDownloadLink(
     @Req() req: AuthenticatedRequest,
@@ -97,9 +102,10 @@ export class PrivacyExportController {
   /**
    * Streams the archive for a signed link. The link must be used with the
    * owner's bearer token; invalid or foreign links return 403 and expired
-   * links 410.
+   * links 410. Needs a step-up approval (DATA_EXPORT_DOWNLOAD).
    */
   @Get(':exportId/archive')
+  @RequireStepUp('DATA_EXPORT_DOWNLOAD')
   async downloadArchive(
     @Req() req: AuthenticatedRequest,
     @Param('exportId', new ParseUUIDPipe()) exportId: string,

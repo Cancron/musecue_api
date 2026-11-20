@@ -24,6 +24,8 @@ import {
   CANCELLATION_ERRORS,
   StripeCancellationService,
 } from './stripe-cancellation.service';
+import { StepUpGuard } from '../../auth/step-up/step-up.guard';
+import { stepUpSatisfied } from '../../../test/support/step-up-satisfied';
 
 const tokenVersions = mock<TokenVersionCache>();
 const cancellation = mock<StripeCancellationService>();
@@ -66,6 +68,8 @@ describe('POST /v1/subscription/cancel (HTTP)', () => {
     })
       .overrideProvider(StripeCancellationService)
       .useValue(cancellation)
+      .overrideGuard(StepUpGuard)
+      .useValue(stepUpSatisfied)
       .compile();
     app = moduleRef.createNestApplication();
     const logger = mock<Logger>();

@@ -17,6 +17,7 @@ import { requestMetadata } from '../../subscription/request-metadata';
 import { EmptyBodyPipe } from '../dto/privacy-export.dto';
 import { RequestAccountDeletionDto } from './account-deletion.dto';
 import { AccountDeletionService } from './account-deletion.service';
+import { RequireStepUp } from '../../auth/step-up/step-up.decorator';
 
 interface AuthenticatedRequest extends Request {
   user: IAccessTokenPayload;
@@ -51,9 +52,10 @@ export class AccountDeletionController {
    * Confirms identity (password and emailed code; the code alone for
    * accounts without a password) and accepts the deletion: the account is
    * blocked and every token invalidated at once. Repeating the request
-   * returns the same deletion.
+   * returns the same deletion. Needs a step-up approval (ACCOUNT_DELETION).
    */
   @Post()
+  @RequireStepUp('ACCOUNT_DELETION')
   @HttpCode(HttpStatus.ACCEPTED)
   @Throttle({ default: THROTTLER_CONFIG.STRICT })
   requestDeletion(

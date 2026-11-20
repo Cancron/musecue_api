@@ -52,6 +52,7 @@ import {
   givenPaidProHistory,
   recordPayment,
 } from './support/subscription-fixtures';
+import { grantStepUp } from './support/step-up-fixtures';
 
 jest.setTimeout(120_000);
 
@@ -81,8 +82,8 @@ describeWithDatabase('Subscription security (PostgreSQL, full stack)', () => {
   const tokens = new AuthUtilsService(mock<RateLimitStore>());
   const T0 = new Date('2026-03-01T09:30:00.000Z');
 
-  const bearer = (userId: string, role: string = UserRole.USER) =>
-    `Bearer ${tokens.createAccessToken({ userId, role: role as UserRole, tokenVersion: 1 })}`;
+  const bearer = (userId: string, role: string = UserRole.USER, sid?: string) =>
+    `Bearer ${tokens.createAccessToken({ userId, role: role as UserRole, tokenVersion: 1, sid })}`;
   const http = () => request(app.getHttpServer());
   const dataOf = (r: { body: unknown }) => (r.body as { data: Data }).data;
   const plan = () =>
@@ -542,16 +543,31 @@ describeWithDatabase('Subscription security (PostgreSQL, full stack)', () => {
       const victim = await createUser(client);
       const before = await snapshot(userId);
       const victimBefore = await snapshot(victim);
+      const spoofed = {
+        userId: victim,
+        status: 'PRO',
+        proExpiresAt: '2099-01-01T00:00:00Z',
+        amountCents: 1900,
+        paymentStatus: 'SUCCEEDED',
+      };
+      // Without a step-up approval the route refuses outright...
       await http()
         .post('/v1/subscription/cancel?status=PRO&userId=' + victim)
         .set('Authorization', bearer(userId, UserRole.SUPERADMIN))
-        .send({
-          userId: victim,
-          status: 'PRO',
-          proExpiresAt: '2099-01-01T00:00:00Z',
-          amountCents: 1900,
-          paymentStatus: 'SUCCEEDED',
-        })
+        .send(spoofed)
+        .expect(403);
+      // ...and with one (for the caller), the spoofed values still change
+      // nothing: the caller has no subscription.
+      const { sessionId, stepUpToken } = await grantStepUp(
+        client,
+        userId,
+        'SUBSCRIPTION_CANCEL',
+      );
+      await http()
+        .post('/v1/subscription/cancel?status=PRO&userId=' + victim)
+        .set('Authorization', bearer(userId, UserRole.SUPERADMIN, sessionId))
+        .set('X-Step-Up-Token', stepUpToken)
+        .send(spoofed)
         .expect(409);
       await expect(snapshot(userId)).resolves.toEqual(before);
       await expect(snapshot(victim)).resolves.toEqual(victimBefore);

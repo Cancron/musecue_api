@@ -113,25 +113,20 @@ export class MfaVerificationService {
   }
 
   /**
-   * Proves a second factor, then replaces every recovery code of the user
-   * (used or not) with ten new ones, in one transaction. A recovery code
-   * used as the proof is consumed like any other use.
+   * Replaces every recovery code of the user (used or not) with ten new ones,
+   * in one transaction. The route requires a step-up approval
+   * (MFA_RECOVERY_CODES), which is the second-factor proof.
    */
   async regenerateRecoveryCodes(
     authId: string,
-    factor: MfaFactor,
     metadata: ActivityLogMetadata,
-    now: Date = new Date(),
   ): Promise<MfaRecoveryCodesView> {
     const result = await this.guard(() =>
       this.repository.withLock(authId, async (uow) => {
-        const outcome = await this.checkFactor(
-          uow,
-          authId,
-          factor,
-          metadata,
-          now,
-        );
+        const account = requireActiveAccount(await uow.account());
+        const outcome: CheckOutcome = account.mfaEnabled
+          ? { kind: 'VERIFIED', method: 'totp' }
+          : { kind: 'NOT_ENABLED' };
         if (outcome.kind !== 'VERIFIED') {
           return { outcome, recoveryCodes: [] as string[] };
         }
@@ -155,7 +150,6 @@ export class MfaVerificationService {
     this.logger.info('MFA recovery codes regenerated', {
       context: CONTEXT,
       authId,
-      method: outcome.method,
     });
     return {
       recoveryCodes: result.recoveryCodes,

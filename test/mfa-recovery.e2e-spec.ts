@@ -480,9 +480,23 @@ describeWithDatabase('MFA recovery codes (e2e, PostgreSQL)', () => {
       const { recoveryCodes } = await enable(user);
       const before = await codesOf(user);
 
-      await kit.regenerate(user, {}).expect(400);
-      await kit.regenerate(user, { recoveryCode: 'ABCDE-FGHJK' }).expect(400);
-      await kit.regenerate(user, { code: '000000' }).expect(400);
+      // No approval: refused before anything happens.
+      await kit
+        .http()
+        .post('/auth/mfa/recovery-codes')
+        .set(kit.as(user))
+        .expect(403);
+      // No approval can be had without a valid second factor.
+      const stepUp = (proof: Record<string, unknown>) =>
+        kit
+          .http()
+          .post('/auth/step-up')
+          .set(kit.as(user))
+          .send({ action: 'MFA_RECOVERY_CODES', ...proof });
+      await stepUp({}).expect(400);
+      await stepUp({ recoveryCode: 'ABCDE-FGHJK' }).expect(400);
+      await stepUp({ code: '000000' }).expect(400);
+      await stepUp({ password: 'correct horse battery staple' }).expect(400);
 
       expect(await codesOf(user)).toEqual(before);
       await useRecovery(user, recoveryCodes[0]).expect(200);
@@ -536,9 +550,25 @@ describeWithDatabase('MFA recovery codes (e2e, PostgreSQL)', () => {
       const aliceBefore = await codesOf(alice);
 
       // Bob cannot prove anything with Alice's code...
-      await kit.regenerate(bob, { recoveryCode: aliceCodes[0] }).expect(400);
       await kit
-        .regenerate(bob, { recoveryCode: bobCodes[0], userId: alice.id })
+        .http()
+        .post('/auth/step-up')
+        .set(kit.as(bob))
+        .send({ action: 'MFA_RECOVERY_CODES', recoveryCode: aliceCodes[0] })
+        .expect(400);
+      // ...nor name Alice: with his own approval, a user ID in the body is
+      // rejected.
+      await kit
+        .http()
+        .post('/auth/mfa/recovery-codes')
+        .set(kit.as(bob))
+        .set(
+          'X-Step-Up-Token',
+          await kit.approve(bob, 'MFA_RECOVERY_CODES', {
+            recoveryCode: bobCodes[1],
+          }),
+        )
+        .send({ userId: alice.id })
         .expect(400);
       // ...and regenerating his own codes leaves Alice's alone.
       const bobView = dataOf<MfaRecoveryCodesView>(

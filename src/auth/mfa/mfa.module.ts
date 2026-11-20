@@ -8,6 +8,7 @@ import { MfaVerificationService } from './mfa-verification.service';
 import { MfaController } from './mfa.controller';
 import { MfaRepository } from './mfa.repository';
 import { MfaService } from './mfa.service';
+import { StepUpGuard } from '../step-up/step-up.guard';
 
 /**
  * Optional MFA of the signed-in user (authenticator app, recovery codes,
@@ -37,6 +38,7 @@ import { MfaService } from './mfa.service';
     MfaRepository,
     ActivityLogService,
     AuthGuard,
+    StepUpGuard,
   ],
   exports: [MfaRepository, MfaVerificationService, MfaLoginService],
 })

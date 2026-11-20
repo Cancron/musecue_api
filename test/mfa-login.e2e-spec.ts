@@ -352,6 +352,112 @@ describeWithDatabase('MFA at sign-in (e2e, PostgreSQL)', () => {
       }).expect(200);
     });
 
+    describe('when the sign-in session cannot be created', () => {
+      /**
+       * Makes PostgreSQL itself refuse the refresh session of `user` (a
+       * trigger on "RefreshSession"), so the real transaction fails exactly
+       * where the session is written.
+       */
+      async function failSessionsOf(user: TestUser) {
+        await ctx.client.$executeRawUnsafe(`
+          CREATE OR REPLACE FUNCTION "e2e_fail_session"() RETURNS trigger
+          LANGUAGE plpgsql AS $$
+          BEGIN
+            IF NEW."authId" = '${user.id}' THEN
+              RAISE EXCEPTION 'e2e: refresh session refused';
+            END IF;
+            RETURN NEW;
+          END;
+          $$`);
+        await ctx.client.$executeRawUnsafe(`
+          CREATE TRIGGER "e2e_fail_session" BEFORE INSERT ON "RefreshSession"
+          FOR EACH ROW EXECUTE FUNCTION "e2e_fail_session"()`);
+      }
+      async function restoreSessions() {
+        await ctx.client.$executeRawUnsafe(
+          'DROP TRIGGER IF EXISTS "e2e_fail_session" ON "RefreshSession"',
+        );
+      }
+      afterEach(restoreSessions);
+
+      const usedCodes = (user: TestUser) =>
+        ctx.client.mfaRecoveryCode.count({
+          where: { authId: user.id, usedAt: { not: null } },
+        });
+
+      it('keeps the recovery code and the challenge usable, and trusts nothing', async () => {
+        const { user, recoveryCodes } = await mfaUser();
+        const { challengeToken } = await challengeOf(user);
+        const sessionsBefore = await sessionsOf(user);
+        const body = {
+          challengeToken,
+          recoveryCode: recoveryCodes[0],
+          trustDevice: true,
+        };
+        await failSessionsOf(user);
+
+        const failed = await completeMfa(user, body).expect(503);
+
+        expect(messageOf(failed)).toBe(
+          'Authentication service temporarily unavailable. Please try again.',
+        );
+        expect(failed.body).not.toHaveProperty('data');
+        // Nothing was consumed or created: one transaction, rolled back.
+        expect(await usedCodes(user)).toBe(0);
+        expect((await challengesOf(user))[0].consumedAt).toBeNull();
+        expect(await devicesOf(user)).toEqual([]);
+        expect(await sessionsOf(user)).toBe(sessionsBefore);
+        expect(
+          await ctx.client.activityLogEventDetail.count({
+            where: {
+              fieldName: 'mfaRecoveryCodesRemaining',
+              event: { recordId: user.id },
+            },
+          }),
+        ).toBe(0);
+        expect(
+          await ctx.client.loginHistory.count({
+            where: { authId: user.id, success: true },
+          }),
+        ).toBe(1); // only the sign-in of createUser()
+
+        // Once sessions can be stored again, the very same challenge and
+        // recovery code complete the sign-in.
+        await restoreSessions();
+        const done = dataOf<IMfaLoginResponse>(
+          await completeMfa(user, body).expect(200),
+        );
+        await expectWorkingSession(user, done as unknown as Tokens);
+        expect(done.trustedDevice).not.toBeNull();
+        expect(await usedCodes(user)).toBe(1);
+        expect((await challengesOf(user))[0].consumedAt).not.toBeNull();
+        expect(await devicesOf(user)).toHaveLength(1);
+      });
+
+      it('keeps the authenticator code usable', async () => {
+        const { user } = await mfaUser();
+        const { challengeToken } = await challengeOf(user);
+        const code = freshCode(user);
+        const { mfaLastUsedStep } =
+          await ctx.client.authSecurity.findUniqueOrThrow({
+            where: { authId: user.id },
+          });
+        await failSessionsOf(user);
+
+        await completeMfa(user, { challengeToken, code }).expect(503);
+
+        expect(
+          (
+            await ctx.client.authSecurity.findUniqueOrThrow({
+              where: { authId: user.id },
+            })
+          ).mfaLastUsedStep,
+        ).toBe(mfaLastUsedStep);
+        await restoreSessions();
+        await completeMfa(user, { challengeToken, code }).expect(200);
+      });
+    });
+
     it('uses each challenge once, even concurrently', async () => {
       const { user, recoveryCodes } = await mfaUser();
       const { challengeToken } = await challengeOf(user);
@@ -687,7 +793,23 @@ describeWithDatabase('MFA at sign-in (e2e, PostgreSQL)', () => {
         ip: `198.21.${Math.floor(Math.random() * 250)}.${Math.floor(Math.random() * 250) + 1}`,
         accessToken: first.accessToken,
       };
-      await kit.enableMfa(user);
+      // A Google-only account steps up by signing in with Google again.
+      const started = dataOf<{ url: string; state: string }>(
+        await http()
+          .post('/auth/step-up/google')
+          .set(kit.as(user))
+          .send({ action: 'MFA_ENROLLMENT' })
+          .expect(201),
+      );
+      const nonce = new URL(started.url).searchParams.get('nonce');
+      const approval = dataOf<{ stepUpToken: string }>(
+        await http()
+          .post('/auth/step-up/google/callback')
+          .set(kit.as(user))
+          .send({ code: google.codeFor(who, { nonce }), state: started.state })
+          .expect(201),
+      );
+      await kit.enableMfa(user, approval.stepUpToken);
       return { who, user };
     }
 
