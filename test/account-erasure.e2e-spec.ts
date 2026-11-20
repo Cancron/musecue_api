@@ -103,7 +103,7 @@ const USER_DATA_TABLES = [
   'MfaTrustedDevice',
   'StepUpApproval',
   'SecurityEvent',
-  'MfaSmsPhone',
+  'MfaPhone',
   'MfaSmsCode',
   'InfrastructureJob',
 ] as const;
@@ -274,6 +274,9 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
 
   /** An account with data in every table, private files and a payment. */
   async function seedAccount(): Promise<SeededAccount> {
+    // One instant for every row: lifetimes bounded by CHECKs (e.g. ten
+    // minutes for an approval) are then exact, never off by a millisecond.
+    const seededAt = new Date();
     const tag = randomBytes(5).toString('hex');
     const email = `${tag}@example.com`;
     const user = await client.authUser.create({
@@ -307,7 +310,7 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
             tokenHash: 'a'.repeat(64),
             ipAddress: '203.0.113.9',
             userAgent: 'phone',
-            expiresAt: new Date(Date.now() + 7 * 24 * 3600_000),
+            expiresAt: new Date(seededAt.getTime() + 7 * 24 * 3600_000),
           },
         },
         authChallenges: {
@@ -315,7 +318,7 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
             purpose: 'EMAIL_VERIFICATION',
             codeHash: 'b'.repeat(64),
             maxAttempts: 5,
-            expiresAt: new Date(Date.now() + 3600_000),
+            expiresAt: new Date(seededAt.getTime() + 3600_000),
           },
         },
         // An MFA enrollment in progress (encrypted pending secret) with an
@@ -323,7 +326,7 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
         mfaEnrollment: {
           create: {
             secret: 'v1.encrypted-pending-totp-secret',
-            expiresAt: new Date(Date.now() + 10 * 60_000),
+            expiresAt: new Date(seededAt.getTime() + 10 * 60_000),
             failedAttemptsAt: [new Date()],
           },
         },
@@ -340,8 +343,8 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
           create: {
             tokenHash: randomBytes(32).toString('hex'),
             provider: 'local',
-            createdAt: new Date(),
-            expiresAt: new Date(Date.now() + 5 * 60_000),
+            createdAt: seededAt,
+            expiresAt: new Date(seededAt.getTime() + 5 * 60_000),
           },
         },
         stepUpApprovals: {
@@ -350,16 +353,35 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
             action: 'ACCOUNT_DELETION',
             method: 'PASSWORD',
             tokenHash: randomBytes(32).toString('hex'),
-            createdAt: new Date(),
-            expiresAt: new Date(Date.now() + 10 * 60_000),
+            createdAt: seededAt,
+            expiresAt: new Date(seededAt.getTime() + 10 * 60_000),
           },
         },
         mfaTrustedDevices: {
           create: {
             tokenHash: randomBytes(32).toString('hex'),
             name: 'phone',
-            createdAt: new Date(),
-            expiresAt: new Date(Date.now() + 30 * 24 * 3600_000),
+            createdAt: seededAt,
+            expiresAt: new Date(seededAt.getTime() + 30 * 24 * 3600_000),
+          },
+        },
+        // A verified SMS phone number and a pending phone verification code.
+        mfaPhone: {
+          create: {
+            phoneNumber: 'mfa2.erasure-test',
+            maskedNumber: '+*******0123',
+            verifiedAt: new Date(),
+          },
+        },
+        mfaSmsCodes: {
+          create: {
+            id: randomUUID(),
+            purpose: 'PHONE_REPLACEMENT',
+            destination: 'mfa2.erasure-test-pending',
+            maskedNumber: '+*******0456',
+            codeHash: randomBytes(32).toString('hex'),
+            createdAt: seededAt,
+            expiresAt: new Date(seededAt.getTime() + 5 * 60_000),
           },
         },
         // An entry of the security activity history.
@@ -393,28 +415,6 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
         firstName: 'First',
         avatarUrl: avatarKey,
         avatarStorageProvider: 'local',
-      },
-    });
-
-    // A verified phone number for SMS codes, and a code sent to it.
-    const smsPhone = await client.mfaSmsPhone.create({
-      data: {
-        authId: user.id,
-        status: 'ACTIVE',
-        phoneNumber: 'mfa2.0000000000000000.iv.tag.ciphertext',
-        phoneHint: '42',
-        verifiedAt: new Date(),
-      },
-    });
-    const sentAt = new Date();
-    await client.mfaSmsCode.create({
-      data: {
-        authId: user.id,
-        phoneId: smsPhone.id,
-        purpose: 'PHONE_VERIFICATION',
-        codeHash: `smsh1.${'0'.repeat(16)}.${'a'.repeat(64)}`,
-        createdAt: sentAt,
-        expiresAt: new Date(sentAt.getTime() + 5 * 60_000),
       },
     });
 
@@ -553,7 +553,7 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
         providerCustomerId,
         billingInterval: 'MONTHLY',
         amountCents: 1900,
-        expiresAt: new Date(Date.now() + 30 * 60_000),
+        expiresAt: new Date(seededAt.getTime() + 30 * 60_000),
       },
     });
 

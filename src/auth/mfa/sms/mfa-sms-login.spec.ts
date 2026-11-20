@@ -6,190 +6,260 @@ import type { Logger } from 'winston';
 import { FakeMfaNotifier } from '../../../../test/support/fake-mfa-notifier';
 import { FakeMfaRepository } from '../../../../test/support/fake-mfa-repository';
 import { testCipher } from '../../../../test/support/mfa-test-keys';
-import config from '../../../common/config/app.config';
+import AppError from '../../../common/errors/app.error';
 import { ApproveStepUpDto } from '../../step-up/step-up.dto';
-import { MfaLoginService } from '../mfa-login.service';
+import { MfaLoginService, type MfaChallengeView } from '../mfa-login.service';
 import { totpCode } from '../mfa-totp';
-import { MfaVerificationService } from '../mfa-verification.service';
 import {
   CompleteMfaLoginDto,
   MfaVerificationDto,
   toMfaLoginFactor,
 } from '../mfa.dto';
+import {
+  MfaVerificationService,
+  type MfaLoginFactor,
+} from '../mfa-verification.service';
 import { MfaService } from '../mfa.service';
 import type { MfaSmsService } from './mfa-sms.service';
+
+jest.setTimeout(30_000);
 
 const ALICE = 'alice';
 const META = { ip: '203.0.113.5', userAgent: 'jest' };
 const T0 = new Date(Math.floor(Date.UTC(2026, 10, 28, 9) / 30_000) * 30_000);
-const CHALLENGE = `mfac_${'A'.repeat(43)}`;
+const plus = (ms: number) => new Date(T0.getTime() + ms);
+const MIN = 60_000;
+const TOKEN = `mfac_${'A'.repeat(43)}`;
 
 const errorsOf = <T extends object>(
-  type: new () => T,
+  cls: new () => T,
   body: Record<string, unknown>,
 ) =>
-  validateSync(plainToInstance(type, body), {
+  validateSync(plainToInstance(cls, body), {
     whitelist: true,
     forbidNonWhitelisted: true,
   }).map((e) => e.property);
 
-async function statusOf(promise: Promise<unknown>): Promise<number> {
-  try {
-    await promise;
-  } catch (error) {
-    if (error instanceof HttpException) return error.getStatus();
-    throw error;
-  }
-  throw new Error('Expected a rejection');
-}
-
 /**
- * SMS codes are a sign-in method only: accepted by POST /auth/login/mfa,
- * refused by step-up and MFA verification, never combined with trusting the
- * device, and offered only to users with a verified number.
+ * SMS as a factor of the MFA step of sign-in only: the request shapes that
+ * accept it (and those that never do), and MfaLoginService's use of
+ * MfaSmsService.
  */
-describe('MFA SMS at sign-in only', () => {
+describe('MFA SMS at sign-in', () => {
   describe('requests', () => {
-    it('a sign-in takes exactly one of code, recoveryCode or smsCode', () => {
-      expect(
-        toMfaLoginFactor(
-          plainToInstance(CompleteMfaLoginDto, {
-            challengeToken: CHALLENGE,
-            smsCode: '123456',
-          }),
-        ),
-      ).toEqual({ method: 'sms', code: '123456' });
-      for (const body of [
-        { smsCode: '123456', code: '123456' },
-        { smsCode: '123456', recoveryCode: 'ABCDE-FGHJK' },
-        {},
-      ]) {
-        expect(() =>
-          toMfaLoginFactor(
-            plainToInstance(CompleteMfaLoginDto, {
-              challengeToken: CHALLENGE,
-              ...body,
-            }),
-          ),
-        ).toThrow(HttpException);
-      }
+    it('only the sign-in MFA step accepts smsCode', () => {
       expect(
         errorsOf(CompleteMfaLoginDto, {
-          challengeToken: CHALLENGE,
+          challengeToken: TOKEN,
+          smsCode: '123456',
+        }),
+      ).toEqual([]);
+      expect(
+        errorsOf(CompleteMfaLoginDto, {
+          challengeToken: TOKEN,
           smsCode: '12345',
+        }),
+      ).toEqual(['smsCode']);
+      // Verification and step-up never accept it.
+      expect(errorsOf(MfaVerificationDto, { smsCode: '123456' })).toEqual([
+        'smsCode',
+      ]);
+      expect(
+        errorsOf(ApproveStepUpDto, {
+          action: 'DATA_EXPORT',
+          smsCode: '123456',
         }),
       ).toEqual(['smsCode']);
     });
 
-    it.each([
-      ['a step-up', ApproveStepUpDto, { action: 'MFA_DISABLE' }],
-      ['an MFA verification', MfaVerificationDto, {}],
-    ] as const)('%s refuses an SMS code (400)', (_, type, base) => {
-      expect(errorsOf(type, { ...base, smsCode: '123456' })).toContain(
-        'smsCode',
-      );
+    it('takes exactly one factor, and an SMS code cannot trust the device', () => {
+      const dto = (body: Partial<CompleteMfaLoginDto>) =>
+        Object.assign(new CompleteMfaLoginDto(), {
+          challengeToken: TOKEN,
+          ...body,
+        });
+      expect(toMfaLoginFactor(dto({ smsCode: '123456' }))).toEqual({
+        method: 'sms',
+        code: '123456',
+      });
+      expect(toMfaLoginFactor(dto({ code: '654321' }))).toEqual({
+        method: 'totp',
+        code: '654321',
+      });
+      for (const body of [
+        {},
+        { smsCode: '123456', code: '654321' },
+        { smsCode: '123456', recoveryCode: 'ABCDE-FGHJK' },
+        { smsCode: '123456', trustDevice: true },
+      ]) {
+        expect(() => toMfaLoginFactor(dto(body))).toThrow(HttpException);
+      }
     });
   });
 
   describe('MfaLoginService', () => {
-    const originalSecret = config.jwt_refresh_secret;
     let repo: FakeMfaRepository;
-    let sms: jest.Mocked<Pick<MfaSmsService, 'loginPhone'>>;
+    let sms: ReturnType<typeof mock<MfaSmsService>>;
     let service: MfaLoginService;
-    let enrollment: MfaService;
-
-    beforeAll(() => {
-      config.jwt_refresh_secret = '';
-    });
-    afterAll(() => {
-      config.jwt_refresh_secret = originalSecret;
-    });
+    let secret: string;
 
     beforeEach(async () => {
       repo = new FakeMfaRepository();
       repo.addAccount(ALICE);
       const cipher = testCipher();
-      const logger = mock<Logger>();
       const notifier = new FakeMfaNotifier().asNotifier();
-      enrollment = new MfaService(
+      const logger = mock<Logger>();
+      const enrollment = new MfaService(
         repo.asRepository(),
         cipher,
         notifier,
         logger,
       );
-      const verification = new MfaVerificationService(
-        repo.asRepository(),
-        cipher,
-        notifier,
-        logger,
-      );
-      sms = { loginPhone: jest.fn() };
+      const started = await enrollment.startEnrollment(ALICE, T0);
+      secret = started.secret;
+      await enrollment.confirmEnrollment(ALICE, totpCode(secret, T0), META, T0);
+      sms = mock<MfaSmsService>();
       service = new MfaLoginService(
         repo.asRepository(),
-        verification,
-        logger,
-        sms as unknown as MfaSmsService,
-      );
-      const { secret } = await enrollment.startEnrollment(ALICE, T0);
-      await enrollment.confirmEnrollment(
-        ALICE,
-        totpCode(secret, T0),
-        { ...META },
-        T0,
-      );
-    });
-
-    const gate = () =>
-      service.gate(
-        { authId: ALICE, provider: 'local', meta: META },
-        new Date(T0.getTime() + 60_000),
-      );
-
-    it('offers SMS (and shows the masked number) only with a verified number', async () => {
-      sms.loginPhone.mockResolvedValue('••••••••23');
-      const offered = await gate();
-      expect(offered).toMatchObject({
-        kind: 'CHALLENGE',
-        challenge: {
-          methods: ['totp', 'recovery_code', 'sms'],
-          smsPhoneNumber: '••••••••23',
-        },
-      });
-
-      sms.loginPhone.mockResolvedValue(null);
-      const plain = await gate();
-      expect(plain).toMatchObject({
-        challenge: { methods: ['totp', 'recovery_code'] },
-      });
-      expect((plain as { challenge: object }).challenge).not.toHaveProperty(
-        'smsPhoneNumber',
-      );
-    });
-
-    it('never trusts a device with an SMS code (400, nothing read)', async () => {
-      const owner = jest.spyOn(repo.asRepository(), 'loginChallengeOwner');
-      const status = await statusOf(
-        service.complete(
-          {
-            challengeToken: CHALLENGE,
-            factor: { method: 'sms', code: '123456' },
-            trustDevice: true,
-            meta: META,
-          },
-          () => Promise.resolve(null),
+        new MfaVerificationService(
+          repo.asRepository(),
+          cipher,
+          notifier,
+          logger,
         ),
+        logger,
+        sms,
       );
-      expect(status).toBe(400);
-      expect(owner).not.toHaveBeenCalled();
     });
 
-    it('without the SMS service, sending a code is unavailable (503)', async () => {
-      const withoutSms = new MfaLoginService(
+    async function challenge(): Promise<MfaChallengeView> {
+      const gate = await service.gate(
+        { authId: ALICE, provider: 'local', meta: META },
+        plus(MIN),
+      );
+      if (gate.kind !== 'CHALLENGE') throw new Error('expected a challenge');
+      return gate.challenge;
+    }
+
+    const complete = (
+      view: MfaChallengeView,
+      factor: MfaLoginFactor,
+      trustDevice = false,
+    ) =>
+      service.complete(
+        {
+          challengeToken: view.challengeToken,
+          factor,
+          trustDevice,
+          meta: META,
+        },
+        () => Promise.resolve('session'),
+        plus(2 * MIN),
+      );
+
+    it('offers SMS (with the masked number) only when the user can use it', async () => {
+      sms.signInPhone.mockResolvedValue(null);
+      const without = await challenge();
+      expect(without.methods).toEqual(['totp', 'recovery_code']);
+      expect(without).not.toHaveProperty('smsPhone');
+
+      sms.signInPhone.mockResolvedValue('+*******0123');
+      const withPhone = await challenge();
+      expect(withPhone.methods).toEqual(['totp', 'recovery_code', 'sms']);
+      expect(withPhone.smsPhone).toBe('+*******0123');
+    });
+
+    it('completes the sign-in with a verified SMS code (method sms)', async () => {
+      sms.signInPhone.mockResolvedValue('+*******0123');
+      sms.checkSignInCode.mockResolvedValue({ kind: 'VERIFIED' });
+      const view = await challenge();
+
+      const { completion } = await complete(view, {
+        method: 'sms',
+        code: '123456',
+      });
+
+      expect(completion).toMatchObject({
+        authId: ALICE,
+        method: 'sms',
+        trustedDevice: null,
+      });
+      const [, authId, challengeId, code] = sms.checkSignInCode.mock.calls[0];
+      expect([authId, typeof challengeId, code]).toEqual([
+        ALICE,
+        'string',
+        '123456',
+      ]);
+      // The challenge is used up.
+      await expect(
+        complete(view, {
+          method: 'totp',
+          code: totpCode(secret, plus(2 * MIN)),
+        }),
+      ).rejects.toMatchObject({ status: 401 });
+    });
+
+    it('a declined SMS code leaves the challenge usable', async () => {
+      sms.signInPhone.mockResolvedValue('+*******0123');
+      sms.checkSignInCode.mockResolvedValue({
+        kind: 'INVALID',
+        remainingAttempts: 4,
+      });
+      sms.declinedError.mockReturnValue(
+        AppError.badRequest('Invalid SMS code'),
+      );
+      const view = await challenge();
+
+      await expect(
+        complete(view, { method: 'sms', code: '123456' }),
+      ).rejects.toMatchObject({ status: 400, message: 'Invalid SMS code' });
+
+      const { completion } = await complete(view, {
+        method: 'totp',
+        code: totpCode(secret, plus(2 * MIN)),
+      });
+      expect(completion.method).toBe('totp');
+    });
+
+    it('never trusts a device with an SMS code, and never checks the code then', async () => {
+      sms.declinedError.mockReturnValue(AppError.conflict('no'));
+      const view = await challenge();
+
+      await expect(
+        complete(view, { method: 'sms', code: '123456' }, true),
+      ).rejects.toMatchObject({ status: 409 });
+      expect(sms.checkSignInCode.mock.calls).toHaveLength(0);
+    });
+
+    it('without the SMS service, SMS codes are refused', async () => {
+      const plain = new MfaLoginService(
         repo.asRepository(),
-        {} as MfaVerificationService,
+        new MfaVerificationService(
+          repo.asRepository(),
+          testCipher(),
+          new FakeMfaNotifier().asNotifier(),
+          mock<Logger>(),
+        ),
         mock<Logger>(),
       );
-      expect(await statusOf(withoutSms.sendSmsCode(CHALLENGE, META))).toBe(503);
+      const gate = await plain.gate(
+        { authId: ALICE, provider: 'local', meta: META },
+        plus(MIN),
+      );
+      if (gate.kind !== 'CHALLENGE') throw new Error('expected a challenge');
+      expect(gate.challenge.methods).toEqual(['totp', 'recovery_code']);
+      await expect(
+        plain.complete(
+          {
+            challengeToken: gate.challenge.challengeToken,
+            factor: { method: 'sms', code: '123456' },
+            trustDevice: false,
+            meta: META,
+          },
+          () => Promise.resolve('session'),
+          plus(2 * MIN),
+        ),
+      ).rejects.toMatchObject({ status: 409 });
     });
   });
 });

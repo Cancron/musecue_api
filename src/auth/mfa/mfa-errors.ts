@@ -27,9 +27,9 @@ export async function guardMfaStorage<T>(
 }
 
 /** The token's user must still exist and be active. */
-export function requireActiveAccount(
-  account: MfaAccountState | null,
-): MfaAccountState {
+export function requireActiveAccount<
+  T extends Pick<MfaAccountState, 'status'> = MfaAccountState,
+>(account: T | null): T {
   if (!account) throw AppError.unauthorized('User not found');
   if (account.status !== 'ACTIVE') {
     throw AppError.forbidden('User account is not active');

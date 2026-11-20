@@ -7,6 +7,57 @@ import {
   type RefreshSessionRepository,
 } from './refresh-session.repository';
 
+/**
+ * How a sign-in skipped the MFA challenge: the account had no MFA, or the
+ * request came from one of the user's trusted devices.
+ */
+export type MfaSkip =
+  | { kind: 'NOT_REQUIRED' }
+  | { kind: 'TRUSTED_DEVICE'; deviceId: string };
+
+/** The MFA decision of a sign-in no longer holds (see confirmMfaSkip). */
+export class MfaStateChangedError extends Error {
+  constructor() {
+    super('MFA state changed during sign-in');
+    this.name = 'MfaStateChangedError';
+  }
+}
+
+/**
+ * Re-checks, under the user's sessions lock, that a sign-in may still skip
+ * MFA: MFA enabled concurrently (whose activation ends every other session
+ * under the same lock), or the trusted device revoked meanwhile, means the
+ * session is not stored. Without this, a password sign-in that passed the
+ * MFA gate just before MFA was enabled could store a session right after the
+ * activation ended all others.
+ */
+export async function confirmMfaSkip(
+  tx: Prisma.TransactionClient,
+  authId: string,
+  skipped: MfaSkip,
+  now: Date,
+): Promise<void> {
+  const security = await tx.authSecurity.findUnique({
+    where: { authId },
+    select: { mfaEnabled: true },
+  });
+  if (skipped.kind === 'NOT_REQUIRED') {
+    if (security?.mfaEnabled) throw new MfaStateChangedError();
+    return;
+  }
+  const trusted = await tx.mfaTrustedDevice.count({
+    where: {
+      id: skipped.deviceId,
+      authId,
+      revokedAt: null,
+      expiresAt: { gt: now },
+    },
+  });
+  if (!security?.mfaEnabled || trusted === 0) {
+    throw new MfaStateChangedError();
+  }
+}
+
 /** Milliseconds a refresh token (and its session) lives. */
 export function refreshTokenLifetimeMs(): number {
   const match = /^(\d+)([smhd])?$/.exec(AUTH_CONFIG.TOKEN_EXPIRY.REFRESH);
@@ -35,6 +86,8 @@ export async function storeLoginSession(
     familyId?: string;
     /** The sign-in proved MFA (the MFA challenge), and how. */
     mfaVerifiedWith?: 'totp' | 'recovery_code';
+    /** The sign-in skipped MFA: re-checked under the sessions lock. */
+    skippedMfa?: MfaSkip;
   } = {},
 ): Promise<void> {
   try {
@@ -58,8 +111,22 @@ export async function storeLoginSession(
       AUTH_CONFIG.SESSION.MAX_DEVICES_PER_USER,
       undefined,
       options.tx,
+      options.skippedMfa
+        ? (tx) =>
+            confirmMfaSkip(
+              tx,
+              userId,
+              options.skippedMfa as MfaSkip,
+              new Date(),
+            )
+        : undefined,
     );
   } catch (error) {
+    if (error instanceof MfaStateChangedError) {
+      throw AppError.conflict(
+        'Your sign-in settings changed while you were signing in. Please sign in again.',
+      );
+    }
     if (error instanceof LoginInProgressError) {
       throw AppError.conflict(
         'Another login is in progress. Please try again in a moment.',

@@ -72,7 +72,6 @@ export interface ILoginResponse {
 
 /** Tokens of a sign-in completed with MFA (POST /auth/login/mfa). */
 export interface IMfaLoginResponse extends ILoginResponse {
-  /** How MFA was completed; `sms` sessions carry no MFA proof. */
   mfaMethod: 'totp' | 'recovery_code' | 'sms';
   /** Set when the device was trusted: the token is shown only here. */
   trustedDevice: {

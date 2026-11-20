@@ -30,11 +30,7 @@ import { LoginDto } from './dto/login.dto';
 import { SessionsService } from './sessions/sessions.service';
 import { requestMetadata } from '../subscription/request-metadata';
 import { MFA_LOGIN } from './mfa/mfa.constants';
-import {
-  CompleteMfaLoginDto,
-  SendMfaLoginSmsDto,
-  toMfaLoginFactor,
-} from './mfa/mfa.dto';
+import { CompleteMfaLoginDto, toMfaLoginFactor } from './mfa/mfa.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
 import {
   ResendVerificationEmailDto,
@@ -367,7 +363,9 @@ export class AuthController {
    * Google callback) and the authenticator `code` or a `recoveryCode`.
    * Returns the same tokens as a regular login; with `trustDevice: true`
    * also a device token (shown once) that skips MFA for 30 days when sent
-   * as the X-MFA-Trusted-Device header.
+   * as the X-MFA-Trusted-Device header. Users with a verified phone may send
+   * `smsCode` (from POST /auth/login/mfa/sms) instead; an SMS sign-in cannot
+   * trust the device.
    */
   @Throttle({ default: THROTTLER_CONFIG.STRICT })
   @Post('login/mfa')
@@ -400,25 +398,6 @@ export class AuthController {
       },
       meta,
     );
-  }
-
-  /**
-   * Sends a sign-in code by SMS for an MFA challenge to the user's verified
-   * phone number (users with authenticator MFA who added one). Complete the
-   * challenge with `{ challengeToken, smsCode }` on POST /auth/login/mfa.
-   * At most 3 codes per 15 minutes; each works 5 minutes, once.
-   */
-  @Throttle({ default: THROTTLER_CONFIG.STRICT })
-  @Post('login/mfa/sms')
-  @HttpCode(HttpStatus.OK)
-  @Header('Cache-Control', 'no-store')
-  sendMfaLoginSms(@Body() payload: SendMfaLoginSmsDto, @Req() req: Request) {
-    const meta = requestMetadata(req);
-    return this.authService.sendMfaLoginSms(payload.challengeToken, {
-      ip: meta.ip ?? 'unknown',
-      userAgent: meta.userAgent ?? 'unknown',
-      device: meta.device,
-    });
   }
 
   /**

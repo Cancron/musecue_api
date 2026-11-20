@@ -82,6 +82,12 @@ export class RefreshSessionRepository {
     maxDevices: number,
     now: Date = new Date(),
     client?: Prisma.TransactionClient,
+    /**
+     * Runs under the sessions lock before the session is stored (for
+     * example to confirm the sign-in's MFA decision still holds); throwing
+     * stores nothing.
+     */
+    confirm?: (tx: Prisma.TransactionClient) => Promise<void>,
   ): Promise<void> {
     const work = async (tx: Prisma.TransactionClient) => {
       const [lock] = await tx.$queryRaw<Array<{ acquired: boolean }>>`
@@ -91,6 +97,7 @@ export class RefreshSessionRepository {
       `;
       if (!lock?.acquired) throw new LoginInProgressError();
       await this.lockSessions(tx, session.authId);
+      await confirm?.(tx);
       await tx.refreshSession.create({
         data: { ...session, createdAt: now },
       });

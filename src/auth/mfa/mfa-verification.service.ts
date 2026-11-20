@@ -32,6 +32,14 @@ export type MfaFactor =
 
 export type MfaMethodUsed = MfaFactor['method'];
 
+/**
+ * A factor of the MFA step of sign-in: also an SMS code (sign-in only; never
+ * accepted by verification or step-up).
+ */
+export type MfaLoginFactor = MfaFactor | { method: 'sms'; code: string };
+
+export type MfaLoginMethod = MfaLoginFactor['method'];
+
 export interface MfaVerificationView {
   verified: true;
   method: MfaMethodUsed;

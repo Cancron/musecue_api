@@ -1,685 +1,764 @@
 import { Inject, Injectable } from '@nestjs/common';
-import type { MfaSmsCodePurpose, StepUpMethod } from '@prisma/client';
+import type { MfaSmsCodePurpose, Prisma } from '@prisma/client';
 import { WINSTON_MODULE_PROVIDER } from 'nest-winston';
-import { randomUUID } from 'node:crypto';
+import { randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
 import type { Logger } from 'winston';
 import AppError from '../../../common/errors/app.error';
-import type { ActivityLogMetadata } from '../../../common/services/activity-log.service';
-import { PrismaService } from '../../../common/services/prisma.service';
 import type { SecurityEventContext } from '../../security-events/security-event.log';
 import { guardMfaStorage, requireActiveAccount } from '../mfa-errors';
+import { hashMfaToken } from '../mfa-login.service';
 import { MfaSecretCipher } from '../mfa-secret.cipher';
 import {
   MfaSecurityNotifier,
   type PendingSecurityNotification,
 } from '../mfa-security-notifier';
-import { MFA_AUDIT_FIELDS } from '../mfa.constants';
-import { MfaRepository, type MfaUnitOfWork } from '../mfa.repository';
+import { MFA_LOGIN, MFA_SMS } from '../mfa.constants';
+import type { MfaChangeContext } from '../mfa.service';
+import { maskPhoneNumber, normalizePhoneNumber } from './mfa-phone-number';
 import {
-  generateSmsCode,
-  maskedPhone,
-  normalizePhoneNumber,
-  phoneHintOf,
-  smsLimit,
-  smsMessage,
-  withUse,
-} from './mfa-sms-codes';
-import { MFA_SMS } from './mfa-sms.constants';
-import { MfaSmsStore, type SmsAccountState } from './mfa-sms.store';
-import { SMS_PROVIDER, type SmsProvider } from './sms-provider';
+  MfaSmsRepository,
+  type MfaSmsUnitOfWork,
+  type SmsAccountState,
+} from './mfa-sms.repository';
+import { SMS_SENDER, type SmsSender } from './sms-sender';
 
-/** GET /auth/mfa/sms: never the number itself, never a code. */
-export interface MfaSmsStatusView {
-  /** Whether SMS can be sent at all (provider and MFA key configured). */
+export type SmsPhoneMode = 'enrollment' | 'replacement';
+
+export interface SmsStatusView {
+  /** SMS can be used: authenticator MFA is on and SMS delivery works. */
   available: boolean;
-  /** Whether the account may use SMS: MFA enabled with an authenticator. */
-  eligible: boolean;
-  /** A verified number receives sign-in codes. */
+  /** A verified phone number is registered. */
   enabled: boolean;
-  phoneNumber: string | null;
-  verifiedAt: Date | null;
-  /** A number being verified (added or replacing the current one). */
-  pending: { phoneNumber: string; codeExpiresAt: Date | null } | null;
-  deliveriesRemaining: number;
-  attemptsRemaining: number;
+  phone: { maskedNumber: string; verifiedAt: Date } | null;
+  /** A phone number waiting for its verification code. */
+  pending: {
+    purpose: SmsPhoneMode;
+    maskedNumber: string;
+    expiresAt: Date;
+  } | null;
 }
 
 export interface SmsCodeSentView {
-  sent: true;
-  phoneNumber: string;
+  purpose: SmsPhoneMode | 'sign_in';
+  maskedNumber: string;
+  expiresAt: Date;
+  /** SMS codes that can still be sent within the current 15 minutes. */
+  deliveriesRemaining: number;
+}
+
+export type SmsCheckOutcome =
+  | { kind: 'VERIFIED' }
+  | { kind: 'NOT_AVAILABLE' }
+  | { kind: 'BLOCKED'; until: Date }
+  | { kind: 'INVALID'; remainingAttempts: number };
+
+type Refusal =
+  | { kind: 'NOT_AVAILABLE' }
+  | { kind: 'CHALLENGE_INVALID' }
+  | { kind: 'ALREADY_ENROLLED' }
+  | { kind: 'NO_PHONE' }
+  | { kind: 'SAME_NUMBER' }
+  | { kind: 'NO_VERIFICATION' }
+  | { kind: 'DELIVERY_LIMIT'; until: Date }
+  | { kind: 'BLOCKED'; until: Date }
+  | { kind: 'INVALID'; remainingAttempts: number };
+
+interface Delivery {
+  kind: 'SEND';
+  codeId: string;
+  to: string;
+  body: string;
+  maskedNumber: string;
   expiresAt: Date;
   deliveriesRemaining: number;
 }
 
-/** How a phone change was made (request and approval; never a secret). */
-export interface SmsChangeContext {
-  metadata: ActivityLogMetadata;
-  sessionId?: string;
-  approvedWith?: StepUpMethod;
-}
-
-/** The result of checking a sign-in SMS code inside the MFA transaction. */
-export type SmsLoginCheck =
-  | { kind: 'VERIFIED' }
-  | { kind: 'REFUSED'; error: AppError };
-
-type Locked<T> =
-  | { kind: 'OK'; value: T }
-  | { kind: 'REFUSED'; error: AppError };
-
-/** A code to deliver once its transaction committed. */
-interface Delivery {
-  codeId: string;
-  to: string;
-  code: string;
-  purpose: 'sign_in' | 'phone';
-}
-
 const CONTEXT = 'MfaSmsService';
+const PURPOSE: Record<SmsPhoneMode, MfaSmsCodePurpose> = {
+  enrollment: 'PHONE_ENROLLMENT',
+  replacement: 'PHONE_REPLACEMENT',
+};
+const PHONE_PURPOSES: MfaSmsCodePurpose[] = [
+  'PHONE_ENROLLMENT',
+  'PHONE_REPLACEMENT',
+];
 
-const eventContext = (change: SmsChangeContext): SecurityEventContext => ({
-  ip: change.metadata.ip,
-  userAgent: change.metadata.userAgent,
-  sessionId: change.sessionId ?? null,
-});
+/** A uniformly random six-digit code (CSPRNG). */
+export function generateSmsCode(): string {
+  return String(randomInt(0, 10 ** MFA_SMS.DIGITS)).padStart(
+    MFA_SMS.DIGITS,
+    '0',
+  );
+}
+
+/** Times within the last `windowMs` (sliding window), oldest first. */
+export function recentTimes(dates: Date[], now: Date, windowMs: number) {
+  return dates
+    .filter((d) => d.getTime() > now.getTime() - windowMs)
+    .sort((a, b) => a.getTime() - b.getTime());
+}
 
 /**
- * Optional SMS sign-in verification for users with authenticator-app MFA:
+ * A limit of `max` events per `windowMs`: either the next list of times
+ * (this event included) or the time the limit frees up.
+ */
+export function slidingLimit(
+  dates: Date[],
+  now: Date,
+  max: number,
+  windowMs: number,
+): { next: Date[]; remaining: number } | { blockedUntil: Date } {
+  const recent = recentTimes(dates, now, windowMs);
+  if (recent.length >= max) {
+    return { blockedUntil: new Date(recent[0].getTime() + windowMs) };
+  }
+  const next = [...recent, now];
+  return { next, remaining: max - next.length };
+}
+
+/** The delivery limit: 3 SMS codes per user within any 15 minutes. */
+const deliveryLimit = (account: SmsAccountState, now: Date) =>
+  slidingLimit(
+    account.deliveriesAt,
+    now,
+    MFA_SMS.MAX_DELIVERIES,
+    MFA_SMS.DELIVERY_WINDOW_MS,
+  );
+
+/** SMS needs authenticator MFA: it is never the only second factor. */
+const smsAllowed = (account: SmsAccountState) =>
+  account.mfaEnabled && account.mfaMethod === 'totp';
+
+const smsBody = (purpose: MfaSmsCodePurpose, code: string) =>
+  purpose === 'SIGN_IN'
+    ? `${code} is your MuseCue sign-in code. It expires in 5 minutes. Never share it: MuseCue will never ask you for it.`
+    : `${code} is your MuseCue code to verify this phone number. It expires in 5 minutes. Never share it.`;
+
+/**
+ * Optional SMS verification for users with authenticator MFA:
  *
- * - phone numbers are added (or replaced) by verifying an SMS code, and
- *   removed, each with a step-up approval (enforced on the routes);
- * - at sign-in, an MFA challenge can send a code to the verified number and
- *   be completed with it (MfaLoginService). SMS never counts as a step-up or
- *   an administrator's MFA proof.
+ * - Phone numbers are registered (enrollment), replaced and removed by their
+ *   owner; the routes require step-up approvals (MFA_SMS_ENROLLMENT,
+ *   MFA_SMS_REPLACE, MFA_SMS_DISABLE), and a new number must be verified
+ *   with a code sent to it. Replacing or removing the number invalidates
+ *   every open SMS code at once.
+ * - At sign-in, an MFA challenge can be completed with a code sent to the
+ *   verified number (POST /auth/login/mfa/sms, then POST /auth/login/mfa
+ *   with `smsCode`). SMS is accepted nowhere else: not for step-up, not for
+ *   POST /auth/mfa/verify, and an SMS sign-in is never an administrator MFA
+ *   proof.
  *
- * Codes are six CSPRNG digits, stored only as an HMAC, valid for 5 minutes,
- * used once; sending a new code for the same purpose invalidates the
- * previous one, and replacing or removing a number invalidates every code
- * sent to it, in the same transaction. At most 3 codes are sent and at most
- * 5 codes are checked per user within any 15 minutes. Everything runs under
- * the user's MFA lock (MfaRepository.withLock).
+ * Codes are six random digits (CSPRNG), stored only as HMAC-SHA256 (keyed
+ * from MFA_ENCRYPTION_KEY), valid for 5 minutes and once. At most 3 codes are
+ * sent and 5 checked per user within any 15 minutes. Numbers are stored
+ * encrypted; only masked numbers are shown or recorded, and neither numbers
+ * nor codes are logged.
  */
 @Injectable()
 export class MfaSmsService {
   constructor(
-    private readonly prisma: PrismaService,
-    private readonly repository: MfaRepository,
+    private readonly repository: MfaSmsRepository,
     private readonly cipher: MfaSecretCipher,
     private readonly notifier: MfaSecurityNotifier,
-    @Inject(SMS_PROVIDER) private readonly provider: SmsProvider,
+    @Inject(SMS_SENDER) private readonly sender: SmsSender,
     @Inject(WINSTON_MODULE_PROVIDER) private readonly logger: Logger,
   ) {}
 
-  /** Whether SMS can be sent (provider and MFA key configured). */
-  get available(): boolean {
-    return this.provider.available && this.cipher.available;
+  /** Whether SMS codes can be sent at all (a provider is configured). */
+  get deliveryConfigured(): boolean {
+    return this.sender.configured;
   }
 
-  async status(
-    authId: string,
-    now: Date = new Date(),
-  ): Promise<MfaSmsStatusView> {
-    return this.guard(() =>
-      this.prisma.$transaction(async (tx) => {
-        const store = new MfaSmsStore(tx, authId);
-        const account = await store.account();
-        const active = await store.phone('ACTIVE');
-        const pending = await store.phone('PENDING');
-        const pendingCode = pending
-          ? (
-              await store.usableCodes(
-                { phoneId: pending.id, purpose: 'PHONE_VERIFICATION' },
-                now,
-              )
-            )[0]
-          : undefined;
-        return {
-          available: this.available,
-          eligible: eligible(account),
-          enabled: !!active,
-          phoneNumber: active ? maskedPhone(active.phoneHint) : null,
-          verifiedAt: active?.verifiedAt ?? null,
-          pending: pending
-            ? {
-                phoneNumber: maskedPhone(pending.phoneHint),
-                codeExpiresAt: pendingCode?.expiresAt ?? null,
-              }
-            : null,
-          deliveriesRemaining: smsLimit(
-            account?.sentAt ?? [],
-            now,
-            MFA_SMS.MAX_DELIVERIES,
-          ).remaining,
-          attemptsRemaining: smsLimit(
-            account?.attemptsAt ?? [],
-            now,
-            MFA_SMS.MAX_ATTEMPTS,
-          ).remaining,
-        };
-      }),
-    );
+  async status(authId: string, now: Date = new Date()): Promise<SmsStatusView> {
+    const state = await this.guard(() => this.repository.read(authId));
+    const authenticator = state.mfaEnabled && state.mfaMethod === 'totp';
+    const pending =
+      state.pending && state.pending.expiresAt.getTime() > now.getTime()
+        ? state.pending
+        : null;
+    return {
+      available: authenticator && this.sender.configured,
+      enabled: authenticator && state.phone !== null,
+      phone: state.phone,
+      pending: pending
+        ? {
+            purpose:
+              pending.purpose === 'PHONE_REPLACEMENT'
+                ? 'replacement'
+                : 'enrollment',
+            maskedNumber: pending.maskedNumber,
+            expiresAt: pending.expiresAt,
+          }
+        : null,
+    };
   }
 
   /**
-   * Adds a number, or starts replacing the verified one: the number becomes
-   * PENDING (a previous pending number is discarded, its codes invalidated)
-   * and a verification code is sent to it. The verified number keeps
-   * working until the new one is verified.
+   * The masked verified number when SMS can complete this user's sign-in
+   * challenge (authenticator MFA, a verified number, delivery configured).
    */
-  async startPhone(
+  async signInPhone(authId: string): Promise<string | null> {
+    if (!this.sender.configured) return null;
+    const state = await this.repository.read(authId);
+    return state.mfaEnabled && state.mfaMethod === 'totp' && state.phone
+      ? state.phone.maskedNumber
+      : null;
+  }
+
+  /**
+   * Sends a verification code to a new number (enrollment: no number yet;
+   * replacement: the current number keeps working until confirmed).
+   */
+  async startPhoneVerification(
     authId: string,
+    mode: SmsPhoneMode,
     phoneNumber: string,
-    change: SmsChangeContext,
+    context: SecurityEventContext,
     now: Date = new Date(),
-  ) {
+  ): Promise<SmsCodeSentView> {
     const e164 = normalizePhoneNumber(phoneNumber);
     if (!e164) {
       throw AppError.badRequest(
-        'phoneNumber must be an international number, for example +14155550123',
+        'phoneNumber must be an international number such as +14155550123',
       );
     }
-    this.requireAvailable();
-    const outcome = await this.locked(authId, async (uow, store) => {
-      requireActiveAccount(await uow.account());
-      const account = await store.account();
-      if (!eligible(account)) return refuse(notEligible());
-      const limit = smsLimit(account!.sentAt, now, MFA_SMS.MAX_DELIVERIES);
-      if (limit.remaining === 0) return refuse(tooManySent(limit.retryAt!));
-
-      const active = await store.phone('ACTIVE');
-      if (
-        active &&
-        this.cipher.decrypt('sms-phone', authId, active.phoneNumber) === e164
-      ) {
-        return refuse(
-          AppError.conflict(
-            'This phone number is already verified for SMS codes',
-          ),
-        );
-      }
-      const previous = await store.phone('PENDING');
-      if (previous) await store.revokePhone(previous.id, 'superseded', now);
-
-      const phone = await store.createPendingPhone({
-        encryptedNumber: this.cipher.encrypt('sms-phone', authId, e164),
-        phoneHint: phoneHintOf(e164),
-        now,
-      });
-      const delivery = await this.issueCode(store, account!, {
-        authId,
-        phoneId: phone.id,
-        to: e164,
-        purpose: 'PHONE_VERIFICATION',
-        loginChallengeId: null,
-        expiresAt: new Date(now.getTime() + MFA_SMS.CODE_TTL_MS),
-        now,
-      });
-      await uow.recordEvent({
-        type: 'MFA_SMS_PHONE_VERIFICATION_STARTED',
-        context: eventContext(change),
-        details: {
-          phone: maskedPhone(phone.phoneHint),
-          replacing: !!active,
-          approvedWith: change.approvedWith ?? null,
-        },
-        now,
-      });
-      return ok({
-        delivery,
-        view: {
-          status: 'PENDING' as const,
-          phoneNumber: maskedPhone(phone.phoneHint),
-          replaces: active ? maskedPhone(active.phoneHint) : null,
-          codeExpiresAt: delivery.expiresAt,
-          deliveriesRemaining: limit.remaining - 1,
-        },
-      });
-    });
-    await this.deliver(authId, outcome.delivery);
-    this.logger.info('SMS phone verification started', {
-      context: CONTEXT,
-      authId,
-    });
-    return outcome.view;
+    this.requireDelivery();
+    const purpose = PURPOSE[mode];
+    const outcome = await this.guard(() =>
+      this.repository.withLock<Refusal | Delivery>(authId, async (uow) => {
+        const account = requireActiveAccount(await uow.account());
+        if (!smsAllowed(account)) return { kind: 'NOT_AVAILABLE' };
+        const phone = await uow.phone();
+        if (mode === 'enrollment' && phone) return { kind: 'ALREADY_ENROLLED' };
+        if (mode === 'replacement') {
+          if (!phone) return { kind: 'NO_PHONE' };
+          if (
+            this.cipher.decrypt('phone', authId, phone.phoneNumber) === e164
+          ) {
+            return { kind: 'SAME_NUMBER' };
+          }
+        }
+        const limit = deliveryLimit(account, now);
+        if ('blockedUntil' in limit) {
+          return { kind: 'DELIVERY_LIMIT', until: limit.blockedUntil };
+        }
+        // A new verification replaces any earlier one.
+        await uow.invalidateOpenCodes(now, { purposes: PHONE_PURPOSES });
+        return this.issueCode(uow, authId, limit, {
+          purpose,
+          to: e164,
+          phoneId: null,
+          challengeId: null,
+          destination: this.cipher.encrypt('phone', authId, e164),
+          context,
+          now,
+        });
+      }),
+    );
+    if (outcome.kind !== 'SEND') throw this.refusalError(outcome);
+    await this.deliver(authId, outcome, purpose, now);
+    return {
+      purpose: mode,
+      maskedNumber: outcome.maskedNumber,
+      expiresAt: outcome.expiresAt,
+      deliveriesRemaining: outcome.deliveriesRemaining,
+    };
   }
 
   /**
-   * Verifies the pending number with the code sent to it. It becomes the
-   * verified number; a previously verified number is revoked and every code
-   * sent to it invalidated, in the same transaction.
+   * Confirms the number being verified with the code sent to it: it becomes
+   * (or replaces) the user's SMS number. Replacing it invalidates every open
+   * SMS code, including sign-in codes sent to the previous number.
    */
-  async confirmPhone(
+  async confirmPhoneVerification(
     authId: string,
+    mode: SmsPhoneMode,
     code: string,
-    change: SmsChangeContext,
+    change: MfaChangeContext,
     now: Date = new Date(),
-  ): Promise<MfaSmsStatusView> {
-    const result = await this.locked(authId, async (uow, store) => {
-      requireActiveAccount(await uow.account());
-      const account = await store.account();
-      if (!eligible(account)) return refuse(notEligible());
-      const pending = await store.phone('PENDING');
-      if (!pending) {
-        return refuse(
-          AppError.conflict(
-            'No phone number is waiting for verification. Add one first.',
-          ),
-        );
-      }
-      const checked = await this.checkCode(uow, store, account!, {
-        authId,
-        phoneId: pending.id,
-        purpose: 'PHONE_VERIFICATION',
-        code,
-        context: 'phone_verification',
-        eventContext: eventContext(change),
-        now,
-      });
-      if (checked.kind === 'REFUSED') return checked;
+  ): Promise<SmsStatusView> {
+    const context = changeEventContext(change);
+    const outcome = await this.guard(() =>
+      this.repository.withLock<
+        Refusal | { kind: 'DONE'; notification: PendingSecurityNotification }
+      >(authId, async (uow) => {
+        const account = requireActiveAccount(await uow.account());
+        if (!smsAllowed(account)) return { kind: 'NOT_AVAILABLE' };
+        const phone = await uow.phone();
+        if (mode === 'enrollment' && phone) return { kind: 'ALREADY_ENROLLED' };
+        if (mode === 'replacement' && !phone) return { kind: 'NO_PHONE' };
+        const pending = await uow.latestOpenCode({
+          purposes: [PURPOSE[mode]],
+        });
+        if (!pending?.destination) return { kind: 'NO_VERIFICATION' };
 
-      const active = await store.phone('ACTIVE');
-      let invalidated = 0;
-      if (active)
-        invalidated = await store.revokePhone(active.id, 'replaced', now);
-      await store.activatePhone(pending.id, now);
-      const metadata = { ...change.metadata, actionedBy: authId };
-      await uow.audit(
-        [
-          {
-            fieldName: MFA_AUDIT_FIELDS.SMS_PHONE,
-            oldValue: active ? maskedPhone(active.phoneHint) : null,
-            newValue: maskedPhone(pending.phoneHint),
+        const checked = await this.checkCode(
+          uow,
+          authId,
+          account,
+          pending,
+          code,
+          now,
+        );
+        if (checked.kind !== 'VERIFIED') {
+          await this.recordFailure(
+            uow,
+            checked,
+            'phone_verification',
+            context,
+            now,
+          );
+          return checked;
+        }
+
+        const e164 = this.cipher.decrypt('phone', authId, pending.destination);
+        const stored = {
+          phoneNumber: this.cipher.encrypt('phone', authId, e164),
+          maskedNumber: pending.maskedNumber,
+          verifiedAt: now,
+        };
+        // Every open code ends: sign-in codes of the previous number and
+        // any other verification.
+        const codesInvalidated = await uow.invalidateOpenCodes(now);
+        if (phone) await uow.replacePhone(phone.id, stored);
+        else await uow.createPhone(stored);
+
+        const metadata = { ...change.metadata, actionedBy: authId };
+        await uow.audit(
+          [
+            {
+              fieldName: 'mfaSmsPhone',
+              oldValue: phone?.maskedNumber ?? null,
+              newValue: pending.maskedNumber,
+            },
+            ...approvalChange(change),
+          ],
+          metadata,
+        );
+        await uow.recordEvent({
+          type: phone ? 'MFA_SMS_PHONE_REPLACED' : 'MFA_SMS_ENABLED',
+          context,
+          details: {
+            phone: pending.maskedNumber,
+            previousPhone: phone?.maskedNumber ?? null,
+            codesInvalidated,
+            approvedWith: change.approvedWith ?? null,
           },
-          ...(change.approvedWith
-            ? [
-                {
-                  fieldName: MFA_AUDIT_FIELDS.STEP_UP_METHOD,
-                  oldValue: null,
-                  newValue: change.approvedWith,
-                },
-              ]
-            : []),
-        ],
-        metadata,
-      );
-      await uow.recordEvent({
-        type: active ? 'MFA_SMS_PHONE_REPLACED' : 'MFA_SMS_ENABLED',
-        context: eventContext(change),
-        details: {
-          phone: maskedPhone(pending.phoneHint),
-          previousPhone: active ? maskedPhone(active.phoneHint) : null,
-          codesInvalidated: invalidated,
-          approvedWith: change.approvedWith ?? null,
-        },
-        now,
-      });
-      const notification = await this.notifier.record(uow.tx, {
-        authId,
-        event: active ? 'MFA_SMS_PHONE_REPLACED' : 'MFA_SMS_PHONE_ADDED',
-        metadata,
-        now,
-      });
-      return ok(notification);
-    });
-    await this.notifier.dispatch(result);
-    this.logger.info('SMS phone verified', { context: CONTEXT, authId });
+          now,
+        });
+        const notification = await this.notifier.record(uow.tx, {
+          authId,
+          event: phone ? 'MFA_SMS_PHONE_REPLACED' : 'MFA_SMS_ENABLED',
+          metadata,
+          now,
+        });
+        return { kind: 'DONE', notification };
+      }),
+    );
+    if (outcome.kind !== 'DONE') throw this.refusalError(outcome);
+    await this.notifier.dispatch(outcome.notification);
+    this.logger.info(
+      mode === 'enrollment' ? 'SMS phone added' : 'SMS phone replaced',
+      { context: CONTEXT, authId },
+    );
     return this.status(authId, now);
   }
 
   /**
-   * Removes the verified and any pending number: both are revoked and every
-   * code sent to them invalidated, in one transaction. 404 without any.
+   * Removes the user's SMS number: SMS can no longer complete a sign-in and
+   * every open SMS code ends at once.
    */
   async removePhone(
     authId: string,
-    change: SmsChangeContext,
+    change: MfaChangeContext,
     now: Date = new Date(),
-  ): Promise<MfaSmsStatusView & { removed: true }> {
-    const result = await this.locked(authId, async (uow, store) => {
-      requireActiveAccount(await uow.account());
-      const active = await store.phone('ACTIVE');
-      const { phones, codes } = await store.revokeAllPhones('removed', now);
-      if (phones === 0) {
-        return refuse(
-          AppError.notFound('No phone number is set up for SMS codes'),
-        );
-      }
-      const metadata = { ...change.metadata, actionedBy: authId };
-      let notification: PendingSecurityNotification | null = null;
-      if (active) {
+  ): Promise<SmsStatusView> {
+    const context = changeEventContext(change);
+    const outcome = await this.guard(() =>
+      this.repository.withLock<
+        Refusal | { kind: 'DONE'; notification: PendingSecurityNotification }
+      >(authId, async (uow) => {
+        requireActiveAccount(await uow.account());
+        const phone = await uow.phone();
+        if (!phone) return { kind: 'NO_PHONE' };
+        const codesInvalidated = await uow.invalidateOpenCodes(now);
+        await uow.deletePhone();
+        const metadata = { ...change.metadata, actionedBy: authId };
         await uow.audit(
           [
             {
-              fieldName: MFA_AUDIT_FIELDS.SMS_PHONE,
-              oldValue: maskedPhone(active.phoneHint),
+              fieldName: 'mfaSmsPhone',
+              oldValue: phone.maskedNumber,
               newValue: null,
             },
-            ...(change.approvedWith
-              ? [
-                  {
-                    fieldName: MFA_AUDIT_FIELDS.STEP_UP_METHOD,
-                    oldValue: null,
-                    newValue: change.approvedWith,
-                  },
-                ]
-              : []),
+            ...approvalChange(change),
           ],
           metadata,
         );
-        notification = await this.notifier.record(uow.tx, {
+        await uow.recordEvent({
+          type: 'MFA_SMS_DISABLED',
+          context,
+          details: {
+            phone: phone.maskedNumber,
+            codesInvalidated,
+            approvedWith: change.approvedWith ?? null,
+          },
+          now,
+        });
+        const notification = await this.notifier.record(uow.tx, {
           authId,
-          event: 'MFA_SMS_PHONE_REMOVED',
+          event: 'MFA_SMS_DISABLED',
           metadata,
           now,
         });
-      }
-      await uow.recordEvent({
-        type: 'MFA_SMS_DISABLED',
-        context: eventContext(change),
-        details: {
-          phone: active ? maskedPhone(active.phoneHint) : null,
-          numbersRemoved: phones,
-          codesInvalidated: codes,
-          approvedWith: change.approvedWith ?? null,
-        },
-        now,
-      });
-      return ok(notification);
-    });
-    if (result) await this.notifier.dispatch(result);
+        return { kind: 'DONE', notification };
+      }),
+    );
+    if (outcome.kind !== 'DONE') throw this.refusalError(outcome);
+    await this.notifier.dispatch(outcome.notification);
     this.logger.info('SMS phone removed', { context: CONTEXT, authId });
-    return { ...(await this.status(authId, now)), removed: true };
+    return this.status(authId, now);
   }
 
   /**
-   * The masked verified number when the user can receive sign-in codes
-   * (SMS available, authenticator MFA on, a verified number); else null.
+   * Sends a sign-in code for an MFA challenge to the owner's verified
+   * number. A new code ends the earlier codes of the same challenge.
    */
-  async loginPhone(authId: string): Promise<string | null> {
-    if (!this.available) return null;
-    const phone = await this.prisma.mfaSmsPhone.findFirst({
-      where: {
-        authId,
-        status: 'ACTIVE',
-        authUser: {
-          authSecurity: { mfaEnabled: true, mfaMethod: 'totp' },
-        },
-      },
-      select: { phoneHint: true },
-    });
-    return phone ? maskedPhone(phone.phoneHint) : null;
-  }
-
-  /**
-   * Sends a sign-in code for an MFA challenge to the verified number (the
-   * previous code of that challenge stops working). `challenge` is the
-   * challenge as read under the user's lock.
-   */
-  async sendLoginCode(
-    uow: MfaUnitOfWork,
-    authId: string,
-    challenge: { id: string; expiresAt: Date },
+  async sendSignInCode(
+    challengeToken: string,
     meta: { ip: string; userAgent: string },
-    now: Date,
-  ): Promise<
-    Locked<{ delivery: Delivery & { expiresAt: Date }; view: SmsCodeSentView }>
-  > {
-    const store = new MfaSmsStore(uow.tx, authId);
-    const account = await store.account();
-    const active = eligible(account) ? await store.phone('ACTIVE') : null;
-    if (!active) return refuse(notSetUp());
-    if (!this.available) return refuse(unavailable());
-    const limit = smsLimit(account!.sentAt, now, MFA_SMS.MAX_DELIVERIES);
-    if (limit.remaining === 0) return refuse(tooManySent(limit.retryAt!));
-
-    await store.invalidateCodes(
-      { purpose: 'LOGIN', loginChallengeId: challenge.id },
-      now,
-    );
-    const expiresAt = new Date(
-      Math.min(
-        now.getTime() + MFA_SMS.CODE_TTL_MS,
-        challenge.expiresAt.getTime(),
-      ),
-    );
-    const to = this.cipher.decrypt('sms-phone', authId, active.phoneNumber);
-    if (this.cipher.needsReencryption(active.phoneNumber)) {
-      // After an MFA key rotation: moved to the current key on use.
-      await store.updatePhoneNumber(
-        active.id,
-        this.cipher.encrypt('sms-phone', authId, to),
-      );
+    now: Date = new Date(),
+  ): Promise<SmsCodeSentView> {
+    if (!MFA_LOGIN.CHALLENGE_TOKEN_PATTERN.test(challengeToken)) {
+      throw invalidChallenge();
     }
-    const delivery = await this.issueCode(store, account!, {
-      authId,
-      phoneId: active.id,
-      to,
-      purpose: 'LOGIN',
-      loginChallengeId: challenge.id,
-      expiresAt,
-      now,
-    });
-    await uow.recordEvent({
-      type: 'MFA_SMS_CODE_SENT',
-      context: { ip: meta.ip, userAgent: meta.userAgent },
-      details: { context: 'sign_in', phone: maskedPhone(active.phoneHint) },
-      now,
-    });
-    return ok({
-      delivery,
-      view: {
-        sent: true as const,
-        phoneNumber: maskedPhone(active.phoneHint),
-        expiresAt,
-        deliveriesRemaining: limit.remaining - 1,
-      },
-    });
-  }
+    const tokenHash = hashMfaToken(challengeToken);
+    const authId = await this.guard(() =>
+      this.repository.loginChallengeOwner(tokenHash),
+    );
+    if (!authId) throw invalidChallenge();
+    this.requireDelivery();
 
-  /** Hands a committed code to the SMS provider (see `deliver`). */
-  async deliverLoginCode(authId: string, delivery: Delivery): Promise<void> {
-    await this.deliver(authId, delivery);
+    const outcome = await this.guard(() =>
+      this.repository.withLock<Refusal | Delivery>(authId, async (uow) => {
+        const challenge = await uow.openLoginChallenge(tokenHash, now);
+        if (!challenge) return { kind: 'CHALLENGE_INVALID' };
+        const account = requireActiveAccount(await uow.account());
+        if (!smsAllowed(account)) return { kind: 'NOT_AVAILABLE' };
+        const phone = await uow.phone();
+        if (!phone) return { kind: 'NOT_AVAILABLE' };
+        const limit = deliveryLimit(account, now);
+        if ('blockedUntil' in limit) {
+          return { kind: 'DELIVERY_LIMIT', until: limit.blockedUntil };
+        }
+        // A new code ends the earlier codes of this challenge.
+        await uow.invalidateOpenCodes(now, { challengeId: challenge.id });
+        return this.issueCode(uow, authId, limit, {
+          purpose: 'SIGN_IN',
+          to: this.cipher.decrypt('phone', authId, phone.phoneNumber),
+          maskedNumber: phone.maskedNumber,
+          phoneId: phone.id,
+          challengeId: challenge.id,
+          destination: null,
+          context: { ip: meta.ip, userAgent: meta.userAgent },
+          now,
+        });
+      }),
+    );
+    if (outcome.kind !== 'SEND') throw this.refusalError(outcome);
+    await this.deliver(authId, outcome, 'SIGN_IN', now);
+    return {
+      purpose: 'sign_in',
+      maskedNumber: outcome.maskedNumber,
+      expiresAt: outcome.expiresAt,
+      deliveriesRemaining: outcome.deliveriesRemaining,
+    };
   }
 
   /**
-   * Checks a sign-in SMS code for an MFA challenge inside the MFA
-   * transaction. Refusals are returned (not thrown) so the counted attempt
-   * commits.
+   * Checks the SMS code of a sign-in challenge inside the sign-in's locked
+   * transaction (see MfaLoginService). Every check counts toward the limit
+   * of 5 per 15 minutes; a match is used up at once. Only a code sent for
+   * this challenge to the currently verified number matches.
    */
-  async checkLoginCode(
-    uow: MfaUnitOfWork,
+  async checkSignInCode(
+    tx: Prisma.TransactionClient,
     authId: string,
     challengeId: string,
     code: string,
     meta: { ip: string; userAgent: string },
     now: Date,
-  ): Promise<SmsLoginCheck> {
-    const store = new MfaSmsStore(uow.tx, authId);
-    const account = await store.account();
-    const active = eligible(account) ? await store.phone('ACTIVE') : null;
-    if (!active) return refuse(notSetUp());
-    const checked = await this.checkCode(uow, store, account!, {
-      authId,
-      phoneId: active.id,
-      purpose: 'LOGIN',
-      loginChallengeId: challengeId,
-      code,
-      context: 'sign_in',
-      eventContext: { ip: meta.ip, userAgent: meta.userAgent },
-      now,
+  ): Promise<SmsCheckOutcome> {
+    const uow = this.repository.unitOfWork(tx, authId);
+    const account = requireActiveAccount(await uow.account());
+    if (!smsAllowed(account)) return { kind: 'NOT_AVAILABLE' };
+    const phone = await uow.phone();
+    if (!phone) return { kind: 'NOT_AVAILABLE' };
+    const candidate = await uow.latestOpenCode({
+      purposes: ['SIGN_IN'],
+      challengeId,
     });
-    return checked.kind === 'OK' ? { kind: 'VERIFIED' } : checked;
+    const current =
+      candidate &&
+      candidate.phoneId === phone.id &&
+      candidate.createdAt.getTime() >= phone.verifiedAt.getTime()
+        ? candidate
+        : null;
+    const checked = await this.checkCode(
+      uow,
+      authId,
+      account,
+      current,
+      code,
+      now,
+    );
+    if (checked.kind !== 'VERIFIED') {
+      await this.recordFailure(
+        uow,
+        checked,
+        'sign_in',
+        { ip: meta.ip, userAgent: meta.userAgent },
+        now,
+      );
+    }
+    return checked;
+  }
+
+  /** The HTTP error of a declined SMS check. */
+  declinedError(
+    authId: string,
+    outcome: Exclude<SmsCheckOutcome, { kind: 'VERIFIED' }>,
+  ): AppError {
+    if (outcome.kind === 'INVALID') {
+      this.logger.warn('Incorrect SMS code', {
+        context: CONTEXT,
+        authId,
+        remainingAttempts: outcome.remainingAttempts,
+      });
+    }
+    return this.refusalError(outcome);
   }
 
   /**
-   * Creates a code for `to` (inside the transaction) and counts the
-   * delivery; it is sent once the transaction committed.
+   * Counts the check (limit: 5 per 15 minutes) and compares the code with
+   * `stored` (none: declined). A match is used up.
    */
-  private async issueCode(
-    store: MfaSmsStore,
+  private async checkCode(
+    uow: MfaSmsUnitOfWork,
+    authId: string,
     account: SmsAccountState,
-    input: {
-      authId: string;
-      phoneId: string;
-      to: string;
+    stored: {
+      id: string;
       purpose: MfaSmsCodePurpose;
-      loginChallengeId: string | null;
+      codeHash: string;
       expiresAt: Date;
+      deliveredAt: Date | null;
+    } | null,
+    code: string,
+    now: Date,
+  ): Promise<SmsCheckOutcome> {
+    const limit = slidingLimit(
+      account.attemptsAt,
+      now,
+      MFA_SMS.MAX_ATTEMPTS,
+      MFA_SMS.ATTEMPT_WINDOW_MS,
+    );
+    if ('blockedUntil' in limit) {
+      return { kind: 'BLOCKED', until: limit.blockedUntil };
+    }
+    await uow.saveAttempts(limit.next);
+    // Only a delivered, unexpired code can match.
+    const matches =
+      !!stored &&
+      stored.deliveredAt !== null &&
+      stored.expiresAt.getTime() > now.getTime() &&
+      /^\d{6}$/.test(code) &&
+      sameHash(
+        stored.codeHash,
+        this.codeHash(authId, stored.id, stored.purpose, code),
+      );
+    if (!matches || !(await uow.markCodeUsed(stored.id, now))) {
+      return { kind: 'INVALID', remainingAttempts: limit.remaining };
+    }
+    return { kind: 'VERIFIED' };
+  }
+
+  private async recordFailure(
+    uow: MfaSmsUnitOfWork,
+    outcome: Exclude<SmsCheckOutcome, { kind: 'VERIFIED' }>,
+    where: 'sign_in' | 'phone_verification',
+    context: SecurityEventContext,
+    now: Date,
+  ) {
+    if (outcome.kind !== 'INVALID') return;
+    // History: never the code, only where it failed.
+    await uow.recordEvent({
+      type: 'MFA_VERIFICATION_FAILED',
+      context,
+      details: {
+        context: where,
+        method: 'sms',
+        remainingAttempts: outcome.remainingAttempts,
+      },
+      now,
+    });
+  }
+
+  /** Creates a code (counted against the delivery limit) to be sent. */
+  private async issueCode(
+    uow: MfaSmsUnitOfWork,
+    authId: string,
+    limit: { next: Date[]; remaining: number },
+    input: {
+      purpose: MfaSmsCodePurpose;
+      to: string;
+      maskedNumber?: string;
+      phoneId: string | null;
+      challengeId: string | null;
+      destination: string | null;
+      context: SecurityEventContext;
       now: Date;
     },
-  ): Promise<Delivery & { expiresAt: Date }> {
+  ): Promise<Delivery> {
+    const { now } = input;
+    const id = randomUUID();
     const code = generateSmsCode();
-    const codeId = randomUUID();
-    await store.createCode({
-      id: codeId,
-      phoneId: input.phoneId,
+    const maskedNumber = input.maskedNumber ?? maskPhoneNumber(input.to);
+    const expiresAt = new Date(now.getTime() + MFA_SMS.CODE_TTL_MS);
+    await uow.createCode({
+      id,
       purpose: input.purpose,
-      loginChallengeId: input.loginChallengeId,
-      codeHash: this.cipher.hashSmsCode(
-        binding(input.authId, input.phoneId, codeId, input.purpose),
-        code,
-      ),
-      createdAt: input.now,
-      expiresAt: input.expiresAt,
+      phoneId: input.phoneId,
+      challengeId: input.challengeId,
+      destination: input.destination,
+      maskedNumber,
+      codeHash: this.codeHash(authId, id, input.purpose, code),
+      createdAt: now,
+      expiresAt,
     });
-    await store.saveSent(
-      withUse(account.sentAt, input.now, MFA_SMS.MAX_DELIVERIES),
-    );
+    await uow.saveDeliveries(limit.next);
+    await uow.recordEvent({
+      type: 'MFA_SMS_CODE_SENT',
+      context: input.context,
+      details: { purpose: input.purpose.toLowerCase(), phone: maskedNumber },
+      now,
+    });
     return {
-      codeId,
+      kind: 'SEND',
+      codeId: id,
       to: input.to,
-      code,
-      purpose: input.purpose === 'LOGIN' ? 'sign_in' : 'phone',
-      expiresAt: input.expiresAt,
+      body: smsBody(input.purpose, code),
+      maskedNumber,
+      expiresAt,
+      deliveriesRemaining: limit.remaining,
     };
   }
 
   /**
-   * Counts an attempt (refused beyond 5 in 15 minutes, without checking)
-   * and checks `code` against the usable codes of the number and purpose; a
-   * match is used up. A wrong, expired, used or invalidated code is refused
-   * alike, and recorded in the security history.
+   * Hands the message to the provider after the code was committed (issued
+   * undelivered, so unusable). Only once the provider accepted it is the code
+   * marked delivered and usable. If sending or recording the delivery fails,
+   * the code stays unusable (even if ending it below fails too), the
+   * delivery is uncounted when possible, and the answer is 503.
    */
-  private async checkCode(
-    uow: MfaUnitOfWork,
-    store: MfaSmsStore,
-    account: SmsAccountState,
-    input: {
-      authId: string;
-      phoneId: string;
-      purpose: MfaSmsCodePurpose;
-      loginChallengeId?: string;
-      code: string;
-      context: 'sign_in' | 'phone_verification';
-      eventContext: SecurityEventContext;
-      now: Date;
-    },
-  ): Promise<Locked<true>> {
-    const { now } = input;
-    const limit = smsLimit(account.attemptsAt, now, MFA_SMS.MAX_ATTEMPTS);
-    if (limit.remaining === 0) return refuse(tooManyAttempts(limit.retryAt!));
-    const attempts = withUse(account.attemptsAt, now, MFA_SMS.MAX_ATTEMPTS);
-    await store.saveAttempts(attempts);
-
-    const candidates = await store.usableCodes(
-      {
-        phoneId: input.phoneId,
-        purpose: input.purpose,
-        ...(input.loginChallengeId
-          ? { loginChallengeId: input.loginChallengeId }
-          : {}),
-      },
-      now,
-    );
-    const match = candidates.find((candidate) =>
-      this.cipher.verifySmsCode(
-        candidate.codeHash,
-        binding(input.authId, candidate.phoneId, candidate.id, input.purpose),
-        input.code,
-      ),
-    );
-    if (match && (await store.consumeCode(match.id, now))) {
-      return ok(true);
-    }
-
-    const after = smsLimit(attempts, now, MFA_SMS.MAX_ATTEMPTS);
-    await uow.recordEvent({
-      type:
-        after.remaining === 0
-          ? 'MFA_VERIFICATION_BLOCKED'
-          : 'MFA_VERIFICATION_FAILED',
-      context: input.eventContext,
-      details:
-        after.remaining === 0
-          ? {
-              context: input.context,
-              method: 'sms',
-              blockedUntil: after.retryAt!.toISOString(),
-            }
-          : {
-              context: input.context,
-              method: 'sms',
-              remainingAttempts: after.remaining,
-            },
-      now,
-    });
-    return refuse(
-      AppError.badRequest(
-        `Invalid or expired SMS code. ${after.remaining} attempt(s) remaining.`,
-      ),
-    );
-  }
-
-  /**
-   * Sends a committed code. If the provider fails, the code is invalidated
-   * (the delivery still counts toward the limit) and the request answers
-   * 503. Neither the code nor the number is ever logged.
-   */
-  private async deliver(authId: string, delivery: Delivery): Promise<void> {
-    try {
-      await this.provider.send(
-        delivery.to,
-        smsMessage(delivery.code, delivery.purpose),
-      );
-    } catch (error) {
-      this.logger.warn('SMS could not be sent', {
-        context: CONTEXT,
-        authId,
-        errorName: error instanceof Error ? error.name : typeof error,
-      });
-      await this.prisma.mfaSmsCode
-        .updateMany({
-          where: {
-            id: delivery.codeId,
-            authId,
-            consumedAt: null,
-            invalidatedAt: null,
-          },
-          data: { invalidatedAt: new Date() },
-        })
-        .catch(() => undefined);
-      throw AppError.serviceUnavailable(
-        'The SMS could not be sent. Please try again later.',
-      );
-    }
-  }
-
-  /** Runs `work` under the user's MFA lock; refusals commit, then throw. */
-  private async locked<T>(
+  private async deliver(
     authId: string,
-    work: (uow: MfaUnitOfWork, store: MfaSmsStore) => Promise<Locked<T>>,
-  ): Promise<T> {
-    const outcome = await this.guard(() =>
-      this.repository.withLock(authId, (uow) =>
-        work(uow, new MfaSmsStore(uow.tx, authId)),
-      ),
+    delivery: Delivery,
+    purpose: MfaSmsCodePurpose,
+    now: Date,
+  ): Promise<void> {
+    let sent = false;
+    try {
+      await this.sender.send(delivery.to, delivery.body);
+      sent = true;
+      await this.repository.markDelivered(authId, delivery.codeId, new Date());
+      this.logger.info('SMS code sent', { context: CONTEXT, authId, purpose });
+      return;
+    } catch (error) {
+      this.logger.error(
+        sent
+          ? 'SMS code delivery could not be recorded'
+          : 'SMS code could not be sent',
+        {
+          context: CONTEXT,
+          authId,
+          purpose,
+          errorName: error instanceof Error ? error.name : typeof error,
+        },
+      );
+    }
+    // Best effort: the code is unusable anyway (never delivered).
+    await this.guard(() =>
+      this.repository.withLock(authId, async (uow) => {
+        await uow.invalidateOpenCodes(now, { id: delivery.codeId });
+        if (sent) return; // A message went out: it stays counted.
+        const account = await uow.account();
+        if (!account) return;
+        const index = account.deliveriesAt.findIndex(
+          (d) => d.getTime() === now.getTime(),
+        );
+        if (index >= 0) {
+          await uow.saveDeliveries(
+            account.deliveriesAt.filter((_, i) => i !== index),
+          );
+        }
+      }),
+    ).catch(() => undefined);
+    throw AppError.serviceUnavailable(
+      'The SMS code could not be sent. Please try again later.',
     );
-    if (outcome.kind === 'REFUSED') throw outcome.error;
-    return outcome.value;
   }
 
-  private requireAvailable() {
-    if (!this.available) throw unavailable();
+  private codeHash(
+    authId: string,
+    codeId: string,
+    purpose: MfaSmsCodePurpose,
+    code: string,
+  ): string {
+    return this.cipher.mac(
+      `mfa-sms-code\u0000${authId}\u0000${codeId}\u0000${purpose}\u0000${code}`,
+    );
+  }
+
+  private requireDelivery() {
+    if (!this.sender.configured) {
+      throw AppError.serviceUnavailable('SMS verification is not available');
+    }
+  }
+
+  private refusalError(refusal: Refusal): AppError {
+    switch (refusal.kind) {
+      case 'NOT_AVAILABLE':
+        return AppError.conflict(
+          'SMS verification is only available with authenticator-app MFA and a verified phone number',
+        );
+      case 'CHALLENGE_INVALID':
+        return invalidChallenge();
+      case 'ALREADY_ENROLLED':
+        return AppError.conflict(
+          'A phone number is already registered. Replace it instead.',
+        );
+      case 'NO_PHONE':
+        return AppError.conflict('No phone number is registered');
+      case 'SAME_NUMBER':
+        return AppError.conflict('This phone number is already registered');
+      case 'NO_VERIFICATION':
+        return AppError.conflict(
+          'No phone number verification is in progress. Start again.',
+        );
+      case 'DELIVERY_LIMIT':
+        return AppError.tooManyRequests(
+          `Too many SMS codes were sent. Try again after ${refusal.until.toISOString()}.`,
+        );
+      case 'BLOCKED':
+        return AppError.tooManyRequests(
+          `Too many SMS code attempts. Try again after ${refusal.until.toISOString()}.`,
+        );
+      case 'INVALID':
+        return AppError.badRequest(
+          `Invalid or expired SMS code. ${refusal.remainingAttempts} attempt(s) remaining.`,
+        );
+    }
   }
 
   private guard<T>(operation: () => Promise<T>): Promise<T> {
@@ -687,38 +766,34 @@ export class MfaSmsService {
   }
 }
 
-/** What a code hash is bound to. */
-const binding = (
-  authId: string,
-  phoneId: string,
-  codeId: string,
-  purpose: MfaSmsCodePurpose,
-) => [authId, phoneId, codeId, purpose].join('\u0000');
-
-/** SMS is only for users with MFA enabled with an authenticator app. */
-function eligible(account: SmsAccountState | null): boolean {
-  return !!account?.mfaEnabled && account.mfaMethod === 'totp';
+function invalidChallenge(): AppError {
+  return AppError.unauthorized(
+    'The MFA challenge is invalid or has expired. Please sign in again.',
+  );
 }
 
-const ok = <T>(value: T): Locked<T> => ({ kind: 'OK', value });
-const refuse = (error: AppError): { kind: 'REFUSED'; error: AppError } => ({
-  kind: 'REFUSED',
-  error,
-});
+function sameHash(stored: string, computed: string): boolean {
+  const a = Buffer.from(stored, 'hex');
+  const b = Buffer.from(computed, 'hex');
+  return a.length === b.length && a.length > 0 && timingSafeEqual(a, b);
+}
 
-const notEligible = () =>
-  AppError.conflict(
-    'SMS verification needs MFA with an authenticator app. Enable it first.',
-  );
-const notSetUp = () =>
-  AppError.conflict('SMS verification is not set up for this account');
-const unavailable = () =>
-  AppError.serviceUnavailable('SMS verification is not available');
-const tooManySent = (retryAt: Date) =>
-  AppError.tooManyRequests(
-    `Too many SMS codes were sent. Try again after ${retryAt.toISOString()}.`,
-  );
-const tooManyAttempts = (retryAt: Date) =>
-  AppError.tooManyRequests(
-    `Too many SMS codes were entered. Try again after ${retryAt.toISOString()}.`,
-  );
+function changeEventContext(change: MfaChangeContext): SecurityEventContext {
+  return {
+    ip: change.metadata.ip,
+    userAgent: change.metadata.userAgent,
+    sessionId: change.sessionId ?? null,
+  };
+}
+
+function approvalChange(change: MfaChangeContext) {
+  return change.approvedWith
+    ? [
+        {
+          fieldName: 'stepUpMethod',
+          oldValue: null,
+          newValue: change.approvedWith,
+        },
+      ]
+    : [];
+}

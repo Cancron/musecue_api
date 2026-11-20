@@ -262,9 +262,14 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
       Array.from({ length: 5 }, () => confirm(user, code)),
     );
 
-    expect(responses.map((r) => r.status).sort()).toEqual([
-      200, 409, 409, 409, 409,
-    ]);
+    // One wins. The others find MFA enabled (409) or, if the winner
+    // committed before their step-up check, their password approval no
+    // longer counts for an MFA account (403).
+    const statuses = responses.map((r) => r.status);
+    expect(statuses.filter((status) => status === 200)).toHaveLength(1);
+    for (const status of statuses.filter((s) => s !== 200)) {
+      expect([403, 409]).toContain(status);
+    }
     expect((await securityOf(user)).mfaEnabled).toBe(true);
     expect(
       await ctx.client.activityLogEvent.count({

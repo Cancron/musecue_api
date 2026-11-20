@@ -54,8 +54,6 @@ export const MFA_AUDIT_FIELDS = {
   AUTHENTICATOR: 'mfaAuthenticator',
   /** Trusted devices revoked by the change (a count). */
   TRUSTED_DEVICES_REVOKED: 'mfaTrustedDevicesRevoked',
-  /** The phone number for SMS codes (masked: last two digits only). */
-  SMS_PHONE: 'mfaSmsPhone',
   /** How the change was approved (TOTP, RECOVERY_CODE, PASSWORD, GOOGLE). */
   STEP_UP_METHOD: 'stepUpMethod',
 } as const;
@@ -73,4 +71,21 @@ export const MFA_LOGIN = {
   /** Opaque token formats (prefix + 32 random bytes, base64url). */
   CHALLENGE_TOKEN_PATTERN: /^mfac_[A-Za-z0-9_-]{43}$/,
   TRUSTED_DEVICE_TOKEN_PATTERN: /^mfatd_[A-Za-z0-9_-]{43}$/,
+} as const;
+
+/**
+ * SMS codes: an optional second way to complete the MFA step of a sign-in
+ * for users with authenticator MFA and a verified phone number. Never a
+ * step-up or administrator MFA proof.
+ */
+export const MFA_SMS = {
+  DIGITS: 6,
+  /** A code is valid for 5 minutes, once. */
+  CODE_TTL_MS: 5 * 60_000,
+  /** At most 3 SMS codes are sent per user within any 15 minutes. */
+  MAX_DELIVERIES: 3,
+  DELIVERY_WINDOW_MS: 15 * 60_000,
+  /** At most 5 SMS codes are checked per user within any 15 minutes. */
+  MAX_ATTEMPTS: 5,
+  ATTEMPT_WINDOW_MS: 15 * 60_000,
 } as const;

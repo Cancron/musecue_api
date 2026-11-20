@@ -19,9 +19,8 @@ import { PrismaService } from '../../src/common/services/prisma.service';
 import { AccountDeletionRecoveryService } from '../../src/privacy/account-deletion/account-deletion-recovery.service';
 import { STRIPE_SETTINGS } from '../../src/subscription/stripe/stripe.config';
 import { STRIPE_CLIENT } from '../../src/subscription/stripe/stripe.gateway';
-import { SMS_PROVIDER } from '../../src/auth/mfa/sms/sms-provider';
-import type { FakeSmsProvider } from './fake-sms-provider';
 import type { FakeStripeApi } from './fake-stripe-api';
+import { SMS_SENDER, type SmsSender } from '../../src/auth/mfa/sms/sms-sender';
 import {
   TEST_DATABASE_URL,
   applyMigrations,
@@ -105,8 +104,8 @@ export interface BootOptions {
    * cancellation and webhooks work without any external service.
    */
   stripe?: { api: FakeStripeApi };
-  /** Replaces the SMS provider (SMS codes) with this fake. */
-  sms?: FakeSmsProvider;
+  /** Replaces the SMS provider (for example with CapturingSmsSender). */
+  sms?: SmsSender;
 }
 
 /** Boots AppModule against a freshly migrated schema. */
@@ -144,7 +143,7 @@ export async function bootApplication(
       .useValue(fakeStripeClient(options.stripe));
   }
   if (options.sms) {
-    builder = builder.overrideProvider(SMS_PROVIDER).useValue(options.sms);
+    builder = builder.overrideProvider(SMS_SENDER).useValue(options.sms);
   }
   const moduleRef = await builder.compile();
   const app = moduleRef.createNestApplication<INestApplication<App>>({

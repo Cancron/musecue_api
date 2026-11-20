@@ -8,8 +8,7 @@ import {
   MinLength,
 } from 'class-validator';
 import { MFA_LOGIN } from './mfa.constants';
-import type { MfaFactor } from './mfa-verification.service';
-import type { MfaLoginFactor } from './mfa-login.service';
+import type { MfaFactor, MfaLoginFactor } from './mfa-verification.service';
 import { RECOVERY_CODE_INPUT_PATTERN } from './mfa-recovery-codes';
 
 const TOTP_CODE_PATTERN = /^\d{6}$/;
@@ -50,12 +49,15 @@ export class MfaVerificationDto {
 
 /**
  * The MFA step of sign-in: the challenge token from POST /auth/login (or the
- * Google callback), exactly one factor (`code`, `recoveryCode`, or
- * `smsCode` for users with a verified phone number), and whether to trust
- * this device for 30 days (not with an SMS code).
+ * Google callback), exactly one factor (`code`, `recoveryCode` or, for users
+ * with a verified phone, `smsCode` from POST /auth/login/mfa/sms), and
+ * whether to trust this device for 30 days (not with an SMS code).
  */
 export class CompleteMfaLoginDto extends MfaVerificationDto {
-  /** A code sent by SMS for this challenge (POST /auth/login/mfa/sms). */
+  /**
+   * The code sent by SMS for this challenge. Only here: SMS never approves
+   * a step-up or POST /auth/mfa/verify.
+   */
   @IsOptional()
   @IsString()
   @Matches(TOTP_CODE_PATTERN, { message: 'smsCode must be exactly 6 digits' })
@@ -80,34 +82,6 @@ export class CompleteMfaLoginDto extends MfaVerificationDto {
   deviceName?: string;
 }
 
-/** Requests an SMS sign-in code for an MFA challenge. */
-export class SendMfaLoginSmsDto {
-  @IsString()
-  @Matches(MFA_LOGIN.CHALLENGE_TOKEN_PATTERN, {
-    message: 'challengeToken is not a valid MFA challenge token',
-  })
-  challengeToken!: string;
-}
-
-/**
- * The factor of a validated sign-in request: exactly one of `code`,
- * `recoveryCode` or `smsCode`. SMS is accepted only at sign-in.
- */
-export function toMfaLoginFactor(dto: CompleteMfaLoginDto): MfaLoginFactor {
-  if (dto.smsCode === undefined || dto.smsCode === null) {
-    return toMfaFactor(dto);
-  }
-  if (
-    (dto.code !== undefined && dto.code !== null) ||
-    (dto.recoveryCode !== undefined && dto.recoveryCode !== null)
-  ) {
-    throw new BadRequestException(
-      'Provide exactly one of code, recoveryCode or smsCode',
-    );
-  }
-  return { method: 'sms', code: dto.smsCode };
-}
-
 /** The factor of a validated request; exactly one must be given. */
 export function toMfaFactor(dto: MfaVerificationDto): MfaFactor {
   const hasCode = dto.code !== undefined && dto.code !== null;
@@ -121,4 +95,28 @@ export function toMfaFactor(dto: MfaVerificationDto): MfaFactor {
   return hasCode
     ? { method: 'totp', code: dto.code as string }
     : { method: 'recovery_code', code: dto.recoveryCode as string };
+}
+
+/**
+ * The factor of a sign-in's MFA step: exactly one of `code`, `recoveryCode`
+ * or `smsCode`. An SMS code cannot trust the device.
+ */
+export function toMfaLoginFactor(dto: CompleteMfaLoginDto): MfaLoginFactor {
+  const given = [dto.code, dto.recoveryCode, dto.smsCode].filter(
+    (value) => value !== undefined && value !== null,
+  );
+  if (given.length !== 1) {
+    throw new BadRequestException(
+      'Provide exactly one of code, recoveryCode or smsCode',
+    );
+  }
+  if (dto.smsCode !== undefined && dto.smsCode !== null) {
+    if (dto.trustDevice) {
+      throw new BadRequestException(
+        'Trusting a device needs the authenticator app or a recovery code',
+      );
+    }
+    return { method: 'sms', code: dto.smsCode };
+  }
+  return toMfaFactor(dto);
 }

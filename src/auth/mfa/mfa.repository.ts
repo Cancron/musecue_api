@@ -18,7 +18,6 @@ import {
 } from '../../common/services/activity-log.service';
 import { PrismaService } from '../../common/services/prisma.service';
 import { MFA_AUDIT_FIELDS, MFA_LOCKOUT } from './mfa.constants';
-import { MfaSmsStore } from './sms/mfa-sms.store';
 
 /** The account fields MFA decisions depend on. */
 export interface MfaAccountState {
@@ -134,9 +133,8 @@ export interface MfaUnitOfWork {
   countRecoveryCodes(): Promise<number>;
   /**
    * Turns MFA off: clears the secret, method, replay step and lockout, and
-   * deletes the recovery codes, any pending enrollment or replacement and
-   * open sign-in challenges; SMS numbers are revoked and their codes
-   * invalidated.
+   * deletes the recovery codes, any pending enrollment or replacement, open
+   * sign-in challenges, the SMS phone number and every SMS code.
    */
   disableMfa(): Promise<void>;
   /**
@@ -175,6 +173,22 @@ export interface MfaUnitOfWork {
 }
 
 const LOCK_NAMESPACE = 'musecue:mfa:';
+
+/**
+ * Takes the user's MFA lock for the rest of the transaction: every change of
+ * a user's MFA state (authenticator, recovery codes, SMS) is serialized.
+ */
+export async function lockMfaUser(
+  tx: Prisma.TransactionClient,
+  authId: string,
+): Promise<void> {
+  await tx.$queryRaw`
+    SELECT 1 AS locked
+    FROM (SELECT pg_advisory_xact_lock(
+      hashtextextended(${LOCK_NAMESPACE + authId}, 0)
+    )) AS lock
+  `;
+}
 
 /**
  * PostgreSQL persistence of MFA (both infrastructure modes). Every change of
@@ -217,12 +231,7 @@ export class MfaRepository {
     work: (uow: MfaUnitOfWork) => Promise<T>,
   ): Promise<T> {
     return this.prisma.$transaction(async (tx) => {
-      await tx.$queryRaw`
-        SELECT 1 AS locked
-        FROM (SELECT pg_advisory_xact_lock(
-          hashtextextended(${LOCK_NAMESPACE + authId}, 0)
-        )) AS lock
-      `;
+      await lockMfaUser(tx, authId);
       return work(this.unitOfWork(tx, authId));
     });
   }
@@ -250,26 +259,14 @@ export class MfaRepository {
         OR: [{ expiresAt: { lte: now } }, { revokedAt: { not: null } }],
       },
     });
-    // SMS codes that can no longer be used, revoked numbers, and numbers
-    // left unverified for an hour. (The SMS limits are counted on
-    // authSecurity, not from these rows.)
+    // SMS codes that can no longer be used (the limits are kept on
+    // authSecurity, not derived from these rows).
     await this.prisma.mfaSmsCode.deleteMany({
       where: {
         OR: [
           { expiresAt: { lte: now } },
-          { consumedAt: { not: null } },
+          { usedAt: { not: null } },
           { invalidatedAt: { not: null } },
-        ],
-      },
-    });
-    await this.prisma.mfaSmsPhone.deleteMany({
-      where: {
-        OR: [
-          { status: 'REVOKED' },
-          {
-            status: 'PENDING',
-            createdAt: { lte: new Date(now.getTime() - 60 * 60_000) },
-          },
         ],
       },
     });
@@ -588,12 +585,10 @@ export class MfaRepository {
         await tx.mfaLoginChallenge.deleteMany({
           where: { authId, consumedAt: null },
         });
-        // SMS verification needs authenticator MFA: every number is revoked
-        // and every code sent to it invalidated.
-        await new MfaSmsStore(tx, authId).revokeAllPhones(
-          'mfa_disabled',
-          new Date(),
-        );
+        // SMS needs authenticator MFA: the phone number and every SMS code
+        // go too.
+        await tx.mfaSmsCode.deleteMany({ where: { authId } });
+        await tx.mfaPhone.deleteMany({ where: { authId } });
       },
       replaceMfaSecret: async ({ encryptedSecret, usedStep }) => {
         await tx.authSecurity.update({

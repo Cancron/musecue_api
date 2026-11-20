@@ -513,7 +513,7 @@ describeWithDatabase('MFA at sign-in (e2e, PostgreSQL)', () => {
       ],
       [
         { challengeToken: `mfac_${'A'.repeat(43)}` },
-        'Provide exactly one of code or recoveryCode',
+        'Provide exactly one of code, recoveryCode or smsCode',
       ],
       [
         {

@@ -20,10 +20,10 @@ import {
 import {
   MfaLoginService,
   type MfaChallengeView,
-  type MfaLoginFactor,
 } from './mfa/mfa-login.service';
+import type { MfaLoginFactor } from './mfa/mfa-verification.service';
 import { AuthChallengeRepository } from './state/auth-challenge.repository';
-import { storeLoginSession } from './state/login-session';
+import { storeLoginSession, type MfaSkip } from './state/login-session';
 import {
   RefreshSessionRepository,
   type StoredRefreshSession,
@@ -629,7 +629,17 @@ export class AuthService {
       return gate.challenge;
     }
 
-    const tokens = await this.issueLoginTokens(user, { ip, userAgent, device });
+    // The MFA decision is confirmed again when the session is stored (MFA
+    // enabled or the device revoked meanwhile: 409, no session).
+    const tokens = await this.issueLoginTokens(
+      user,
+      { ip, userAgent, device },
+      undefined,
+      undefined,
+      gate.kind === 'TRUSTED_DEVICE'
+        ? { kind: 'TRUSTED_DEVICE', deviceId: gate.deviceId }
+        : { kind: 'NOT_REQUIRED' },
+    );
     void this.logLoginAttempt({
       authId: user.id,
       ip,
@@ -646,17 +656,6 @@ export class AuthService {
    * refresh tokens. Optionally trusts the device for 30 days; its token is
    * returned only in this response.
    */
-  /**
-   * Sends a sign-in code by SMS for an MFA challenge (users with a verified
-   * number); the code completes only that challenge.
-   */
-  sendMfaLoginSms(
-    challengeToken: string,
-    meta: { ip: string; userAgent: string; device?: string },
-  ) {
-    return this.mfaLogin.sendSmsCode(challengeToken, meta);
-  }
-
   async completeMfaLogin(
     input: {
       challengeToken: string;
@@ -687,8 +686,9 @@ export class AuthService {
         if (!user || user.status !== 'ACTIVE' || !user.verified) {
           throw AppError.unauthorized('User account is not active');
         }
-        // The new session proved MFA (administrators rely on it), except
-        // with an SMS code: SMS never counts as an MFA proof.
+        // The new session proved MFA with the authenticator or a recovery
+        // code (administrators rely on it); an SMS code is never such a
+        // proof.
         return this.issueLoginTokens(
           user,
           meta,
@@ -731,6 +731,7 @@ export class AuthService {
     meta: { ip: string; userAgent: string; device?: string },
     tx?: Prisma.TransactionClient,
     mfaVerifiedWith?: 'totp' | 'recovery_code',
+    skippedMfa?: MfaSkip,
   ): Promise<ILoginResponse> {
     const { ip, userAgent, device } = meta;
 
@@ -764,7 +765,7 @@ export class AuthService {
       jti,
       refreshToken,
       { ip, userAgent, device },
-      { tx, familyId, mfaVerifiedWith },
+      { tx, familyId, mfaVerifiedWith, skippedMfa },
     );
 
     return {

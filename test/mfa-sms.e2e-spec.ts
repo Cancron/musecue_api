@@ -2,7 +2,8 @@
 // MFA_ENCRYPTION_KEY) before any application module reads it.
 import './support/env-postgres-mode';
 import { totpCode } from '../src/auth/mfa/mfa-totp';
-import { FakeSmsProvider } from './support/fake-sms-provider';
+import { MfaSmsRepository } from '../src/auth/mfa/sms/mfa-sms.repository';
+import { CapturingSmsSender } from './support/fake-sms';
 import { freezeTime } from './support/freeze-time';
 import {
   bootApplication,
@@ -11,7 +12,6 @@ import {
 } from './support/infrastructure-flows';
 import {
   dataOf,
-  lazyRequest,
   messageOf,
   MfaTestKit,
   MIN,
@@ -30,50 +30,45 @@ interface ChallengeView {
   challengeToken: string;
   expiresAt: string;
   methods: string[];
-  smsPhoneNumber?: string;
+  smsPhone?: string;
 }
 
 interface SentView {
-  sent: true;
-  phoneNumber: string;
+  purpose: string;
+  maskedNumber: string;
   expiresAt: string;
   deliveriesRemaining: number;
 }
 
-interface SmsStatusView {
+interface SmsStatus {
   available: boolean;
-  eligible: boolean;
   enabled: boolean;
-  phoneNumber: string | null;
-  verifiedAt: string | null;
-  pending: { phoneNumber: string; codeExpiresAt: string | null } | null;
-  deliveriesRemaining: number;
-  attemptsRemaining: number;
+  phone: { maskedNumber: string; verifiedAt: string } | null;
+  pending: { purpose: string; maskedNumber: string; expiresAt: string } | null;
 }
 
-interface SmsUser extends TestUser {
+interface PhoneUser extends TestUser {
   /** The verified number (E.164). */
   phone: string;
-  recoveryCodes: string[];
 }
 
 /**
- * Optional SMS sign-in verification through the real endpoints of the
- * whole application on a temporary, freshly migrated PostgreSQL schema,
- * with the SMS provider mocked (FakeSmsProvider: nothing is sent) and
- * emails captured.
+ * Optional SMS verification at sign-in, through the real endpoints of the
+ * whole application on a temporary, freshly migrated PostgreSQL schema, with
+ * a mocked SMS provider (messages are captured, never sent) and captured
+ * emails.
  *
- * Users with authenticator MFA add a phone number and verify it with a code
- * sent to it; at sign-in, the MFA challenge can then send a six-digit code
- * by SMS and be completed with it. Codes are random, stored only as HMACs
- * in PostgreSQL, expire after five minutes and work once; at most three
- * are sent and five checked per user within 15 minutes.
+ * Users with authenticator MFA register and verify a phone number, then can
+ * complete the MFA step of a sign-in with a six-digit code sent by SMS:
+ * random, stored only as an HMAC, valid for 5 minutes and once. At most 3
+ * codes are sent and 5 checked per user within 15 minutes. Users without
+ * authenticator MFA or without a verified number cannot use SMS.
  */
-describeWithDatabase('MFA: SMS sign-in verification (e2e)', () => {
-  const sms = new FakeSmsProvider();
+describeWithDatabase('MFA SMS sign-in verification (e2e, PostgreSQL)', () => {
+  const sms = new CapturingSmsSender();
   let ctx: TestApplication;
   let kit: MfaTestKit;
-  let phoneCounter = 0;
+  let numbers = 0;
 
   beforeAll(async () => {
     ctx = await bootApplication({ sms });
@@ -87,13 +82,14 @@ describeWithDatabase('MFA: SMS sign-in verification (e2e)', () => {
     await ctx?.close();
   });
 
-  // Far apart: the 15-minute limits and tokens of other tests never matter.
+  // Far apart: the SMS and sign-in limits of other tests never matter.
   beforeEach(() => kit.nextStepStart(60 * MIN));
 
   const http = () => kit.http();
 
-  /** A number nobody else in this suite uses (E.164). */
-  const newPhone = () => `+1415555${String(1000 + ++phoneCounter)}`;
+  /** A new, unused E.164 number. */
+  const newNumber = () => `+1415555${String(1000 + ++numbers).slice(-4)}`;
+  const masked = (e164: string) => `+*******${e164.slice(-4)}`;
 
   /** A fresh authenticator code (the next 30-second step, never used). */
   const freshCode = (user: TestUser) => {
@@ -101,586 +97,605 @@ describeWithDatabase('MFA: SMS sign-in verification (e2e)', () => {
     return totpCode(user.totpSecret as string, kit.clock);
   };
 
+  async function mfaUser(): Promise<TestUser> {
+    const user = await kit.createUser();
+    await kit.enableMfa(user);
+    return user;
+  }
+
   const smsStatus = async (user: TestUser) =>
-    dataOf<SmsStatusView>(
+    dataOf<SmsStatus>(
       await http().get('/auth/mfa/sms').set(kit.as(user)).expect(200),
     );
 
-  /** POST /auth/mfa/sms/phone with an MFA_SMS_PHONE approval. */
-  const startPhone = (user: TestUser, phoneNumber: string) =>
-    lazyRequest(async () => ({
-      test: http()
-        .post('/auth/mfa/sms/phone')
-        .set(kit.as(user))
-        .set(HEADER, await kit.approve(user, 'MFA_SMS_PHONE'))
-        .send({ phoneNumber }),
-    }));
+  /** POST /auth/mfa/sms/enrollment with an authenticator step-up. */
+  const startEnrollment = async (
+    user: TestUser,
+    phoneNumber: string,
+    status: number,
+  ) =>
+    http()
+      .post('/auth/mfa/sms/enrollment')
+      .set(kit.as(user))
+      .set(HEADER, await kit.approve(user, 'MFA_SMS_ENROLLMENT'))
+      .send({ phoneNumber })
+      .expect(status);
 
-  /** POST /auth/mfa/sms/phone/confirm with an MFA_SMS_PHONE approval. */
-  const confirmPhone = (user: TestUser, code: string) =>
-    lazyRequest(async () => ({
-      test: http()
-        .post('/auth/mfa/sms/phone/confirm')
-        .set(kit.as(user))
-        .set(HEADER, await kit.approve(user, 'MFA_SMS_PHONE'))
-        .send({ code }),
-    }));
+  const confirmEnrollment = async (
+    user: TestUser,
+    code: string,
+    status: number,
+  ) =>
+    http()
+      .post('/auth/mfa/sms/enrollment/confirm')
+      .set(kit.as(user))
+      .set(HEADER, await kit.approve(user, 'MFA_SMS_ENROLLMENT'))
+      .send({ code })
+      .expect(status);
 
-  /** A user with authenticator MFA (through the API). */
-  async function mfaUser() {
-    const user = await kit.createUser();
-    const { recoveryCodes } = await kit.enableMfa(user);
-    return { user, recoveryCodes };
+  /** A user with authenticator MFA and a verified phone number. */
+  async function phoneUser(): Promise<PhoneUser> {
+    const user = await mfaUser();
+    const phone = newNumber();
+    await startEnrollment(user, phone, 202);
+    kit.advance(SECOND);
+    await confirmEnrollment(user, sms.lastCodeTo(phone), 200);
+    return { ...user, phone };
   }
 
-  /**
-   * A user with authenticator MFA and a verified number, 16 minutes later
-   * (so the delivery used for the verification no longer counts), signed
-   * in again.
-   */
-  async function smsUser(): Promise<SmsUser> {
-    const { user, recoveryCodes } = await mfaUser();
-    const phone = newPhone();
-    await startPhone(user, phone).expect(201);
-    await confirmPhone(user, sms.lastCode(phone)).expect(200);
-    kit.advance(16 * MIN);
-    await kit.signIn(user);
-    return { ...user, phone, recoveryCodes };
-  }
+  /** Password sign-in of an MFA user: the challenge. */
+  const challengeOf = async (user: TestUser) => {
+    kit.advance(SECOND);
+    const body = dataOf<ChallengeView>(await kit.login(user).expect(201));
+    expect(body.mfaRequired).toBe(true);
+    return body;
+  };
 
-  /** Password sign-in that must end in an MFA challenge. */
-  async function challengeOf(user: TestUser): Promise<ChallengeView> {
-    const challenge = dataOf<ChallengeView>(await kit.login(user).expect(201));
-    expect(challenge.mfaRequired).toBe(true);
-    return challenge;
-  }
-
-  /** POST /auth/login/mfa/sms (raw response). */
-  const sendCode = (user: TestUser, challengeToken: string) =>
+  const sendSms = (user: TestUser, challengeToken: string) =>
     http()
       .post('/auth/login/mfa/sms')
       .set('X-Forwarded-For', user.ip)
       .send({ challengeToken });
 
-  /** POST /auth/login/mfa (raw response). */
   const complete = (user: TestUser, body: Record<string, unknown>) =>
     http().post('/auth/login/mfa').set('X-Forwarded-For', user.ip).send(body);
 
+  const securityOf = (user: TestUser) =>
+    ctx.client.authSecurity.findUniqueOrThrow({ where: { authId: user.id } });
   const codesOf = (user: TestUser) =>
     ctx.client.mfaSmsCode.findMany({
       where: { authId: user.id },
       orderBy: { createdAt: 'asc' },
     });
 
-  describe('adding and verifying a phone number', () => {
-    it('sends a code to the number, stores it hashed and the number encrypted, and verifies it', async () => {
-      const { user } = await mfaUser();
-      const phone = newPhone();
-      const typed = `${phone.slice(0, 2)} (${phone.slice(2, 5)}) ${phone.slice(5, 8)}-${phone.slice(8)}`;
-
-      const started = await startPhone(user, typed).expect(201);
-
-      expect(started.headers['cache-control']).toBe('no-store');
-      expect(dataOf(started)).toEqual({
-        status: 'PENDING',
-        phoneNumber: `••••••••${phone.slice(-2)}`,
-        replaces: null,
-        codeExpiresAt: new Date(kit.clock.getTime() + 5 * MIN).toISOString(),
-        deliveriesRemaining: 2,
-      });
-      // Sent to the normalized number, with a six-digit code.
-      const [message] = sms.to(phone);
-      expect(message.body).toMatch(
-        /^Your MuseCue phone verification code is \d{6}\. It expires in 5 minutes\./,
-      );
-      // PostgreSQL: the number encrypted, the code only as an HMAC.
-      const [row] = await ctx.client.mfaSmsPhone.findMany({
-        where: { authId: user.id },
-      });
-      expect(row).toMatchObject({
-        status: 'PENDING',
-        phoneHint: phone.slice(-2),
-        verifiedAt: null,
-      });
-      expect(row.phoneNumber).toMatch(/^mfa2\./);
-      expect(row.phoneNumber).not.toContain(phone.slice(2));
-      const [stored] = await codesOf(user);
-      expect(stored).toMatchObject({
-        purpose: 'PHONE_VERIFICATION',
-        phoneId: row.id,
-        loginChallengeId: null,
-        consumedAt: null,
-      });
-      expect(stored.codeHash).toMatch(/^smsh1\.[0-9a-f]{16}\.[0-9a-f]{64}$/);
-      expect(stored.codeHash).not.toContain(message.code);
-      expect(await smsStatus(user)).toMatchObject({
+  describe('registering a phone number', () => {
+    it('verifies the number with a code sent to it; only masked numbers are shown or stored readable', async () => {
+      const user = await mfaUser();
+      const phone = newNumber();
+      expect(await smsStatus(user)).toEqual({
         available: true,
-        eligible: true,
         enabled: false,
-        pending: { phoneNumber: `••••••••${phone.slice(-2)}` },
-      });
-
-      const confirmed = await confirmPhone(user, message.code).expect(200);
-
-      expect(dataOf<SmsStatusView>(confirmed)).toMatchObject({
-        enabled: true,
-        phoneNumber: `••••••••${phone.slice(-2)}`,
-        verifiedAt: kit.clock.toISOString(),
+        phone: null,
         pending: null,
       });
-      expect(
-        await ctx.client.mfaSmsPhone.findUniqueOrThrow({
-          where: { id: row.id },
-        }),
-      ).toMatchObject({ status: 'ACTIVE', verifiedAt: kit.clock });
-      expect((await codesOf(user))[0].consumedAt).toEqual(kit.clock);
-      // The owner is told by email (captured).
+
+      // Formatting characters are accepted and removed.
+      const formatted = `+1 (415) 555-${phone.slice(-4)}`;
+      const started = await startEnrollment(user, formatted, 202);
+
+      expect(dataOf<SentView>(started)).toEqual({
+        purpose: 'enrollment',
+        maskedNumber: masked(phone),
+        expiresAt: new Date(kit.clock.getTime() + 5 * MIN).toISOString(),
+        deliveriesRemaining: 2,
+      });
+      expect(started.headers['cache-control']).toBe('no-store');
+      const message = sms.to(phone).at(-1)!;
+      expect(message.body).toMatch(/^\d{6} is your MuseCue code/);
+      expect(await smsStatus(user)).toMatchObject({
+        enabled: false,
+        pending: {
+          purpose: 'enrollment',
+          maskedNumber: masked(phone),
+        },
+      });
+      // Stored: an HMAC of the code and the encrypted number, never either.
+      const [row] = await codesOf(user);
+      expect(row).toMatchObject({
+        purpose: 'PHONE_ENROLLMENT',
+        maskedNumber: masked(phone),
+        codeHash: expect.stringMatching(/^[0-9a-f]{64}$/) as string,
+        expiresAt: new Date(kit.clock.getTime() + 5 * MIN),
+        usedAt: null,
+      });
+      expect(JSON.stringify(row)).not.toContain(message.code);
+      expect(JSON.stringify(row)).not.toContain(phone.slice(2));
+
+      const confirmed = await confirmEnrollment(user, message.code, 200);
+
+      expect(dataOf<SmsStatus>(confirmed)).toEqual({
+        available: true,
+        enabled: true,
+        phone: {
+          maskedNumber: masked(phone),
+          verifiedAt: kit.clock.toISOString(),
+        },
+        pending: null,
+      });
+      const stored = await ctx.client.mfaPhone.findUniqueOrThrow({
+        where: { authId: user.id },
+      });
+      expect(stored.phoneNumber).toMatch(/^mfa2\./);
+      expect(stored.phoneNumber).not.toContain(phone.slice(2));
+      expect((await codesOf(user))[0].usedAt).toEqual(kit.clock);
+      // The owner is told by email (mocked delivery).
       await eventually(
         () =>
           Promise.resolve(
             ctx.emails.sent.find(
               (e) =>
-                e.kind === 'security-notification' &&
                 e.to === user.email &&
-                e.event === 'MFA_SMS_PHONE_ADDED',
+                e.kind === 'security-notification' &&
+                e.event === 'MFA_SMS_ENABLED',
             ),
           ),
         30_000,
         'the notification',
       );
-      // Never the full number or the code in an API response.
-      expect(JSON.stringify([started.body, confirmed.body])).not.toContain(
-        phone.slice(2),
-      );
     });
 
-    it('refuses a wrong, an expired and an already used verification code', async () => {
-      const { user } = await mfaUser();
-      const phone = newPhone();
-      await startPhone(user, phone).expect(201);
-      const code = sms.lastCode(phone);
+    it('refuses wrong, expired and superseded verification codes', async () => {
+      const user = await mfaUser();
+      const phone = newNumber();
+      await startEnrollment(user, phone, 202);
+      const first = sms.lastCodeTo(phone);
 
-      const wrong = await confirmPhone(user, wrongCode(code)).expect(400);
+      const wrong = await confirmEnrollment(user, wrongCode(first), 400);
       expect(messageOf(wrong)).toBe(
         'Invalid or expired SMS code. 4 attempt(s) remaining.',
       );
+      // Five minutes later the code has expired.
       kit.advance(5 * MIN);
-      await confirmPhone(user, code).expect(400); // expired
-
-      // A new start sends a new code; the previous one never works again.
-      await startPhone(user, phone).expect(201);
-      const second = sms.lastCode(phone);
-      if (second !== code) {
-        await confirmPhone(user, code).expect(400);
-      }
-      await confirmPhone(user, second).expect(200);
-      // Used: nothing is waiting for verification any more.
-      await confirmPhone(user, second).expect(409);
-      expect(await smsStatus(user)).toMatchObject({ enabled: true });
-    });
-
-    it('is only for users with MFA enabled with an authenticator app', async () => {
-      const user = await kit.createUser();
-      const phone = newPhone();
-
-      const refused = await startPhone(user, phone).expect(409);
-
-      expect(messageOf(refused)).toBe(
-        'SMS verification needs MFA with an authenticator app. Enable it first.',
-      );
-      expect(sms.to(phone)).toEqual([]);
-      expect(
-        await ctx.client.mfaSmsPhone.count({ where: { authId: user.id } }),
-      ).toBe(0);
-      expect(await smsStatus(user)).toMatchObject({
-        eligible: false,
-        enabled: false,
-      });
-    });
-
-    it.each([
-      'not a number',
-      '4155550123',
-      '+0123456789',
-      '+1 415',
-      '+1415555012345678',
-    ])('rejects the number %p (400), sending nothing', async (phoneNumber) => {
-      const { user } = await mfaUser();
-      const before = sms.sent.length;
-
-      await startPhone(user, phoneNumber).expect(400);
-
-      expect(sms.sent.length).toBe(before);
-      expect(
-        await ctx.client.mfaSmsPhone.count({ where: { authId: user.id } }),
-      ).toBe(0);
-    });
-  });
-
-  describe('signing in with an SMS code', () => {
-    it('offers SMS, sends a code and completes the sign-in, without an MFA proof for the session', async () => {
-      const user = await smsUser();
-      const challenge = await challengeOf(user);
-      expect(challenge.methods).toEqual(['totp', 'recovery_code', 'sms']);
-      expect(challenge.smsPhoneNumber).toBe(`••••••••${user.phone.slice(-2)}`);
-
-      const sent = dataOf<SentView>(
-        await sendCode(user, challenge.challengeToken).expect(200),
-      );
-      expect(sent).toEqual({
-        sent: true,
-        phoneNumber: `••••••••${user.phone.slice(-2)}`,
-        expiresAt: challenge.expiresAt, // at most the challenge's lifetime
-        deliveriesRemaining: 2,
-      });
-      const code = sms.lastCode(user.phone);
-      expect(sms.to(user.phone).at(-1)?.body).toMatch(
-        /^Your MuseCue sign-in code is \d{6}\./,
-      );
-
-      const signedIn = dataOf<{
-        accessToken: string;
-        refreshToken: string;
-        mfaMethod: string;
-        trustedDevice: null;
-      }>(
-        await complete(user, {
-          challengeToken: challenge.challengeToken,
-          smsCode: code,
-        }).expect(200),
-      );
-
-      expect(signedIn).toMatchObject({ mfaMethod: 'sms', trustedDevice: null });
-      await http()
-        .get('/auth/mfa')
-        .set({ Authorization: `Bearer ${signedIn.accessToken}` })
-        .expect(200);
-      const sid = (
-        JSON.parse(
-          Buffer.from(
-            signedIn.accessToken.split('.')[1],
-            'base64url',
-          ).toString(),
-        ) as { sid: string }
-      ).sid;
-      // SMS never counts as an MFA proof (administrators, step-up).
-      expect(
-        await ctx.client.refreshSession.findFirst({
-          where: { familyId: sid },
-          select: { mfaVerifiedAt: true, mfaVerifiedWith: true },
-        }),
-      ).toEqual({ mfaVerifiedAt: null, mfaVerifiedWith: null });
-      const [stored] = (await codesOf(user)).filter(
-        (c) => c.purpose === 'LOGIN',
-      );
-      expect(stored.consumedAt).toEqual(kit.clock);
-      expect(
-        await ctx.client.mfaLoginChallenge.count({
-          where: { authId: user.id, consumedAt: null },
-        }),
-      ).toBe(0);
-    });
-
-    it('a code works once; wrong and used codes are refused', async () => {
-      const user = await smsUser();
-      const first = await challengeOf(user);
-      await sendCode(user, first.challengeToken).expect(200);
-      const code = sms.lastCode(user.phone);
-
-      const wrong = await complete(user, {
-        challengeToken: first.challengeToken,
-        smsCode: wrongCode(code),
-      }).expect(400);
-      expect(messageOf(wrong)).toBe(
-        'Invalid or expired SMS code. 4 attempt(s) remaining.',
-      );
-      await complete(user, {
-        challengeToken: first.challengeToken,
-        smsCode: code,
-      }).expect(200);
-
-      // The same code for a new challenge: used.
+      await confirmEnrollment(user, first, 400);
+      // A new verification supersedes the previous code.
       kit.advance(SECOND);
-      const second = await challengeOf(user);
-      await complete(user, {
-        challengeToken: second.challengeToken,
-        smsCode: code,
-      }).expect(400);
-      // The first challenge is consumed too.
-      await complete(user, {
-        challengeToken: first.challengeToken,
-        smsCode: code,
-      }).expect(401);
-    });
-
-    it('an expired code is refused (codes live at most five minutes)', async () => {
-      const user = await smsUser();
-      const challenge = await challengeOf(user);
-      await sendCode(user, challenge.challengeToken).expect(200);
-      const [stored] = await codesOf(user).then((codes) =>
-        codes.filter((c) => c.purpose === 'LOGIN'),
-      );
-      expect(stored.expiresAt.getTime() - stored.createdAt.getTime()).toBe(
-        5 * MIN,
-      );
-      // A longer lifetime is refused by the database.
-      await expect(
-        ctx.client.mfaSmsCode.create({
-          data: {
-            authId: user.id,
-            phoneId: stored.phoneId,
-            purpose: 'PHONE_VERIFICATION',
-            codeHash: stored.codeHash,
-            createdAt: kit.clock,
-            expiresAt: new Date(kit.clock.getTime() + 5 * MIN + 1),
-          },
-        }),
-      ).rejects.toThrow();
-
-      kit.advance(5 * MIN);
-      // (The challenge expired with it: the sign-in starts again.)
-      await complete(user, {
-        challengeToken: challenge.challengeToken,
-        smsCode: sms.lastCode(user.phone),
-      }).expect(401);
-      const again = await challengeOf(user);
-      await complete(user, {
-        challengeToken: again.challengeToken,
-        smsCode: sms.lastCode(user.phone),
-      }).expect(400);
-    });
-
-    it('a new code replaces the previous one, and a code completes only its own challenge', async () => {
-      const user = await smsUser();
-      const other = await smsUser();
-      const a = await challengeOf(user);
-      await sendCode(user, a.challengeToken).expect(200);
-      const firstCode = sms.lastCode(user.phone);
-      kit.advance(30 * SECOND);
-      await sendCode(user, a.challengeToken).expect(200);
-      const secondCode = sms.lastCode(user.phone);
-      kit.advance(SECOND);
-      const b = await challengeOf(user);
-      const theirs = await challengeOf(other);
-      await sendCode(other, theirs.challengeToken).expect(200);
-
-      const refused = [
-        // replaced by the second code
-        firstCode === secondCode
-          ? null
-          : { challengeToken: a.challengeToken, smsCode: firstCode },
-        // sent for challenge A, not B
-        { challengeToken: b.challengeToken, smsCode: secondCode },
-        // another user's code
-        {
-          challengeToken: a.challengeToken,
-          smsCode: sms.lastCode(other.phone),
-        },
-      ].filter((body) => body !== null);
-      for (const body of refused) {
-        await complete(user, body).expect(400);
+      await startEnrollment(user, phone, 202);
+      const second = sms.lastCodeTo(phone);
+      if (second !== first) {
+        await confirmEnrollment(user, first, 400);
       }
-      await complete(user, {
-        challengeToken: a.challengeToken,
-        smsCode: secondCode,
-      }).expect(200);
+      await confirmEnrollment(user, second, 200);
+      // Used: it cannot confirm anything again.
+      expect((await smsStatus(user)).enabled).toBe(true);
       expect(
-        (await codesOf(user))
-          .filter((c) => c.purpose === 'LOGIN')
-          .map((c) => [c.consumedAt !== null, c.invalidatedAt !== null]),
+        (await codesOf(user)).map((c) => [
+          c.usedAt !== null,
+          c.invalidatedAt !== null,
+        ]),
       ).toEqual([
         [false, true],
         [true, false],
       ]);
     });
 
-    it('sends at most three codes per 15 minutes (sign-in and verification codes together)', async () => {
-      const user = await smsUser();
-      const challenge = await challengeOf(user);
-      for (let i = 0; i < 3; i++) {
-        await sendCode(user, challenge.challengeToken).expect(200);
-        kit.advance(10 * SECOND);
+    it('refuses invalid numbers and a second number (replace it instead)', async () => {
+      const user = await phoneUser();
+      const sent = sms.sent.length;
+
+      for (const phoneNumber of ['4155550123', '+0123456789', '+1', 'abc']) {
+        await startEnrollment(user, phoneNumber, 400);
       }
-      const before = sms.to(user.phone).length;
-
-      const limited = await sendCode(user, challenge.challengeToken).expect(
-        429,
-      );
-      expect(messageOf(limited)).toMatch(
-        /^Too many SMS codes were sent\. Try again after /,
-      );
-      // Adding a number counts too, and changes nothing when refused.
-      const other = newPhone();
-      await startPhone(user, other).expect(429);
-      expect(sms.to(other)).toEqual([]);
-      expect(sms.to(user.phone).length).toBe(before);
-      expect(
-        await ctx.client.mfaSmsPhone.count({
-          where: { authId: user.id, status: 'PENDING' },
-        }),
-      ).toBe(0);
-      expect(
-        (
-          await ctx.client.authSecurity.findUniqueOrThrow({
-            where: { authId: user.id },
-          })
-        ).mfaSmsSentAt,
-      ).toHaveLength(3);
-
-      // 15 minutes after the first, a code can be sent again.
-      kit.advance(15 * MIN - 30 * SECOND);
-      const later = await challengeOf(user);
-      await sendCode(user, later.challengeToken).expect(200);
+      const again = await startEnrollment(user, newNumber(), 409);
+      expect(messageOf(again)).toMatch(/already registered/);
+      expect(sms.sent.length).toBe(sent);
     });
 
-    it('checks at most five codes per 15 minutes; then even the right code is refused', async () => {
-      const user = await smsUser();
-      const challenge = await challengeOf(user);
-      await sendCode(user, challenge.challengeToken).expect(200);
-      const code = sms.lastCode(user.phone);
+    it('is not available without authenticator MFA', async () => {
+      const user = await kit.createUser(); // no MFA: a password step-up
+      const phone = newNumber();
 
-      const failedAt = kit.clock;
-      const statuses: number[] = [];
-      for (let i = 0; i < 5; i++) {
-        statuses.push(
-          (
-            await complete(user, {
-              challengeToken: challenge.challengeToken,
-              smsCode: wrongCode(code),
-            })
-          ).status,
-        );
-      }
-      const blocked = await complete(user, {
+      expect(await smsStatus(user)).toMatchObject({
+        available: false,
+        enabled: false,
+      });
+      const refused = await startEnrollment(user, phone, 409);
+      expect(messageOf(refused)).toMatch(/authenticator-app MFA/);
+      expect(sms.to(phone)).toEqual([]);
+      expect(await codesOf(user)).toEqual([]);
+      expect(
+        await ctx.client.mfaPhone.count({ where: { authId: user.id } }),
+      ).toBe(0);
+    });
+  });
+
+  describe('signing in with an SMS code', () => {
+    it('completes the MFA step with a code sent to the verified number, once', async () => {
+      const user = await phoneUser();
+      const challenge = await challengeOf(user);
+      expect(challenge.methods).toEqual(['totp', 'recovery_code', 'sms']);
+      expect(challenge.smsPhone).toBe(masked(user.phone));
+
+      const sent = await sendSms(user, challenge.challengeToken).expect(202);
+      expect(dataOf<SentView>(sent)).toEqual({
+        purpose: 'sign_in',
+        maskedNumber: masked(user.phone),
+        expiresAt: new Date(kit.clock.getTime() + 5 * MIN).toISOString(),
+        deliveriesRemaining: 1, // the verification used one
+      });
+      const code = sms.lastCodeTo(user.phone);
+      expect(sms.to(user.phone).at(-1)!.body).toMatch(
+        /^\d{6} is your MuseCue sign-in code/,
+      );
+
+      const response = await complete(user, {
         challengeToken: challenge.challengeToken,
         smsCode: code,
-      }).expect(429);
+      }).expect(200);
 
-      expect(statuses).toEqual([400, 400, 400, 400, 400]);
-      expect(messageOf(blocked)).toMatch(
-        /^Too many SMS codes were entered\. Try again after /,
-      );
-      // The right code was not used up; the authenticator still works.
-      const [stored] = (await codesOf(user)).filter(
-        (c) => c.purpose === 'LOGIN',
-      );
-      expect(stored.consumedAt).toBeNull();
+      const tokens = dataOf<{
+        accessToken: string;
+        refreshToken: string;
+        mfaMethod: string;
+        trustedDevice: unknown;
+      }>(response);
+      expect(tokens).toMatchObject({
+        mfaMethod: 'sms',
+        trustedDevice: null,
+      });
+      await http()
+        .get('/auth/mfa')
+        .set('Authorization', `Bearer ${tokens.accessToken}`)
+        .expect(200);
+      const [, signInCode] = await codesOf(user);
+      expect(signInCode).toMatchObject({
+        purpose: 'SIGN_IN',
+        usedAt: kit.clock,
+      });
+
+      // Used: the same code never works again, not even for a new sign-in.
+      kit.advance(16 * MIN);
+      const next = await challengeOf(user);
+      await complete(user, {
+        challengeToken: next.challengeToken,
+        smsCode: code,
+      }).expect(400);
       await complete(user, {
         challengeToken: challenge.challengeToken,
-        code: freshCode(user),
-      }).expect(200);
-      const history = await ctx.client.securityEvent.findMany({
-        where: {
-          authId: user.id,
-          type: { in: ['MFA_VERIFICATION_FAILED', 'MFA_VERIFICATION_BLOCKED'] },
-        },
-      });
-      expect(history.map((e) => e.type).sort()).toEqual([
-        'MFA_VERIFICATION_BLOCKED',
-        'MFA_VERIFICATION_FAILED',
-        'MFA_VERIFICATION_FAILED',
-        'MFA_VERIFICATION_FAILED',
-        'MFA_VERIFICATION_FAILED',
-      ]);
-      expect(history.map((e) => e.details)).toEqual(
-        expect.arrayContaining([
-          { context: 'sign_in', method: 'sms', remainingAttempts: 4 },
-          {
-            context: 'sign_in',
-            method: 'sms',
-            blockedUntil: new Date(failedAt.getTime() + 15 * MIN).toISOString(),
-          },
-        ]),
-      );
+        smsCode: code,
+      }).expect(401); // that challenge is used up
+    });
 
-      // 15 minutes later SMS works again.
-      kit.advance(15 * MIN);
-      const later = await challengeOf(user);
-      await sendCode(user, later.challengeToken).expect(200);
-      await complete(user, {
-        challengeToken: later.challengeToken,
-        smsCode: sms.lastCode(user.phone),
+    it('refuses wrong codes, codes of another challenge or user, and earlier codes of a resent challenge', async () => {
+      const alice = await phoneUser();
+      const bob = await phoneUser();
+      const other = await challengeOf(alice);
+      const bobs = await challengeOf(bob);
+
+      await sendSms(alice, other.challengeToken).expect(202);
+      const otherCode = sms.lastCodeTo(alice.phone);
+      await sendSms(bob, bobs.challengeToken).expect(202);
+      const bobCode = sms.lastCodeTo(bob.phone);
+
+      kit.advance(16 * MIN); // (Alice's SMS limit)
+      const fresh = await challengeOf(alice);
+      await sendSms(alice, fresh.challengeToken).expect(202);
+      const first = sms.lastCodeTo(alice.phone);
+      await sendSms(alice, fresh.challengeToken).expect(202); // resent
+      const second = sms.lastCodeTo(alice.phone);
+
+      const declined: [string, string][] = [
+        ['a wrong code', wrongCode(second)],
+        ['a code of another challenge', otherCode],
+        ['another user’s code', bobCode],
+      ];
+      if (first !== second) declined.push(['the earlier code', first]);
+      for (const [, smsCode] of declined) {
+        const response = await complete(alice, {
+          challengeToken: fresh.challengeToken,
+          smsCode,
+        });
+        expect([response.status, messageOf(response)]).toEqual([
+          400,
+          expect.stringMatching(/^Invalid or expired SMS code\./),
+        ]);
+      }
+
+      await complete(alice, {
+        challengeToken: fresh.challengeToken,
+        smsCode: second,
       }).expect(200);
     });
 
-    it('cannot trust the device with an SMS code', async () => {
-      const user = await smsUser();
+    it('refuses a code once it expired (5 minutes)', async () => {
+      const user = await phoneUser();
       const challenge = await challengeOf(user);
-      await sendCode(user, challenge.challengeToken).expect(200);
-      const code = sms.lastCode(user.phone);
+      await sendSms(user, challenge.challengeToken).expect(202);
+      const code = sms.lastCodeTo(user.phone);
 
+      kit.advance(5 * MIN);
+
+      // The challenge (also five minutes) has ended with it.
       await complete(user, {
+        challengeToken: challenge.challengeToken,
+        smsCode: code,
+      }).expect(401);
+      const [, row] = await codesOf(user);
+      expect(row.usedAt).toBeNull();
+      expect(row.expiresAt.getTime()).toBeLessThanOrEqual(kit.clock.getTime());
+    });
+
+    it('cannot trust the device (SMS is weaker than the authenticator), and nothing is used up', async () => {
+      const user = await phoneUser();
+      const challenge = await challengeOf(user);
+      await sendSms(user, challenge.challengeToken).expect(202);
+      const code = sms.lastCodeTo(user.phone);
+
+      const refused = await complete(user, {
         challengeToken: challenge.challengeToken,
         smsCode: code,
         trustDevice: true,
       }).expect(400);
+      expect(messageOf(refused)).toMatch(
+        /authenticator app or a recovery code/,
+      );
+
       await complete(user, {
         challengeToken: challenge.challengeToken,
         smsCode: code,
+      }).expect(200);
+      expect(
+        await ctx.client.mfaTrustedDevice.count({
+          where: { authId: user.id },
+        }),
+      ).toBe(0);
+    });
+
+    it('exactly one factor: an SMS code with an authenticator code is refused', async () => {
+      const user = await phoneUser();
+      const challenge = await challengeOf(user);
+
+      await complete(user, {
+        challengeToken: challenge.challengeToken,
+        smsCode: '123456',
         code: freshCode(user),
       }).expect(400);
-
-      expect(
-        await ctx.client.mfaTrustedDevice.count({ where: { authId: user.id } }),
-      ).toBe(0);
-      // Refused before checking: the code still works.
-      await complete(user, {
-        challengeToken: challenge.challengeToken,
-        smsCode: code,
-      }).expect(200);
-    });
-
-    it('is unavailable without a verified number', async () => {
-      const { user } = await mfaUser();
-      // A number added but never verified does not receive sign-in codes.
-      const phone = newPhone();
-      await startPhone(user, phone).expect(201);
-      const challenge = await challengeOf(user);
-      expect(challenge.methods).toEqual(['totp', 'recovery_code']);
-      expect(challenge).not.toHaveProperty('smsPhoneNumber');
-
-      const refused = await sendCode(user, challenge.challengeToken).expect(
-        409,
-      );
-      expect(messageOf(refused)).toBe(
-        'SMS verification is not set up for this account',
-      );
-      await complete(user, {
-        challengeToken: challenge.challengeToken,
-        smsCode: sms.lastCode(phone), // the verification code
-      }).expect(409);
-      expect(sms.to(phone)).toHaveLength(1);
-    });
-
-    it('refuses unknown, expired and used challenges (401)', async () => {
-      const user = await smsUser();
-      await sendCode(user, `mfac_${'A'.repeat(43)}`).expect(401);
-      await sendCode(user, 'not-a-token').expect(400);
-      const challenge = await challengeOf(user);
+      // The authenticator still completes it.
       await complete(user, {
         challengeToken: challenge.challengeToken,
         code: freshCode(user),
       }).expect(200);
-      await sendCode(user, challenge.challengeToken).expect(401);
-      expect(sms.to(user.phone)).toHaveLength(1); // the verification code
     });
 
-    it('a failed delivery answers 503 and its code never works', async () => {
-      const user = await smsUser();
+    it('is not offered to users without a verified number, nor to users without MFA', async () => {
+      const user = await mfaUser();
       const challenge = await challengeOf(user);
-      sms.failNext();
+      expect(challenge.methods).toEqual(['totp', 'recovery_code']);
+      expect(challenge).not.toHaveProperty('smsPhone');
 
-      await sendCode(user, challenge.challengeToken).expect(503);
-
-      const [stored] = (await codesOf(user)).filter(
-        (c) => c.purpose === 'LOGIN',
-      );
-      expect(stored.invalidatedAt).not.toBeNull();
-      await sendCode(user, challenge.challengeToken).expect(200);
+      const refused = await sendSms(user, challenge.challengeToken).expect(409);
+      expect(messageOf(refused)).toMatch(/verified phone number/);
       await complete(user, {
         challengeToken: challenge.challengeToken,
-        smsCode: sms.lastCode(user.phone),
+        smsCode: '123456',
+      }).expect(409);
+      expect(await codesOf(user)).toEqual([]);
+      expect((await securityOf(user)).mfaSmsAttemptsAt).toEqual([]);
+
+      // No MFA: sign-in returns tokens, there is no challenge to send for.
+      const plain = await kit.createUser();
+      const login = dataOf<{ mfaRequired: boolean }>(
+        await kit.login(plain).expect(201),
+      );
+      expect(login.mfaRequired).toBe(false);
+      await sendSms(plain, `mfac_${'A'.repeat(43)}`).expect(401);
+      await sendSms(plain, 'not-a-challenge').expect(400);
+    });
+  });
+
+  describe('limits', () => {
+    it('sends at most 3 SMS codes within 15 minutes', async () => {
+      const user = await phoneUser(); // 1: the verification
+      const challenge = await challengeOf(user);
+      await sendSms(user, challenge.challengeToken).expect(202); // 2
+      kit.advance(MIN);
+      const third = await sendSms(user, challenge.challengeToken).expect(202);
+      expect(dataOf<SentView>(third).deliveriesRemaining).toBe(0);
+      const sent = sms.to(user.phone).length;
+      const firstSent = (await codesOf(user))[0].createdAt;
+
+      const limited = await sendSms(user, challenge.challengeToken).expect(429);
+      expect(messageOf(limited)).toBe(
+        `Too many SMS codes were sent. Try again after ${new Date(
+          firstSent.getTime() + 15 * MIN,
+        ).toISOString()}.`,
+      );
+      expect(sms.to(user.phone)).toHaveLength(sent);
+      expect((await securityOf(user)).mfaSmsDeliveriesAt).toHaveLength(3);
+
+      // Phone verification codes count too.
+      await startEnrollment(user, newNumber(), 409); // (has one)
+      const replacement = await http()
+        .post('/auth/mfa/sms/replacement')
+        .set(kit.as(user))
+        .set(HEADER, await kit.approve(user, 'MFA_SMS_REPLACE'))
+        .send({ phoneNumber: newNumber() })
+        .expect(429);
+      expect(messageOf(replacement)).toMatch(/^Too many SMS codes/);
+
+      // Once the oldest leaves the 15 minutes, a code can be sent again.
+      kit.advance(15 * MIN);
+      const later = await challengeOf(user);
+      await sendSms(user, later.challengeToken).expect(202);
+    });
+
+    it('checks at most 5 SMS codes within 15 minutes, then refuses even the right one', async () => {
+      const user = await phoneUser(); // its confirmation was the 1st check
+      const challenge = await challengeOf(user);
+      await sendSms(user, challenge.challengeToken).expect(202);
+      const code = sms.lastCodeTo(user.phone);
+
+      const messages: string[] = [];
+      for (let i = 0; i < 4; i++) {
+        messages.push(
+          messageOf(
+            await complete(user, {
+              challengeToken: challenge.challengeToken,
+              smsCode: wrongCode(code),
+            }).expect(400),
+          ),
+        );
+      }
+      expect(messages).toEqual([
+        'Invalid or expired SMS code. 3 attempt(s) remaining.',
+        'Invalid or expired SMS code. 2 attempt(s) remaining.',
+        'Invalid or expired SMS code. 1 attempt(s) remaining.',
+        'Invalid or expired SMS code. 0 attempt(s) remaining.',
+      ]);
+      const blocked = await complete(user, {
+        challengeToken: challenge.challengeToken,
+        smsCode: code,
+      }).expect(429);
+      expect(messageOf(blocked)).toMatch(/^Too many SMS code attempts/);
+      const [, row] = await codesOf(user);
+      expect(row.usedAt).toBeNull();
+      // The authenticator is not affected by the SMS limit.
+      await complete(user, {
+        challengeToken: challenge.challengeToken,
+        code: freshCode(user),
+      }).expect(200);
+
+      // 15 minutes after the first check, SMS works again.
+      kit.advance(15 * MIN);
+      const later = await challengeOf(user);
+      await sendSms(user, later.challengeToken).expect(202);
+      await complete(user, {
+        challengeToken: later.challengeToken,
+        smsCode: sms.lastCodeTo(user.phone),
       }).expect(200);
     });
+
+    it('a failed delivery answers 503, its code never works and it does not count', async () => {
+      const user = await phoneUser();
+      const challenge = await challengeOf(user);
+      const before = (await securityOf(user)).mfaSmsDeliveriesAt;
+      sms.failNext();
+
+      await sendSms(user, challenge.challengeToken).expect(503);
+
+      expect((await securityOf(user)).mfaSmsDeliveriesAt).toEqual(before);
+      const [, failed] = await codesOf(user);
+      expect(failed.invalidatedAt).toEqual(kit.clock);
+      // A retry is sent and works.
+      const retry = await sendSms(user, challenge.challengeToken).expect(202);
+      expect(dataOf<SentView>(retry).deliveriesRemaining).toBe(1);
+      await complete(user, {
+        challengeToken: challenge.challengeToken,
+        smsCode: sms.lastCodeTo(user.phone),
+      }).expect(200);
+    });
+  });
+
+  describe('failed deliveries', () => {
+    it('a code whose delivery failed is never usable, even when ending it fails', async () => {
+      const user = await phoneUser();
+      const challenge = await challengeOf(user);
+      const repository = ctx.get<MfaSmsRepository>(MfaSmsRepository);
+      // The phone receives the message but the provider's answer is lost,
+      // and the database cannot end the code afterwards.
+      sms.deliverThenFail();
+      sms.onSend = () => {
+        jest
+          .spyOn(repository, 'withLock')
+          .mockRejectedValueOnce(new Error('database unavailable'));
+      };
+
+      await sendSms(user, challenge.challengeToken).expect(503);
+      sms.onSend = undefined;
+
+      const [, failed] = await codesOf(user);
+      expect(failed).toMatchObject({
+        purpose: 'SIGN_IN',
+        deliveredAt: null,
+        invalidatedAt: null, // the cleanup failed
+        usedAt: null,
+      });
+      // The code that reached the phone does not work.
+      const refused = await complete(user, {
+        challengeToken: challenge.challengeToken,
+        smsCode: sms.lastCodeTo(user.phone),
+      }).expect(400);
+      expect(messageOf(refused)).toMatch(/^Invalid or expired SMS code/);
+      // Nor can anything mark it used in PostgreSQL.
+      await expect(
+        ctx.client.mfaSmsCode.update({
+          where: { id: failed.id },
+          data: { usedAt: kit.clock },
+        }),
+      ).rejects.toThrow();
+      expect(await smsStatus(user)).toMatchObject({ pending: null });
+    });
+
+    it('a sent code whose delivery cannot be recorded is never usable (503)', async () => {
+      const user = await phoneUser();
+      const challenge = await challengeOf(user);
+      const repository = ctx.get<MfaSmsRepository>(MfaSmsRepository);
+      jest
+        .spyOn(repository, 'markDelivered')
+        .mockRejectedValueOnce(new Error('database unavailable'));
+
+      await sendSms(user, challenge.challengeToken).expect(503);
+
+      const [, failed] = await codesOf(user);
+      expect(failed.deliveredAt).toBeNull();
+      expect(failed.invalidatedAt).toEqual(kit.clock);
+      await complete(user, {
+        challengeToken: challenge.challengeToken,
+        smsCode: sms.lastCodeTo(user.phone),
+      }).expect(400);
+    });
+  });
+
+  it('records SMS activity in the security history without numbers or codes', async () => {
+    const user = await phoneUser();
+    const challenge = await challengeOf(user);
+    await sendSms(user, challenge.challengeToken).expect(202);
+    kit.advance(SECOND);
+    await complete(user, {
+      challengeToken: challenge.challengeToken,
+      smsCode: wrongCode(sms.lastCodeTo(user.phone)),
+    }).expect(400);
+
+    const events = await ctx.client.securityEvent.findMany({
+      where: { authId: user.id },
+      orderBy: { createdAt: 'asc' },
+    });
+    const smsEvents = events
+      .filter((e) => e.type.includes('SMS') || e.type.includes('FAILED'))
+      .map((e) => [e.type, e.details]);
+    expect(smsEvents).toEqual([
+      [
+        'MFA_SMS_CODE_SENT',
+        { purpose: 'phone_enrollment', phone: masked(user.phone) },
+      ],
+      [
+        'MFA_SMS_ENABLED',
+        {
+          phone: masked(user.phone),
+          previousPhone: null,
+          codesInvalidated: 0,
+          approvedWith: 'TOTP',
+        },
+      ],
+      ['MFA_SMS_CODE_SENT', { purpose: 'sign_in', phone: masked(user.phone) }],
+      [
+        'MFA_VERIFICATION_FAILED',
+        { context: 'sign_in', method: 'sms', remainingAttempts: 3 },
+      ],
+    ]);
+    const text = JSON.stringify(events);
+    expect(text).not.toContain(user.phone.slice(2));
+    for (const message of sms.to(user.phone)) {
+      expect(text).not.toContain(message.code);
+    }
   });
 });

@@ -9,7 +9,10 @@ import { AccountDeletionController } from '../../privacy/account-deletion/accoun
 import { PrivacyExportController } from '../../privacy/privacy-export.controller';
 import { StripeWebhookController } from '../../subscription/stripe/stripe-webhook.controller';
 import { SubscriptionController } from '../../subscription/subscription.controller';
-import { MfaSmsController } from '../mfa/sms/mfa-sms.controller';
+import {
+  MfaSmsController,
+  MfaSmsSignInController,
+} from '../mfa/sms/mfa-sms.controller';
 import { STEP_UP_ACTION_KEY } from './step-up.constants';
 import { MFA_STEP_UP_METHODS, StepUpGuard } from './step-up.guard';
 
@@ -49,9 +52,11 @@ describe('MFA step-up policy', () => {
       [PrivacyExportController, 'createDownloadLink', 'DATA_EXPORT_DOWNLOAD'],
       [PrivacyExportController, 'downloadArchive', 'DATA_EXPORT_DOWNLOAD'],
       [AccountDeletionController, 'requestDeletion', 'ACCOUNT_DELETION'],
-      [MfaSmsController, 'startPhone', 'MFA_SMS_PHONE'],
-      [MfaSmsController, 'confirmPhone', 'MFA_SMS_PHONE'],
-      [MfaSmsController, 'removePhone', 'MFA_SMS_PHONE_REMOVE'],
+      [MfaSmsController, 'startEnrollment', 'MFA_SMS_ENROLLMENT'],
+      [MfaSmsController, 'confirmEnrollment', 'MFA_SMS_ENROLLMENT'],
+      [MfaSmsController, 'startReplacement', 'MFA_SMS_REPLACE'],
+      [MfaSmsController, 'confirmReplacement', 'MFA_SMS_REPLACE'],
+      [MfaSmsController, 'disable', 'MFA_SMS_DISABLE'],
     ] as const)(
       '%p.%s needs a %s approval, checked after authentication',
       (controller, handler, action) => {
@@ -69,9 +74,11 @@ describe('MFA step-up policy', () => {
       [PrivacyExportController, 'getExport'],
       [PrivacyExportController, 'listExports'],
       [AccountDeletionController, 'requestConfirmationCode'],
-      [MfaSmsController, 'status'],
       // Stripe's webhooks are verified by their signature, never a step-up.
       [StripeWebhookController, 'receive'],
+      // Reading the SMS status; sending a sign-in code (no session yet).
+      [MfaSmsController, 'status'],
+      [MfaSmsSignInController, 'send'],
     ] as const)('%p.%s needs no approval', (controller, handler) => {
       const route = routeOf(controller, handler);
       expect(route.action).toBeUndefined();

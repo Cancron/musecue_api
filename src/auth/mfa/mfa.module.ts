@@ -13,17 +13,22 @@ import { MfaService } from './mfa.service';
 import { RefreshSessionRepository } from '../state/refresh-session.repository';
 import { SecurityEventLog } from '../security-events/security-event.log';
 import { StepUpGuard } from '../step-up/step-up.guard';
-import { MfaSmsController } from './sms/mfa-sms.controller';
+import {
+  MfaSmsController,
+  MfaSmsSignInController,
+} from './sms/mfa-sms.controller';
+import { MfaSmsRepository } from './sms/mfa-sms.repository';
 import { MfaSmsService } from './sms/mfa-sms.service';
-import { createSmsProvider, SMS_PROVIDER } from './sms/sms-provider';
+import { MFA_SMS_SERVICE } from './sms/mfa-sms.tokens';
+import { createSmsSender, SMS_SENDER } from './sms/sms-sender';
 
 /**
  * Optional MFA of the signed-in user (authenticator app, recovery codes,
- * trusted devices, SMS codes at sign-in) and the MFA step of sign-in.
+ * trusted devices, SMS sign-in codes) and the MFA step of sign-in.
  */
 @Module({
   imports: [QueueModule],
-  controllers: [MfaController, MfaSmsController],
+  controllers: [MfaController, MfaSmsController, MfaSmsSignInController],
   providers: [
     {
       provide: MFA_KEYRING,
@@ -39,11 +44,25 @@ import { createSmsProvider, SMS_PROVIDER } from './sms/sms-provider';
         return keyring;
       },
     },
+    {
+      provide: SMS_SENDER,
+      // Read once at startup: an invalid configuration stops the
+      // application; without a provider SMS answers 503.
+      useFactory: () => {
+        const sender = createSmsSender(process.env);
+        if (!sender.configured) {
+          new Logger('MfaSms').log(
+            'SMS_PROVIDER is disabled: SMS sign-in codes are unavailable',
+          );
+        }
+        return sender;
+      },
+    },
     MfaSecretCipher,
     MfaSecurityNotifier,
-    // SMS codes (SMS_PROVIDER=twilio; disabled by default).
-    { provide: SMS_PROVIDER, useFactory: () => createSmsProvider(process.env) },
+    MfaSmsRepository,
     MfaSmsService,
+    { provide: MFA_SMS_SERVICE, useExisting: MfaSmsService },
     MfaService,
     MfaVerificationService,
     MfaLoginService,
@@ -56,6 +75,11 @@ import { createSmsProvider, SMS_PROVIDER } from './sms/sms-provider';
     RefreshSessionRepository,
     SecurityEventLog,
   ],
-  exports: [MfaRepository, MfaVerificationService, MfaLoginService],
+  exports: [
+    MfaRepository,
+    MfaVerificationService,
+    MfaLoginService,
+    MfaSmsService,
+  ],
 })
 export class MfaModule {}

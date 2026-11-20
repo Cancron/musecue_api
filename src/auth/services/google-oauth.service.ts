@@ -6,7 +6,7 @@ import { CustomLoggerService } from '../../common/services/custom-logger.service
 import { PrismaService } from '../../common/services/prisma.service';
 import { ActivityLogService } from '../../common/services/activity-log.service';
 import { AuthUtilsService } from './auth-utils.service';
-import { storeLoginSession } from '../state/login-session';
+import { storeLoginSession, type MfaSkip } from '../state/login-session';
 import { OAuthStateRepository } from '../state/oauth-state.repository';
 import { RefreshSessionRepository } from '../state/refresh-session.repository';
 import {
@@ -430,6 +430,9 @@ export class GoogleOAuthService {
       user,
       { ip, userAgent, device },
       isNewUser,
+      gate.kind === 'TRUSTED_DEVICE'
+        ? { kind: 'TRUSTED_DEVICE', deviceId: gate.deviceId }
+        : { kind: 'NOT_REQUIRED' },
     );
 
     this.customLogger.log(
@@ -618,6 +621,7 @@ export class GoogleOAuthService {
     },
     meta: { ip: string; userAgent: string; device?: string },
     isNewUser: boolean,
+    skippedMfa?: MfaSkip,
   ): Promise<IGoogleOAuthLoginResponse> {
     const { ip, userAgent, device } = meta;
 
@@ -649,7 +653,8 @@ export class GoogleOAuthService {
       jti,
       refreshToken,
       { ip, userAgent, device },
-      { familyId },
+      // Confirmed again under the sessions lock (see confirmMfaSkip).
+      { familyId, skippedMfa },
     );
 
     // Log login attempt (fire-and-forget)
