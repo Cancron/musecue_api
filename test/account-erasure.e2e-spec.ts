@@ -103,6 +103,7 @@ const USER_DATA_TABLES = [
   'CreditLedgerEntry',
   'CreditSessionOverage',
   'CreditAllocationSchedule',
+  'AiUsage',
 ] as const;
 
 describeWithDatabase('Account erasure (PostgreSQL)', () => {
@@ -426,7 +427,8 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
       },
     });
 
-    // AI credits: a purchased grant, then a session debit that used overage.
+    // AI credits: a purchased grant, then a session debit that used overage
+    // for a metered OpenRouter request.
     // One transaction, as the ledger's consistency checks run at commit.
     await client.$transaction(async (tx) => {
       const wallet = await tx.creditWallet.create({
@@ -455,7 +457,7 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
           entries: { create: [{ allocationId: allocation.id, amount: 10 }] },
         },
       });
-      await tx.creditTransaction.create({
+      const debit = await tx.creditTransaction.create({
         data: {
           ...ledger,
           type: 'DEBIT',
@@ -464,8 +466,33 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
           balanceAfter: 8,
           idempotencyKey: `debit:${tag}`,
           sessionId: session.id,
+          usageCostUsd: '0.009',
+          creditCostUsdMicros: 5000,
           occurredAt: new Date(),
           entries: { create: [{ allocationId: allocation.id, amount: -2 }] },
+        },
+      });
+      await tx.aiUsage.create({
+        data: {
+          authId: user.id,
+          sessionId: session.id,
+          runId: `run-${tag}`,
+          operation: 'GUIDE_QUESTION',
+          provider: 'openrouter',
+          model: 'openai/gpt-4o-mini',
+          providerRequestId: `gen-${tag}`,
+          outcome: 'SUCCEEDED',
+          inputTokens: 900,
+          outputTokens: 100,
+          totalTokens: 1000,
+          costUsd: '0.009',
+          chargeStatus: 'CHARGED',
+          creditCostUsdMicros: 5000,
+          creditsExact: '1.8',
+          creditsDue: 2,
+          creditsCharged: 2,
+          transactionId: debit.id,
+          occurredAt: new Date(),
         },
       });
       await tx.creditSessionOverage.create({

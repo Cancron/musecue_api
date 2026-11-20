@@ -23,6 +23,7 @@ describe('CreditSettingsService', () => {
     proMonthlyCredits: 1000,
     creditCostUsdMicros: 5000,
     sessionOverageCredits: 5,
+    deductionStepMicroCredits: 1000000,
     createdAt: updatedAt,
     updatedAt,
     ...overrides,
@@ -92,6 +93,8 @@ describe('CreditSettingsService', () => {
         creditCostUsdMicros: 2500,
         creditCostUsd: '0.0025',
         sessionOverageCredits: 5,
+        deductionStepMicroCredits: 1000000,
+        deductionStepCredits: '1',
         updatedAt: updatedAt.toISOString(),
       });
       expect(prisma.creditSettings.createMany.mock.calls).toHaveLength(0);
@@ -110,6 +113,8 @@ describe('CreditSettingsService', () => {
         creditCostUsdMicros: 5000,
         creditCostUsd: '0.005',
         sessionOverageCredits: 5,
+        deductionStepMicroCredits: 1000000,
+        deductionStepCredits: '1',
       });
       expect(prisma.creditSettings.createMany.mock.calls).toHaveLength(1);
     });
@@ -146,6 +151,7 @@ describe('CreditSettingsService', () => {
         proMonthlyCredits: 1000,
         creditCostUsdMicros: 5000,
         sessionOverageCredits: 5,
+        deductionStepMicroCredits: 1000000,
         ...input,
       });
     });

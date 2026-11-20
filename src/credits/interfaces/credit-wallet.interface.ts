@@ -1,4 +1,8 @@
-import type { CreditSource, CreditTransactionType } from '@prisma/client';
+import type {
+  CreditSource,
+  CreditTransactionType,
+  Prisma,
+} from '@prisma/client';
 import type { CreditAmountInput } from '../credit-amount';
 import type { PaymentLink } from '../credit-ledger.policy';
 
@@ -43,6 +47,22 @@ export interface DebitCreditsInput {
    */
   sessionId?: string;
   description?: string;
+  /**
+   * Spend only credits of these sources (e.g. the ones the user may use
+   * now); all sources if omitted.
+   */
+  sources?: CreditSource[];
+  /**
+   * Collect what the balance and the session's overage allowance can cover
+   * and report the rest as `uncollected`, instead of rejecting the debit.
+   * Still rejected (nothing written) when nothing at all can be collected.
+   */
+  partial?: boolean;
+  /**
+   * A charge for AI usage: the provider's cost in USD and the conversion
+   * rate in force (USD micros per credit), recorded on the transaction.
+   */
+  usage?: { costUsd: Prisma.Decimal; creditCostUsdMicros: number };
 }
 
 export interface CreditAllocationView {
@@ -64,6 +84,9 @@ export interface CreditTransactionView {
   type: CreditTransactionType;
   /** Signed change to the available balance. */
   amount: CreditAmountString;
+  /** AI usage charges: the provider's cost in USD and the rate in force. */
+  usageCostUsd: CreditAmountString | null;
+  creditCostUsdMicros: number | null;
   overageAmount: CreditAmountString;
   balanceAfter: CreditAmountString;
   sessionId: string | null;
@@ -85,6 +108,8 @@ export interface DebitCreditsResult {
   consumed: CreditAmountString;
   /** Credits covered by the session overage allowance. */
   overage: CreditAmountString;
+  /** Credits that could not be collected (`partial` debits only). */
+  uncollected: CreditAmountString;
   replayed: boolean;
 }
 

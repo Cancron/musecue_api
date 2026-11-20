@@ -110,6 +110,7 @@ describe('Credit settings administration (HTTP)', () => {
       proMonthlyCredits: 1000,
       creditCostUsdMicros: 5000,
       sessionOverageCredits: 5,
+      deductionStepMicroCredits: 1000000,
       createdAt: seededAt,
       updatedAt: seededAt,
     };
@@ -217,6 +218,8 @@ describe('Credit settings administration (HTTP)', () => {
           creditCostUsdMicros: 5000,
           creditCostUsd: '0.005',
           sessionOverageCredits: 5,
+          deductionStepMicroCredits: 1000000,
+          deductionStepCredits: '1',
           updatedAt: seededAt.toISOString(),
         },
       });
@@ -235,6 +238,8 @@ describe('Credit settings administration (HTTP)', () => {
         creditCostUsdMicros: 2500,
         creditCostUsd: '0.0025',
         sessionOverageCredits: 0,
+        deductionStepMicroCredits: 1000000,
+        deductionStepCredits: '1',
         updatedAt: updatedAt.toISOString(),
       });
     });

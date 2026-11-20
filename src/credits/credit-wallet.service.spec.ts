@@ -68,6 +68,8 @@ describe('CreditWalletService', () => {
     idempotencyKey: 'debit:key-1',
     sessionId: null,
     description: null,
+    usageCostUsd: null,
+    creditCostUsdMicros: null,
     occurredAt: NOW,
     createdAt: NOW,
     ...overrides,
@@ -163,6 +165,8 @@ describe('CreditWalletService', () => {
       creditCostUsdMicros: 5000,
       creditCostUsd: '0.005',
       sessionOverageCredits: 5,
+      deductionStepMicroCredits: 1000000,
+      deductionStepCredits: '1',
       updatedAt: NOW.toISOString(),
     });
   });
@@ -550,6 +554,131 @@ describe('CreditWalletService', () => {
       expect(createdTransactions()[0]).toMatchObject({
         balanceAfter: D('1000.5'),
       });
+    });
+
+    it('spends only the allowed sources and records the usage cost and rate on the transaction', async () => {
+      allocations = [
+        allocation({
+          id: 'trial',
+          source: CreditSource.TRIAL,
+          remaining: D(50),
+          expiresAt: later(HOUR),
+        }),
+        allocation({ id: 'purchase', remaining: D(10) }),
+      ];
+
+      await service.debit({
+        authId: 'user-1',
+        amount: '5',
+        idempotencyKey: 'ai-run:1',
+        sources: [CreditSource.PURCHASE],
+        usage: { costUsd: D('0.023'), creditCostUsdMicros: 5000 },
+      });
+
+      expect(prisma.creditAllocation.updateMany.mock.calls).toEqual([
+        [
+          {
+            where: { id: 'purchase', remaining: { gte: D(5) } },
+            data: { remaining: { decrement: D(5) } },
+          },
+        ],
+      ]);
+      expect(createdTransactions()[0]).toMatchObject({
+        amount: D(-5),
+        // The held balance includes the (unspendable) trial credits.
+        balanceAfter: D(55),
+        usageCostUsd: D('0.023'),
+        creditCostUsdMicros: 5000,
+      });
+    });
+
+    it('collects what the balance and the rest of the session overage cover in a partial debit', async () => {
+      allocations = [allocation({ remaining: D(1) })];
+      prisma.makeupSession.findFirst.mockResolvedValue({ id: 's-1' } as never);
+      prisma.creditSessionOverage.findUnique.mockResolvedValue({
+        id: 'ov-1',
+        overageLimit: D(5),
+        overageUsed: D(4),
+      } as never);
+
+      const result = await service.debit({
+        authId: 'user-1',
+        amount: '5',
+        idempotencyKey: 'ai-run:2',
+        sessionId: 's-1',
+        partial: true,
+      });
+
+      expect(result).toMatchObject({
+        consumed: '1',
+        overage: '1',
+        uncollected: '3',
+      });
+      expect(createdTransactions()[0]).toMatchObject({
+        amount: D(-1),
+        overageAmount: D(1),
+      });
+      expect(prisma.creditSessionOverage.update.mock.calls[0]?.[0]).toEqual({
+        where: { id: 'ov-1' },
+        data: { overageUsed: D(5) },
+      });
+    });
+
+    it('collects the balance in a partial debit outside a session', async () => {
+      allocations = [allocation({ remaining: D(2) })];
+      await expect(
+        service.debit({
+          authId: 'user-1',
+          amount: '5',
+          idempotencyKey: 'ai-run:3',
+          partial: true,
+        }),
+      ).resolves.toMatchObject({
+        consumed: '2',
+        overage: '0',
+        uncollected: '3',
+      });
+    });
+
+    it('rejects a partial debit when nothing at all can be collected', async () => {
+      allocations = [];
+      prisma.makeupSession.findFirst.mockResolvedValue({ id: 's-1' } as never);
+      prisma.creditSessionOverage.findUnique.mockResolvedValue({
+        id: 'ov-1',
+        overageLimit: D(5),
+        overageUsed: D(5),
+      } as never);
+
+      await expect(
+        service.debit({
+          authId: 'user-1',
+          amount: '1',
+          idempotencyKey: 'ai-run:4',
+          sessionId: 's-1',
+          partial: true,
+        }),
+      ).rejects.toBeInstanceOf(InsufficientCreditsError);
+      expectNothingWritten();
+    });
+
+    it('returns the original partial debit for a repeated key, whatever it collected', async () => {
+      prisma.creditTransaction.findUnique.mockResolvedValue(
+        storedTransaction({ amount: D(-2), overageAmount: D(0) }) as never,
+      );
+
+      await expect(
+        service.debit({
+          authId: 'user-1',
+          amount: '5',
+          idempotencyKey: 'ai-run:5',
+          partial: true,
+        }),
+      ).resolves.toMatchObject({
+        replayed: true,
+        consumed: '2',
+        uncollected: '3',
+      });
+      expectNothingWritten();
     });
 
     it('rejects a debit the balance cannot cover outside a session and writes nothing', async () => {

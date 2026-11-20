@@ -21,6 +21,10 @@ model CreditSettings {
   creditCostUsdMicros   Int      @default(5000)
   // Credits a makeup session may use beyond the remaining balance.
   sessionOverageCredits Int      @default(5)
+  // AI usage is charged in multiples of this step, rounded up, in millionths
+  // of a credit: 1000000 = whole credits ($0.023 at $0.005 -> 5 credits),
+  // 1 = exact to the ledger's six decimal places (4.6 credits).
+  deductionStepMicroCredits Int  @default(1000000)
   createdAt             DateTime @default(now())
   updatedAt             DateTime @updatedAt
 }
@@ -129,12 +133,18 @@ model CreditTransaction {
   // it after the session is deleted.
   sessionId      String?               @db.VarChar(64)
   description    String?               @db.VarChar(255)
+  // DEBIT for AI usage only: the provider's cost in USD and the conversion
+  // rate in force (USD micros per credit), fixed with the transaction, so
+  // later rate changes never alter history. See AiUsage.
+  usageCostUsd        Decimal?         @db.Decimal(20, 10)
+  creditCostUsdMicros Int?
   // When the change took effect (an EXPIRATION: the allocation's expiry).
   occurredAt     DateTime
   createdAt      DateTime              @default(now())
 
-  wallet  CreditWallet        @relation(fields: [walletId, authId], references: [id, authId], onDelete: Cascade)
-  entries CreditLedgerEntry[]
+  wallet   CreditWallet        @relation(fields: [walletId, authId], references: [id, authId], onDelete: Cascade)
+  entries  CreditLedgerEntry[]
+  aiUsage  AiUsage?
 
   @@unique([walletId, idempotencyKey])
   @@unique([walletId, id])
@@ -215,4 +225,56 @@ model CreditAllocationSchedule {
   @@unique([paymentId, periodStart])
   @@index([status, periodStart])
   @@index([authId, status])
+}
+
+// One AI provider request (an OpenRouter chat completion) that the provider
+// reported usage for: who it was for (user, makeup session, AI run), what it
+// used (tokens, the provider's cost in USD) and whether it was charged.
+// Requests that failed after the provider produced (and billed) a response
+// are recorded too (outcome FAILED, never charged). A run is charged once,
+// for the request that produced its result: credits = cost / rate, rounded
+// up to the configured step, with the rate fixed on the usage and its DEBIT.
+// Usage facts never change; the charge fields are written once (database
+// trigger).
+model AiUsage {
+  id                String              @id @default(uuid())
+  authId            String
+  // The makeup session and AI run (not foreign keys: usage is kept as
+  // billing history when a session is deleted).
+  sessionId         String              @db.VarChar(64)
+  runId             String              @db.VarChar(64)
+  operation         AiOperation
+  provider          String              @db.VarChar(50)
+  model             String              @db.VarChar(255)
+  // The provider's generation ID; unique per provider.
+  providerRequestId String?             @db.VarChar(255)
+  outcome           AiUsageOutcome
+  // Why the request failed (an AiProviderError code), when it did.
+  errorCode         String?             @db.VarChar(100)
+  inputTokens       Int
+  outputTokens      Int
+  totalTokens       Int
+  // usage.cost reported by the provider, in USD; NULL if not reported.
+  costUsd           Decimal?            @db.Decimal(20, 10)
+  chargeStatus      AiUsageChargeStatus @default(PENDING)
+  // Why a usage was not (fully) charged, e.g. FAILED_ATTEMPT.
+  chargeNote        String?             @db.VarChar(50)
+  // Conversion rate used (USD micros per credit) and the resulting credits:
+  // exact, due (rounded up to the step), and actually deducted.
+  creditCostUsdMicros Int?
+  creditsExact      Decimal?            @db.Decimal(30, 12)
+  creditsDue        Decimal?            @db.Decimal(18, 6)
+  creditsCharged    Decimal?            @db.Decimal(18, 6)
+  transactionId     String?             @unique
+  occurredAt        DateTime
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+
+  authUser    authUser           @relation(fields: [authId], references: [id], onDelete: Cascade)
+  transaction CreditTransaction? @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerRequestId])
+  @@index([sessionId, occurredAt])
+  @@index([authId, occurredAt])
+  @@index([runId])
 }

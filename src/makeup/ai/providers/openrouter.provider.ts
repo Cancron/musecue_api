@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { Prisma } from '@prisma/client';
 import sharp from 'sharp';
 
 /** Same decoding limit as upload validation (8192 x 8192). */
@@ -13,11 +14,21 @@ import {
   AiProviderError,
   type AiFailureDiagnostics,
 } from '../ai-provider.error';
+import type { AiCallMetadata } from '../ai.gateway';
 import type {
   StructuredAiProvider,
   StructuredGenerationRequest,
   StructuredGenerationResponse,
 } from './structured-ai.provider';
+
+/**
+ * A JSON number as an exact decimal string without exponent, from its
+ * shortest representation (1.2e-7 -> "0.00000012"), never via binary
+ * floating-point arithmetic.
+ */
+function decimalString(value: number): string {
+  return new Prisma.Decimal(String(value)).toFixed();
+}
 
 const openRouterEnvelopeSchema = z.object({
   id: z.string().optional(),
@@ -37,6 +48,28 @@ const openRouterEnvelopeSchema = z.object({
       total_tokens: z.number().optional(),
     })
     .optional(),
+});
+
+// What OpenRouter billed for a response: read before any other check, so a
+// request that fails afterwards (truncated, filtered, invalid output) still
+// has its usage recorded. `usage.cost` is in USD (OpenRouter credits).
+const billedUsageSchema = z.object({
+  id: z.string().min(1).max(255).optional().catch(undefined),
+  model: z.string().min(1).max(255).optional().catch(undefined),
+  usage: z
+    .object({
+      prompt_tokens: z.number().int().nonnegative().optional().catch(undefined),
+      completion_tokens: z
+        .number()
+        .int()
+        .nonnegative()
+        .optional()
+        .catch(undefined),
+      total_tokens: z.number().int().nonnegative().optional().catch(undefined),
+      cost: z.number().nonnegative().finite().optional().catch(undefined),
+    })
+    .nullish()
+    .catch(undefined),
 });
 
 // Parse only metadata; never retain upstream messages or reasoning text.
@@ -200,6 +233,7 @@ export class OpenRouterProvider implements StructuredAiProvider {
       () => controller.abort(),
       this.timeoutFor(request.operation),
     );
+    let billed: AiCallMetadata | undefined;
     try {
       const image = request.image
         ? await this.prepareImage(request.image)
@@ -219,6 +253,8 @@ export class OpenRouterProvider implements StructuredAiProvider {
           ],
           temperature: 0.2,
           max_tokens: diagnostics.maxTokens,
+          // Usage accounting: tokens and cost (USD) in every response.
+          usage: { include: true },
           ...this.reasoningOptions(request.operation),
           response_format: {
             type: 'json_schema',
@@ -273,6 +309,7 @@ export class OpenRouterProvider implements StructuredAiProvider {
           true,
         );
       }
+      billed = this.billedResponse(responseBody, request.operation);
       const metadata = responseMetadataSchema.safeParse(responseBody);
       if (metadata.success) {
         const choice = metadata.data.choices?.[0];
@@ -359,19 +396,15 @@ export class OpenRouterProvider implements StructuredAiProvider {
 
       return {
         value,
-        responseId: envelope.data.id,
-        model: envelope.data.model ?? this.modelFor(request.operation),
-        usage: envelope.data.usage
-          ? {
-              promptTokens: envelope.data.usage.prompt_tokens,
-              completionTokens: envelope.data.usage.completion_tokens,
-              totalTokens: envelope.data.usage.total_tokens,
-            }
-          : undefined,
+        responseId: billed?.responseId ?? envelope.data.id,
+        model: billed?.model ?? this.modelFor(request.operation),
+        usage: billed?.usage,
       };
     } catch (error) {
       if (error instanceof AiProviderError) {
         error.diagnostics = diagnostics;
+        // The provider billed this response even though it is unusable.
+        if (billed?.usage) error.billedResponse = billed;
         throw error;
       }
       if (error instanceof Error && error.name === 'AbortError') {
@@ -393,6 +426,29 @@ export class OpenRouterProvider implements StructuredAiProvider {
     } finally {
       clearTimeout(timeout);
     }
+  }
+
+  /** Generation ID, model and usage (tokens, cost in USD) of a response. */
+  private billedResponse(
+    body: unknown,
+    operation: AiOperation,
+  ): AiCallMetadata | undefined {
+    const parsed = billedUsageSchema.safeParse(body);
+    if (!parsed.success) return undefined;
+    const usage = parsed.data.usage;
+    return {
+      responseId: parsed.data.id,
+      model: parsed.data.model ?? this.modelFor(operation),
+      usage: usage
+        ? {
+            promptTokens: usage.prompt_tokens,
+            completionTokens: usage.completion_tokens,
+            totalTokens: usage.total_tokens,
+            costUsd:
+              usage.cost === undefined ? undefined : decimalString(usage.cost),
+          }
+        : undefined,
+    };
   }
 
   private userContent(

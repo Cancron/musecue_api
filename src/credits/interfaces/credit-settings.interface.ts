@@ -10,11 +10,18 @@ export interface CreditSettingsValues {
   creditCostUsdMicros: number;
   /** Credits a makeup session may use beyond the remaining balance. */
   sessionOverageCredits: number;
+  /**
+   * AI usage is charged in multiples of this many millionths of a credit,
+   * rounded up (1000000 = whole credits; 1 = exact fractional credits).
+   */
+  deductionStepMicroCredits: number;
 }
 
 export interface CreditSettingsView extends CreditSettingsValues {
   /** `creditCostUsdMicros` as an exact decimal string, e.g. "0.005". Read-only. */
   creditCostUsd: string;
+  /** `deductionStepMicroCredits` in credits, e.g. "1" or "0.1". Read-only. */
+  deductionStepCredits: string;
   /** When the stored settings were last written. */
   updatedAt: string;
 }

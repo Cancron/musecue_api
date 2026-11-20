@@ -10,6 +10,7 @@ import { PrivateStorageError } from '../storage/private-storage.error';
 import type { AiGateway } from './ai/ai.gateway';
 import { MakeupService } from './makeup.service';
 import { MakeupJobHandler } from './queues/makeup-job.handler';
+import { MakeupCreditService } from './makeup-credit.service';
 import type { JobExecution } from '../infrastructure/jobs/job.types';
 import type { MakeupAiJob } from './queues/makeup.queue';
 import { MakeupQueueService } from './queues/makeup.queue';
@@ -463,6 +464,7 @@ describe('MakeupJobHandler private cloud storage reads', () => {
       storage,
       mock<Logger>(),
       new ConfigService(),
+      mock<MakeupCreditService>(),
     );
     const discard = jest.fn();
     const job = {

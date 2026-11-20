@@ -26,6 +26,8 @@ describe('CreditAllowanceService', () => {
       creditCostUsdMicros: 5000,
       creditCostUsd: '0.005',
       sessionOverageCredits: 5,
+      deductionStepMicroCredits: 1000000,
+      deductionStepCredits: '1',
       updatedAt: startedAt.toISOString(),
     });
     wallet.grant.mockResolvedValue({ replayed: false } as GrantCreditsResult);

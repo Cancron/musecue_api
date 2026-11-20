@@ -82,6 +82,19 @@ export class CreditEligibilityService {
   }
 
   /**
+   * The credit sources the user may spend now (the same rule as
+   * `getEligibility`): purchased and referral credits always, trial and
+   * subscription credits only while that trial or paid term is active.
+   */
+  async usableSources(authId: string): Promise<CreditSource[]> {
+    const now = new Date();
+    const { record } = await this.access.getAccessDetails(authId, now);
+    return Object.values(CreditSource).filter((source) =>
+      isCreditSourceUsable(source, record, now),
+    );
+  }
+
+  /**
    * Grants the trial allowance and the monthly Pro credits of recorded
    * payments that the user is due and has not received yet (see above).
    * Returns how many were newly granted.

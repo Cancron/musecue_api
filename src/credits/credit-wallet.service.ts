@@ -273,99 +273,117 @@ export class CreditWalletService {
    * and nothing is written. Retrying with the same idempotency key returns
    * the original debit.
    */
-  async debit(input: DebitCreditsInput): Promise<DebitCreditsResult> {
+  async debit(
+    input: DebitCreditsInput,
+    options: WalletOperationOptions = {},
+  ): Promise<DebitCreditsResult> {
     const requested = this.parseAmount(input.amount);
     this.assertReference('idempotencyKey', input.idempotencyKey);
     const sessionId = input.sessionId ?? null;
     if (sessionId !== null) this.assertReference('sessionId', sessionId);
     const idempotencyKey = `debit:${input.idempotencyKey}`;
 
-    return this.withLockedWallet(input.authId, async (tx, wallet) => {
-      const previous = await tx.creditTransaction.findUnique({
-        where: {
-          walletId_idempotencyKey: { walletId: wallet.id, idempotencyKey },
-        },
-        include: { entries: true },
-      });
-      if (previous) {
-        const previousRequested = previous.amount
-          .negated()
-          .plus(previous.overageAmount);
-        if (
-          !previousRequested.eq(requested) ||
-          previous.sessionId !== sessionId
-        ) {
-          throw new CreditConflictError(
-            'This idempotency key was already used for a different debit',
-          );
-        }
-        return this.toDebitResult(previous, true);
-      }
-
-      if (sessionId !== null) {
-        const session = await tx.makeupSession.findFirst({
-          where: { id: sessionId, authId: wallet.authId },
-          select: { id: true },
-        });
-        if (!session) throw new CreditSessionNotFoundError();
-      }
-
-      const allocations = await tx.creditAllocation.findMany({
-        where: { walletId: wallet.id, remaining: { gt: 0 } },
-      });
-      const available = sumCredits(
-        allocations
-          .filter((allocation) => isAllocationAvailable(allocation, wallet.now))
-          .map((allocation) => allocation.remaining),
-      );
-      // Everything the wallet holds (due expirations are already recorded),
-      // including credits of periods that have not started.
-      const held = sumCredits(
-        allocations.map((allocation) => allocation.remaining),
-      );
-      const plan = planDebit(allocations, requested, wallet.now);
-
-      if (plan.shortfall.gt(0)) {
-        await this.useSessionOverage(tx, wallet, sessionId, {
-          requested,
-          available,
-          shortfall: plan.shortfall,
-        });
-      }
-
-      for (const take of plan.takes) {
-        const { count } = await tx.creditAllocation.updateMany({
-          where: { id: take.allocationId, remaining: { gte: take.amount } },
-          data: { remaining: { decrement: take.amount } },
-        });
-        if (count !== 1) {
-          // Cannot happen while the wallet is locked; never debit silently.
-          throw new Error('Credit allocation changed during a locked debit');
-        }
-      }
-      const transaction = await tx.creditTransaction.create({
-        data: {
-          walletId: wallet.id,
-          authId: wallet.authId,
-          type: CreditTransactionType.DEBIT,
-          amount: plan.consumed.negated(),
-          overageAmount: plan.shortfall,
-          balanceAfter: held.minus(plan.consumed),
-          idempotencyKey,
-          sessionId,
-          description: input.description,
-          occurredAt: wallet.now,
-          entries: {
-            create: plan.takes.map((take) => ({
-              allocationId: take.allocationId,
-              amount: take.amount.negated(),
-            })),
+    return this.withLockedWallet(
+      input.authId,
+      async (tx, wallet) => {
+        const previous = await tx.creditTransaction.findUnique({
+          where: {
+            walletId_idempotencyKey: { walletId: wallet.id, idempotencyKey },
           },
-        },
-        include: { entries: true },
-      });
-      return this.toDebitResult(transaction, false);
-    });
+          include: { entries: true },
+        });
+        if (previous) {
+          const previousRequested = previous.amount
+            .negated()
+            .plus(previous.overageAmount);
+          if (
+            // A partial debit may have collected less than was requested.
+            (!input.partial && !previousRequested.eq(requested)) ||
+            previous.sessionId !== sessionId
+          ) {
+            throw new CreditConflictError(
+              'This idempotency key was already used for a different debit',
+            );
+          }
+          return this.toDebitResult(previous, true, requested);
+        }
+
+        if (sessionId !== null) {
+          const session = await tx.makeupSession.findFirst({
+            where: { id: sessionId, authId: wallet.authId },
+            select: { id: true },
+          });
+          if (!session) throw new CreditSessionNotFoundError();
+        }
+
+        const allocations = await tx.creditAllocation.findMany({
+          where: { walletId: wallet.id, remaining: { gt: 0 } },
+        });
+        const spendable = input.sources
+          ? allocations.filter((allocation) =>
+              input.sources?.includes(allocation.source),
+            )
+          : allocations;
+        const available = sumCredits(
+          spendable
+            .filter((allocation) =>
+              isAllocationAvailable(allocation, wallet.now),
+            )
+            .map((allocation) => allocation.remaining),
+        );
+        // Everything the wallet holds (due expirations are already recorded),
+        // including credits of periods that have not started.
+        const held = sumCredits(
+          allocations.map((allocation) => allocation.remaining),
+        );
+        const plan = planDebit(spendable, requested, wallet.now);
+
+        const overage = plan.shortfall.gt(0)
+          ? await this.useSessionOverage(tx, wallet, sessionId, {
+              requested,
+              available,
+              shortfall: plan.shortfall,
+              partial: input.partial === true,
+            })
+          : ZERO_CREDITS;
+
+        for (const take of plan.takes) {
+          const { count } = await tx.creditAllocation.updateMany({
+            where: { id: take.allocationId, remaining: { gte: take.amount } },
+            data: { remaining: { decrement: take.amount } },
+          });
+          if (count !== 1) {
+            // Cannot happen while the wallet is locked; never debit silently.
+            throw new Error('Credit allocation changed during a locked debit');
+          }
+        }
+        const transaction = await tx.creditTransaction.create({
+          data: {
+            walletId: wallet.id,
+            authId: wallet.authId,
+            type: CreditTransactionType.DEBIT,
+            amount: plan.consumed.negated(),
+            overageAmount: overage,
+            balanceAfter: held.minus(plan.consumed),
+            idempotencyKey,
+            sessionId,
+            description: input.description,
+            usageCostUsd: input.usage?.costUsd ?? null,
+            creditCostUsdMicros: input.usage?.creditCostUsdMicros ?? null,
+            occurredAt: wallet.now,
+            entries: {
+              create: plan.takes.map((take) => ({
+                allocationId: take.allocationId,
+                amount: take.amount.negated(),
+              })),
+            },
+          },
+          include: { entries: true },
+        });
+        return this.toDebitResult(transaction, false, requested);
+      },
+      options,
+    );
   }
 
   /**
@@ -502,6 +520,27 @@ export class CreditWalletService {
     return result;
   }
 
+  /**
+   * Overage a makeup session could still use: its recorded limit (or the
+   * current setting if it has used none) minus what it used. Read-only.
+   */
+  async sessionOverageRemaining(
+    authId: string,
+    sessionId: string,
+  ): Promise<Prisma.Decimal> {
+    const used = await this.prisma.creditSessionOverage.findFirst({
+      where: { authId, sessionId },
+    });
+    if (used) {
+      return Prisma.Decimal.max(
+        used.overageLimit.minus(used.overageUsed),
+        ZERO_CREDITS,
+      );
+    }
+    const settings = await this.settings.getSettings();
+    return new Prisma.Decimal(settings.sessionOverageCredits);
+  }
+
   /** Whether the user already received credits for this source event. */
   async hasGrant(
     authId: string,
@@ -627,7 +666,12 @@ export class CreditWalletService {
     });
   }
 
-  /** Records overage for a session, or rejects the debit. */
+  /**
+   * Covers a shortfall from the session's overage allowance and returns the
+   * overage used, or rejects the debit. A `partial` debit uses whatever
+   * overage is left (the rest is uncollected) and is rejected only if
+   * nothing at all can be collected.
+   */
   private async useSessionOverage(
     tx: Tx,
     wallet: LockedWallet,
@@ -636,15 +680,20 @@ export class CreditWalletService {
       requested: Prisma.Decimal;
       available: Prisma.Decimal;
       shortfall: Prisma.Decimal;
+      partial: boolean;
     },
-  ): Promise<void> {
+  ): Promise<Prisma.Decimal> {
     const reject = (overageRemaining: Prisma.Decimal) =>
       new InsufficientCreditsError({
         requested: formatCredits(debit.requested),
         available: formatCredits(debit.available),
         overageRemaining: formatCredits(overageRemaining),
       });
-    if (sessionId === null) throw reject(ZERO_CREDITS);
+    const collectedFromBalance = debit.requested.minus(debit.shortfall);
+    if (sessionId === null) {
+      if (debit.partial && collectedFromBalance.gt(0)) return ZERO_CREDITS;
+      throw reject(ZERO_CREDITS);
+    }
 
     const existing = await tx.creditSessionOverage.findUnique({
       where: { walletId_sessionId: { walletId: wallet.id, sessionId } },
@@ -655,8 +704,18 @@ export class CreditWalletService {
         (await this.settings.getSettings(tx)).sessionOverageCredits,
       );
     const used = existing?.overageUsed ?? ZERO_CREDITS;
-    const decision = decideOverage(limit, used, debit.shortfall);
-    if (!decision.allowed) throw reject(decision.remainingBefore);
+    let decision = decideOverage(limit, used, debit.shortfall);
+    if (!decision.allowed) {
+      const remaining = decision.remainingBefore;
+      if (!debit.partial) throw reject(remaining);
+      if (remaining.lte(0)) {
+        if (collectedFromBalance.gt(0)) return ZERO_CREDITS;
+        throw reject(remaining);
+      }
+      // Use the rest of the allowance; the remainder stays uncollected.
+      decision = decideOverage(limit, used, remaining);
+    }
+    const overageUsed = decision.usedAfter.minus(used);
 
     if (existing) {
       await tx.creditSessionOverage.update({
@@ -674,6 +733,7 @@ export class CreditWalletService {
         },
       });
     }
+    return overageUsed;
   }
 
   private async remainingCredits(
@@ -717,11 +777,18 @@ export class CreditWalletService {
   private toDebitResult(
     transaction: TransactionWithEntries,
     replayed: boolean,
+    requested: Prisma.Decimal,
   ): DebitCreditsResult {
+    const collected = transaction.amount
+      .negated()
+      .plus(transaction.overageAmount);
     return {
       transaction: this.toTransactionView(transaction),
       consumed: formatCredits(transaction.amount.negated()),
       overage: formatCredits(transaction.overageAmount),
+      uncollected: formatCredits(
+        Prisma.Decimal.max(requested.minus(collected), ZERO_CREDITS),
+      ),
       replayed,
     };
   }
@@ -748,6 +815,11 @@ export class CreditWalletService {
       id: transaction.id,
       type: transaction.type,
       amount: formatCredits(transaction.amount),
+      usageCostUsd:
+        transaction.usageCostUsd === null
+          ? null
+          : formatCredits(transaction.usageCostUsd),
+      creditCostUsdMicros: transaction.creditCostUsdMicros,
       overageAmount: formatCredits(transaction.overageAmount),
       balanceAfter: formatCredits(transaction.balanceAfter),
       sessionId: transaction.sessionId,

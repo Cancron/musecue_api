@@ -4,6 +4,9 @@ export const CREDIT_SETTINGS_ID = 1;
 /** One US dollar in the millionths used by `creditCostUsdMicros`. */
 export const USD_MICROS_PER_USD = 1_000_000;
 
+/** One credit in the millionths used by `deductionStepMicroCredits`. */
+export const MICRO_CREDITS_PER_CREDIT = 1_000_000;
+
 /** Request validation bounds. */
 export const CREDIT_SETTINGS_LIMITS = {
   /**
@@ -21,6 +24,10 @@ export const CREDIT_SETTINGS_LIMITS = {
   /** Zero is valid: sessions may not go beyond the remaining balance. */
   SESSION_OVERAGE_CREDITS_MIN: 0,
   SESSION_OVERAGE_CREDITS_MAX: 1_000,
+  /** 0.000001 credit: charges are exact to the ledger's precision. */
+  DEDUCTION_STEP_MICRO_CREDITS_MIN: 1,
+  /** 1 credit: charges are rounded up to whole credits (the default). */
+  DEDUCTION_STEP_MICRO_CREDITS_MAX: 1_000_000,
 } as const;
 
 /**

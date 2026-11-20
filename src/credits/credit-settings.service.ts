@@ -10,6 +10,7 @@ import { PrismaService } from '../common/services/prisma.service';
 import {
   CREDIT_SETTINGS_ID,
   formatUsdMicros,
+  MICRO_CREDITS_PER_CREDIT,
 } from './credit-settings.constants';
 import type {
   CreditSettingsChangeActor,
@@ -23,6 +24,7 @@ const SETTING_FIELDS: readonly (keyof CreditSettingsValues)[] = [
   'proMonthlyCredits',
   'creditCostUsdMicros',
   'sessionOverageCredits',
+  'deductionStepMicroCredits',
 ];
 
 /**
@@ -159,6 +161,10 @@ export class CreditSettingsService implements OnApplicationBootstrap {
       creditCostUsdMicros: stored.creditCostUsdMicros,
       creditCostUsd: formatUsdMicros(stored.creditCostUsdMicros),
       sessionOverageCredits: stored.sessionOverageCredits,
+      deductionStepMicroCredits: stored.deductionStepMicroCredits,
+      deductionStepCredits: new Prisma.Decimal(stored.deductionStepMicroCredits)
+        .dividedBy(MICRO_CREDITS_PER_CREDIT)
+        .toFixed(),
       updatedAt: stored.updatedAt.toISOString(),
     };
   }

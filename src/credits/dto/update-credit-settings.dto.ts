@@ -41,4 +41,15 @@ export class UpdateCreditSettingsDto {
   @Min(LIMITS.SESSION_OVERAGE_CREDITS_MIN)
   @Max(LIMITS.SESSION_OVERAGE_CREDITS_MAX)
   sessionOverageCredits?: number;
+
+  /**
+   * AI usage is charged in multiples of this step, rounded up, in millionths
+   * of a credit (1-1000000): 1000000 charges whole credits, 100000 tenths,
+   * 1 exact fractional credits.
+   */
+  @ValidateIf(isPresent)
+  @IsInt()
+  @Min(LIMITS.DEDUCTION_STEP_MICRO_CREDITS_MIN)
+  @Max(LIMITS.DEDUCTION_STEP_MICRO_CREDITS_MAX)
+  deductionStepMicroCredits?: number;
 }
