@@ -37,6 +37,8 @@ model authUser {
   mfaTrustedDevices  MfaTrustedDevice[]
   stepUpApprovals    StepUpApproval[]
   securityEvents     SecurityEvent[]
+  mfaSmsPhones       MfaSmsPhone[]
+  mfaSmsCodes        MfaSmsCode[]
 
   @@index([email, id, providerId])
   @@index([username])
@@ -65,6 +67,11 @@ model authSecurity {
   // last 15 minutes (at most 5); the fifth sets `mfaBlockedUntil`.
   mfaFailedAttemptsAt DateTime[] @default([])
   mfaBlockedUntil     DateTime?
+  // SMS codes sent to the user (login and phone verification) in the last
+  // 15 minutes (at most 3), and SMS codes submitted in the last 15 minutes
+  // (at most 5): the delivery and verification limits of SMS.
+  mfaSmsSentAt        DateTime[] @default([])
+  mfaSmsAttemptsAt    DateTime[] @default([])
   createdAt           DateTime   @default(now())
   updatedAt           DateTime   @updatedAt
   lastPasswordChange  DateTime?
@@ -149,9 +156,67 @@ model MfaLoginChallenge {
   consumedAt DateTime?
   createdAt  DateTime  @default(now())
 
-  authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
+  authUser authUser     @relation(fields: [authId], references: [id], onDelete: Cascade)
+  smsCodes MfaSmsCode[]
 
   @@index([authId])
+  @@index([expiresAt])
+}
+
+// ================================
+// MFA SMS Models
+// ================================
+
+// A phone number for SMS sign-in verification, an optional extra method of
+// users who enabled MFA with an authenticator app. `phoneNumber` is the
+// E.164 number encrypted with MFA_ENCRYPTION_KEY and bound to the user;
+// `phoneHint` (its last two digits) is what responses show. A user has at
+// most one ACTIVE (verified) and one PENDING (being verified) number
+// (partial unique indexes). Replacing or removing a number makes it REVOKED
+// (number erased) and invalidates its SMS codes in the same transaction.
+model MfaSmsPhone {
+  id            String            @id @default(uuid())
+  authId        String
+  status        MfaSmsPhoneStatus
+  phoneNumber   String?
+  phoneHint     String            @db.VarChar(2)
+  createdAt     DateTime          @default(now())
+  verifiedAt    DateTime?
+  revokedAt     DateTime?
+  // superseded (another number started), replaced (another number was
+  // verified), removed (by the user) or mfa_disabled.
+  revokedReason String?           @db.VarChar(32)
+
+  authUser authUser     @relation(fields: [authId], references: [id], onDelete: Cascade)
+  codes    MfaSmsCode[]
+
+  @@index([authId, status])
+}
+
+// One SMS code: six random digits, stored only as an HMAC (keyed with
+// MFA_ENCRYPTION_KEY, bound to the user, the number, the code record and its
+// purpose). Valid for 5 minutes (CHECK), used at most once (a trigger makes
+// consumption and invalidation permanent). LOGIN codes belong to one MFA
+// sign-in challenge; PHONE_VERIFICATION codes to a PENDING number.
+model MfaSmsCode {
+  id               String            @id @default(uuid())
+  authId           String
+  phoneId          String
+  purpose          MfaSmsCodePurpose
+  loginChallengeId String?
+  codeHash         String            @db.VarChar(128)
+  createdAt        DateTime
+  expiresAt        DateTime
+  consumedAt       DateTime?
+  invalidatedAt    DateTime?
+
+  authUser       authUser           @relation(fields: [authId], references: [id], onDelete: Cascade)
+  phone          MfaSmsPhone        @relation(fields: [phoneId], references: [id], onDelete: Cascade)
+  loginChallenge MfaLoginChallenge? @relation(fields: [loginChallengeId], references: [id], onDelete: SetNull)
+
+  @@index([authId, createdAt])
+  @@index([phoneId])
+  @@index([loginChallengeId])
   @@index([expiresAt])
 }
 

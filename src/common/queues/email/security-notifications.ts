@@ -7,7 +7,10 @@
 export type SecurityNotificationEvent =
   | 'MFA_DISABLED'
   | 'MFA_AUTHENTICATOR_REPLACED'
-  | 'MFA_RECOVERY_CODES_REGENERATED';
+  | 'MFA_RECOVERY_CODES_REGENERATED'
+  | 'MFA_SMS_PHONE_ADDED'
+  | 'MFA_SMS_PHONE_REPLACED'
+  | 'MFA_SMS_PHONE_REMOVED';
 
 export interface SecurityNotificationText {
   subject: string;
@@ -36,5 +39,23 @@ export const SECURITY_NOTIFICATIONS: Record<
     title: 'New recovery codes were created',
     description:
       'New two-step verification recovery codes were created for your MuseCue account. Your previous recovery codes no longer work.',
+  },
+  MFA_SMS_PHONE_ADDED: {
+    subject: 'Security alert: a phone number was added for sign-in codes',
+    title: 'A phone number was added for sign-in codes',
+    description:
+      'A phone number was verified for two-step verification by text message (SMS) on your MuseCue account. Sign-in codes can now be sent to it.',
+  },
+  MFA_SMS_PHONE_REPLACED: {
+    subject: 'Security alert: your phone number for sign-in codes was changed',
+    title: 'Your phone number for sign-in codes was changed',
+    description:
+      'A new phone number now receives the two-step verification text messages (SMS) of your MuseCue account. The previous number no longer receives codes, and codes sent to it no longer work.',
+  },
+  MFA_SMS_PHONE_REMOVED: {
+    subject: 'Security alert: sign-in codes by text message were turned off',
+    title: 'Sign-in codes by text message were turned off',
+    description:
+      'The phone number for two-step verification by text message (SMS) was removed from your MuseCue account. Codes sent to it no longer work.',
   },
 };

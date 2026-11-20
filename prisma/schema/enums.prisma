@@ -60,6 +60,11 @@ enum SecurityEventType {
   TRUSTED_DEVICE_ADDED
   TRUSTED_DEVICE_REVOKED
   SESSION_REVOKED
+  MFA_SMS_PHONE_VERIFICATION_STARTED
+  MFA_SMS_ENABLED
+  MFA_SMS_PHONE_REPLACED
+  MFA_SMS_DISABLED
+  MFA_SMS_CODE_SENT
 }
 
 // Sensitive actions that need a step-up approval (see StepUpApproval).
@@ -72,6 +77,21 @@ enum StepUpAction {
   DATA_EXPORT
   DATA_EXPORT_DOWNLOAD
   ACCOUNT_DELETION
+  MFA_SMS_PHONE
+  MFA_SMS_PHONE_REMOVE
+}
+
+// A phone number for SMS sign-in verification.
+enum MfaSmsPhoneStatus {
+  PENDING
+  ACTIVE
+  REVOKED
+}
+
+// What an SMS code is for.
+enum MfaSmsCodePurpose {
+  LOGIN
+  PHONE_VERIFICATION
 }
 
 // How a step-up was proven.

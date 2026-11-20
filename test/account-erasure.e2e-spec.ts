@@ -103,6 +103,8 @@ const USER_DATA_TABLES = [
   'MfaTrustedDevice',
   'StepUpApproval',
   'SecurityEvent',
+  'MfaSmsPhone',
+  'MfaSmsCode',
   'InfrastructureJob',
 ] as const;
 
@@ -391,6 +393,28 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
         firstName: 'First',
         avatarUrl: avatarKey,
         avatarStorageProvider: 'local',
+      },
+    });
+
+    // A verified phone number for SMS codes, and a code sent to it.
+    const smsPhone = await client.mfaSmsPhone.create({
+      data: {
+        authId: user.id,
+        status: 'ACTIVE',
+        phoneNumber: 'mfa2.0000000000000000.iv.tag.ciphertext',
+        phoneHint: '42',
+        verifiedAt: new Date(),
+      },
+    });
+    const sentAt = new Date();
+    await client.mfaSmsCode.create({
+      data: {
+        authId: user.id,
+        phoneId: smsPhone.id,
+        purpose: 'PHONE_VERIFICATION',
+        codeHash: `smsh1.${'0'.repeat(16)}.${'a'.repeat(64)}`,
+        createdAt: sentAt,
+        expiresAt: new Date(sentAt.getTime() + 5 * 60_000),
       },
     });
 

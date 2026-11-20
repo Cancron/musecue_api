@@ -54,6 +54,8 @@ export const MFA_AUDIT_FIELDS = {
   AUTHENTICATOR: 'mfaAuthenticator',
   /** Trusted devices revoked by the change (a count). */
   TRUSTED_DEVICES_REVOKED: 'mfaTrustedDevicesRevoked',
+  /** The phone number for SMS codes (masked: last two digits only). */
+  SMS_PHONE: 'mfaSmsPhone',
   /** How the change was approved (TOTP, RECOVERY_CODE, PASSWORD, GOOGLE). */
   STEP_UP_METHOD: 'stepUpMethod',
 } as const;

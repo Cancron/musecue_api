@@ -9,6 +9,7 @@ import {
 } from 'class-validator';
 import { MFA_LOGIN } from './mfa.constants';
 import type { MfaFactor } from './mfa-verification.service';
+import type { MfaLoginFactor } from './mfa-login.service';
 import { RECOVERY_CODE_INPUT_PATTERN } from './mfa-recovery-codes';
 
 const TOTP_CODE_PATTERN = /^\d{6}$/;
@@ -49,10 +50,17 @@ export class MfaVerificationDto {
 
 /**
  * The MFA step of sign-in: the challenge token from POST /auth/login (or the
- * Google callback), exactly one factor (`code` or `recoveryCode`), and
- * whether to trust this device for 30 days.
+ * Google callback), exactly one factor (`code`, `recoveryCode`, or
+ * `smsCode` for users with a verified phone number), and whether to trust
+ * this device for 30 days (not with an SMS code).
  */
 export class CompleteMfaLoginDto extends MfaVerificationDto {
+  /** A code sent by SMS for this challenge (POST /auth/login/mfa/sms). */
+  @IsOptional()
+  @IsString()
+  @Matches(TOTP_CODE_PATTERN, { message: 'smsCode must be exactly 6 digits' })
+  smsCode?: string;
+
   @IsString()
   @Matches(MFA_LOGIN.CHALLENGE_TOKEN_PATTERN, {
     message: 'challengeToken is not a valid MFA challenge token',
@@ -70,6 +78,34 @@ export class CompleteMfaLoginDto extends MfaVerificationDto {
   @MinLength(1)
   @MaxLength(100)
   deviceName?: string;
+}
+
+/** Requests an SMS sign-in code for an MFA challenge. */
+export class SendMfaLoginSmsDto {
+  @IsString()
+  @Matches(MFA_LOGIN.CHALLENGE_TOKEN_PATTERN, {
+    message: 'challengeToken is not a valid MFA challenge token',
+  })
+  challengeToken!: string;
+}
+
+/**
+ * The factor of a validated sign-in request: exactly one of `code`,
+ * `recoveryCode` or `smsCode`. SMS is accepted only at sign-in.
+ */
+export function toMfaLoginFactor(dto: CompleteMfaLoginDto): MfaLoginFactor {
+  if (dto.smsCode === undefined || dto.smsCode === null) {
+    return toMfaFactor(dto);
+  }
+  if (
+    (dto.code !== undefined && dto.code !== null) ||
+    (dto.recoveryCode !== undefined && dto.recoveryCode !== null)
+  ) {
+    throw new BadRequestException(
+      'Provide exactly one of code, recoveryCode or smsCode',
+    );
+  }
+  return { method: 'sms', code: dto.smsCode };
 }
 
 /** The factor of a validated request; exactly one must be given. */

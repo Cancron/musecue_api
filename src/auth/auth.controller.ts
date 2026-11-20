@@ -30,7 +30,11 @@ import { LoginDto } from './dto/login.dto';
 import { SessionsService } from './sessions/sessions.service';
 import { requestMetadata } from '../subscription/request-metadata';
 import { MFA_LOGIN } from './mfa/mfa.constants';
-import { CompleteMfaLoginDto, toMfaFactor } from './mfa/mfa.dto';
+import {
+  CompleteMfaLoginDto,
+  SendMfaLoginSmsDto,
+  toMfaLoginFactor,
+} from './mfa/mfa.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
 import {
   ResendVerificationEmailDto,
@@ -390,12 +394,31 @@ export class AuthController {
     return this.authService.completeMfaLogin(
       {
         challengeToken: payload.challengeToken,
-        factor: toMfaFactor(payload),
+        factor: toMfaLoginFactor(payload),
         trustDevice: payload.trustDevice ?? false,
         deviceName: payload.deviceName,
       },
       meta,
     );
+  }
+
+  /**
+   * Sends a sign-in code by SMS for an MFA challenge to the user's verified
+   * phone number (users with authenticator MFA who added one). Complete the
+   * challenge with `{ challengeToken, smsCode }` on POST /auth/login/mfa.
+   * At most 3 codes per 15 minutes; each works 5 minutes, once.
+   */
+  @Throttle({ default: THROTTLER_CONFIG.STRICT })
+  @Post('login/mfa/sms')
+  @HttpCode(HttpStatus.OK)
+  @Header('Cache-Control', 'no-store')
+  sendMfaLoginSms(@Body() payload: SendMfaLoginSmsDto, @Req() req: Request) {
+    const meta = requestMetadata(req);
+    return this.authService.sendMfaLoginSms(payload.challengeToken, {
+      ip: meta.ip ?? 'unknown',
+      userAgent: meta.userAgent ?? 'unknown',
+      device: meta.device,
+    });
   }
 
   /**

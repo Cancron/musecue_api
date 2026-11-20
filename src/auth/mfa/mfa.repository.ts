@@ -18,6 +18,7 @@ import {
 } from '../../common/services/activity-log.service';
 import { PrismaService } from '../../common/services/prisma.service';
 import { MFA_AUDIT_FIELDS, MFA_LOCKOUT } from './mfa.constants';
+import { MfaSmsStore } from './sms/mfa-sms.store';
 
 /** The account fields MFA decisions depend on. */
 export interface MfaAccountState {
@@ -134,7 +135,8 @@ export interface MfaUnitOfWork {
   /**
    * Turns MFA off: clears the secret, method, replay step and lockout, and
    * deletes the recovery codes, any pending enrollment or replacement and
-   * open sign-in challenges.
+   * open sign-in challenges; SMS numbers are revoked and their codes
+   * invalidated.
    */
   disableMfa(): Promise<void>;
   /**
@@ -246,6 +248,29 @@ export class MfaRepository {
     await this.prisma.mfaTrustedDevice.deleteMany({
       where: {
         OR: [{ expiresAt: { lte: now } }, { revokedAt: { not: null } }],
+      },
+    });
+    // SMS codes that can no longer be used, revoked numbers, and numbers
+    // left unverified for an hour. (The SMS limits are counted on
+    // authSecurity, not from these rows.)
+    await this.prisma.mfaSmsCode.deleteMany({
+      where: {
+        OR: [
+          { expiresAt: { lte: now } },
+          { consumedAt: { not: null } },
+          { invalidatedAt: { not: null } },
+        ],
+      },
+    });
+    await this.prisma.mfaSmsPhone.deleteMany({
+      where: {
+        OR: [
+          { status: 'REVOKED' },
+          {
+            status: 'PENDING',
+            createdAt: { lte: new Date(now.getTime() - 60 * 60_000) },
+          },
+        ],
       },
     });
     const windowStart = new Date(now.getTime() - MFA_LOCKOUT.FAILURE_WINDOW_MS);
@@ -563,6 +588,12 @@ export class MfaRepository {
         await tx.mfaLoginChallenge.deleteMany({
           where: { authId, consumedAt: null },
         });
+        // SMS verification needs authenticator MFA: every number is revoked
+        // and every code sent to it invalidated.
+        await new MfaSmsStore(tx, authId).revokeAllPhones(
+          'mfa_disabled',
+          new Date(),
+        );
       },
       replaceMfaSecret: async ({ encryptedSecret, usedStep }) => {
         await tx.authSecurity.update({

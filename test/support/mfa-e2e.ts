@@ -38,7 +38,9 @@ export interface LazyRequest extends PromiseLike<request.Response> {
   expect(status: number): Promise<request.Response>;
 }
 
-function lazyRequest(make: () => Promise<{ test: request.Test }>): LazyRequest {
+export function lazyRequest(
+  make: () => Promise<{ test: request.Test }>,
+): LazyRequest {
   // `make` wraps the request in an object, so resolving the promise does not
   // send it (a supertest request is thenable).
   const prepared = make;

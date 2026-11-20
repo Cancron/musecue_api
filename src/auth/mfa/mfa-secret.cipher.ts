@@ -2,8 +2,10 @@ import { Inject, Injectable } from '@nestjs/common';
 import {
   createCipheriv,
   createDecipheriv,
+  createHmac,
   hkdfSync,
   randomBytes,
+  timingSafeEqual,
 } from 'node:crypto';
 import { type MfaKeyring } from './mfa-keys';
 
@@ -18,7 +20,7 @@ import { type MfaKeyring } from './mfa-keys';
  * ID selects the key among MFA_ENCRYPTION_KEY and
  * MFA_ENCRYPTION_PREVIOUS_KEYS.
  */
-export type MfaSecretRole = 'enrollment' | 'confirmed';
+export type MfaSecretRole = 'enrollment' | 'confirmed' | 'sms-phone';
 
 export const MFA_KEYRING = Symbol('MFA_KEYRING');
 
@@ -30,6 +32,9 @@ const IV_BYTES = 12;
 const TAG_BYTES = 16;
 const HKDF_SALT = 'musecue-mfa-key';
 const HKDF_INFO = 'musecue/mfa-totp-secret/v2';
+/** Key of the SMS code HMACs (separate from the encryption key). */
+const HKDF_SMS_CODE_INFO = 'musecue/mfa-sms-code/v1';
+const SMS_CODE_HASH_FORMAT = 'smsh1';
 
 /** MFA_ENCRYPTION_KEY is not configured. */
 export class MfaKeyUnavailableError extends Error {
@@ -67,11 +72,41 @@ function deriveEncryptionKey(masterKey: Buffer): Buffer {
 @Injectable()
 export class MfaSecretCipher {
   private readonly keys = new Map<string, Buffer>();
+  private readonly macKeys = new Map<string, Buffer>();
 
   constructor(@Inject(MFA_KEYRING) private readonly keyring: MfaKeyring) {
     for (const [id, key] of keyring.keys) {
       this.keys.set(id, deriveEncryptionKey(key));
+      this.macKeys.set(
+        id,
+        Buffer.from(hkdfSync('sha256', key, HKDF_SALT, HKDF_SMS_CODE_INFO, 32)),
+      );
     }
+  }
+
+  /**
+   * The stored form of an SMS code: HMAC-SHA-256 under a key derived from
+   * the current MFA key, over the code and what it is bound to (user,
+   * number, code record, purpose), so a hash verifies nothing else.
+   * Format: `smsh1.<keyId>.<hex>`.
+   */
+  hashSmsCode(binding: string, code: string): string {
+    const keyId = this.keyring.currentKeyId;
+    const key = keyId ? this.macKeys.get(keyId) : undefined;
+    if (!keyId || !key) throw new MfaKeyUnavailableError();
+    return [SMS_CODE_HASH_FORMAT, keyId, smsMac(key, binding, code)].join('.');
+  }
+
+  /** Whether `code` matches a stored SMS code hash (constant time). */
+  verifySmsCode(stored: string, binding: string, code: string): boolean {
+    const [format, keyId, digest] = stored.split('.');
+    const key = this.macKeys.get(keyId);
+    if (format !== SMS_CODE_HASH_FORMAT || !key || !digest) return false;
+    const expected = Buffer.from(digest, 'hex');
+    const actual = Buffer.from(smsMac(key, binding, code), 'hex');
+    return (
+      expected.length === actual.length && timingSafeEqual(expected, actual)
+    );
   }
 
   /** Whether new secrets can be encrypted (MFA_ENCRYPTION_KEY is set). */
@@ -126,6 +161,12 @@ export class MfaSecretCipher {
       parts[1] !== this.keyring.currentKeyId
     );
   }
+}
+
+function smsMac(key: Buffer, binding: string, code: string): string {
+  return createHmac('sha256', key)
+    .update(`mfa-sms-code\u0000${binding}\u0000${code}`, 'utf8')
+    .digest('hex');
 }
 
 function decryptWith(

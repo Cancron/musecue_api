@@ -20,8 +20,8 @@ import {
 import {
   MfaLoginService,
   type MfaChallengeView,
+  type MfaLoginFactor,
 } from './mfa/mfa-login.service';
-import type { MfaFactor } from './mfa/mfa-verification.service';
 import { AuthChallengeRepository } from './state/auth-challenge.repository';
 import { storeLoginSession } from './state/login-session';
 import {
@@ -646,10 +646,21 @@ export class AuthService {
    * refresh tokens. Optionally trusts the device for 30 days; its token is
    * returned only in this response.
    */
+  /**
+   * Sends a sign-in code by SMS for an MFA challenge (users with a verified
+   * number); the code completes only that challenge.
+   */
+  sendMfaLoginSms(
+    challengeToken: string,
+    meta: { ip: string; userAgent: string; device?: string },
+  ) {
+    return this.mfaLogin.sendSmsCode(challengeToken, meta);
+  }
+
   async completeMfaLogin(
     input: {
       challengeToken: string;
-      factor: MfaFactor;
+      factor: MfaLoginFactor;
       trustDevice: boolean;
       deviceName?: string;
     },
@@ -676,8 +687,14 @@ export class AuthService {
         if (!user || user.status !== 'ACTIVE' || !user.verified) {
           throw AppError.unauthorized('User account is not active');
         }
-        // The new session proved MFA (administrators rely on it).
-        return this.issueLoginTokens(user, meta, tx, completion.method);
+        // The new session proved MFA (administrators rely on it), except
+        // with an SMS code: SMS never counts as an MFA proof.
+        return this.issueLoginTokens(
+          user,
+          meta,
+          tx,
+          completion.method === 'sms' ? undefined : completion.method,
+        );
       },
     );
 

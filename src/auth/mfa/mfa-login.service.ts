@@ -1,4 +1,4 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Optional } from '@nestjs/common';
 import type { Prisma } from '@prisma/client';
 import { createHash, randomBytes } from 'node:crypto';
 import { WINSTON_MODULE_PROVIDER } from 'nest-winston';
@@ -14,6 +14,8 @@ import {
 import { MFA_LOGIN } from './mfa.constants';
 import { MfaRepository, type TrustedDeviceView } from './mfa.repository';
 import type { SecurityEventContext } from '../security-events/security-event.log';
+import { MfaSmsService, type SmsCodeSentView } from './sms/mfa-sms.service';
+import { SMS_CODE_PATTERN } from './sms/mfa-sms-codes';
 
 export type FirstFactorProvider = 'local' | 'google';
 
@@ -23,12 +25,24 @@ export interface MfaLoginMeta {
   device?: string;
 }
 
+/** How an MFA sign-in can be completed. */
+export type MfaLoginMethod = MfaMethodUsed | 'sms';
+
+/**
+ * A second factor at sign-in: the authenticator, a recovery code, or (for
+ * users with a verified number) a code sent by SMS. SMS is accepted only
+ * here, never for a step-up or verification.
+ */
+export type MfaLoginFactor = MfaFactor | { method: 'sms'; code: string };
+
 /** What a sign-in of an MFA user receives instead of tokens. */
 export interface MfaChallengeView {
   mfaRequired: true;
   challengeToken: string;
   expiresAt: Date;
-  methods: MfaMethodUsed[];
+  methods: MfaLoginMethod[];
+  /** With `sms` in `methods`: the number codes go to (masked). */
+  smsPhoneNumber?: string;
 }
 
 export type MfaGateResult =
@@ -47,7 +61,7 @@ export interface NewTrustedDevice {
 export interface MfaLoginCompletion {
   authId: string;
   provider: FirstFactorProvider;
-  method: MfaMethodUsed;
+  method: MfaLoginMethod;
   trustedDevice: NewTrustedDevice | null;
 }
 
@@ -59,6 +73,7 @@ export interface TrustedDeviceListItem extends TrustedDeviceView {
 type CompleteOutcome<T> =
   | { kind: 'CHALLENGE_INVALID' }
   | { kind: 'DECLINED'; outcome: Exclude<CheckOutcome, { kind: 'VERIFIED' }> }
+  | { kind: 'REFUSED'; error: AppError }
   | { kind: 'VERIFIED'; completion: MfaLoginCompletion; result: T };
 
 const CONTEXT = 'MfaLoginService';
@@ -90,6 +105,7 @@ export class MfaLoginService {
     private readonly repository: MfaRepository,
     private readonly verification: MfaVerificationService,
     @Inject(WINSTON_MODULE_PROVIDER) private readonly logger: Logger,
+    @Optional() private readonly sms?: MfaSmsService,
   ) {}
 
   /**
@@ -133,6 +149,7 @@ export class MfaLoginService {
 
       const challengeToken = newToken('mfac');
       const expiresAt = new Date(now.getTime() + MFA_LOGIN.CHALLENGE_TTL_MS);
+      const smsPhoneNumber = await this.sms?.loginPhone(input.authId);
       await this.repository.createLoginChallenge({
         authId: input.authId,
         tokenHash: hashMfaToken(challengeToken),
@@ -154,7 +171,10 @@ export class MfaLoginService {
           mfaRequired: true,
           challengeToken,
           expiresAt,
-          methods: ['totp', 'recovery_code'],
+          methods: smsPhoneNumber
+            ? ['totp', 'recovery_code', 'sms']
+            : ['totp', 'recovery_code'],
+          ...(smsPhoneNumber ? { smsPhoneNumber } : {}),
         },
       };
     });
@@ -172,7 +192,7 @@ export class MfaLoginService {
   async complete<T>(
     input: {
       challengeToken: string;
-      factor: MfaFactor;
+      factor: MfaLoginFactor;
       trustDevice: boolean;
       deviceName?: string;
       meta: MfaLoginMeta;
@@ -183,14 +203,20 @@ export class MfaLoginService {
     ) => Promise<T>,
     now: Date = new Date(),
   ): Promise<{ completion: MfaLoginCompletion; result: T }> {
-    if (!MFA_LOGIN.CHALLENGE_TOKEN_PATTERN.test(input.challengeToken)) {
-      throw this.invalidChallenge();
+    if (input.factor.method === 'sms') {
+      if (input.trustDevice) {
+        throw AppError.badRequest(
+          'A device can only be trusted after the authenticator app or a recovery code',
+        );
+      }
+      if (!SMS_CODE_PATTERN.test(input.factor.code)) {
+        throw AppError.badRequest('smsCode must be exactly 6 digits');
+      }
     }
-    const tokenHash = hashMfaToken(input.challengeToken);
-    const authId = await this.guard(() =>
-      this.repository.loginChallengeOwner(tokenHash),
+    const { tokenHash, authId } = await this.challengeOwner(
+      input.challengeToken,
     );
-    if (!authId) throw this.invalidChallenge();
+    const factor = input.factor;
 
     const outcome = await this.guard(() =>
       this.repository.withLock<CompleteOutcome<T>>(authId, async (uow) => {
@@ -204,20 +230,37 @@ export class MfaLoginService {
         ) {
           return { kind: 'CHALLENGE_INVALID' };
         }
-        const checked = await this.verification.checkFactor(
-          uow,
-          authId,
-          input.factor,
-          {
-            ip: input.meta.ip,
-            userAgent: input.meta.userAgent,
-            device: input.meta.device,
-          },
-          now,
-          { source: 'sign_in' },
-        );
-        if (checked.kind !== 'VERIFIED') {
-          return { kind: 'DECLINED', outcome: checked };
+        let method: MfaLoginMethod;
+        if (factor.method === 'sms') {
+          // SMS: only here, for the challenge it was sent for.
+          if (!this.sms) return { kind: 'REFUSED', error: smsUnavailable() };
+          const sms = await this.sms.checkLoginCode(
+            uow,
+            authId,
+            challenge.id,
+            factor.code,
+            input.meta,
+            now,
+          );
+          if (sms.kind !== 'VERIFIED') return sms;
+          method = 'sms';
+        } else {
+          const checked = await this.verification.checkFactor(
+            uow,
+            authId,
+            factor,
+            {
+              ip: input.meta.ip,
+              userAgent: input.meta.userAgent,
+              device: input.meta.device,
+            },
+            now,
+            { source: 'sign_in' },
+          );
+          if (checked.kind !== 'VERIFIED') {
+            return { kind: 'DECLINED', outcome: checked };
+          }
+          method = checked.method;
         }
         if (!(await uow.consumeLoginChallenge(challenge.id, now))) {
           // Cannot happen under the lock; roll everything back if it does.
@@ -273,7 +316,7 @@ export class MfaLoginService {
         const completion: MfaLoginCompletion = {
           authId,
           provider: challenge.provider === 'google' ? 'google' : 'local',
-          method: checked.method,
+          method,
           trustedDevice,
         };
         // Same transaction: a failure here undoes everything above.
@@ -283,6 +326,7 @@ export class MfaLoginService {
     );
 
     if (outcome.kind === 'CHALLENGE_INVALID') throw this.invalidChallenge();
+    if (outcome.kind === 'REFUSED') throw outcome.error;
     if (outcome.kind === 'DECLINED') {
       throw this.verification.declinedError(authId, outcome.outcome);
     }
@@ -293,6 +337,42 @@ export class MfaLoginService {
       trustedDevice: outcome.completion.trustedDevice?.id ?? null,
     });
     return { completion: outcome.completion, result: outcome.result };
+  }
+
+  /**
+   * Sends a sign-in code by SMS for an open MFA challenge to the user's
+   * verified number (POST /auth/login/mfa/sms). The challenge token is the
+   * only credential; the code works only to complete that challenge.
+   */
+  async sendSmsCode(
+    challengeToken: string,
+    meta: MfaLoginMeta,
+    now: Date = new Date(),
+  ): Promise<SmsCodeSentView> {
+    const sms = this.sms;
+    if (!sms) throw smsUnavailable();
+    const { tokenHash, authId } = await this.challengeOwner(challengeToken);
+    const outcome = await this.guard(() =>
+      this.repository.withLock(authId, async (uow) => {
+        const challenge = await uow.loginChallenge(tokenHash);
+        if (
+          !challenge ||
+          challenge.consumedAt ||
+          challenge.expiresAt.getTime() <= now.getTime()
+        ) {
+          return { kind: 'CHALLENGE_INVALID' as const };
+        }
+        return sms.sendLoginCode(uow, authId, challenge, meta, now);
+      }),
+    );
+    if (outcome.kind === 'CHALLENGE_INVALID') throw this.invalidChallenge();
+    if (outcome.kind === 'REFUSED') throw outcome.error;
+    await sms.deliverLoginCode(authId, outcome.value.delivery);
+    this.logger.info('MFA sign-in code sent by SMS', {
+      context: CONTEXT,
+      authId,
+    });
+    return outcome.value.view;
   }
 
   /** The user's trusted devices (never their tokens). */
@@ -335,6 +415,19 @@ export class MfaLoginService {
     return { id: deviceId, revoked: true };
   }
 
+  /** The hash and owner of a well-formed, known challenge token (or 401). */
+  private async challengeOwner(challengeToken: string) {
+    if (!MFA_LOGIN.CHALLENGE_TOKEN_PATTERN.test(challengeToken)) {
+      throw this.invalidChallenge();
+    }
+    const tokenHash = hashMfaToken(challengeToken);
+    const authId = await this.guard(() =>
+      this.repository.loginChallengeOwner(tokenHash),
+    );
+    if (!authId) throw this.invalidChallenge();
+    return { tokenHash, authId };
+  }
+
   private invalidChallenge(): AppError {
     return AppError.unauthorized(
       'The MFA challenge is invalid or has expired. Please sign in again.',
@@ -345,6 +438,9 @@ export class MfaLoginService {
     return guardMfaStorage(this.logger, CONTEXT, operation);
   }
 }
+
+const smsUnavailable = () =>
+  AppError.serviceUnavailable('SMS verification is not available');
 
 /** SHA-256 of a well-formed trusted-device token; null for anything else. */
 export function trustedDeviceTokenHash(

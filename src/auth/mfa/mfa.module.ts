@@ -13,14 +13,17 @@ import { MfaService } from './mfa.service';
 import { RefreshSessionRepository } from '../state/refresh-session.repository';
 import { SecurityEventLog } from '../security-events/security-event.log';
 import { StepUpGuard } from '../step-up/step-up.guard';
+import { MfaSmsController } from './sms/mfa-sms.controller';
+import { MfaSmsService } from './sms/mfa-sms.service';
+import { createSmsProvider, SMS_PROVIDER } from './sms/sms-provider';
 
 /**
  * Optional MFA of the signed-in user (authenticator app, recovery codes,
- * trusted devices) and the MFA step of sign-in.
+ * trusted devices, SMS codes at sign-in) and the MFA step of sign-in.
  */
 @Module({
   imports: [QueueModule],
-  controllers: [MfaController],
+  controllers: [MfaController, MfaSmsController],
   providers: [
     {
       provide: MFA_KEYRING,
@@ -38,6 +41,9 @@ import { StepUpGuard } from '../step-up/step-up.guard';
     },
     MfaSecretCipher,
     MfaSecurityNotifier,
+    // SMS codes (SMS_PROVIDER=twilio; disabled by default).
+    { provide: SMS_PROVIDER, useFactory: () => createSmsProvider(process.env) },
+    MfaSmsService,
     MfaService,
     MfaVerificationService,
     MfaLoginService,
