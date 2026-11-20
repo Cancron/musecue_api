@@ -65,6 +65,14 @@ export interface TestUser {
 export class MfaTestKit {
   /** The frozen application time. */
   clock: Date;
+  /**
+   * Approvals by session and action: like the app, the kit reuses an
+   * approval while it is valid (ten minutes).
+   */
+  private readonly approvals = new Map<
+    string,
+    { token: string; expiresAt: number }
+  >();
   private passwordHash?: string;
   private ipCounter = 0;
 
@@ -180,6 +188,11 @@ export class MfaTestKit {
     action: string,
     proof?: Record<string, unknown>,
   ): Promise<string> {
+    const cacheKey = `${user.accessToken}|${action}`;
+    const cached = this.approvals.get(cacheKey);
+    if (!proof && cached && cached.expiresAt - 5_000 > this.clock.getTime()) {
+      return cached.token;
+    }
     let body = proof;
     if (!body && user.totpSecret) {
       this.nextStepStart();
@@ -190,7 +203,14 @@ export class MfaTestKit {
       .set(this.as(user))
       .send({ action, ...(body ?? { password: PASSWORD }) })
       .expect(201);
-    return dataOf<{ stepUpToken: string }>(response).stepUpToken;
+    const approval = dataOf<{ stepUpToken: string; expiresAt: string }>(
+      response,
+    );
+    this.approvals.set(cacheKey, {
+      token: approval.stepUpToken,
+      expiresAt: new Date(approval.expiresAt).getTime(),
+    });
+    return approval.stepUpToken;
   }
 
   /** POST /auth/mfa/enrollment, with a step-up approval (MFA_ENROLLMENT). */
@@ -206,11 +226,21 @@ export class MfaTestKit {
     }));
   }
 
-  confirm(user: TestUser, code: string) {
-    return this.http()
-      .post('/auth/mfa/enrollment/confirm')
-      .set(this.as(user))
-      .send({ code });
+  /**
+   * POST /auth/mfa/enrollment/confirm, with a step-up approval
+   * (MFA_ENROLLMENT).
+   */
+  confirm(user: TestUser, code: string, stepUpToken?: string): LazyRequest {
+    return lazyRequest(async () => ({
+      test: this.http()
+        .post('/auth/mfa/enrollment/confirm')
+        .set(this.as(user))
+        .set(
+          'X-Step-Up-Token',
+          stepUpToken ?? (await this.approve(user, 'MFA_ENROLLMENT')),
+        )
+        .send({ code }),
+    }));
   }
 
   verify(user: TestUser, body: object) {
@@ -245,6 +275,7 @@ export class MfaTestKit {
     const response = await this.confirm(
       user,
       totpCode(started.secret, this.clock),
+      stepUpToken,
     ).expect(200);
     user.totpSecret = started.secret;
     return {

@@ -53,6 +53,9 @@ export class EmailJobHandler implements JobHandler<EmailJob> {
           });
           break;
         }
+        case 'security-notification':
+          await this.handleSecurityNotification(job);
+          break;
         default:
           this.logger.warn(
             `Unknown email job type: ${String((job.data as { type?: string }).type || 'undefined')}`,
@@ -75,6 +78,16 @@ export class EmailJobHandler implements JobHandler<EmailJob> {
    * (PostgreSQL driver) is recorded as failed, like a failed send.
    */
   async onAbandoned(job: AbandonedJob<EmailJob>): Promise<void> {
+    if (job.data?.type === 'security-notification') {
+      await this.prismaService.emailHistory.updateMany({
+        where: { id: job.data.historyId, emailStatus: 'pending' },
+        data: {
+          emailStatus: 'failed',
+          errorMessage: 'Sending was interrupted',
+        },
+      });
+      return;
+    }
     if (job.data?.type !== 'verification') return;
     await this.markVerificationFailed(
       job.data.authId,
@@ -145,6 +158,47 @@ export class EmailJobHandler implements JobHandler<EmailJob> {
         errorMessage,
       },
     });
+  }
+
+  /**
+   * Sends a security notification and records the outcome on the
+   * emailHistory row written together with the change. Only the event and
+   * the job are logged (the email itself holds no secret either).
+   */
+  private async handleSecurityNotification(
+    job: JobExecution<EmailJob>,
+  ): Promise<void> {
+    const data = job.data as Extract<
+      EmailJob,
+      { type: 'security-notification' }
+    >;
+    try {
+      await this.emailService.sendSecurityNotificationEmail(
+        data.email,
+        data.username,
+        data.event,
+        data.occurredAt,
+      );
+      await this.prismaService.emailHistory.updateMany({
+        where: { id: data.historyId },
+        data: { emailStatus: 'sent', errorMessage: null },
+      });
+      this.logger.info('Security notification sent', {
+        context: 'EmailProcessor',
+        jobId: job.id,
+        event: data.event,
+      });
+    } catch (error) {
+      await this.prismaService.emailHistory.updateMany({
+        where: { id: data.historyId },
+        data: {
+          emailStatus: 'failed',
+          errorMessage: error instanceof Error ? error.name : 'Error',
+          retry_count: { increment: 1 },
+        },
+      });
+      throw error; // retried by the queue
+    }
   }
 
   private async handleWelcomeEmail(job: JobExecution<EmailJob>): Promise<void> {

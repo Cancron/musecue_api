@@ -50,6 +50,12 @@ export const MFA_AUDIT_FIELDS = {
   ENABLED: 'mfaEnabled',
   METHOD: 'mfaMethod',
   RECOVERY_CODES_REMAINING: 'mfaRecoveryCodesRemaining',
+  /** The authenticator was replaced (values: null -> 'replaced'). */
+  AUTHENTICATOR: 'mfaAuthenticator',
+  /** Trusted devices revoked by the change (a count). */
+  TRUSTED_DEVICES_REVOKED: 'mfaTrustedDevicesRevoked',
+  /** How the change was approved (TOTP, RECOVERY_CODE, PASSWORD, GOOGLE). */
+  STEP_UP_METHOD: 'stepUpMethod',
 } as const;
 
 /** MFA at sign-in. */

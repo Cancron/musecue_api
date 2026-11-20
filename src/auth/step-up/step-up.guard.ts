@@ -1,12 +1,19 @@
 import { CanActivate, ExecutionContext, Injectable } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
-import type { StepUpAction } from '@prisma/client';
+import type { StepUpAction, StepUpMethod } from '@prisma/client';
 import type { Request } from 'express';
 import { createHash } from 'node:crypto';
 import AppError from '../../common/errors/app.error';
 import { PrismaService } from '../../common/services/prisma.service';
 import type { IAccessTokenPayload } from '../interfaces/auth.interface';
 import { STEP_UP, STEP_UP_ACTION_KEY } from './step-up.constants';
+
+/** The approval a request was admitted with (set on `request.stepUp`). */
+export interface StepUpContext {
+  action: StepUpAction;
+  method: StepUpMethod;
+  approvalId: string;
+}
 
 /**
  * Requires a valid step-up approval (`X-Step-Up-Token`) for routes marked
@@ -32,7 +39,9 @@ export class StepUpGuard implements CanActivate {
 
     const request = context
       .switchToHttp()
-      .getRequest<Request & { user?: IAccessTokenPayload }>();
+      .getRequest<
+        Request & { user?: IAccessTokenPayload; stepUp?: StepUpContext }
+      >();
     const header = request.headers[STEP_UP.HEADER];
     if (typeof header !== 'string' || header.length === 0) {
       throw AppError.forbidden(
@@ -42,28 +51,36 @@ export class StepUpGuard implements CanActivate {
 
     const user = request.user;
     const now = new Date();
-    const valid =
-      !!user?.sid &&
-      STEP_UP.TOKEN_PATTERN.test(header) &&
-      (await this.isApproved(user.userId, user.sid, action, header, now));
-    if (!valid) {
+    const approval =
+      user?.sid && STEP_UP.TOKEN_PATTERN.test(header)
+        ? await this.approved(user.userId, user.sid, action, header, now)
+        : null;
+    if (!approval) {
       throw AppError.forbidden(
         `The step-up approval is missing, expired or not valid for this action (${action}). Verify again.`,
       );
     }
+    request.stepUp = {
+      action,
+      method: approval.method,
+      approvalId: approval.id,
+    };
     return true;
   }
 
-  private async isApproved(
+  /** The matching approval, or null. */
+  private async approved(
     authId: string,
     sessionId: string,
     action: StepUpAction,
     token: string,
     now: Date,
-  ): Promise<boolean> {
+  ): Promise<{ id: string; method: StepUpMethod } | null> {
     const approval = await this.prisma.stepUpApproval.findUnique({
       where: { tokenHash: createHash('sha256').update(token).digest('hex') },
       select: {
+        id: true,
+        method: true,
         authId: true,
         sessionId: true,
         action: true,
@@ -77,7 +94,7 @@ export class StepUpGuard implements CanActivate {
       approval.action !== action ||
       approval.expiresAt.getTime() <= now.getTime()
     ) {
-      return false;
+      return null;
     }
     const activeSessions = await this.prisma.refreshSession.count({
       where: {
@@ -87,6 +104,8 @@ export class StepUpGuard implements CanActivate {
         expiresAt: { gt: now },
       },
     });
-    return activeSessions > 0;
+    return activeSessions > 0
+      ? { id: approval.id, method: approval.method }
+      : null;
   }
 }

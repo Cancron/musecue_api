@@ -36,9 +36,16 @@ import {
  */
 
 export interface SentEmail {
-  kind: 'verification' | 'welcome' | 'account-deletion-code';
+  kind:
+    | 'verification'
+    | 'welcome'
+    | 'account-deletion-code'
+    | 'security-notification';
   to: string;
   code?: string;
+  /** Security notifications: the event and every argument as passed. */
+  event?: string;
+  args?: unknown[];
 }
 
 /** Stands in for EmailService: records what would have been sent. */
@@ -57,6 +64,21 @@ export class CapturingEmailService {
 
   sendAccountDeletionCodeEmail(to: string, _username: string, code: string) {
     this.sent.push({ kind: 'account-deletion-code', to, code });
+    return Promise.resolve();
+  }
+
+  sendSecurityNotificationEmail(
+    to: string,
+    username: string,
+    event: string,
+    occurredAt: string,
+  ) {
+    this.sent.push({
+      kind: 'security-notification',
+      to,
+      event,
+      args: [to, username, event, occurredAt],
+    });
     return Promise.resolve();
   }
 }

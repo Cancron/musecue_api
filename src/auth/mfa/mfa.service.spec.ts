@@ -10,6 +10,7 @@ import {
 import { MfaSecretCipher } from './mfa-secret.cipher';
 import { totpCode, totpStep } from './mfa-totp';
 import { MfaService } from './mfa.service';
+import { FakeMfaNotifier } from '../../../test/support/fake-mfa-notifier';
 
 // Recovery codes use salted scrypt (deliberately slow, ~50-80 ms each), so
 // tests that issue and verify many codes need more than the 5 s default
@@ -53,13 +54,21 @@ describe('MfaService', () => {
     config.jwt_refresh_secret = originalSecret;
   });
 
+  let notifier: FakeMfaNotifier;
+
   beforeEach(() => {
+    notifier = new FakeMfaNotifier();
     repo = new FakeMfaRepository();
     repo.addAccount(USER, { email: 'owner@example.com' });
     repo.addAccount(OTHER);
     logger = mock<Logger>();
     cipher = testCipher();
-    service = new MfaService(repo.asRepository(), cipher, logger);
+    service = new MfaService(
+      repo.asRepository(),
+      cipher,
+      notifier.asNotifier(),
+      logger,
+    );
   });
 
   const start = (now = T0, authId = USER) =>
@@ -517,6 +526,7 @@ describe('MfaService', () => {
       service = new MfaService(
         repo.asRepository(),
         new MfaSecretCipher({ currentKeyId: null, keys: new Map() }),
+        notifier.asNotifier(),
         logger,
       );
       await expect(rejection(start())).resolves.toMatchObject({

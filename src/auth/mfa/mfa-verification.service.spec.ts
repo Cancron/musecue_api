@@ -14,6 +14,7 @@ import {
   type MfaFactor,
 } from './mfa-verification.service';
 import { MfaService } from './mfa.service';
+import { FakeMfaNotifier } from '../../../test/support/fake-mfa-notifier';
 
 // Recovery codes use salted scrypt (deliberately slow, ~50-80 ms each), so
 // tests that issue and verify many codes need more than the 5 s default
@@ -59,14 +60,27 @@ describe('MfaVerificationService', () => {
     config.jwt_refresh_secret = originalSecret;
   });
 
+  let notifier: FakeMfaNotifier;
+
   beforeEach(() => {
+    notifier = new FakeMfaNotifier();
     repo = new FakeMfaRepository();
     repo.addAccount(ALICE);
     repo.addAccount(BOB);
     logger = mock<Logger>();
     const cipher = testCipher();
-    enrollment = new MfaService(repo.asRepository(), cipher, logger);
-    service = new MfaVerificationService(repo.asRepository(), cipher, logger);
+    enrollment = new MfaService(
+      repo.asRepository(),
+      cipher,
+      notifier.asNotifier(),
+      logger,
+    );
+    service = new MfaVerificationService(
+      repo.asRepository(),
+      cipher,
+      notifier.asNotifier(),
+      logger,
+    );
   });
 
   /** Enables MFA at T0 and returns the TOTP secret and recovery codes. */
@@ -282,7 +296,9 @@ describe('MfaVerificationService', () => {
       const { recoveryCodes: old } = await enable();
       await verify(recovery(old[0]));
 
-      const view = await service.regenerateRecoveryCodes(ALICE, META);
+      const view = await service.regenerateRecoveryCodes(ALICE, {
+        metadata: META,
+      });
 
       expect(view.recoveryCodes).toHaveLength(10);
       expect(view.recoveryCodesRemaining).toBe(10);
@@ -314,7 +330,7 @@ describe('MfaVerificationService', () => {
 
     it('is refused while MFA is not enabled, and creates nothing', async () => {
       await expect(
-        rejection(service.regenerateRecoveryCodes(ALICE, META)),
+        rejection(service.regenerateRecoveryCodes(ALICE, { metadata: META })),
       ).resolves.toEqual({
         status: 409,
         message: 'MFA is not enabled for this account',
@@ -350,7 +366,7 @@ describe('MfaVerificationService', () => {
     await verify(totp(code), now);
     const { recoveryCodes: fresh } = await service.regenerateRecoveryCodes(
       ALICE,
-      META,
+      { metadata: META },
     );
 
     const logged = JSON.stringify([

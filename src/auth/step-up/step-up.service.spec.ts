@@ -16,6 +16,7 @@ import type { GoogleOAuthService } from '../services/google-oauth.service';
 import type { OAuthStateRepository } from '../state/oauth-state.repository';
 import type { RefreshSessionRepository } from '../state/refresh-session.repository';
 import { StepUpService } from './step-up.service';
+import { FakeMfaNotifier } from '../../../test/support/fake-mfa-notifier';
 
 // Recovery codes use salted scrypt (deliberately slow).
 jest.setTimeout(30_000);
@@ -85,7 +86,10 @@ describe('StepUpService', () => {
     config.jwt_refresh_secret = originalSecret;
   });
 
+  let notifier: FakeMfaNotifier;
+
   beforeEach(() => {
+    notifier = new FakeMfaNotifier();
     users = new Map();
     approvals = [];
     activeSessions = new Set([`alice:${SID}`, `gina:${SID}`, `paul:${SID}`]);
@@ -182,12 +186,22 @@ describe('StepUpService', () => {
     google = mock<GoogleOAuthService>();
     logger = mock<Logger>();
     const cipher = testCipher();
-    enrollment = new MfaService(repo.asRepository(), cipher, logger);
+    enrollment = new MfaService(
+      repo.asRepository(),
+      cipher,
+      notifier.asNotifier(),
+      logger,
+    );
     service = new StepUpService(
       prisma as unknown as PrismaService,
       sessions,
       repo.asRepository(),
-      new MfaVerificationService(repo.asRepository(), cipher, logger),
+      new MfaVerificationService(
+        repo.asRepository(),
+        cipher,
+        notifier.asNotifier(),
+        logger,
+      ),
       auth,
       google,
       oauthStates,
@@ -375,9 +389,14 @@ describe('StepUpService', () => {
       return service.startGoogle(principal, action, plus(MIN));
     }
 
-    /** What Google returns for a sign-in of `sub` with `nonce`. */
+    /**
+     * What Google returns for a sign-in of `sub` with `nonce`. By default
+     * the signed ID token states a fresh sign-in (auth_time = 2 minutes in,
+     * after the challenge started at 1 minute); pass `auth_time: null` to
+     * leave the claim out.
+     */
     function googleSignsIn(
-      claims: { sub?: string; nonce?: string; auth_time?: number } = {},
+      claims: { sub?: string; nonce?: string; auth_time?: number | null } = {},
     ) {
       google.exchangeCodeForTokens.mockResolvedValue({
         access_token: 'ya29',
@@ -394,7 +413,10 @@ describe('StepUpService', () => {
         email: 'gina@example.com',
         email_verified: true,
         nonce: claims.nonce,
-        auth_time: claims.auth_time,
+        auth_time:
+          claims.auth_time === null
+            ? undefined
+            : (claims.auth_time ?? Math.floor(plus(2 * MIN).getTime() / 1000)),
         iat: 0,
         exp: 0,
       });
@@ -421,6 +443,10 @@ describe('StepUpService', () => {
         prompt: 'select_account',
         max_age: '0',
         login_hint: 'gina@example.com',
+      });
+      // The signed ID token must carry auth_time.
+      expect(JSON.parse(params.claims)).toEqual({
+        id_token: { auth_time: { essential: true } },
       });
       expect(params.nonce).toMatch(/^[A-Za-z0-9_-]{43}$/);
       expect(started.expiresAt).toEqual(plus(11 * MIN));
@@ -461,6 +487,9 @@ describe('StepUpService', () => {
       ['a token for another nonce', 'nonce'],
       ['another Google account', 'identity'],
       ['a sign-in older than the challenge', 'stale'],
+      ['an ID token without auth_time', 'no-auth-time'],
+      ['an auth_time that is not a number', 'bad-auth-time'],
+      ['an auth_time in the future', 'future'],
     ])('refuse %s (403), approving nothing', async (_, variant) => {
       const started = await start();
       const nonce = new URL(started.url).searchParams.get('nonce')!;
@@ -470,7 +499,13 @@ describe('StepUpService', () => {
         auth_time:
           variant === 'stale'
             ? Math.floor(plus(-MIN).getTime() / 1000) - 1
-            : undefined,
+            : variant === 'no-auth-time'
+              ? null
+              : variant === 'bad-auth-time'
+                ? ('recently' as unknown as number)
+                : variant === 'future'
+                  ? Math.floor(plus(30 * MIN).getTime() / 1000)
+                  : undefined,
       });
       let who = principal;
       if (variant === 'session') who = { userId: 'gina', sid: 'session-2' };

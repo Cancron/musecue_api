@@ -120,6 +120,22 @@ export interface MfaUnitOfWork {
   replaceRecoveryCodes(codeHashes: string[]): Promise<void>;
   /** Unused recovery codes left. */
   countRecoveryCodes(): Promise<number>;
+  /**
+   * Turns MFA off: clears the secret, method, replay step and lockout, and
+   * deletes the recovery codes, any pending enrollment or replacement and
+   * open sign-in challenges.
+   */
+  disableMfa(): Promise<void>;
+  /**
+   * Replaces the confirmed secret with a newly confirmed one (the old
+   * authenticator stops working) and records the new code's step.
+   */
+  replaceMfaSecret(input: {
+    encryptedSecret: string;
+    usedStep: number;
+  }): Promise<void>;
+  /** Revokes every trusted device of the user; returns how many. */
+  revokeTrustedDevices(now: Date): Promise<number>;
   audit(changes: FieldChange[], metadata: ActivityLogMetadata): Promise<void>;
 }
 
@@ -483,6 +499,42 @@ export class MfaRepository {
         });
       },
       countRecoveryCodes: () => this.countUnused(tx, authId),
+      disableMfa: async () => {
+        await tx.authSecurity.update({
+          where: { authId },
+          data: {
+            mfaEnabled: false,
+            mfaMethod: null,
+            mfaSecret: null,
+            mfaLastUsedStep: null,
+            mfaFailedAttemptsAt: [],
+            mfaBlockedUntil: null,
+          },
+        });
+        await tx.mfaRecoveryCode.deleteMany({ where: { authId } });
+        await tx.mfaEnrollment.deleteMany({ where: { authId } });
+        await tx.mfaLoginChallenge.deleteMany({
+          where: { authId, consumedAt: null },
+        });
+      },
+      replaceMfaSecret: async ({ encryptedSecret, usedStep }) => {
+        await tx.authSecurity.update({
+          where: { authId },
+          data: {
+            mfaSecret: encryptedSecret,
+            mfaLastUsedStep: usedStep,
+            mfaFailedAttemptsAt: [],
+            mfaBlockedUntil: null,
+          },
+        });
+      },
+      revokeTrustedDevices: async (now) => {
+        const { count } = await tx.mfaTrustedDevice.updateMany({
+          where: { authId, revokedAt: null },
+          data: { revokedAt: now },
+        });
+        return count;
+      },
       audit,
     };
   }

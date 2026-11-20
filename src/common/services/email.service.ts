@@ -6,6 +6,18 @@ import config from '../config/app.config';
 import AppError from '../errors/app.error';
 import httpStatus from 'http-status';
 import { CustomLoggerService } from './custom-logger.service';
+import {
+  SECURITY_NOTIFICATIONS,
+  type SecurityNotificationEvent,
+} from '../queues/email/security-notifications';
+
+const escapeHtml = (value: string) =>
+  value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 
 export interface EmailOptions {
   to: string;
@@ -138,6 +150,28 @@ export class EmailService {
       subject: 'Confirm the deletion of your MuseCue account',
       html,
     });
+  }
+
+  /**
+   * Send a security notification: fixed text per event (what changed and
+   * when), never a secret, code or token. Values are HTML-escaped.
+   */
+  async sendSecurityNotificationEmail(
+    email: string,
+    username: string,
+    event: SecurityNotificationEvent,
+    occurredAt: string,
+  ): Promise<void> {
+    const text = SECURITY_NOTIFICATIONS[event];
+    const html = this.getEmailTemplate('security-notification.html', {
+      username: escapeHtml(username),
+      title: escapeHtml(text.title),
+      description: escapeHtml(text.description),
+      occurredAt: escapeHtml(new Date(occurredAt).toUTCString()),
+      year: new Date().getFullYear().toString(),
+    });
+
+    await this.sendEmail({ to: email, subject: text.subject, html });
   }
 
   /**

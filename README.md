@@ -554,7 +554,10 @@ Authentication routes:
 | `POST` | `/auth/logout-all`                | Revoke all user sessions                     |
 | `GET`  | `/auth/mfa`                       | Whether MFA is enabled; enrollment state (bearer token) |
 | `POST` | `/auth/mfa/enrollment`            | Start an authenticator-app enrollment (bearer token, step-up `MFA_ENROLLMENT`) |
-| `POST` | `/auth/mfa/enrollment/confirm`    | Confirm it with a six-digit code and enable MFA; shows the recovery codes once (bearer token) |
+| `POST` | `/auth/mfa/enrollment/confirm`    | Confirm it with a six-digit code and enable MFA; shows the recovery codes once (bearer token, step-up `MFA_ENROLLMENT`) |
+| `POST` | `/auth/mfa/disable`               | Turn MFA off (bearer token, step-up `MFA_DISABLE`) |
+| `POST` | `/auth/mfa/authenticator/replacement` | Start replacing the authenticator app (bearer token, step-up `MFA_AUTHENTICATOR_REPLACE`) |
+| `POST` | `/auth/mfa/authenticator/replacement/confirm` | Confirm it with the new app's code (bearer token, step-up `MFA_AUTHENTICATOR_REPLACE`) |
 | `POST` | `/auth/mfa/verify`                | Verify a second factor: app code or recovery code (bearer token) |
 | `POST` | `/auth/mfa/recovery-codes`        | Replace all recovery codes; shows them once (bearer token, step-up `MFA_RECOVERY_CODES`) |
 | `GET`  | `/auth/step-up`                   | How this account steps up (`mfa`, `password`, `google`) (bearer token) |
@@ -725,7 +728,7 @@ npm test -- --runInBand mfa
 TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json test/mfa-
 ```
 
-`test/mfa-login.e2e-spec.ts` covers sign-in with and without MFA (password and Google, with Google's servers simulated), challenges, token issuance (including a refused session write that consumes nothing), trusted-device validity, expiry, revocation and ownership; `test/mfa-step-up.e2e-spec.ts` step-up authentication; `test/mfa-rekey.e2e-spec.ts` the upgrade command.
+`test/mfa-login.e2e-spec.ts` covers sign-in with and without MFA (password and Google, with Google's servers simulated), challenges, token issuance (including a refused session write that consumes nothing), trusted-device validity, expiry, revocation and ownership; `test/mfa-step-up.e2e-spec.ts` step-up authentication (including Google reauthentication without `auth_time`); `test/mfa-security.e2e-spec.ts` MFA management (refused and approved changes, PostgreSQL records, invalidation of old secrets, codes and devices, notifications, absence of sensitive information); `test/mfa-rekey.e2e-spec.ts` the upgrade command.
 
 Migrations: `20261122120000_mfa_totp_enrollment` adds `MfaEnrollment` (CHECK: a pending secret always has an expiry; at most five stored failures) and `authSecurity.mfaLastUsedStep`. `20261123120000_mfa_recovery_codes` adds `MfaRecoveryCode` (protecting trigger) and the verification lockout (`authSecurity.mfaFailedAttemptsAt`, `mfaBlockedUntil`). `20261124120000_mfa_login_and_independent_keys` adds `MfaLoginChallenge` and `MfaTrustedDevice` (CHECKs and trigger above) and switches recovery codes to scrypt (see "Upgrading"). Existing users keep MFA disabled.
 
@@ -737,8 +740,10 @@ Sensitive actions need a fresh proof of identity, even in a signed-in session an
 
 | Action | Protected routes |
 | --- | --- |
-| `MFA_ENROLLMENT` | `POST /auth/mfa/enrollment` |
+| `MFA_ENROLLMENT` | `POST /auth/mfa/enrollment`, `POST /auth/mfa/enrollment/confirm` |
 | `MFA_RECOVERY_CODES` | `POST /auth/mfa/recovery-codes` |
+| `MFA_DISABLE` | `POST /auth/mfa/disable` |
+| `MFA_AUTHENTICATOR_REPLACE` | `POST /auth/mfa/authenticator/replacement`, `POST /auth/mfa/authenticator/replacement/confirm` |
 | `SUBSCRIPTION_CANCEL` | `POST /v1/subscription/cancel` |
 | `DATA_EXPORT` | `POST /v1/privacy/exports` |
 | `DATA_EXPORT_DOWNLOAD` | `GET /v1/privacy/exports/:exportId/download`, `GET /v1/privacy/exports/:exportId/archive` |
@@ -748,7 +753,7 @@ Sensitive actions need a fresh proof of identity, even in a signed-in session an
 2. Get an approval for one action:
    - **MFA enabled:** `POST /auth/step-up` `{ "action": "DATA_EXPORT", "code": "123456" }` or `{ ..., "recoveryCode": "K7MPQ-3XWNR" }` (the password is refused with `400`). Codes are checked like at sign-in: current 30-second step only, each code once, a recovery code is consumed (in the same transaction as the approval), and the shared 5-in-15-minutes MFA lockout applies (`400`, then `429`).
    - **No MFA, with a password:** `POST /auth/step-up` `{ "action": ..., "password": "..." }`. A wrong password answers `403 Incorrect password` and counts toward the account lockout (like failed sign-ins); codes are refused with `400`.
-   - **Google-only (no password, no MFA):** `POST /auth/step-up/google` `{ "action": ... }` returns a Google authorization `url` (with `login_hint`, `prompt=select_account`, `max_age=0`, PKCE and a nonce) and its `state`. Google returns the user to `GOOGLE_STEP_UP_REDIRECT_URI` (a client URL; default `GOOGLE_REDIRECT_URI`), and the client posts `{ "code", "state" }` to `POST /auth/step-up/google/callback` **with the same session's access token**. The one-time challenge (encrypted OAuth state, ten minutes) records the user, session and action; the first callback uses it up, whatever its outcome. Refused with `403`: expired or repeated callbacks, another session or user, an ID token for another nonce, another Google account (`sub` must be the account's), or a Google sign-in older than the challenge (when Google reports `auth_time`).
+   - **Google-only (no password, no MFA):** `POST /auth/step-up/google` `{ "action": ... }` returns a Google authorization `url` (with `login_hint`, `prompt=select_account`, PKCE, a nonce, `max_age=0` and an OpenID Connect `claims` request marking `auth_time` essential in the ID token) and its `state`. Google returns the user to `GOOGLE_STEP_UP_REDIRECT_URI` (a client URL; default `GOOGLE_REDIRECT_URI`), and the client posts `{ "code", "state" }` to `POST /auth/step-up/google/callback` **with the same session's access token**. The one-time challenge (encrypted OAuth state, ten minutes) records the user, session and action; the first callback uses it up, whatever its outcome. Refused with `403`: expired or repeated callbacks, another session or user, an ID token for another nonce, another Google account (`sub` must be the account's), and any signed ID token that does not prove a fresh sign-in: `auth_time` missing, not a number, before the challenge started (one minute of clock skew allowed) or in the future.
    The answer is `{ "stepUpToken": "stup_...", "action", "method", "expiresAt" }` (`201`, `Cache-Control: no-store`).
 3. Send it as `X-Step-Up-Token` on the protected request. It is valid for **ten minutes**, for that action, that user and that sign-in session only, and may be used for that action repeatedly within those ten minutes (for example the download link and the archive, or a retry). Without it, with an expired one, or with one for another action, user or session, the route answers `403` before anything is read or changed. Ending the session (logout, logout-all, security events) ends its approvals at once.
 
@@ -757,6 +762,27 @@ Sessions: every sign-in now has an ID (`RefreshSession.familyId`) that refresh-t
 Migration `20261125120000_step_up_authentication` adds `StepUpApproval` and `RefreshSession.familyId` (existing sessions get the first session of their rotation chain).
 
 Account deletion keeps its own confirmation (password and emailed code) in addition to the step-up.
+
+Migration `20261126120000_mfa_management` adds the `MFA_DISABLE` and `MFA_AUTHENTICATOR_REPLACE` actions.
+
+### MFA management
+
+Every change of the MFA configuration needs a step-up approval for its action (see above). Without a valid one the route answers `403` before anything is read or changed. Each change runs in one transaction under the user's MFA lock, together with its audit entry and the record of its security notification.
+
+| Operation | What happens | Still valid afterwards |
+| --- | --- | --- |
+| `POST /auth/mfa/disable` (`MFA_DISABLE`, no body) | `authSecurity` MFA columns cleared (`mfaEnabled=false`, no method, secret, replay step or MFA lockout); recovery codes, a pending enrollment/replacement and open sign-in challenges deleted; **every trusted device revoked**. Sign-in and step-up use the password again. `409` if MFA is off. | nothing of MFA; a new enrollment uses a new secret |
+| `POST /auth/mfa/authenticator/replacement` then `.../confirm` `{ "code" }` (`MFA_AUTHENTICATOR_REPLACE` on both) | Start returns a new secret and `otpauthUrl` (shown once, pending and encrypted for 10 minutes); the current app keeps working until the confirmation. Confirming with the **new** app's current code (the old app's is refused) re-encrypts the new secret into `authSecurity.mfaSecret` and **revokes every trusted device**. Same lockout (5 incorrect codes in 15 minutes), expiry (`410`) and restart rules as an enrollment; `409` if MFA is off. | recovery codes (the replacement is about the app) |
+| `POST /auth/mfa/recovery-codes` (`MFA_RECOVERY_CODES`, no body) | Ten new codes (shown once) replace all previous ones. | the authenticator and trusted devices |
+
+Responses of disable and replacement confirmation are the MFA status plus `trustedDevicesRevoked`. The confirmation of an enrollment (`MFA_ENROLLMENT`) also needs the approval now, like its start.
+
+**Records (PostgreSQL), never containing a secret, code, key or token:**
+
+- `ActivityLogEvent` (`tableName: authUser`, the user's ID, request IP, user agent, device) with field changes: disable `mfaEnabled true→false`, `mfaMethod totp→null`, `mfaRecoveryCodesRemaining N→0`, `mfaTrustedDevicesRevoked →N`; replacement `mfaAuthenticator →replaced`, `mfaTrustedDevicesRevoked →N`; regeneration `mfaRecoveryCodesRemaining N→10`; each with `stepUpMethod` (`TOTP`, `RECOVERY_CODE`, `PASSWORD` or `GOOGLE`: how the change was approved).
+- `emailHistory` (`emailType: notification`, the subject, recipient, IP and user agent), written in the same transaction as the change with status `pending`, then `sent` by the email worker (`failed` if sending fails for good or the email cannot be queued).
+
+**Security notification emails** (`templates/emails/security-notification.html`) are queued only after the change committed, so a rolled-back change is never announced. They state what changed and when (for example "Two-step verification was turned off") and what to do if it was not the owner; they contain no secret, code, token, IP address or device detail. Values are HTML-escaped. Trusted-device revocation on its own (`DELETE /auth/mfa/trusted-devices/:id`) only reduces access and needs neither a step-up nor a notification.
 
 ### Subscriptions
 
@@ -1084,7 +1110,7 @@ Migration `20261113120000_add_stripe_checkout` adds `PaymentCustomer` and `Check
 
 Not implemented yet: immediate cancellation (including canceling a past-due subscription to stop Stripe's retries), undoing a cancellation (a cancellation reversed in Stripe is not reflected), the customer portal (so users cannot update their card in-app; Stripe's own emails and hosted invoice page can be used), exposing the past-due state in `GET /v1/subscription`, requesting refunds from MuseCue, disputes (`charge.dispute.*`), canceling the Stripe subscription automatically when a payment is refunded, revoking an active free trial on refund (a trial is not a payment and keeps running), reactions to other `customer.subscription.updated` changes (e.g. `unpaid`), and automatic refunds or cancellation of duplicate payments and subscriptions. Renewal delays within Stripe's retry window (up to 3 days) are handled. If a renewal for an older period arrives after a newer one, the older period is recorded but cannot be merged into the term: the database allows one payment per term change.
 
-Database tests (`test/auth-state.e2e-spec.ts`, `test/mfa-enrollment.e2e-spec.ts`, `test/mfa-recovery.e2e-spec.ts`, `test/mfa-login.e2e-spec.ts`, `test/mfa-rekey.e2e-spec.ts`, `test/mfa-step-up.e2e-spec.ts`, `test/postgres-job-queue.e2e-spec.ts`, `test/postgres-mode.e2e-spec.ts`, `test/rate-limit-contract.e2e-spec.ts` (PostgreSQL part), `test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`, `test/privacy-export.e2e-spec.ts`, `test/account-deletion.e2e-spec.ts`, `test/account-erasure.e2e-spec.ts`, `test/stripe-checkout.e2e-spec.ts`, `test/stripe-renewal.e2e-spec.ts`, `test/stripe-payment-failure.e2e-spec.ts`, `test/stripe-cancellation.e2e-spec.ts`, `test/stripe-refund.e2e-spec.ts`, `test/subscription-billing.e2e-spec.ts`, `test/stripe-webhook-reliability.e2e-spec.ts`, `test/stripe-payment-lifecycle.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
+Database tests (`test/auth-state.e2e-spec.ts`, `test/mfa-enrollment.e2e-spec.ts`, `test/mfa-recovery.e2e-spec.ts`, `test/mfa-login.e2e-spec.ts`, `test/mfa-rekey.e2e-spec.ts`, `test/mfa-step-up.e2e-spec.ts`, `test/mfa-security.e2e-spec.ts`, `test/postgres-job-queue.e2e-spec.ts`, `test/postgres-mode.e2e-spec.ts`, `test/rate-limit-contract.e2e-spec.ts` (PostgreSQL part), `test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`, `test/privacy-export.e2e-spec.ts`, `test/account-deletion.e2e-spec.ts`, `test/account-erasure.e2e-spec.ts`, `test/stripe-checkout.e2e-spec.ts`, `test/stripe-renewal.e2e-spec.ts`, `test/stripe-payment-failure.e2e-spec.ts`, `test/stripe-cancellation.e2e-spec.ts`, `test/stripe-refund.e2e-spec.ts`, `test/subscription-billing.e2e-spec.ts`, `test/stripe-webhook-reliability.e2e-spec.ts`, `test/stripe-payment-lifecycle.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
 
 ```bash
 TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json test/subscription-plan test/user-subscription test/subscription-trial test/subscription-status test/pro-access test/trial-lifecycle test/billing test/subscription-security test/privacy-export test/account-deletion test/account-erasure

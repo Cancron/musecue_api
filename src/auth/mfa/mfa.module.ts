@@ -1,4 +1,6 @@
 import { Logger, Module } from '@nestjs/common';
+import { QueueModule } from '../../common/modules';
+import { MfaSecurityNotifier } from './mfa-security-notifier';
 import { AuthGuard } from '../../common/guards/auth.guard';
 import { ActivityLogService } from '../../common/services/activity-log.service';
 import { loadMfaKeyring, MFA_ENCRYPTION_KEY_ENV } from './mfa-keys';
@@ -15,6 +17,7 @@ import { StepUpGuard } from '../step-up/step-up.guard';
  * trusted devices) and the MFA step of sign-in.
  */
 @Module({
+  imports: [QueueModule],
   controllers: [MfaController],
   providers: [
     {
@@ -32,6 +35,7 @@ import { StepUpGuard } from '../step-up/step-up.guard';
       },
     },
     MfaSecretCipher,
+    MfaSecurityNotifier,
     MfaService,
     MfaVerificationService,
     MfaLoginService,

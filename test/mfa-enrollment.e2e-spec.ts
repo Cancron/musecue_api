@@ -231,8 +231,10 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
       mfaMethod: enabled.mfaMethod,
       mfaSecret: enabled.mfaSecret,
     });
-    // Only the step-up's own, newer code was recorded as used.
-    expect(after.mfaLastUsedStep).toBeGreaterThan(enabled.mfaLastUsedStep!);
+    // Never moved back (a step-up with a fresh code may record a newer one).
+    expect(after.mfaLastUsedStep).toBeGreaterThanOrEqual(
+      enabled.mfaLastUsedStep!,
+    );
     expect(
       await ctx.client.activityLogEvent.count({
         where: {
@@ -324,9 +326,12 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
         const user = await createUser();
         await startOk(user);
 
+        // (With an approval: without one the step-up guard answers 403
+        // before the body is even read.)
         await http()
           .post('/auth/mfa/enrollment/confirm')
           .set(as(user))
+          .set('X-Step-Up-Token', await kit.approve(user, 'MFA_ENROLLMENT'))
           .send(body)
           .expect(400);
 
@@ -553,6 +558,12 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
       await http()
         .post('/auth/mfa/enrollment/confirm')
         .set(as(bob))
+        .send({ code: totpCode(secret, kit.clock), userId: alice.id })
+        .expect(403);
+      await http()
+        .post('/auth/mfa/enrollment/confirm')
+        .set(as(bob))
+        .set('X-Step-Up-Token', await kit.approve(bob, 'MFA_ENROLLMENT'))
         .send({ code: totpCode(secret, kit.clock), userId: alice.id })
         .expect(400);
       // ...and query parameters are ignored: Bob only ever sees himself.

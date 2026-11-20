@@ -29,11 +29,20 @@ import {
   MfaVerificationDto,
   toMfaFactor,
 } from './mfa.dto';
-import { MfaService } from './mfa.service';
+import { MfaService, type MfaChangeContext } from './mfa.service';
+import type { StepUpContext } from '../step-up/step-up.guard';
 
 interface AuthenticatedRequest extends Request {
   user: IAccessTokenPayload;
+  /** Set by StepUpGuard on routes that require a step-up. */
+  stepUp?: StepUpContext;
 }
+
+/** Request metadata and how the change was approved (never a secret). */
+const changeContext = (req: AuthenticatedRequest): MfaChangeContext => ({
+  metadata: requestMetadata(req),
+  approvedWith: req.stepUp?.method,
+});
 
 /**
  * Optional MFA (authenticator app) of the signed-in user's own account. The
@@ -79,10 +88,12 @@ export class MfaController {
 
   /**
    * Confirms the enrollment with the app's current six-digit code and
-   * enables MFA. The response carries the ten recovery codes: the only time
+   * enables MFA. Needs a step-up approval (MFA_ENROLLMENT, the same as for
+   * starting it). The response carries the ten recovery codes: the only time
    * they are ever shown.
    */
   @Post('enrollment/confirm')
+  @RequireStepUp('MFA_ENROLLMENT')
   @HttpCode(HttpStatus.OK)
   @Header('Cache-Control', 'no-store')
   @Header('Pragma', 'no-cache')
@@ -132,7 +143,65 @@ export class MfaController {
   ) {
     return this.verification.regenerateRecoveryCodes(
       req.user.userId,
-      requestMetadata(req),
+      changeContext(req),
+    );
+  }
+
+  /**
+   * Turns MFA off: the authenticator secret and every recovery code stop
+   * working, trusted devices are revoked, and a security notification is
+   * sent. Needs a step-up approval (MFA_DISABLE); takes no body.
+   */
+  @Post('disable')
+  @RequireStepUp('MFA_DISABLE')
+  @HttpCode(HttpStatus.OK)
+  @Header('Cache-Control', 'no-store')
+  @Throttle({ default: THROTTLER_CONFIG.STRICT })
+  disable(
+    @Body(EmptyBodyPipe) _body: unknown,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    return this.mfa.disable(req.user.userId, changeContext(req));
+  }
+
+  /**
+   * Starts replacing the authenticator app: returns a new secret (shown only
+   * here) to add to the new app, confirmable for 10 minutes. The current app
+   * keeps working until the replacement is confirmed. Needs a step-up
+   * approval (MFA_AUTHENTICATOR_REPLACE); takes no body.
+   */
+  @Post('authenticator/replacement')
+  @RequireStepUp('MFA_AUTHENTICATOR_REPLACE')
+  @HttpCode(HttpStatus.CREATED)
+  @Header('Cache-Control', 'no-store')
+  @Header('Pragma', 'no-cache')
+  @Throttle({ default: THROTTLER_CONFIG.STRICT })
+  startReplacement(
+    @Body(EmptyBodyPipe) _body: unknown,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    return this.mfa.startReplacement(req.user.userId);
+  }
+
+  /**
+   * Confirms the replacement with the new app's current code: the previous
+   * app's codes stop working, trusted devices are revoked, and a security
+   * notification is sent. Needs a step-up approval
+   * (MFA_AUTHENTICATOR_REPLACE).
+   */
+  @Post('authenticator/replacement/confirm')
+  @RequireStepUp('MFA_AUTHENTICATOR_REPLACE')
+  @HttpCode(HttpStatus.OK)
+  @Header('Cache-Control', 'no-store')
+  @Throttle({ default: THROTTLER_CONFIG.STRICT })
+  confirmReplacement(
+    @Body() dto: ConfirmMfaEnrollmentDto,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    return this.mfa.confirmReplacement(
+      req.user.userId,
+      dto.code,
+      changeContext(req),
     );
   }
 

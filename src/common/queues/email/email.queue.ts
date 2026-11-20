@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { EMAIL_QUEUE } from '../../../infrastructure/jobs/job-queues';
+import type { SecurityNotificationEvent } from './security-notifications';
 import {
   JobDispatcher,
   type JobRequest,
@@ -28,10 +29,25 @@ export interface AccountDeletionCodeEmailJob {
   expiresInMinutes: number;
 }
 
+/**
+ * A security notification (see security-notifications.ts). `historyId` is
+ * the emailHistory row recorded with the change; the handler marks it sent
+ * or failed.
+ */
+export interface SecurityNotificationEmailJob {
+  type: 'security-notification';
+  email: string;
+  username: string;
+  event: SecurityNotificationEvent;
+  occurredAt: string;
+  historyId: string;
+}
+
 export type EmailJob =
   | VerificationEmailJob
   | WelcomeEmailJob
-  | AccountDeletionCodeEmailJob;
+  | AccountDeletionCodeEmailJob
+  | SecurityNotificationEmailJob;
 
 /** 3 attempts, exponential backoff from 2 seconds. */
 const RETRIES = {
@@ -90,6 +106,21 @@ export class EmailQueueService {
       ...RETRIES,
       removeOnComplete: true,
       removeOnFail: true,
+    });
+  }
+
+  /** Queues a security notification (no secret is ever part of it). */
+  async sendSecurityNotification(
+    job: Omit<SecurityNotificationEmailJob, 'type'>,
+    authId: string,
+  ): Promise<void> {
+    await this.jobs.dispatch<EmailJob>(EMAIL_QUEUE, {
+      name: 'send-security-notification',
+      ownerId: authId,
+      data: { type: 'security-notification', ...job },
+      ...RETRIES,
+      removeOnComplete: 100,
+      removeOnFail: 500,
     });
   }
 

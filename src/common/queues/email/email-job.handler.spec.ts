@@ -112,4 +112,66 @@ describe('EmailJobHandler (both queue drivers)', () => {
     });
     expect(prisma.emailHistory.updateMany.mock.calls).toHaveLength(1);
   });
+
+  describe('security notifications', () => {
+    const notification: EmailJob = {
+      type: 'security-notification',
+      email: 'user@example.com',
+      username: 'user',
+      event: 'MFA_DISABLED',
+      occurredAt: '2026-11-26T09:00:00.000Z',
+      historyId: 'history-1',
+    };
+
+    it('sends it and marks exactly its emailHistory row as sent', async () => {
+      await handler.process(job(notification));
+
+      expect(email.sendSecurityNotificationEmail.mock.calls).toEqual([
+        [
+          'user@example.com',
+          'user',
+          'MFA_DISABLED',
+          '2026-11-26T09:00:00.000Z',
+        ],
+      ]);
+      expect(prisma.emailHistory.updateMany.mock.calls).toEqual([
+        [
+          {
+            where: { id: 'history-1' },
+            data: { emailStatus: 'sent', errorMessage: null },
+          },
+        ],
+      ]);
+    });
+
+    it('marks it failed (error class only) and rethrows for a retry', async () => {
+      const failure = new Error('SMTP said: user@example.com rejected');
+      email.sendSecurityNotificationEmail.mockRejectedValue(failure);
+
+      await expect(handler.process(job(notification))).rejects.toBe(failure);
+      expect(prisma.emailHistory.updateMany.mock.calls[0]?.[0]).toEqual({
+        where: { id: 'history-1' },
+        data: {
+          emailStatus: 'failed',
+          errorMessage: 'Error',
+          retry_count: { increment: 1 },
+        },
+      });
+    });
+
+    it('marks an interrupted last attempt as failed', async () => {
+      await handler.onAbandoned({
+        id: 'job-1',
+        name: 'send',
+        data: notification,
+      } as never);
+      expect(prisma.emailHistory.updateMany.mock.calls[0]?.[0]).toEqual({
+        where: { id: 'history-1', emailStatus: 'pending' },
+        data: {
+          emailStatus: 'failed',
+          errorMessage: 'Sending was interrupted',
+        },
+      });
+    });
+  });
 });

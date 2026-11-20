@@ -28,6 +28,8 @@ import { testKeyring } from '../../../test/support/mfa-test-keys';
 import { randomBytes } from 'node:crypto';
 import { StepUpGuard } from '../step-up/step-up.guard';
 import { stepUpSatisfied } from '../../../test/support/step-up-satisfied';
+import { MfaSecurityNotifier } from './mfa-security-notifier';
+import { FakeMfaNotifier } from '../../../test/support/fake-mfa-notifier';
 
 // Recovery codes use salted scrypt (deliberately slow, ~50-80 ms each), so
 // tests that issue and verify many codes need more than the 5 s default
@@ -75,6 +77,10 @@ describe('MFA enrollment (HTTP)', () => {
         MfaVerificationService,
         MfaLoginService,
         MfaSecretCipher,
+        {
+          provide: MfaSecurityNotifier,
+          useValue: new FakeMfaNotifier().asNotifier(),
+        },
         { provide: MFA_KEYRING, useValue: testKeyring(randomBytes(32)) },
         AuthGuard,
         { provide: MfaRepository, useValue: repo.asRepository() },

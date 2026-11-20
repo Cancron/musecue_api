@@ -806,7 +806,13 @@ describeWithDatabase('MFA at sign-in (e2e, PostgreSQL)', () => {
         await http()
           .post('/auth/step-up/google/callback')
           .set(kit.as(user))
-          .send({ code: google.codeFor(who, { nonce }), state: started.state })
+          .send({
+            code: google.codeFor(who, {
+              nonce,
+              auth_time: Math.floor(kit.clock.getTime() / 1000),
+            }),
+            state: started.state,
+          })
           .expect(201),
       );
       await kit.enableMfa(user, approval.stepUpToken);

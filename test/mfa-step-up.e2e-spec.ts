@@ -126,6 +126,36 @@ describeWithDatabase('Step-up authentication (e2e, PostgreSQL)', () => {
           orderBy: { id: 'asc' },
         }),
     },
+    MFA_DISABLE: {
+      mfa: true,
+      send: (user, headers) =>
+        http().post('/auth/mfa/disable').set(kit.as(user)).set(headers),
+      records: async (user) => [
+        await ctx.client.authSecurity.findUnique({
+          where: { authId: user.id },
+        }),
+        await ctx.client.mfaRecoveryCode.count({ where: { authId: user.id } }),
+        await ctx.client.mfaTrustedDevice.findMany({
+          where: { authId: user.id },
+        }),
+      ],
+    },
+    MFA_AUTHENTICATOR_REPLACE: {
+      mfa: true,
+      send: (user, headers) =>
+        http()
+          .post('/auth/mfa/authenticator/replacement')
+          .set(kit.as(user))
+          .set(headers),
+      records: async (user) => [
+        await ctx.client.authSecurity.findUnique({
+          where: { authId: user.id },
+        }),
+        await ctx.client.mfaEnrollment.findUnique({
+          where: { authId: user.id },
+        }),
+      ],
+    },
     SUBSCRIPTION_CANCEL: {
       send: (user, headers) =>
         http().post('/v1/subscription/cancel').set(kit.as(user)).set(headers),
@@ -622,6 +652,8 @@ describeWithDatabase('Step-up authentication (e2e, PostgreSQL)', () => {
           .expect(201),
       );
     const nonceOf = (url: string) => new URL(url).searchParams.get('nonce');
+    /** auth_time of a Google sign-in happening now (seconds). */
+    const signedInNow = () => Math.floor(kit.clock.getTime() / 1000);
     const callback = (user: TestUser, body: { code: string; state: string }) =>
       http().post('/auth/step-up/google/callback').set(kit.as(user)).send(body);
 
@@ -648,9 +680,17 @@ describeWithDatabase('Step-up authentication (e2e, PostgreSQL)', () => {
         prompt: 'select_account',
         code_challenge_method: 'S256',
       });
+      // The request asks Google for auth_time in the signed ID token.
+      expect(JSON.parse(url.searchParams.get('claims') as string)).toEqual({
+        id_token: { auth_time: { essential: true } },
+      });
+      expect(url.searchParams.get('max_age')).toBe('0');
       const approval = dataOf<Approval>(
         await callback(user, {
-          code: google.codeFor(who, { nonce: nonceOf(started.url) }),
+          code: google.codeFor(who, {
+            nonce: nonceOf(started.url),
+            auth_time: signedInNow(),
+          }),
           state: started.state,
         }).expect(201),
       );
@@ -671,6 +711,8 @@ describeWithDatabase('Step-up authentication (e2e, PostgreSQL)', () => {
       'another Google account',
       'a token for another challenge (nonce)',
       'a sign-in older than the challenge',
+      'a signed ID token without auth_time',
+      'an auth_time in the future',
     ])('refuse %s (403), approving nothing', async (variant) => {
       const who = profile();
       const user = await googleSession(who);
@@ -678,12 +720,16 @@ describeWithDatabase('Step-up authentication (e2e, PostgreSQL)', () => {
       const nonce = nonceOf(started.url);
       let caller = user;
       let signedInAs = who;
-      const claims: Record<string, unknown> = { nonce };
+      // Everything valid (including a fresh auth_time) except the variant.
+      const claims: Record<string, unknown> = {
+        nonce,
+        auth_time: signedInNow(),
+      };
 
       if (variant === 'expired') kit.advance(10 * MIN);
       if (variant === 'repeated') {
         await callback(user, {
-          code: google.codeFor(who, { nonce }),
+          code: google.codeFor(who, { nonce, auth_time: signedInNow() }),
           state: started.state,
         }).expect(201);
         await ctx.client.stepUpApproval.deleteMany({
@@ -700,6 +746,12 @@ describeWithDatabase('Step-up authentication (e2e, PostgreSQL)', () => {
       }
       if (variant === 'a sign-in older than the challenge') {
         claims.auth_time = Math.floor(kit.clock.getTime() / 1000) - 3600;
+      }
+      if (variant === 'a signed ID token without auth_time') {
+        delete claims.auth_time;
+      }
+      if (variant === 'an auth_time in the future') {
+        claims.auth_time = Math.floor(kit.clock.getTime() / 1000) + 3600;
       }
 
       const refused = await callback(caller, {

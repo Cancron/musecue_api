@@ -324,6 +324,47 @@ export class FakeMfaRepository {
       },
       countRecoveryCodes: () =>
         Promise.resolve(codes.filter((c) => !c.usedAt).length),
+      disableMfa: () => {
+        if (!account) return reject('no account');
+        account = {
+          ...account,
+          mfaEnabled: false,
+          mfaMethod: null,
+          mfaSecret: null,
+          mfaLastUsedStep: null,
+          mfaFailedAttemptsAt: [],
+          mfaBlockedUntil: null,
+        };
+        codes = [];
+        enrollment = undefined;
+        for (let i = challenges.length - 1; i >= 0; i--) {
+          if (challenges[i].authId === authId && !challenges[i].consumedAt) {
+            challenges.splice(i, 1);
+          }
+        }
+        return Promise.resolve();
+      },
+      replaceMfaSecret: ({ encryptedSecret, usedStep }) => {
+        if (!account) return reject('no account');
+        account = {
+          ...account,
+          mfaSecret: encryptedSecret,
+          mfaLastUsedStep: usedStep,
+          mfaFailedAttemptsAt: [],
+          mfaBlockedUntil: null,
+        };
+        return Promise.resolve();
+      },
+      revokeTrustedDevices: (now) => {
+        let count = 0;
+        for (const d of devices) {
+          if (d.authId === authId && !d.revokedAt) {
+            d.revokedAt = now;
+            count += 1;
+          }
+        }
+        return Promise.resolve(count);
+      },
       audit: (changes, metadata) => {
         audits.push({ authId, changes, metadata });
         return Promise.resolve();

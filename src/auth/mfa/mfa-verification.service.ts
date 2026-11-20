@@ -22,6 +22,8 @@ import {
   type MfaUnitOfWork,
   type MfaVerificationState,
 } from './mfa.repository';
+import { MfaSecurityNotifier } from './mfa-security-notifier';
+import type { MfaChangeContext } from './mfa.service';
 
 /** A second factor: the authenticator app's code or a recovery code. */
 export type MfaFactor =
@@ -75,6 +77,7 @@ export class MfaVerificationService {
   constructor(
     private readonly repository: MfaRepository,
     private readonly cipher: MfaSecretCipher,
+    private readonly notifier: MfaSecurityNotifier,
     @Inject(WINSTON_MODULE_PROVIDER) private readonly logger: Logger,
   ) {}
 
@@ -119,19 +122,16 @@ export class MfaVerificationService {
    */
   async regenerateRecoveryCodes(
     authId: string,
-    metadata: ActivityLogMetadata,
+    change: MfaChangeContext,
+    now: Date = new Date(),
   ): Promise<MfaRecoveryCodesView> {
     const result = await this.guard(() =>
       this.repository.withLock(authId, async (uow) => {
         const account = requireActiveAccount(await uow.account());
-        const outcome: CheckOutcome = account.mfaEnabled
-          ? { kind: 'VERIFIED', method: 'totp' }
-          : { kind: 'NOT_ENABLED' };
-        if (outcome.kind !== 'VERIFIED') {
-          return { outcome, recoveryCodes: [] as string[] };
-        }
+        if (!account.mfaEnabled) return { kind: 'NOT_ENABLED' as const };
         const previous = await uow.countRecoveryCodes();
         const recoveryCodes = await issueRecoveryCodes(uow, authId);
+        const metadata = { ...change.metadata, actionedBy: authId };
         await uow.audit(
           [
             {
@@ -139,14 +139,32 @@ export class MfaVerificationService {
               oldValue: String(previous),
               newValue: String(recoveryCodes.length),
             },
+            ...(change.approvedWith
+              ? [
+                  {
+                    fieldName: MFA_AUDIT_FIELDS.STEP_UP_METHOD,
+                    oldValue: null,
+                    newValue: change.approvedWith,
+                  },
+                ]
+              : []),
           ],
-          { ...metadata, actionedBy: authId },
+          metadata,
         );
-        return { outcome, recoveryCodes };
+        // Recorded with the change; sent once it committed.
+        const notification = await this.notifier.record(uow.tx, {
+          authId,
+          event: 'MFA_RECOVERY_CODES_REGENERATED',
+          metadata,
+          now,
+        });
+        return { kind: 'REGENERATED' as const, recoveryCodes, notification };
       }),
     );
-    const { outcome } = result;
-    if (outcome.kind !== 'VERIFIED') throw this.declinedError(authId, outcome);
+    if (result.kind === 'NOT_ENABLED') {
+      throw this.declinedError(authId, { kind: 'NOT_ENABLED' });
+    }
+    await this.notifier.dispatch(result.notification);
     this.logger.info('MFA recovery codes regenerated', {
       context: CONTEXT,
       authId,

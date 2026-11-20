@@ -16,6 +16,7 @@ import {
   type MfaFactor,
 } from './mfa-verification.service';
 import { MfaService } from './mfa.service';
+import { FakeMfaNotifier } from '../../../test/support/fake-mfa-notifier';
 
 // Recovery codes use salted scrypt (deliberately slow, ~50-80 ms each), so
 // tests that issue and verify many codes need more than the 5 s default
@@ -57,16 +58,25 @@ describe('MfaLoginService', () => {
     config.jwt_refresh_secret = originalSecret;
   });
 
+  let notifier: FakeMfaNotifier;
+
   beforeEach(() => {
+    notifier = new FakeMfaNotifier();
     repo = new FakeMfaRepository();
     repo.addAccount(ALICE);
     repo.addAccount(BOB);
     logger = mock<Logger>();
     const cipher = testCipher();
-    enrollment = new MfaService(repo.asRepository(), cipher, logger);
+    enrollment = new MfaService(
+      repo.asRepository(),
+      cipher,
+      notifier.asNotifier(),
+      logger,
+    );
     verification = new MfaVerificationService(
       repo.asRepository(),
       cipher,
+      notifier.asNotifier(),
       logger,
     );
     service = new MfaLoginService(repo.asRepository(), verification, logger);
@@ -614,7 +624,9 @@ describe('MfaLoginService', () => {
 
     /** A new set of recovery codes for Alice. */
     async function regenerateCodes(): Promise<string[]> {
-      const view = await verification.regenerateRecoveryCodes(ALICE, META);
+      const view = await verification.regenerateRecoveryCodes(ALICE, {
+        metadata: META,
+      });
       return view.recoveryCodes;
     }
   });

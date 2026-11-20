@@ -196,9 +196,13 @@ export class StepUpService {
         .update(codeVerifier)
         .digest('base64url'),
       code_challenge_method: 'S256',
-      // Ask Google for a fresh, interactive sign-in of this account.
+      // Ask Google for a fresh, interactive sign-in of this account, and for
+      // the time of that sign-in (auth_time) in the signed ID token: max_age
+      // makes auth_time required (OpenID Connect), and the claims request
+      // marks it essential. A callback without it is refused.
       prompt: 'select_account',
       max_age: '0',
+      claims: JSON.stringify({ id_token: { auth_time: { essential: true } } }),
       login_hint: account.email,
     });
     return {
@@ -272,14 +276,15 @@ export class StepUpService {
         'The Google account does not match this account. Sign in with the same Google account.',
       );
     }
-    const startedAt = new Date(challenge.createdAt).getTime();
-    if (
-      claims.auth_time !== undefined &&
-      claims.auth_time * 1000 < startedAt - STEP_UP.GOOGLE_AUTH_TIME_SKEW_MS
-    ) {
-      this.refused(principal.userId, 'stale_google_sign_in');
+    if (!this.isFreshSignIn(claims.auth_time, challenge.createdAt, now)) {
+      this.refused(
+        principal.userId,
+        claims.auth_time === undefined
+          ? 'google_auth_time_missing'
+          : 'stale_google_sign_in',
+      );
       throw AppError.forbidden(
-        'Google did not ask for a new sign-in. Start again.',
+        'Google did not confirm a new sign-in. Start again.',
       );
     }
 
@@ -297,6 +302,28 @@ export class StepUpService {
       method: approval.method,
     });
     return approval;
+  }
+
+  /**
+   * The signed ID token must state when the user signed in (`auth_time`,
+   * seconds), and that must be after this reauthentication started (allowing
+   * a small clock skew) and not in the future. Anything else does not prove a
+   * fresh authentication.
+   */
+  private isFreshSignIn(
+    authTime: unknown,
+    challengeCreatedAt: string,
+    now: Date,
+  ): boolean {
+    if (typeof authTime !== 'number' || !Number.isFinite(authTime)) {
+      return false;
+    }
+    const signedInAt = authTime * 1000;
+    const startedAt = new Date(challengeCreatedAt).getTime();
+    return (
+      signedInAt >= startedAt - STEP_UP.GOOGLE_AUTH_TIME_SKEW_MS &&
+      signedInAt <= now.getTime() + STEP_UP.GOOGLE_AUTH_TIME_SKEW_MS
+    );
   }
 
   private async approveWithMfa(
