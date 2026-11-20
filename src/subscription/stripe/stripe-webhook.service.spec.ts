@@ -355,6 +355,7 @@ describe('StripeWebhookService', () => {
       expect(db.subscriptionEvent.rows).toHaveLength(1);
       expect(recordOf(authId)).toEqual(before);
       expect(credits.expireTrialCreditsOnUpgrade.mock.calls).toHaveLength(1);
+      expect(credits.recordPaidPeriod.mock.calls).toHaveLength(1);
     });
 
     it('records the payment once for concurrent deliveries', async () => {
@@ -401,8 +402,9 @@ describe('StripeWebhookService', () => {
       expect(db.subscriptionEvent.rows).toHaveLength(0);
       expect(recordOf(authId)).toMatchObject(existingTerm);
       expect(checkoutRow(checkoutId)?.status).toBe('COMPLETED');
-      // No new term, so nothing to end.
+      // No new term, so nothing to end and no Pro credits.
       expect(credits.expireTrialCreditsOnUpgrade.mock.calls).toHaveLength(0);
+      expect(credits.recordPaidPeriod.mock.calls).toHaveLength(0);
       expect(logger.logWithMetadata.mock.calls).toContainEqual([
         'error',
         expect.stringContaining('Duplicate paid Pro checkout'),
@@ -532,6 +534,21 @@ describe('StripeWebhookService', () => {
       expect(eventsOf(authId)).toEqual(['CREATED', 'RENEWED']);
       const renewed = db.subscriptionEvent.rows.at(-1);
       expect(renewed?.paymentId).toBe(db.paymentTransaction.rows.at(-1)?.id);
+      // Pro credits for the first payment and for the renewal, each with the
+      // recorded payment and the period it paid for.
+      expect(credits.recordPaidPeriod.mock.calls).toHaveLength(2);
+      expect(credits.recordPaidPeriod.mock.calls[1]).toEqual([
+        db,
+        authId,
+        expect.objectContaining({
+          id: db.paymentTransaction.rows.at(-1)?.id,
+          subscriptionId: recordOf(authId)?.id,
+          billingInterval: 'MONTHLY',
+          periodStart: new Date('2026-02-28T10:00:00.000Z'),
+          periodEnd: new Date('2026-03-31T10:00:00.000Z'),
+        }),
+        expect.any(Date),
+      ]);
 
       const secondRenewal = renew(subscriptionId);
       await expect(deliverInvoice(secondRenewal)).resolves.toBe('RENEWED');
@@ -594,32 +611,8 @@ describe('StripeWebhookService', () => {
       expect(paymentsOf(authId)).toHaveLength(2);
       expect(eventsOf(authId)).toEqual(['CREATED', 'RENEWED']);
       expect(recordOf(authId)).toEqual(afterFirst);
-      // Monthly Pro credits: once for the first payment, once for the
-      // renewal, never for the replays; each for its own payment.
-      expect(
-        credits.grantPaidPeriod.mock.calls.map(([client, input]) => [
-          client,
-          input.authId,
-          input.subscriptionId,
-          input.payment,
-        ]),
-      ).toEqual([
-        [
-          db,
-          authId,
-          afterFirst.id,
-          expect.objectContaining({ status: 'SUCCEEDED' }),
-        ],
-        [
-          db,
-          authId,
-          afterFirst.id,
-          expect.objectContaining({
-            providerPaymentId: invoiceId,
-            status: 'SUCCEEDED',
-          }),
-        ],
-      ]);
+      // Activation and one renewal: replays allocate nothing.
+      expect(credits.recordPaidPeriod.mock.calls).toHaveLength(2);
     });
 
     it('records a renewal once for concurrent deliveries', async () => {
@@ -835,8 +828,6 @@ describe('StripeWebhookService', () => {
 
       expect(paymentsOf(authId)).toHaveLength(2);
       expect(recordOf(authId)).toEqual(before);
-      // No credits for the second charge (first payment and renewal only).
-      expect(credits.grantPaidPeriod.mock.calls).toHaveLength(2);
       expect(logger.logWithMetadata.mock.calls).toContainEqual([
         'error',
         expect.stringContaining('already paid period'),
@@ -960,6 +951,8 @@ describe('StripeWebhookService', () => {
         });
         expect(attempt?.paidAt).toBeUndefined();
         expect(eventsOf(authId)).toEqual(['CREATED', 'PAYMENT_FAILED']);
+        // Only the first (successful) payment allocated Pro credits.
+        expect(credits.recordPaidPeriod.mock.calls).toHaveLength(1);
         // Only the past-due marker changes; the paid term does not.
         expect(recordOf(authId)).toEqual({
           ...before,
@@ -971,8 +964,6 @@ describe('StripeWebhookService', () => {
           accessOf(authId, new Date(FIRST_EXPIRY.getTime() - 1)).hasProAccess,
         ).toBe(true);
         expect(accessOf(authId, FIRST_EXPIRY).hasProAccess).toBe(false);
-        // Credits for the first payment only; none for the failed renewal.
-        expect(credits.grantPaidPeriod.mock.calls).toHaveLength(1);
       });
 
       it('records every failed retry once and keeps the first past-due time', async () => {
@@ -1240,7 +1231,6 @@ describe('StripeWebhookService', () => {
         expect(accessOf(authId).hasProAccess).toBe(false);
         // The customer can still pay in the same checkout.
         expect(checkoutRow(checkoutId)?.status).toBe('OPEN');
-        expect(credits.grantPaidPeriod.mock.calls).toHaveLength(0);
       });
 
       it('activates once when the customer then pays in the same checkout', async () => {

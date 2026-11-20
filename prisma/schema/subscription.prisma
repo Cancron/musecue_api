@@ -66,8 +66,6 @@ model UserSubscription {
   payments         PaymentTransaction[]
   events           SubscriptionEvent[]
   checkoutSessions CheckoutSession[]
-  // Monthly Pro credits granted for this subscription's payments.
-  creditAllocations CreditAllocation[]
 
   @@unique([paymentProvider, providerSubscriptionId])
   @@index([status])
@@ -109,10 +107,12 @@ model PaymentTransaction {
 
   subscription UserSubscription?  @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
   event           SubscriptionEvent?
+  // Monthly Pro credits paid for by this payment (see CreditAllocation),
+  // and the months they are scheduled for (CreditAllocationSchedule).
+  creditAllocations CreditAllocation[]
+  creditSchedule    CreditAllocationSchedule[]
   checkoutSession CheckoutSession?
   refunds         PaymentRefund[]
-  // Monthly Pro credits this payment paid for.
-  creditAllocations CreditAllocation[]
 
   @@unique([provider, providerPaymentId])
   @@index([subscriptionId, createdAt])

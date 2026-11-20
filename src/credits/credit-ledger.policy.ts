@@ -40,41 +40,6 @@ export function getGrantExpiryRejection(
   return null;
 }
 
-/**
- * Returns why a grant's paid period is invalid, or null if valid. SUBSCRIPTION
- * credits must name the payment that paid for them and the period they cover
- * (ending when they expire); other sources must not.
- */
-export function getPaidPeriodRejection(
-  source: CreditSource,
-  expiresAt: Date | null | undefined,
-  paidPeriod:
-    | {
-        subscriptionId: string;
-        paymentId: string;
-        periodStart: Date;
-        periodEnd: Date;
-      }
-    | undefined,
-): string | null {
-  if (source !== CreditSource.SUBSCRIPTION) {
-    return paidPeriod ? `${source} credits have no paid period` : null;
-  }
-  if (!paidPeriod) {
-    return 'SUBSCRIPTION credits require the successful payment that paid for them';
-  }
-  if (!paidPeriod.subscriptionId || !paidPeriod.paymentId) {
-    return 'The paid period needs its subscription and payment';
-  }
-  if (paidPeriod.periodStart.getTime() >= paidPeriod.periodEnd.getTime()) {
-    return 'The paid period must end after it starts';
-  }
-  if (!expiresAt || expiresAt.getTime() !== paidPeriod.periodEnd.getTime()) {
-    return 'SUBSCRIPTION credits expire at the end of their paid period';
-  }
-  return null;
-}
-
 /** Returns why a reference or key is invalid, or null if valid. */
 export function getReferenceRejection(
   name: string,
@@ -91,14 +56,66 @@ export function getReferenceRejection(
 
 /** Whether an allocation counts towards the available balance at `now`. */
 export function isAllocationAvailable(
-  allocation: { remaining: Prisma.Decimal; expiresAt: Date | null },
+  allocation: {
+    remaining: Prisma.Decimal;
+    expiresAt: Date | null;
+    periodStart?: Date | null;
+  },
   now: Date,
 ): boolean {
   return (
     allocation.remaining.gt(0) &&
+    hasAllocationStarted(allocation, now) &&
     (allocation.expiresAt === null ||
       allocation.expiresAt.getTime() > now.getTime())
   );
+}
+
+/** Whether an allocation's period has begun (no period: from its grant). */
+export function hasAllocationStarted(
+  allocation: { periodStart?: Date | null },
+  now: Date,
+): boolean {
+  return (
+    allocation.periodStart === undefined ||
+    allocation.periodStart === null ||
+    allocation.periodStart.getTime() <= now.getTime()
+  );
+}
+
+/** The payment a SUBSCRIPTION allocation belongs to, and its month. */
+export interface PaymentLink {
+  subscriptionId: string;
+  paymentId: string;
+  /** Start of the month the credits are for; they count from then. */
+  periodStart: Date;
+}
+
+/**
+ * Returns why a grant's payment link is invalid for its source, or null.
+ * SUBSCRIPTION credits must belong to a payment and a month that starts
+ * before it expires; other sources have no payment.
+ */
+export function getPaymentLinkRejection(
+  source: CreditSource,
+  link: PaymentLink | null | undefined,
+  expiresAt: Date | null,
+): string | null {
+  if (source !== CreditSource.SUBSCRIPTION) {
+    return link ? `${source} credits do not belong to a payment` : null;
+  }
+  if (!link) return 'SUBSCRIPTION credits require their payment and period';
+  if (
+    getReferenceRejection('subscriptionId', link.subscriptionId) ||
+    getReferenceRejection('paymentId', link.paymentId)
+  ) {
+    return 'SUBSCRIPTION credits require their subscription and payment';
+  }
+  if (Number.isNaN(link.periodStart.getTime())) return 'Invalid period start';
+  if (expiresAt && link.periodStart.getTime() >= expiresAt.getTime()) {
+    return 'The period must start before the credits expire';
+  }
+  return null;
 }
 
 /** Whether an allocation's unused credits have expired at `now`. */
@@ -118,6 +135,7 @@ export interface SpendableAllocation {
   remaining: Prisma.Decimal;
   expiresAt: Date | null;
   grantedAt: Date;
+  periodStart?: Date | null;
 }
 
 /**

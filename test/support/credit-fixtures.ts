@@ -1,6 +1,4 @@
-import { BillingInterval, Prisma, type PrismaClient } from '@prisma/client';
-import type { PaidPeriod } from '../../src/credits/interfaces/credit-wallet.interface';
-import { givenProPurchased } from './subscription-fixtures';
+import { Prisma, type PrismaClient } from '@prisma/client';
 
 /**
  * Purchased and referral credits are not issued by the application yet; they
@@ -103,36 +101,4 @@ export async function expectConsistentLedger(
   );
   expect(balance.toFixed()).toBe(remaining.toFixed());
   return { allocations, transactions };
-}
-
-/**
- * A successful Pro payment for `authId` covering [periodStart, one billing
- * interval later), recorded as the repository's payment fixtures do (a
- * SUCCEEDED PaymentTransaction and its CREATED event), so that SUBSCRIPTION
- * credits can be granted for it. Returns the wallet's `paidPeriod`.
- */
-export async function givenPaidPeriod(
-  client: PrismaClient,
-  authId: string,
-  periodStart: Date,
-  billingInterval: BillingInterval = BillingInterval.MONTHLY,
-): Promise<PaidPeriod> {
-  await client.userSubscription.upsert({
-    where: { authId },
-    create: { authId },
-    update: {},
-  });
-  const subscription = await givenProPurchased(client, authId, {
-    billingInterval,
-    startedAt: periodStart,
-  });
-  const payment = await client.paymentTransaction.findFirstOrThrow({
-    where: { subscriptionId: subscription.id, periodStart },
-  });
-  return {
-    subscriptionId: subscription.id,
-    paymentId: payment.id,
-    periodStart: payment.periodStart,
-    periodEnd: payment.periodEnd,
-  };
 }

@@ -48,17 +48,10 @@ describe('CreditWalletService', () => {
     subscriptionId: null,
     paymentId: null,
     periodStart: null,
-    periodEnd: null,
     createdAt: later(-24 * HOUR),
     updatedAt: later(-24 * HOUR),
     ...overrides,
   });
-  const paidPeriod = {
-    subscriptionId: 'sub-1',
-    paymentId: 'pay-1',
-    periodStart: NOW,
-    periodEnd: later(30 * 24 * HOUR),
-  };
 
   const storedTransaction = (
     overrides: Partial<CreditTransaction> = {},
@@ -240,7 +233,11 @@ describe('CreditWalletService', () => {
         sourceReference: 'sub_1:2026-11-23',
         amount: '1000',
         expiresAt: later(30 * 24 * HOUR),
-        paidPeriod,
+        payment: {
+          subscriptionId: 'sub-1',
+          paymentId: 'pay-1',
+          periodStart: NOW,
+        },
       });
 
       expect(calls.slice(0, 2)).toEqual(['ensure-wallet', 'lock']);
@@ -262,13 +259,6 @@ describe('CreditWalletService', () => {
         subscriptionId: 'sub-1',
         paymentId: 'pay-1',
         periodStart: NOW,
-        periodEnd: later(30 * 24 * HOUR),
-      });
-      expect(result.allocation).toMatchObject({
-        subscriptionId: 'sub-1',
-        paymentId: 'pay-1',
-        periodStart: NOW.toISOString(),
-        periodEnd: later(30 * 24 * HOUR).toISOString(),
       });
       expect(createdTransactions()[0]).toMatchObject({
         type: CreditTransactionType.GRANT,
@@ -384,37 +374,61 @@ describe('CreditWalletService', () => {
     });
 
     it.each([
+      [CreditSource.TRIAL, null, /require an expiration date/],
+      [CreditSource.SUBSCRIPTION, later(-1), /in the future/],
+      [CreditSource.PURCHASE, later(HOUR), /never expire/],
+      [CreditSource.REFERRAL, later(HOUR), /never expire/],
+    ])(
+      'enforces the expiry rule for %s credits',
+      async (source, expiresAt, message) => {
+        await expect(
+          service.grant({
+            authId: 'user-1',
+            source,
+            sourceReference: 'ref',
+            amount: 1,
+            expiresAt,
+            ...(source === CreditSource.SUBSCRIPTION
+              ? {
+                  payment: {
+                    subscriptionId: 'sub-1',
+                    paymentId: 'pay-1',
+                    periodStart: later(-2),
+                  },
+                }
+              : {}),
+          }),
+        ).rejects.toThrow(message);
+        expectNothingWritten();
+      },
+    );
+
+    it.each([
       [
-        'SUBSCRIPTION credits without the payment that paid for them',
+        'SUBSCRIPTION credits without their payment',
         { source: CreditSource.SUBSCRIPTION, expiresAt: later(HOUR) },
-        /require the successful payment/,
+        /require their payment and period/,
       ],
       [
-        'SUBSCRIPTION credits expiring before the end of their paid period',
+        'SUBSCRIPTION credits whose period starts at their expiry',
         {
           source: CreditSource.SUBSCRIPTION,
           expiresAt: later(HOUR),
-          paidPeriod,
-        },
-        /expire at the end of their paid period/,
-      ],
-      [
-        'a paid period that ends before it starts',
-        {
-          source: CreditSource.SUBSCRIPTION,
-          expiresAt: later(HOUR),
-          paidPeriod: {
-            ...paidPeriod,
-            periodStart: later(2 * HOUR),
-            periodEnd: later(HOUR),
+          payment: {
+            subscriptionId: 'sub-1',
+            paymentId: 'pay-1',
+            periodStart: later(HOUR),
           },
         },
-        /end after it starts/,
+        /must start before/,
       ],
       [
-        'a paid period on purchased credits',
-        { source: CreditSource.PURCHASE, paidPeriod },
-        /have no paid period/,
+        'purchased credits with a payment',
+        {
+          source: CreditSource.PURCHASE,
+          payment: { subscriptionId: 's', paymentId: 'p', periodStart: NOW },
+        },
+        /do not belong to a payment/,
       ],
     ])(
       'rejects %s before any database access',
@@ -431,26 +445,24 @@ describe('CreditWalletService', () => {
       },
     );
 
-    it.each([
-      [CreditSource.TRIAL, null, /require an expiration date/],
-      [CreditSource.TRIAL, later(-1), /in the future/],
-      [CreditSource.PURCHASE, later(HOUR), /never expire/],
-      [CreditSource.REFERRAL, later(HOUR), /never expire/],
-    ])(
-      'enforces the expiry rule for %s credits',
-      async (source, expiresAt, message) => {
-        await expect(
-          service.grant({
-            authId: 'user-1',
-            source,
-            sourceReference: 'ref',
-            amount: 1,
-            expiresAt,
-          }),
-        ).rejects.toThrow(message);
-        expectNothingWritten();
-      },
-    );
+    it('does not count credits whose period has not started, but reports them as upcoming', async () => {
+      prisma.creditAllocation.findMany.mockResolvedValue([
+        allocation({ id: 'now', remaining: D(3) }),
+        allocation({
+          id: 'next-month',
+          source: CreditSource.SUBSCRIPTION,
+          remaining: D(1000),
+          periodStart: later(HOUR),
+          expiresAt: later(31 * 24 * HOUR),
+        }),
+      ]);
+
+      await expect(service.getBalance('user-1')).resolves.toMatchObject({
+        available: '3',
+        upcoming: '1000',
+        bySource: { SUBSCRIPTION: '0', PURCHASE: '3' },
+      });
+    });
   });
 
   describe('debit', () => {
@@ -503,6 +515,40 @@ describe('CreditWalletService', () => {
         consumed: '0.45',
         overage: '0',
         replayed: false,
+      });
+    });
+
+    it('never spends credits whose period has not started, but keeps them in balanceAfter', async () => {
+      allocations = [
+        allocation({ id: 'purchase', remaining: D('2') }),
+        allocation({
+          id: 'next-month',
+          source: CreditSource.SUBSCRIPTION,
+          remaining: D('1000'),
+          periodStart: later(HOUR),
+          expiresAt: later(31 * 24 * HOUR),
+          paymentId: 'pay-2',
+          subscriptionId: 'sub-1',
+        }),
+      ];
+
+      await service.debit({
+        authId: 'user-1',
+        amount: '1.5',
+        idempotencyKey: 'run-future',
+      });
+
+      expect(prisma.creditAllocation.updateMany.mock.calls).toEqual([
+        [
+          {
+            where: { id: 'purchase', remaining: { gte: D('1.5') } },
+            data: { remaining: { decrement: D('1.5') } },
+          },
+        ],
+      ]);
+      // What the wallet holds after the debit (the database checks this).
+      expect(createdTransactions()[0]).toMatchObject({
+        balanceAfter: D('1000.5'),
       });
     });
 

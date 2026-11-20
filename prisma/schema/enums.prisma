@@ -324,3 +324,12 @@ enum CreditTransactionType {
   DEBIT
   EXPIRATION
 }
+
+// Progress of one scheduled month of Pro credits. Only moves forward:
+// PENDING -> ALLOCATED (credits granted) or SKIPPED (not entitled any more,
+// e.g. the payment was refunded or the paid term no longer covers it).
+enum CreditScheduleStatus {
+  PENDING
+  ALLOCATED
+  SKIPPED
+}

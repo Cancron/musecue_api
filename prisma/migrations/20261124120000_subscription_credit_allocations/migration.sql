@@ -1,124 +1,82 @@
--- Monthly Pro credits are granted for successful payments: every new
--- SUBSCRIPTION allocation records the user's subscription, the payment that
--- paid for it and the billing period it covers, and expires at the end of
--- that period (the billing boundary). See prisma/schema/credit.prisma.
+-- Monthly Pro credits belong to the successful Stripe payment that paid for
+-- them. Each SUBSCRIPTION allocation records the UserSubscription, the
+-- PaymentTransaction and the month [periodStart, expiresAt) it is for; its
+-- credits count from periodStart (a renewal paid before its period starts is
+-- allocated at payment time but only counts once the period begins).
 --
 -- Guarantees:
---   * a new SUBSCRIPTION allocation must reference a SUCCEEDED (or, for
---     later months of a yearly payment, PARTIALLY_REFUNDED) payment of the
---     same subscription, which belongs to the allocation's user, that paid
---     for Pro (it created or renewed the paid term: a CREATED or RENEWED
---     SubscriptionEvent; duplicate charges kept for refunds do not count),
---     and its period must lie within the payment's period (insert trigger);
---   * at most one allocation per user and billing period start (partial
---     unique index), so a payment, a retried or duplicated webhook, or a
---     second payment for the same period cannot grant a period twice;
---   * the link and period never change afterwards (CreditAllocation_protect);
---   * deleting the user still removes everything: the subscription (deleted
---     only with its user) cascades to its allocations, so the ledger's delete
---     guard now allows deletes once the user is gone, whichever cascade
---     reaches a row first (previously: once the wallet was gone).
--- Existing SUBSCRIPTION allocations from before this migration have no
--- payment link; the columns stay NULL for them and for other sources.
+--   * SUBSCRIPTION allocations always have these links; other sources never;
+--   * one allocation per payment and month (unique index);
+--   * a new SUBSCRIPTION allocation is accepted only for a SUCCEEDED payment
+--     of the same user's subscription that created or renewed the paid term
+--     (CREATED/RENEWED event), inside the payment's period (trigger);
+--   * the links never change afterwards.
 
 -- AlterTable
 ALTER TABLE "CreditAllocation" ADD COLUMN     "paymentId" TEXT,
-ADD COLUMN     "periodEnd" TIMESTAMP(3),
 ADD COLUMN     "periodStart" TIMESTAMP(3),
 ADD COLUMN     "subscriptionId" TEXT;
 
--- CreateIndex
-CREATE INDEX "CreditAllocation_paymentId_idx" ON "CreditAllocation"("paymentId");
+-- Monthly Pro credits granted before this migration (on first use, with the
+-- reference 'pro:<proStartedAt>:<monthStart>', both 24-character ISO times)
+-- are linked to the payment whose period contains their month.
+UPDATE "CreditAllocation" a
+SET "periodStart" = m."monthStart",
+    "paymentId" = m."paymentId",
+    "subscriptionId" = m."subscriptionId"
+FROM (
+  SELECT a2."id",
+         (right(a2."sourceReference", 24)::timestamptz AT TIME ZONE 'UTC') AS "monthStart",
+         p."id" AS "paymentId",
+         p."subscriptionId"
+  FROM "CreditAllocation" a2
+  JOIN "UserSubscription" s ON s."authId" = a2."authId"
+  JOIN LATERAL (
+    SELECT pt."id", pt."subscriptionId"
+    FROM "PaymentTransaction" pt
+    WHERE pt."subscriptionId" = s."id"
+      AND pt."periodStart" <= (right(a2."sourceReference", 24)::timestamptz AT TIME ZONE 'UTC')
+      AND (right(a2."sourceReference", 24)::timestamptz AT TIME ZONE 'UTC') < pt."periodEnd"
+    ORDER BY pt."periodStart" DESC
+    LIMIT 1
+  ) p ON true
+  WHERE a2."source" = 'SUBSCRIPTION'
+    AND a2."paymentId" IS NULL
+    AND a2."sourceReference" LIKE 'pro:%'
+) m
+WHERE a."id" = m."id";
+
+-- The update queued the deferred ledger-consistency check; run it now, so
+-- the table has no pending trigger events before it is altered below.
+SET CONSTRAINTS "CreditAllocation_consistency_check" IMMEDIATE;
+
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM "CreditAllocation"
+    WHERE "source" = 'SUBSCRIPTION' AND "paymentId" IS NULL
+  ) THEN
+    RAISE EXCEPTION 'Some SUBSCRIPTION credit allocations could not be linked to the payment of their month; link or review them, then rerun this migration';
+  END IF;
+END $$;
 
 -- CreateIndex
-CREATE INDEX "CreditAllocation_subscriptionId_idx" ON "CreditAllocation"("subscriptionId");
+CREATE UNIQUE INDEX "CreditAllocation_paymentId_periodStart_key" ON "CreditAllocation"("paymentId", "periodStart");
 
 -- AddForeignKey
-ALTER TABLE "CreditAllocation" ADD CONSTRAINT "CreditAllocation_subscriptionId_fkey" FOREIGN KEY ("subscriptionId") REFERENCES "UserSubscription"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+ALTER TABLE "CreditAllocation" ADD CONSTRAINT "CreditAllocation_paymentId_fkey" FOREIGN KEY ("paymentId") REFERENCES "PaymentTransaction"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
--- AddForeignKey
-ALTER TABLE "CreditAllocation" ADD CONSTRAINT "CreditAllocation_paymentId_fkey" FOREIGN KEY ("paymentId") REFERENCES "PaymentTransaction"("id") ON DELETE NO ACTION ON UPDATE CASCADE;
-
--- The paid-period columns are set together, only for SUBSCRIPTION credits,
--- and the credits expire exactly at the end of the period.
 ALTER TABLE "CreditAllocation"
-  ADD CONSTRAINT "CreditAllocation_paid_period_complete" CHECK (
-    ("subscriptionId" IS NULL) = ("paymentId" IS NULL)
+  ADD CONSTRAINT "CreditAllocation_payment_link" CHECK (
+    ("source" = 'SUBSCRIPTION') = ("paymentId" IS NOT NULL)
+    AND ("paymentId" IS NULL) = ("subscriptionId" IS NULL)
     AND ("paymentId" IS NULL) = ("periodStart" IS NULL)
-    AND ("periodStart" IS NULL) = ("periodEnd" IS NULL)
-  ),
-  ADD CONSTRAINT "CreditAllocation_paid_period_subscription_only" CHECK (
-    "paymentId" IS NULL OR "source" = 'SUBSCRIPTION'
-  ),
-  ADD CONSTRAINT "CreditAllocation_paid_period_valid" CHECK (
-    "periodStart" IS NULL
-    OR ("periodStart" < "periodEnd" AND "expiresAt" = "periodEnd")
+    AND ("periodStart" IS NULL OR "periodStart" < "expiresAt")
   );
 
--- One allocation per user and billing period.
-CREATE UNIQUE INDEX "CreditAllocation_one_per_paid_period"
-  ON "CreditAllocation" ("walletId", "periodStart")
-  WHERE "source" = 'SUBSCRIPTION' AND "periodStart" IS NOT NULL;
+SET CONSTRAINTS "CreditAllocation_consistency_check" DEFERRED;
 
--- New SUBSCRIPTION credits must be paid for by this user's subscription.
-CREATE FUNCTION "CreditAllocation_paid_period_check"() RETURNS trigger
-LANGUAGE plpgsql AS $$
-DECLARE
-  payment_status text;
-  payment_subscription text;
-  payment_start timestamp(3);
-  payment_end timestamp(3);
-  subscription_owner text;
-  paid_for_pro boolean;
-BEGIN
-  IF NEW."source" = 'SUBSCRIPTION' AND NEW."paymentId" IS NULL THEN
-    RAISE EXCEPTION 'SUBSCRIPTION credits require the successful payment that paid for them'
-      USING ERRCODE = 'check_violation';
-  END IF;
-  IF NEW."paymentId" IS NULL THEN
-    RETURN NEW;
-  END IF;
-
-  EXECUTE format(
-    'SELECT p."status"::text, p."subscriptionId", p."periodStart", p."periodEnd", s."authId"
-       FROM %1$I."PaymentTransaction" p
-       LEFT JOIN %1$I."UserSubscription" s ON s."id" = p."subscriptionId"
-      WHERE p."id" = $1',
-    TG_TABLE_SCHEMA
-  ) INTO payment_status, payment_subscription, payment_start, payment_end, subscription_owner
-    USING NEW."paymentId";
-
-  IF payment_status IS NULL OR payment_status NOT IN ('SUCCEEDED', 'PARTIALLY_REFUNDED') THEN
-    RAISE EXCEPTION 'SUBSCRIPTION credits require a successful payment (payment %)', NEW."paymentId"
-      USING ERRCODE = 'check_violation';
-  END IF;
-  EXECUTE format(
-    'SELECT EXISTS (SELECT 1 FROM %I."SubscriptionEvent"
-                     WHERE "paymentId" = $1 AND "type" IN (''CREATED'', ''RENEWED''))',
-    TG_TABLE_SCHEMA
-  ) INTO paid_for_pro USING NEW."paymentId";
-  IF NOT paid_for_pro THEN
-    RAISE EXCEPTION 'SUBSCRIPTION credits require a payment that created or renewed the paid term'
-      USING ERRCODE = 'check_violation';
-  END IF;
-  IF payment_subscription IS DISTINCT FROM NEW."subscriptionId"
-    OR subscription_owner IS DISTINCT FROM NEW."authId" THEN
-    RAISE EXCEPTION 'SUBSCRIPTION credits must belong to the user and subscription of their payment'
-      USING ERRCODE = 'check_violation';
-  END IF;
-  IF NEW."periodStart" < payment_start OR NEW."periodEnd" > payment_end THEN
-    RAISE EXCEPTION 'SUBSCRIPTION credits must cover a period within the paid period'
-      USING ERRCODE = 'check_violation';
-  END IF;
-  RETURN NEW;
-END;
-$$;
-
-CREATE TRIGGER "CreditAllocation_paid_period_check"
-  BEFORE INSERT ON "CreditAllocation"
-  FOR EACH ROW EXECUTE FUNCTION "CreditAllocation_paid_period_check"();
-
--- The payment link and period are grant details: they never change.
+-- The links are part of the grant: they never change.
 CREATE OR REPLACE FUNCTION "CreditAllocation_protect"() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -138,7 +96,6 @@ BEGIN
     OR NEW."subscriptionId" IS DISTINCT FROM OLD."subscriptionId"
     OR NEW."paymentId" IS DISTINCT FROM OLD."paymentId"
     OR NEW."periodStart" IS DISTINCT FROM OLD."periodStart"
-    OR NEW."periodEnd" IS DISTINCT FROM OLD."periodEnd"
     OR NEW."createdAt" IS DISTINCT FROM OLD."createdAt" THEN
     RAISE EXCEPTION 'CreditAllocation grant details cannot change'
       USING ERRCODE = 'check_violation';
@@ -151,24 +108,59 @@ BEGIN
 END;
 $$;
 
--- Ledger rows may be deleted only as part of deleting their user. During the
--- account deletion cascade the user row is already gone, but the wallet may
--- not be yet (the subscription's cascade can reach allocations first).
-CREATE OR REPLACE FUNCTION "Credit_wallet_child_delete_guard"(p_schema text, p_wallet_id text, p_table text)
-RETURNS void
+-- Monthly Pro credits only for a successful payment that created or renewed
+-- the same user's paid term, and only within the period it paid for.
+CREATE FUNCTION "CreditAllocation_subscription_payment_check"() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE
-  owner_exists boolean;
+  v_subscription_id text;
+  v_status text;
+  v_period_start timestamp(3);
+  v_period_end timestamp(3);
+  v_owner text;
+  v_granted_term boolean;
 BEGIN
+  IF NEW."source" <> 'SUBSCRIPTION' THEN
+    RETURN NEW;
+  END IF;
+
   EXECUTE format(
-    'SELECT EXISTS (SELECT 1 FROM %1$I."CreditWallet" w
-                      JOIN %1$I."authUser" u ON u."id" = w."authId"
-                     WHERE w."id" = $1)',
-    p_schema
-  ) INTO owner_exists USING p_wallet_id;
-  IF owner_exists THEN
-    RAISE EXCEPTION '% history cannot be deleted while its user exists', p_table
+    'SELECT "subscriptionId", "status"::text, "periodStart", "periodEnd" FROM %I."PaymentTransaction" WHERE "id" = $1',
+    TG_TABLE_SCHEMA
+  ) INTO v_subscription_id, v_status, v_period_start, v_period_end USING NEW."paymentId";
+  IF v_status IS NULL OR v_subscription_id IS DISTINCT FROM NEW."subscriptionId" THEN
+    RAISE EXCEPTION 'Monthly Pro credits must belong to a payment of their subscription'
       USING ERRCODE = 'check_violation';
   END IF;
+  IF v_status <> 'SUCCEEDED' THEN
+    RAISE EXCEPTION 'Monthly Pro credits require a successful payment (payment is %)', v_status
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  EXECUTE format('SELECT "authId" FROM %I."UserSubscription" WHERE "id" = $1', TG_TABLE_SCHEMA)
+    INTO v_owner USING NEW."subscriptionId";
+  IF v_owner IS DISTINCT FROM NEW."authId" THEN
+    RAISE EXCEPTION 'Monthly Pro credits must belong to the subscription''s user'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  EXECUTE format(
+    'SELECT EXISTS (SELECT 1 FROM %I."SubscriptionEvent" WHERE "paymentId" = $1 AND "type" IN (''CREATED'', ''RENEWED''))',
+    TG_TABLE_SCHEMA
+  ) INTO v_granted_term USING NEW."paymentId";
+  IF NOT v_granted_term THEN
+    RAISE EXCEPTION 'Monthly Pro credits require a payment that created or renewed the paid term'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  IF NEW."periodStart" < v_period_start OR NEW."expiresAt" > v_period_end THEN
+    RAISE EXCEPTION 'Monthly Pro credits must lie within the paid period'
+      USING ERRCODE = 'check_violation';
+  END IF;
+  RETURN NEW;
 END;
 $$;
+
+CREATE TRIGGER "CreditAllocation_subscription_payment_check"
+  BEFORE INSERT ON "CreditAllocation"
+  FOR EACH ROW EXECUTE FUNCTION "CreditAllocation_subscription_payment_check"();

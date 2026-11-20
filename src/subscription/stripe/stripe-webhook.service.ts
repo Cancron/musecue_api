@@ -516,15 +516,17 @@ export class StripeWebhookService {
       });
       await this.audit(tx, record, next, metadata);
       // Buying Pro ends any unused trial credits, in the same transaction
-      // (purchased and referral credits are kept), and grants the monthly Pro
-      // credits this payment paid for.
+      // (purchased and referral credits are kept).
       await this.credits.expireTrialCreditsOnUpgrade(tx, record.authId, now);
-      await this.credits.grantPaidPeriod(tx, {
-        authId: record.authId,
-        subscriptionId: record.id,
-        payment: saved,
-        at: now,
-      });
+      // The months of Pro credits this payment pays for are scheduled and
+      // the first is allocated, only now that the payment is verified and
+      // recorded (a yearly payment's later months as each begins).
+      await this.credits.recordPaidPeriod(
+        tx,
+        record.authId,
+        { ...payment, id: saved.id, subscriptionId: record.id },
+        now,
+      );
       return 'ACTIVATED';
     });
   }
@@ -778,16 +780,14 @@ export class StripeWebhookService {
       });
       await tx.subscriptionEvent.create({ data: renewedEvent });
       await this.audit(tx, record, next, metadata);
-      // The renewal pays for the next billing period: grant its monthly Pro
-      // credits. The previous period's unused credits expire at the billing
-      // boundary (recorded by the wallet before this grant if it has passed,
-      // otherwise by the expiration sweep).
-      await this.credits.grantPaidPeriod(tx, {
-        authId: record.authId,
-        subscriptionId: record.id,
-        payment: saved,
-        at: now,
-      });
+      // Fresh Pro credits for the renewed period, with the payment. The
+      // previous month's credits expire at the boundary.
+      await this.credits.recordPaidPeriod(
+        tx,
+        record.authId,
+        { ...payment, id: saved.id, subscriptionId: record.id },
+        now,
+      );
       return 'RENEWED';
     });
   }

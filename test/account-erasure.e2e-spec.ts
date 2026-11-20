@@ -102,6 +102,7 @@ const USER_DATA_TABLES = [
   'CreditTransaction',
   'CreditLedgerEntry',
   'CreditSessionOverage',
+  'CreditAllocationSchedule',
 ] as const;
 
 describeWithDatabase('Account erasure (PostgreSQL)', () => {
@@ -516,40 +517,15 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
     const payment = await client.paymentTransaction.findFirstOrThrow({
       where: { subscriptionId: subscription.id },
     });
-    // Monthly Pro credits for that payment, linked to the subscription and
-    // payment (erased with the account; the payment is kept).
-    await client.$transaction(async (tx) => {
-      const { id: walletId } = await tx.creditWallet.findUniqueOrThrow({
-        where: { authId: user.id },
-      });
-      const proCredits = await tx.creditAllocation.create({
-        data: {
-          walletId,
-          authId: user.id,
-          source: 'SUBSCRIPTION',
-          sourceReference: `payment:${payment.id}:${payment.periodStart.toISOString()}`,
-          amount: 1000,
-          remaining: 1000,
-          grantedAt: new Date(),
-          expiresAt: payment.periodEnd,
-          subscriptionId: subscription.id,
-          paymentId: payment.id,
-          periodStart: payment.periodStart,
-          periodEnd: payment.periodEnd,
-        },
-      });
-      await tx.creditTransaction.create({
-        data: {
-          walletId,
-          authId: user.id,
-          type: 'GRANT',
-          amount: 1000,
-          balanceAfter: 1008,
-          idempotencyKey: `grant:SUBSCRIPTION:payment:${payment.id}`,
-          occurredAt: new Date(),
-          entries: { create: [{ allocationId: proCredits.id, amount: 1000 }] },
-        },
-      });
+    // A scheduled month of Pro credits for that payment.
+    await client.creditAllocationSchedule.create({
+      data: {
+        authId: user.id,
+        subscriptionId: subscription.id,
+        paymentId: payment.id,
+        periodStart: payment.periodStart,
+        periodEnd: payment.periodEnd,
+      },
     });
     const providerCustomerId = `cus_erasure_${tag}`;
     await client.paymentCustomer.create({

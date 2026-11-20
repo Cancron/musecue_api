@@ -55,10 +55,9 @@ const allocation = (
   remaining,
   grantedAt: '2026-06-01T00:00:00.000Z',
   expiresAt,
+  periodStart: null,
   subscriptionId: null,
   paymentId: null,
-  periodStart: null,
-  periodEnd: null,
 });
 
 /**
@@ -81,6 +80,7 @@ describe('CreditEligibilityService', () => {
 
   beforeEach(() => {
     jest.resetAllMocks();
+    allowances.catchUpPaidMonths.mockResolvedValue(0);
     freezeTime(NOW);
     stored = null;
     allocations = [];
@@ -118,7 +118,6 @@ describe('CreditEligibilityService', () => {
         expect(wallet.grant.mock.calls).toHaveLength(0);
         expect(wallet.hasGrant.mock.calls).toHaveLength(0);
         expect(settings.getSettings.mock.calls).toHaveLength(0);
-        expect(allowances.grantCurrentPaidPeriod.mock.calls).toHaveLength(0);
       },
     );
   });
@@ -151,36 +150,22 @@ describe('CreditEligibilityService', () => {
       ]);
     });
 
-    it("asks for the paid period's Pro credits during an active paid term (granted only for a successful payment)", async () => {
+    it('never grants Pro credits itself: it only catches up on recorded payments', async () => {
       stored = row({
         billingInterval: BillingInterval.YEARLY,
         proStartedAt: iso('2026-01-20T00:00:00.000Z'),
         proExpiresAt: iso('2027-01-20T00:00:00.000Z'),
       });
-      allowances.grantCurrentPaidPeriod.mockResolvedValue('GRANTED');
-
-      await expect(service.grantDueAllowances('user-1')).resolves.toBe(1);
-
-      expect(allowances.grantCurrentPaidPeriod.mock.calls).toEqual([
-        ['user-1', NOW],
-      ]);
-      // Pro credits never come from the wallet directly here.
-      expect(wallet.grant.mock.calls).toHaveLength(0);
-    });
-
-    it('does not ask for Pro credits outside a paid term', async () => {
-      stored = row({
-        billingInterval: BillingInterval.MONTHLY,
-        proStartedAt: iso('2026-04-01T00:00:00.000Z'),
-        proExpiresAt: iso('2026-05-01T00:00:00.000Z'),
-      });
 
       await service.getEligibility('user-1');
 
-      expect(allowances.grantCurrentPaidPeriod.mock.calls).toHaveLength(0);
+      expect(wallet.grant.mock.calls).toHaveLength(0);
+      expect(allowances.catchUpPaidMonths.mock.calls).toEqual([
+        ['user-1', stored, NOW],
+      ]);
     });
 
-    it('does not grant the trial allowance again once it was received', async () => {
+    it('does not open a wallet transaction when the trial allowance was already granted', async () => {
       stored = row({
         trialUsed: true,
         trialStartedAt: iso('2026-06-08T00:00:00.000Z'),

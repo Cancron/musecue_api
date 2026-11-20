@@ -1,5 +1,10 @@
 import { PrismaPg } from '@prisma/adapter-pg';
-import { CreditSource, Prisma, PrismaClient } from '@prisma/client';
+import {
+  BillingInterval,
+  CreditSource,
+  Prisma,
+  PrismaClient,
+} from '@prisma/client';
 import { mock } from 'jest-mock-extended';
 import { ActivityLogService } from '../src/common/services/activity-log.service';
 import type { CustomLoggerService } from '../src/common/services/custom-logger.service';
@@ -12,7 +17,6 @@ import {
 } from '../src/credits/credit-wallet.errors';
 import { CreditWalletService } from '../src/credits/credit-wallet.service';
 import { freezeTime } from './support/freeze-time';
-import { givenPaidPeriod } from './support/credit-fixtures';
 import {
   TEST_DATABASE_URL,
   applyMigrations,
@@ -21,7 +25,10 @@ import {
   dropSchema,
   migrationNames,
 } from './support/migrated-schema';
-import { createUser } from './support/subscription-fixtures';
+import {
+  createUser,
+  givenPaidProHistory,
+} from './support/subscription-fixtures';
 
 jest.setTimeout(120_000);
 
@@ -52,6 +59,32 @@ describeWithDatabase('Credit wallet and ledger (PostgreSQL)', () => {
       sourceReference: ref,
       amount,
     });
+
+  /**
+   * A paid month of Pro for the user (record, SUCCEEDED payment and CREATED
+   * event, as the Stripe webhook writes them): monthly Pro credits must
+   * belong to such a payment. Returns the link for `grant({ payment })`.
+   */
+  const paidMonth = async (authId: string, startedAt: Date) => {
+    await givenPaidProHistory(
+      client,
+      authId,
+      { billingInterval: BillingInterval.MONTHLY, startedAt },
+      startedAt,
+    );
+    const { id, payments } = await client.userSubscription.findUniqueOrThrow({
+      where: { authId },
+      include: { payments: true },
+    });
+    return {
+      link: {
+        subscriptionId: id,
+        paymentId: payments[0].id,
+        periodStart: payments[0].periodStart,
+      },
+      periodEnd: payments[0].periodEnd,
+    };
+  };
 
   /**
    * Re-checks every ledger invariant from the stored rows:
@@ -146,14 +179,14 @@ describeWithDatabase('Credit wallet and ledger (PostgreSQL)', () => {
         sourceReference: 'ref_1',
         amount: '2.5',
       });
-      const bobPaid = await givenPaidPeriod(client, bob, new Date(now));
+      const bobPaid = await paidMonth(bob, new Date(now));
       await wallet.grant({
         authId: bob,
         source: CreditSource.SUBSCRIPTION,
         sourceReference: 'sub_1:2026-11',
         amount: 1000,
         expiresAt: bobPaid.periodEnd,
-        paidPeriod: bobPaid,
+        payment: bobPaid.link,
       });
 
       const wallets = await client.creditWallet.findMany({
@@ -227,6 +260,8 @@ describeWithDatabase('Credit wallet and ledger (PostgreSQL)', () => {
         grantedAt: new Date(),
       };
       const future = new Date(Date.now() + DAY);
+      // A valid payment link, so the SUBSCRIPTION row reaches the CHECK.
+      const { link } = await paidMonth(userId, new Date(Date.now() - DAY));
 
       for (const [data, constraint] of [
         [
@@ -254,9 +289,9 @@ describeWithDatabase('Credit wallet and ledger (PostgreSQL)', () => {
             source: CreditSource.SUBSCRIPTION,
             sourceReference: 's',
             expiresAt: null,
+            ...link,
           },
-          // Checked first: SUBSCRIPTION credits need a successful payment.
-          'require the successful payment that paid for them',
+          'CreditAllocation_expiry_by_source',
         ],
         [
           {
@@ -365,7 +400,7 @@ describeWithDatabase('Credit wallet and ledger (PostgreSQL)', () => {
     it('applies the same grant once when it is delivered many times concurrently', async () => {
       const userId = await createUser(client);
       // One delivery's values, computed once: every retry carries the same.
-      const paidPeriod = await givenPaidPeriod(client, userId, new Date());
+      const paid = await paidMonth(userId, new Date());
       const results = await Promise.all(
         Array.from({ length: 20 }, () =>
           wallet.grant({
@@ -373,8 +408,8 @@ describeWithDatabase('Credit wallet and ledger (PostgreSQL)', () => {
             source: CreditSource.SUBSCRIPTION,
             sourceReference: 'sub_42:2026-11-01',
             amount: '1000',
-            expiresAt: paidPeriod.periodEnd,
-            paidPeriod,
+            expiresAt: paid.periodEnd,
+            payment: paid.link,
           }),
         ),
       );
@@ -522,20 +557,14 @@ describeWithDatabase('Credit wallet and ledger (PostgreSQL)', () => {
       await grantPurchase(userId, '3');
       // Expires while the operations below run (the clock is moved past it
       // halfway through), so expirations race with grants and debits.
-      // A monthly period paid from Apr 1, 01:00 that ends at t0 + 1 hour.
-      const shortLived = await givenPaidPeriod(
-        client,
-        userId,
-        new Date('2032-04-01T01:00:00.000Z'),
-      );
-      expect(shortLived.periodEnd).toEqual(new Date(t0.getTime() + HOUR));
+      const { link } = await paidMonth(userId, t0);
       await wallet.grant({
         authId: userId,
         source: CreditSource.SUBSCRIPTION,
         sourceReference: 'short-lived',
         amount: '4',
-        expiresAt: shortLived.periodEnd,
-        paidPeriod: shortLived,
+        expiresAt: new Date(t0.getTime() + HOUR),
+        payment: link,
       });
 
       const operations: Promise<unknown>[] = [];
@@ -581,15 +610,15 @@ describeWithDatabase('Credit wallet and ledger (PostgreSQL)', () => {
         amount: '50',
         expiresAt: new Date(t0.getTime() + 7 * DAY),
       });
-      const january = await givenPaidPeriod(client, userId, t0);
-      expect(january.periodEnd).toEqual(new Date(t0.getTime() + 31 * DAY));
+      const paid = await paidMonth(userId, t0);
+      expect(paid.periodEnd).toEqual(new Date(t0.getTime() + 31 * DAY));
       await wallet.grant({
         authId: userId,
         source: CreditSource.SUBSCRIPTION,
         sourceReference: 'sub:2030-01',
         amount: '1000',
-        expiresAt: january.periodEnd,
-        paidPeriod: january,
+        expiresAt: paid.periodEnd,
+        payment: paid.link,
       });
       await wallet.grant({
         authId: userId,
@@ -701,15 +730,15 @@ describeWithDatabase('Credit wallet and ledger (PostgreSQL)', () => {
         amount: '50',
         expiresAt: trialEnds,
       });
-      const february = await givenPaidPeriod(client, proUser, t0);
-      expect(february.periodEnd).toEqual(monthEnds);
+      const paid = await paidMonth(proUser, t0);
+      expect(paid.periodEnd).toEqual(monthEnds);
       await wallet.grant({
         authId: proUser,
         source: CreditSource.SUBSCRIPTION,
         sourceReference: 'pro:2033-02',
         amount: '1000',
         expiresAt: monthEnds,
-        paidPeriod: february,
+        payment: paid.link,
       });
       await wallet.grant({
         authId: proUser,

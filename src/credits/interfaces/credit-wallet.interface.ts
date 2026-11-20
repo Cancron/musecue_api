@@ -1,5 +1,6 @@
 import type { CreditSource, CreditTransactionType } from '@prisma/client';
 import type { CreditAmountInput } from '../credit-amount';
+import type { PaymentLink } from '../credit-ledger.policy';
 
 /** Amounts in views are exact decimal strings (e.g. "12.5"). */
 export type CreditAmountString = string;
@@ -16,12 +17,6 @@ export interface GrantCreditsInput {
   amount: CreditAmountInput;
   /** Required for TRIAL and SUBSCRIPTION; must be omitted otherwise. */
   expiresAt?: Date | null;
-  /**
-   * SUBSCRIPTION only, and required: the subscription, the successful payment
-   * that paid for the credits and the billing period they cover. `expiresAt`
-   * must be `periodEnd`.
-   */
-  paidPeriod?: PaidPeriod;
   description?: string;
   /**
    * If this source event was already granted with a different amount or
@@ -30,13 +25,11 @@ export interface GrantCreditsInput {
    * first grant. Never grants twice either way.
    */
   keepExistingGrant?: boolean;
-}
-
-export interface PaidPeriod {
-  subscriptionId: string;
-  paymentId: string;
-  periodStart: Date;
-  periodEnd: Date;
+  /**
+   * SUBSCRIPTION only (required): the subscription, successful payment and
+   * month the credits are for. They count from `periodStart`.
+   */
+  payment?: PaymentLink;
 }
 
 export interface DebitCreditsInput {
@@ -60,11 +53,10 @@ export interface CreditAllocationView {
   remaining: CreditAmountString;
   grantedAt: string;
   expiresAt: string | null;
-  /** SUBSCRIPTION credits: what paid for them and the period they cover. */
+  /** SUBSCRIPTION: when the month starts (credits count from then). */
+  periodStart: string | null;
   subscriptionId: string | null;
   paymentId: string | null;
-  periodStart: string | null;
-  periodEnd: string | null;
 }
 
 export interface CreditTransactionView {
@@ -99,6 +91,11 @@ export interface DebitCreditsResult {
 export interface CreditBalanceView {
   /** Unexpired remaining credits; expired credits never count. */
   available: CreditAmountString;
+  /**
+   * Credits already allocated for a period that has not started yet (e.g. a
+   * renewal paid before its month begins); not available until it does.
+   */
+  upcoming: CreditAmountString;
   bySource: Record<CreditSource, CreditAmountString>;
   /** The earliest upcoming expiry and the credits that expire then. */
   nextExpiration: { expiresAt: string; amount: CreditAmountString } | null;

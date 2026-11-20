@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import {
+  CreditScheduleStatus,
   CreditSource,
   PaymentStatus,
   Prisma,
@@ -10,35 +11,61 @@ import { CreditSettingsService } from '../credits/credit-settings.service';
 import { CreditWalletService } from '../credits/credit-wallet.service';
 import type { GrantCreditsResult } from '../credits/interfaces/credit-wallet.interface';
 import {
-  paidAllowancePeriod,
-  paidAllowanceReference,
+  paymentAllowancePeriods,
+  paymentAllowanceReference,
+  scheduledAllocationTime,
   trialAllowanceReference,
-  type PaidPeriodSource,
+  type PaidPeriod,
 } from './credit-allowance.policy';
-import { isProActive } from './subscription-access.policy';
+import {
+  isProActive,
+  type SubscriptionRecord,
+} from './subscription-access.policy';
 
 export const TRIAL_CREDITS_DESCRIPTION = 'Free trial credits';
 export const TRIAL_CREDITS_ENDED_BY_UPGRADE =
   'TRIAL credits expired: upgraded to Pro';
 export const PRO_CREDITS_DESCRIPTION = 'Monthly Pro credits';
 
-/**
- * GRANTED: new credits. ALREADY_GRANTED: this period already has its credits
- * (a repeated event, retry or second payment for the period). PERIOD_OVER:
- * the paid period has ended, nothing to grant. NOT_PAID: no successful
- * payment that granted or extended Pro covers the moment.
- */
-export type PaidPeriodGrantOutcome =
-  | 'GRANTED'
-  | 'ALREADY_GRANTED'
-  | 'PERIOD_OVER'
-  | 'NOT_PAID';
+/** Why a scheduled month was not allocated. */
+export const SKIP_PAYMENT_NOT_SUCCEEDED = 'PAYMENT_NOT_SUCCEEDED';
+export const SKIP_OUTSIDE_PAID_TERM = 'OUTSIDE_PAID_TERM';
 
-/** Payments that paid for Pro (a refunded one no longer grants credits). */
-const PAID_STATUSES = [
-  PaymentStatus.SUCCEEDED,
-  PaymentStatus.PARTIALLY_REFUNDED,
-];
+/** A successful payment that created or renewed the paid term. */
+export interface TermPayment extends PaidPeriod {
+  id: string;
+  subscriptionId: string;
+}
+
+/** What happened to one scheduled month. */
+export type ScheduledMonthOutcome =
+  | 'ALLOCATED'
+  | 'SKIPPED'
+  /** Already processed, or being processed by another worker right now. */
+  | 'NOT_PENDING';
+
+export interface DueMonthsResult {
+  allocated: number;
+  skipped: number;
+  notPending: number;
+  failed: number;
+}
+
+const RECORD_SELECT = {
+  trialUsed: true,
+  trialStartedAt: true,
+  trialExpiresAt: true,
+  billingInterval: true,
+  proStartedAt: true,
+  proExpiresAt: true,
+  proCanceledAt: true,
+} as const;
+
+/** Each month waits for other operations on the same wallet. */
+const MONTH_TRANSACTION_OPTIONS = { maxWait: 10_000, timeout: 20_000 };
+
+const errorText = (error: unknown) =>
+  (error instanceof Error ? error.message : String(error)).slice(0, 255);
 
 /**
  * Credit changes caused by subscription events, written in the same
@@ -50,17 +77,18 @@ const PAID_STATUSES = [
  *   back;
  * - buying paid Pro ends any unused trial credits at once (EXPIRATION,
  *   effective at the purchase), leaving purchased and referral credits
- *   untouched.
+ *   untouched;
+ * - every successful Stripe payment that creates or renews the paid term
+ *   schedules `proMonthlyCredits` (default 1000) for each month it pays for
+ *   (CreditAllocationSchedule: one month for monthly billing, twelve for
+ *   yearly) and allocates the first month at once. Each later month is
+ *   allocated when it begins (CreditAllocationScheduler), never all at once.
+ *   Each month's credits expire at its end, the next billing boundary.
  *
- * - a successful Pro payment (first payment or renewal) grants the
- *   administrator's `proMonthlyCredits` (default 1000) for its billing
- *   period, expiring at the period's end (the billing boundary), linked to
- *   the user, subscription, payment and period.
- *
- * All are idempotent: a trial's credits are granted once (one TRIAL
- * allocation per user), a billing period's credits once (one allocation per
- * user and period start), and an allocation is expired once; the database
- * enforces the same.
+ * All are idempotent: a trial's credits are granted once; each payment's
+ * month is scheduled once, allocated at most once, and only while the
+ * payment is SUCCEEDED and the paid term covers the month (also enforced by
+ * the database); an allocation is expired once.
  */
 @Injectable()
 export class CreditAllowanceService {
@@ -69,118 +97,6 @@ export class CreditAllowanceService {
     private readonly wallet: CreditWalletService,
     private readonly settings: CreditSettingsService,
   ) {}
-
-  /**
-   * Grants the monthly Pro credits `payment` paid for: its allowance period
-   * at `at` (see paidAllowancePeriod). Call only for a successful payment
-   * that created or renewed the paid term, in the transaction that recorded
-   * it and holds the subscription row lock, so that concurrent grants for
-   * the subscription are applied one at a time.
-   */
-  async grantPaidPeriod(
-    tx: Prisma.TransactionClient,
-    input: {
-      authId: string;
-      subscriptionId: string;
-      payment: PaidPeriodSource & { id: string };
-      at: Date;
-    },
-  ): Promise<PaidPeriodGrantOutcome> {
-    const period = paidAllowancePeriod(input.payment, input.at);
-    if (!period) return 'PERIOD_OVER';
-
-    const granted = await tx.creditAllocation.findFirst({
-      where: {
-        authId: input.authId,
-        source: CreditSource.SUBSCRIPTION,
-        OR: [
-          { periodStart: period.start },
-          // Monthly credits granted before payments were linked, for a
-          // month overlapping this period.
-          {
-            paymentId: null,
-            expiresAt: { gt: period.start },
-            grantedAt: { lt: period.end },
-          },
-        ],
-      },
-      select: { id: true },
-    });
-    if (granted) return 'ALREADY_GRANTED';
-
-    const settings = await this.settings.getSettings(tx);
-    await this.wallet.grant(
-      {
-        authId: input.authId,
-        source: CreditSource.SUBSCRIPTION,
-        sourceReference: paidAllowanceReference(input.payment.id, period.start),
-        amount: settings.proMonthlyCredits,
-        expiresAt: period.end,
-        description: PRO_CREDITS_DESCRIPTION,
-        paidPeriod: {
-          subscriptionId: input.subscriptionId,
-          paymentId: input.payment.id,
-          periodStart: period.start,
-          periodEnd: period.end,
-        },
-      },
-      { tx, at: input.at },
-    );
-    return 'GRANTED';
-  }
-
-  /**
-   * Grants the current period's monthly Pro credits if they are missing:
-   * for example a later month of a yearly payment, or a payment recorded
-   * before credits were granted with payments. Only a successful payment
-   * that created or renewed the paid term and covers `at` counts; duplicate
-   * charges (kept for refunds) never grant credits.
-   */
-  grantCurrentPaidPeriod(
-    authId: string,
-    at: Date = new Date(),
-  ): Promise<PaidPeriodGrantOutcome> {
-    return this.prisma.$transaction(async (tx) => {
-      const found = await tx.userSubscription.findUnique({
-        where: { authId },
-        select: { id: true },
-      });
-      if (!found) return 'NOT_PAID';
-      // Same lock as the Stripe webhooks: one grant at a time.
-      await tx.$queryRaw`
-        SELECT "id" FROM "UserSubscription" WHERE "id" = ${found.id} FOR UPDATE
-      `;
-      const record = await tx.userSubscription.findUniqueOrThrow({
-        where: { id: found.id },
-      });
-      if (!isProActive(record, at)) return 'NOT_PAID';
-
-      const payment = await tx.paymentTransaction.findFirst({
-        where: {
-          subscriptionId: record.id,
-          status: { in: PAID_STATUSES },
-          periodStart: { lte: at },
-          periodEnd: { gt: at },
-          event: {
-            type: {
-              in: [
-                SubscriptionEventType.CREATED,
-                SubscriptionEventType.RENEWED,
-              ],
-            },
-          },
-        },
-        orderBy: { periodStart: 'desc' },
-      });
-      if (!payment) return 'NOT_PAID';
-      return this.grantPaidPeriod(tx, {
-        authId,
-        subscriptionId: record.id,
-        payment,
-        at,
-      });
-    });
-  }
 
   async grantTrialCredits(
     tx: Prisma.TransactionClient,
@@ -217,5 +133,279 @@ export class CreditAllowanceService {
       TRIAL_CREDITS_ENDED_BY_UPGRADE,
       { tx, at },
     );
+  }
+
+  /**
+   * In the transaction that records a successful payment creating or
+   * renewing the paid term: schedules every month the payment pays for and
+   * allocates the first one (an early renewal's first month counts from its
+   * start), plus any later month that has already begun (a late webhook).
+   * The remaining months of a yearly payment are allocated when they begin.
+   * Returns how many months were allocated now.
+   */
+  async recordPaidPeriod(
+    tx: Prisma.TransactionClient,
+    authId: string,
+    payment: TermPayment,
+    now: Date,
+  ): Promise<number> {
+    const periods = paymentAllowancePeriods(payment);
+    if (periods.length === 0) return 0;
+    await tx.creditAllocationSchedule.createMany({
+      data: periods.map((period) => ({
+        authId,
+        subscriptionId: payment.subscriptionId,
+        paymentId: payment.id,
+        periodStart: period.start,
+        periodEnd: period.end,
+      })),
+      skipDuplicates: true,
+    });
+    const due = await tx.creditAllocationSchedule.findMany({
+      where: {
+        paymentId: payment.id,
+        status: CreditScheduleStatus.PENDING,
+        OR: [{ periodStart: periods[0].start }, { periodStart: { lte: now } }],
+      },
+      orderBy: { periodStart: 'asc' },
+      select: { id: true },
+    });
+    let allocated = 0;
+    for (const row of due) {
+      if (
+        (await this.allocateScheduledMonth(tx, row.id, now)) === 'ALLOCATED'
+      ) {
+        allocated += 1;
+      }
+    }
+    return allocated;
+  }
+
+  /**
+   * Allocates one scheduled month in the caller's transaction if it is still
+   * PENDING; the row is locked first, so concurrent callers never process
+   * the same month. Background workers pass `skipLocked` (FOR UPDATE SKIP
+   * LOCKED: a month another worker holds is left to it); a user's request
+   * waits for the other transaction instead and then finds the month
+   * ALLOCATED, so its balance includes the credits. The month is SKIPPED
+   * instead when its payment is no longer SUCCEEDED (refunded) or the paid
+   * term does not cover its start.
+   */
+  async allocateScheduledMonth(
+    tx: Prisma.TransactionClient,
+    scheduleId: string,
+    now: Date,
+    lock: { skipLocked?: boolean } = {},
+  ): Promise<ScheduledMonthOutcome> {
+    const claimed = await tx.$queryRaw<{ id: string }[]>`
+      SELECT "id" FROM "CreditAllocationSchedule"
+      WHERE "id" = ${scheduleId} AND "status" = 'PENDING'
+      FOR UPDATE ${lock.skipLocked ? Prisma.sql`SKIP LOCKED` : Prisma.empty}
+    `;
+    if (claimed.length === 0) return 'NOT_PENDING';
+    const month = await tx.creditAllocationSchedule.findUniqueOrThrow({
+      where: { id: scheduleId },
+      include: { payment: { select: { status: true } } },
+    });
+
+    const record = await tx.userSubscription.findUnique({
+      where: { id: month.subscriptionId },
+      select: RECORD_SELECT,
+    });
+    const skipReason =
+      month.payment.status !== PaymentStatus.SUCCEEDED
+        ? SKIP_PAYMENT_NOT_SUCCEEDED
+        : !isProActive(record, month.periodStart)
+          ? SKIP_OUTSIDE_PAID_TERM
+          : null;
+    if (skipReason) {
+      await tx.creditAllocationSchedule.update({
+        where: { id: month.id },
+        data: {
+          status: CreditScheduleStatus.SKIPPED,
+          skipReason,
+          processedAt: now,
+        },
+      });
+      return 'SKIPPED';
+    }
+
+    // Amounts are the settings when the month is allocated.
+    const settings = await this.settings.getSettings(tx);
+    const grant = await this.wallet.grant(
+      {
+        authId: month.authId,
+        source: CreditSource.SUBSCRIPTION,
+        sourceReference: paymentAllowanceReference(
+          month.paymentId,
+          month.periodStart,
+        ),
+        amount: settings.proMonthlyCredits,
+        expiresAt: month.periodEnd,
+        description: PRO_CREDITS_DESCRIPTION,
+        // A repeat keeps the first allocation, even if settings changed.
+        keepExistingGrant: true,
+        payment: {
+          subscriptionId: month.subscriptionId,
+          paymentId: month.paymentId,
+          periodStart: month.periodStart,
+        },
+      },
+      {
+        tx,
+        at: scheduledAllocationTime(
+          { start: month.periodStart, end: month.periodEnd },
+          now,
+        ),
+      },
+    );
+    await tx.creditAllocationSchedule.update({
+      where: { id: month.id },
+      data: {
+        status: CreditScheduleStatus.ALLOCATED,
+        allocationId: grant.allocation.id,
+        processedAt: now,
+      },
+    });
+    return 'ALLOCATED';
+  }
+
+  /**
+   * Allocates every scheduled month that has begun by `now` and is still
+   * PENDING (all users, or one), oldest first, each in its own transaction:
+   * a failure rolls back only that month, which stays PENDING with its
+   * attempt count and error, and is retried next time. Months that ended
+   * while nothing ran are allocated as of their start and their expiry is
+   * recorded right away. Safe to run concurrently and repeatedly. Workers
+   * pass `skipLocked` (see allocateScheduledMonth).
+   */
+  async allocateDueMonths(
+    options: {
+      now?: Date;
+      authId?: string;
+      limit?: number;
+      exclude?: string[];
+      skipLocked?: boolean;
+    } = {},
+  ): Promise<DueMonthsResult & { processed: string[] }> {
+    const now = options.now ?? new Date();
+    const due = await this.prisma.creditAllocationSchedule.findMany({
+      where: {
+        status: CreditScheduleStatus.PENDING,
+        periodStart: { lte: now },
+        ...(options.authId ? { authId: options.authId } : {}),
+        ...(options.exclude?.length ? { id: { notIn: options.exclude } } : {}),
+      },
+      orderBy: [{ periodStart: 'asc' }, { id: 'asc' }],
+      take: options.limit ?? 100,
+      select: { id: true, authId: true, periodEnd: true },
+    });
+    const result: DueMonthsResult = {
+      allocated: 0,
+      skipped: 0,
+      notPending: 0,
+      failed: 0,
+    };
+    const ended = new Set<string>();
+    for (const month of due) {
+      try {
+        const outcome = await this.prisma.$transaction(
+          (tx) =>
+            this.allocateScheduledMonth(tx, month.id, now, {
+              skipLocked: options.skipLocked,
+            }),
+          MONTH_TRANSACTION_OPTIONS,
+        );
+        if (outcome === 'ALLOCATED') {
+          result.allocated += 1;
+          if (month.periodEnd.getTime() <= now.getTime()) {
+            ended.add(month.authId);
+          }
+        } else if (outcome === 'SKIPPED') {
+          result.skipped += 1;
+        } else {
+          result.notPending += 1;
+        }
+      } catch (error) {
+        result.failed += 1;
+        await this.prisma.creditAllocationSchedule
+          .updateMany({
+            where: { id: month.id, status: CreditScheduleStatus.PENDING },
+            data: { attempts: { increment: 1 }, lastError: errorText(error) },
+          })
+          .catch(() => undefined);
+      }
+    }
+    for (const authId of ended) {
+      await this.wallet.expireCredits(authId).catch(() => undefined);
+    }
+    return { ...result, processed: due.map((month) => month.id) };
+  }
+
+  /**
+   * For payments recorded before months were scheduled with the payment:
+   * schedules the months that have not ended of the successful payments
+   * that created or renewed the current paid term and have no schedule yet,
+   * then allocates the user's due months. New payments are scheduled when
+   * recorded, so the first step finds nothing for them.
+   */
+  async catchUpPaidMonths(
+    authId: string,
+    record: SubscriptionRecord | null,
+    now: Date,
+  ): Promise<number> {
+    if (record && isProActive(record, now)) {
+      await this.scheduleLegacyPayments(authId, record, now);
+    }
+    return (await this.allocateDueMonths({ authId, now })).allocated;
+  }
+
+  private async scheduleLegacyPayments(
+    authId: string,
+    record: SubscriptionRecord,
+    now: Date,
+  ): Promise<void> {
+    const payments = await this.prisma.paymentTransaction.findMany({
+      where: {
+        subscription: { authId },
+        status: PaymentStatus.SUCCEEDED,
+        event: {
+          is: {
+            type: {
+              in: [
+                SubscriptionEventType.CREATED,
+                SubscriptionEventType.RENEWED,
+              ],
+            },
+          },
+        },
+        periodStart: { gte: record.proStartedAt as Date },
+        periodEnd: { lte: record.proExpiresAt as Date, gt: now },
+        creditSchedule: { none: {} },
+      },
+      select: {
+        id: true,
+        subscriptionId: true,
+        billingInterval: true,
+        periodStart: true,
+        periodEnd: true,
+      },
+    });
+    for (const payment of payments) {
+      if (payment.subscriptionId === null) continue;
+      const periods = paymentAllowancePeriods(payment).filter(
+        (period) => period.end.getTime() > now.getTime(),
+      );
+      await this.prisma.creditAllocationSchedule.createMany({
+        data: periods.map((period) => ({
+          authId,
+          subscriptionId: payment.subscriptionId as string,
+          paymentId: payment.id,
+          periodStart: period.start,
+          periodEnd: period.end,
+        })),
+        skipDuplicates: true,
+      });
+    }
   }
 }

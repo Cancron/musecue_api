@@ -417,7 +417,7 @@ describeWithDatabase('Credit-based access to makeup sessions (e2e)', () => {
       ).resolves.toMatchObject({ bySource: { SUBSCRIPTION: '1000' } });
     });
 
-    it("grant each month's Pro allowance once, even under concurrent requests", async () => {
+    it('catch up once on a yearly payment recorded before this release, even under concurrent requests', async () => {
       const account = await createAccount();
       const t0 = new Date('2033-05-15T00:00:00.000Z');
       await givenPaidProHistory(
@@ -435,42 +435,48 @@ describeWithDatabase('Credit-based access to makeup sessions (e2e)', () => {
       expect(responses.map((r) => r.status)).toEqual(Array(8).fill(201));
       await expect(sessionsOf(account.id)).resolves.toBe(8);
 
-      // The next month of the yearly term brings the next allowance.
+      // The fixture recorded the payment without scheduling it (as before
+      // these releases): the first request schedules its months and
+      // allocates only the current one, once, linked to the payment.
+      const [payment] = await ctx.client.paymentTransaction.findMany({
+        where: { subscription: { authId: account.id } },
+      });
+      const schedule = await ctx.client.creditAllocationSchedule.findMany({
+        where: { authId: account.id },
+        orderBy: { periodStart: 'asc' },
+      });
+      expect(schedule).toHaveLength(12);
+      expect(schedule.map((m) => m.status)).toEqual([
+        'ALLOCATED',
+        ...Array<string>(11).fill('PENDING'),
+      ]);
+      let allocations = await allocationsOf(account.id);
+      expect(allocations).toHaveLength(1);
+      expect(allocations[0]).toMatchObject({
+        paymentId: payment.id,
+        subscriptionId: payment.subscriptionId,
+        sourceReference: `payment:${payment.id}:${t0.toISOString()}`,
+        periodStart: t0,
+        expiresAt: new Date('2033-06-15T00:00:00.000Z'),
+      });
+
+      // The next month is allocated once it begins (here by the request).
       freezeTime(daysFrom(t0, 33));
       auth = await signIn(account);
       await createSession(auth).expect(201);
-
-      // Both months are paid by the one yearly payment.
-      const yearly = await ctx.client.paymentTransaction.findFirstOrThrow({
-        where: { subscription: { authId: account.id } },
+      allocations = await allocationsOf(account.id);
+      expect(allocations).toHaveLength(2);
+      expect(allocations[1].periodStart).toEqual(
+        new Date('2033-06-15T00:00:00.000Z'),
+      );
+      await expect(
+        ctx
+          .get<CreditWalletService>(CreditWalletService)
+          .getBalance(account.id),
+      ).resolves.toMatchObject({
+        available: '1000',
+        upcoming: '0',
       });
-      expect(
-        (await allocationsOf(account.id)).map((a) => [
-          a.source,
-          a.sourceReference,
-          a.amount.toFixed(),
-          a.paymentId,
-          a.periodStart?.toISOString(),
-          a.periodEnd?.toISOString(),
-        ]),
-      ).toEqual([
-        [
-          'SUBSCRIPTION',
-          `payment:${yearly.id}:${t0.toISOString()}`,
-          '1000',
-          yearly.id,
-          t0.toISOString(),
-          '2033-06-15T00:00:00.000Z',
-        ],
-        [
-          'SUBSCRIPTION',
-          `payment:${yearly.id}:2033-06-15T00:00:00.000Z`,
-          '1000',
-          yearly.id,
-          '2033-06-15T00:00:00.000Z',
-          '2033-07-15T00:00:00.000Z',
-        ],
-      ]);
     });
   });
 

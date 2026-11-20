@@ -4,6 +4,7 @@ import { AuthGuard } from '../common/guards/auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { ActivityLogService } from '../common/services/activity-log.service';
 import { CreditsModule } from '../credits/credits.module';
+import { CreditAllocationScheduler } from './credit-allocation.scheduler';
 import { CreditAllowanceService } from './credit-allowance.service';
 import { CreditEligibilityService } from './credit-eligibility.service';
 import { ProAccessGuard } from './pro-access.guard';
@@ -40,6 +41,7 @@ import { STRIPE_CLIENT, StripeGateway } from './stripe/stripe.gateway';
     SubscriptionTrialService,
     CreditEligibilityService,
     CreditAllowanceService,
+    CreditAllocationScheduler,
     ActivityLogService,
     AuthGuard,
     RolesGuard,

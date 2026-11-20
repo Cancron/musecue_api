@@ -57,9 +57,18 @@ model CreditWallet {
 
 // Credits granted to a user from one source. `remaining` is what is left;
 // it only decreases (debits, expiration). An allocation counts towards the
-// available balance while remaining > 0 and it has not expired
+// available balance while remaining > 0, its period has started
+// (periodStart IS NULL OR periodStart <= now) and it has not expired
 // (expiresAt IS NULL OR expiresAt > now), even before its expiration has
 // been recorded in the ledger.
+//
+// SUBSCRIPTION allocations are the monthly Pro credits of one successful
+// Stripe payment: they record the UserSubscription, the PaymentTransaction
+// and the month [periodStart, expiresAt) they are for, one allocation per
+// payment and month. A database trigger only accepts them for a SUCCEEDED
+// payment of the same user's subscription that created or renewed the paid
+// term, within the payment's period (migration
+// 20261124120000_subscription_credit_allocations).
 model CreditAllocation {
   id              String       @id @default(uuid())
   walletId        String
@@ -73,35 +82,28 @@ model CreditAllocation {
   grantedAt       DateTime
   // Required for TRIAL and SUBSCRIPTION, NULL for PURCHASE and REFERRAL.
   expiresAt       DateTime?
-  // SUBSCRIPTION only (required): the user's subscription, the successful
-  // payment that paid for these credits, and the billing period they cover
-  // ([periodStart, periodEnd), within the payment's period; the credits
-  // expire at periodEnd). A database trigger checks on insert that the
-  // payment is a successful payment of this subscription, which belongs to
-  // this user. NULL for other sources.
+  // SUBSCRIPTION only (NULL otherwise): the subscription record (not a
+  // foreign key; the payment links it), the paying transaction, and the
+  // start of the month the credits are for (they count from then).
   subscriptionId  String?
   paymentId       String?
   periodStart     DateTime?
-  periodEnd       DateTime?
   createdAt       DateTime     @default(now())
   updatedAt       DateTime     @updatedAt
 
-  wallet       CreditWallet        @relation(fields: [walletId, authId], references: [id, authId], onDelete: Cascade)
-  // A subscription is only deleted together with its user (database
-  // trigger), which deletes the wallet and its allocations too. Payments are
-  // never deleted (they are kept, detached, when the user is erased).
-  subscription UserSubscription?   @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
-  payment      PaymentTransaction? @relation(fields: [paymentId], references: [id], onDelete: NoAction)
-  entries      CreditLedgerEntry[]
+  wallet   CreditWallet              @relation(fields: [walletId, authId], references: [id, authId], onDelete: Cascade)
+  payment  PaymentTransaction?       @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  entries  CreditLedgerEntry[]
+  schedule CreditAllocationSchedule?
 
+  // One allocation per payment and month.
+  @@unique([paymentId, periodStart])
   // One allocation per source event: repeated or concurrent grants of the
   // same event cannot add credits twice. At most one TRIAL allocation per
   // wallet (partial unique index in the migration).
   @@unique([walletId, source, sourceReference])
   @@unique([walletId, id])
   @@index([walletId, expiresAt])
-  @@index([paymentId])
-  @@index([subscriptionId])
 }
 
 // Append-only ledger of every change to a wallet's available balance.
@@ -176,4 +178,41 @@ model CreditSessionOverage {
   wallet CreditWallet @relation(fields: [walletId, authId], references: [id, authId], onDelete: Cascade)
 
   @@unique([walletId, sessionId])
+}
+
+// The months of Pro credits a successful payment entitles its user to: one
+// row per month (one for a monthly payment, twelve for a yearly one),
+// written in the webhook transaction that records the payment. The first
+// month is allocated with the payment; each later month when it begins, by
+// CreditAllocationScheduler, which also allocates months it missed while it
+// was not running. A month is allocated only while its payment is
+// SUCCEEDED and the paid term covers the month's start; otherwise it is
+// SKIPPED. Status only moves forward (database trigger), and one row per
+// payment and month plus one allocation per row prevent double allocation.
+model CreditAllocationSchedule {
+  id             String               @id @default(uuid())
+  authId         String
+  // The user's UserSubscription (not a foreign key; the payment links it).
+  subscriptionId String
+  paymentId      String
+  periodStart    DateTime
+  periodEnd      DateTime
+  status         CreditScheduleStatus @default(PENDING)
+  allocationId   String?              @unique
+  // Why a month was skipped, e.g. PAYMENT_NOT_SUCCEEDED, OUTSIDE_PAID_TERM.
+  skipReason     String?              @db.VarChar(50)
+  // Failed allocation attempts (retried while PENDING) and the last error.
+  attempts       Int                  @default(0)
+  lastError      String?              @db.VarChar(255)
+  processedAt    DateTime?
+  createdAt      DateTime             @default(now())
+  updatedAt      DateTime             @updatedAt
+
+  authUser   authUser           @relation(fields: [authId], references: [id], onDelete: Cascade)
+  payment    PaymentTransaction @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  allocation CreditAllocation?  @relation(fields: [allocationId], references: [id], onDelete: Cascade)
+
+  @@unique([paymentId, periodStart])
+  @@index([status, periodStart])
+  @@index([authId, status])
 }

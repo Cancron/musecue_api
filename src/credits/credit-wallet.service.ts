@@ -19,7 +19,8 @@ import {
   compareSpendingOrder,
   decideOverage,
   getGrantExpiryRejection,
-  getPaidPeriodRejection,
+  getPaymentLinkRejection,
+  hasAllocationStarted,
   getReferenceRejection,
   isAllocationAvailable,
   planDebit,
@@ -88,10 +89,10 @@ const WALLET_TRANSACTION_OPTIONS = { maxWait: 10_000, timeout: 20_000 };
  * (user, source, sourceReference) and debits per (user, idempotencyKey), and
  * the database enforces the same uniqueness. Before any change, expired
  * allocations are closed with EXPIRATION transactions, so each transaction's
- * `balanceAfter` is the available balance at that moment. Reads never count
- * expired credits, even before their expiration has been recorded.
- *
- * Foundation only: nothing in the application grants or debits credits yet.
+ * `balanceAfter` is what the wallet holds at that moment: the available
+ * balance plus any credits allocated for a period that has not started yet.
+ * Reads never count expired credits, even before their expiration has been
+ * recorded, nor credits whose period has not started.
  */
 @Injectable()
 export class CreditWalletService {
@@ -116,14 +117,12 @@ export class CreditWalletService {
       throw new InvalidCreditOperationError('Unknown credit source');
     }
     const expiresAt = input.expiresAt ?? null;
-    const paidPeriodRejection = getPaidPeriodRejection(
+    const linkRejection = getPaymentLinkRejection(
       input.source,
+      input.payment,
       expiresAt,
-      input.paidPeriod,
     );
-    if (paidPeriodRejection) {
-      throw new InvalidCreditOperationError(paidPeriodRejection);
-    }
+    if (linkRejection) throw new InvalidCreditOperationError(linkRejection);
     const idempotencyKey = `grant:${input.source}:${input.sourceReference}`;
 
     return this.withLockedWallet(
@@ -192,10 +191,9 @@ export class CreditWalletService {
             remaining: amount,
             grantedAt: wallet.now,
             expiresAt,
-            subscriptionId: input.paidPeriod?.subscriptionId,
-            paymentId: input.paidPeriod?.paymentId,
-            periodStart: input.paidPeriod?.periodStart,
-            periodEnd: input.paidPeriod?.periodEnd,
+            subscriptionId: input.payment?.subscriptionId ?? null,
+            paymentId: input.payment?.paymentId ?? null,
+            periodStart: input.payment?.periodStart ?? null,
           },
         });
         const transaction = await tx.creditTransaction.create({
@@ -320,6 +318,11 @@ export class CreditWalletService {
           .filter((allocation) => isAllocationAvailable(allocation, wallet.now))
           .map((allocation) => allocation.remaining),
       );
+      // Everything the wallet holds (due expirations are already recorded),
+      // including credits of periods that have not started.
+      const held = sumCredits(
+        allocations.map((allocation) => allocation.remaining),
+      );
       const plan = planDebit(allocations, requested, wallet.now);
 
       if (plan.shortfall.gt(0)) {
@@ -347,7 +350,7 @@ export class CreditWalletService {
           type: CreditTransactionType.DEBIT,
           amount: plan.consumed.negated(),
           overageAmount: plan.shortfall,
-          balanceAfter: available.minus(plan.consumed),
+          balanceAfter: held.minus(plan.consumed),
           idempotencyKey,
           sessionId,
           description: input.description,
@@ -365,20 +368,28 @@ export class CreditWalletService {
     });
   }
 
-  /** The user's available balance now. Read-only; expired credits never count. */
+  /**
+   * The user's available balance now. Read-only; expired credits and
+   * credits whose period has not started never count (the latter are
+   * reported as `upcoming`).
+   */
   async getBalance(authId: string): Promise<CreditBalanceView> {
     const now = new Date();
-    const allocations = (
-      await this.prisma.creditAllocation.findMany({
-        where: {
-          authId,
-          remaining: { gt: 0 },
-          OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
-        },
-      })
-    )
+    const unexpired = await this.prisma.creditAllocation.findMany({
+      where: {
+        authId,
+        remaining: { gt: 0 },
+        OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
+      },
+    });
+    const allocations = unexpired
       .filter((allocation) => isAllocationAvailable(allocation, now))
       .sort(compareSpendingOrder);
+    const upcoming = sumCredits(
+      unexpired
+        .filter((allocation) => !hasAllocationStarted(allocation, now))
+        .map((allocation) => allocation.remaining),
+    );
 
     const bySource = Object.fromEntries(
       Object.values(CreditSource).map((source) => [
@@ -401,6 +412,7 @@ export class CreditWalletService {
       available: formatCredits(
         sumCredits(allocations.map((allocation) => allocation.remaining)),
       ),
+      upcoming: formatCredits(upcoming),
       bySource,
       nextExpiration: nextExpiresAt
         ? {
@@ -723,10 +735,9 @@ export class CreditWalletService {
       remaining: formatCredits(allocation.remaining),
       grantedAt: allocation.grantedAt.toISOString(),
       expiresAt: allocation.expiresAt?.toISOString() ?? null,
+      periodStart: allocation.periodStart?.toISOString() ?? null,
       subscriptionId: allocation.subscriptionId,
       paymentId: allocation.paymentId,
-      periodStart: allocation.periodStart?.toISOString() ?? null,
-      periodEnd: allocation.periodEnd?.toISOString() ?? null,
     };
   }
 
