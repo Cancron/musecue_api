@@ -36,6 +36,7 @@ model authUser {
   mfaLoginChallenges MfaLoginChallenge[]
   mfaTrustedDevices  MfaTrustedDevice[]
   stepUpApprovals    StepUpApproval[]
+  securityEvents     SecurityEvent[]
 
   @@index([email, id, providerId])
   @@index([username])
@@ -193,24 +194,30 @@ model MfaTrustedDevice {
 // exactly once even under concurrent requests. `rotatedFromId` records the
 // rotation lineage. Rows are removed by the cleanup sweep after `expiresAt`.
 model RefreshSession {
-  id            String                    @id @default(uuid())
-  authId        String
+  id              String                    @id @default(uuid())
+  authId          String
   // The sign-in session this token belongs to: set at sign-in and kept by
   // every rotation, so it identifies the session for its whole life. Access
   // tokens carry it as their `sid` claim (step-up approvals are bound to it).
-  familyId      String                    @default(uuid())
+  familyId        String                    @default(uuid())
+  // When this sign-in session last proved MFA (MFA sign-in, POST
+  // /auth/mfa/verify, an MFA step-up or MFA activation) and how ('totp' or
+  // 'recovery_code'); copied by every rotation. A session opened through a
+  // trusted device has none. Administrators need a recent one.
+  mfaVerifiedAt   DateTime?
+  mfaVerifiedWith String?                   @db.VarChar(32)
   // The refresh token's JWT ID (`jti`).
-  tokenId       String                    @unique @db.VarChar(128)
+  tokenId         String                    @unique @db.VarChar(128)
   // SHA-256 (hex) of the complete refresh token.
-  tokenHash     String                    @db.Char(64)
-  ipAddress     String?
-  userAgent     String?
-  device        String?
-  rotatedFromId String?                   @unique
-  createdAt     DateTime                  @default(now())
-  expiresAt     DateTime
-  revokedAt     DateTime?
-  revokedReason RefreshSessionRevocation?
+  tokenHash       String                    @db.Char(64)
+  ipAddress       String?
+  userAgent       String?
+  device          String?
+  rotatedFromId   String?                   @unique
+  createdAt       DateTime                  @default(now())
+  expiresAt       DateTime
+  revokedAt       DateTime?
+  revokedReason   RefreshSessionRevocation?
 
   authUser    authUser        @relation(fields: [authId], references: [id], onDelete: Cascade)
   rotatedFrom RefreshSession? @relation("RefreshSessionRotation", fields: [rotatedFromId], references: [id], onDelete: SetNull)
@@ -246,6 +253,31 @@ model StepUpApproval {
 
   @@index([authId, sessionId, action])
   @@index([expiresAt])
+}
+
+// ================================
+// Security Event Model
+// ================================
+
+// The security activity history of an account (GET /v1/security/activity):
+// MFA enrollment and changes, failed MFA verifications, trusted-device
+// changes and session revocations. Written in the same transaction as the
+// change it records. `details` holds only non-sensitive facts (counts,
+// reasons, IDs, device labels): never a secret, code, token or hash.
+model SecurityEvent {
+  id        String            @id @default(uuid())
+  authId    String
+  type      SecurityEventType
+  // The sign-in session that acted (the access token's `sid`), if any.
+  sessionId String?           @db.VarChar(64)
+  ipAddress String?
+  userAgent String?
+  details   Json              @default("{}")
+  createdAt DateTime          @default(now())
+
+  authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
+
+  @@index([authId, createdAt(sort: Desc), id(sort: Desc)])
 }
 
 // ================================

@@ -7,6 +7,8 @@ import { CreateAuthDto } from './dto/create-auth.dto';
 import type { Request } from 'express';
 import { CustomLoggerService } from '../common/services/custom-logger.service';
 import { AuthGuard } from '../common/guards/auth.guard';
+import { SessionsService } from './sessions/sessions.service';
+import { mock } from 'jest-mock-extended';
 
 describe('AuthController', () => {
   let controller: AuthController;
@@ -48,6 +50,7 @@ describe('AuthController', () => {
           provide: AuthService,
           useValue: mockAuthService,
         },
+        { provide: SessionsService, useValue: mock<SessionsService>() },
         {
           provide: AuthUtilsService,
           useValue: mockAuthUtilsService,

@@ -425,11 +425,11 @@ describeWithDatabase('Step-up authentication (e2e, PostgreSQL)', () => {
         .send({ refreshToken: login.refreshToken })
         .expect(201);
 
-      // The access token itself still works until it expires...
-      await http().get('/auth/mfa').set(kit.as(user)).expect(200);
-      // ...but the session's approvals do not, and no new one can be made.
+      // The session's access token stops working at once, so neither its
+      // approvals nor a new step-up can be used any more.
+      await http().get('/auth/mfa').set(kit.as(user)).expect(401);
       await routes.DATA_EXPORT.send(user, { [HEADER]: stepUpToken }).expect(
-        403,
+        401,
       );
       await stepUp(user, { action: 'DATA_EXPORT', password: PASSWORD }).expect(
         401,

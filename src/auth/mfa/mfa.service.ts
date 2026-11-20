@@ -23,6 +23,7 @@ import {
   type MfaUnitOfWork,
 } from './mfa.repository';
 import { MfaSecurityNotifier } from './mfa-security-notifier';
+import type { SecurityEventContext } from '../security-events/security-event.log';
 import { MfaSecretCipher, MfaSecretDecryptionError } from './mfa-secret.cipher';
 import { buildOtpAuthUri, generateTotpSecret, verifyTotp } from './mfa-totp';
 import { MFA_AUDIT_FIELDS, MFA_ENROLLMENT, MFA_TOTP } from './mfa.constants';
@@ -59,6 +60,8 @@ export interface MfaStatusView {
  */
 export interface MfaEnabledView extends MfaStatusView {
   recoveryCodes: string[];
+  /** Other sign-in sessions ended by enabling MFA. */
+  sessionsRevoked: number;
 }
 
 /** Returned once, when an enrollment starts; never stored in plaintext. */
@@ -86,6 +89,8 @@ type PendingMode = 'enrollment' | 'replacement';
 /** Who approved an MFA change, and from where (never a secret). */
 export interface MfaChangeContext {
   metadata: ActivityLogMetadata;
+  /** The sign-in session making the change (the access token's `sid`). */
+  sessionId?: string;
   /** How the step-up was proven (from the approval). */
   approvedWith?: StepUpMethod;
 }
@@ -93,6 +98,31 @@ export interface MfaChangeContext {
 /** The status after a management change. */
 export interface MfaChangeView extends MfaStatusView {
   trustedDevicesRevoked: number;
+}
+
+const changeEventContext = (
+  change: MfaChangeContext,
+): SecurityEventContext => ({
+  ip: change.metadata.ip,
+  userAgent: change.metadata.userAgent,
+  sessionId: change.sessionId ?? null,
+});
+
+/** History entry for trusted devices revoked by an MFA change. */
+async function recordDevicesRevoked(
+  uow: MfaUnitOfWork,
+  count: number,
+  reason: 'mfa_enabled' | 'mfa_disabled' | 'authenticator_replaced',
+  context: SecurityEventContext,
+  now: Date,
+) {
+  if (count === 0) return;
+  await uow.recordEvent({
+    type: 'TRUSTED_DEVICE_REVOKED',
+    context,
+    details: { reason, count },
+    now,
+  });
 }
 
 const approvalChange = (change: MfaChangeContext) =>
@@ -157,8 +187,9 @@ export class MfaService {
   startEnrollment(
     authId: string,
     now: Date = new Date(),
+    context: SecurityEventContext = {},
   ): Promise<MfaEnrollmentStartView> {
-    return this.startPending(authId, 'enrollment', now);
+    return this.startPending(authId, 'enrollment', now, context);
   }
 
   /**
@@ -169,17 +200,30 @@ export class MfaService {
   startReplacement(
     authId: string,
     now: Date = new Date(),
+    context: SecurityEventContext = {},
   ): Promise<MfaEnrollmentStartView> {
-    return this.startPending(authId, 'replacement', now);
+    return this.startPending(authId, 'replacement', now, context);
   }
 
+  /**
+   * Confirms the enrollment and enables MFA. In the same transaction, the
+   * sign-in session that confirms it (`sessionId`) stays, and every other
+   * session, its approvals, open sign-in challenges and trusted devices are
+   * revoked: whatever was signed in before MFA must prove MFA again.
+   */
   async confirmEnrollment(
     authId: string,
     code: string,
     metadata: ActivityLogMetadata,
     now: Date = new Date(),
+    sessionId?: string,
   ): Promise<MfaEnabledView> {
-    const { recoveryCodes } = await this.confirmPending(
+    const context = {
+      ip: metadata.ip,
+      userAgent: metadata.userAgent,
+      sessionId: sessionId ?? null,
+    };
+    const { recoveryCodes, sessionsRevoked } = await this.confirmPending(
       authId,
       code,
       'enrollment',
@@ -195,16 +239,63 @@ export class MfaService {
         await uow.deleteEnrollment();
         // Ten single-use recovery codes, stored only as salted scrypt hashes,
         // in the same commit; the plaintext leaves only in this response.
-        return { recoveryCodes: await issueRecoveryCodes(uow, authId) };
+        const codes = await issueRecoveryCodes(uow, authId);
+        // Everything signed in before MFA ends, except this session.
+        const revokedSessions = await uow.revokeOtherSessions(sessionId, now);
+        const revokedDevices = await uow.revokeTrustedDevices(now);
+        if (sessionId) {
+          await uow.markSessionMfaVerified(sessionId, 'totp', now);
+        }
+        await uow.recordEvent({
+          type: 'MFA_ENABLED',
+          context,
+          details: {
+            method: 'totp',
+            recoveryCodes: codes.length,
+            sessionsRevoked: revokedSessions.length,
+            trustedDevicesRevoked: revokedDevices,
+          },
+          now,
+        });
+        if (revokedSessions.length > 0) {
+          await uow.recordEvent({
+            type: 'SESSION_REVOKED',
+            context,
+            details: {
+              scope: 'mfa_enabled',
+              count: revokedSessions.length,
+              sessionIds: revokedSessions,
+              includesCurrentSession: false,
+            },
+            now,
+          });
+        }
+        await recordDevicesRevoked(
+          uow,
+          revokedDevices,
+          'mfa_enabled',
+          context,
+          now,
+        );
+        return {
+          recoveryCodes: codes,
+          sessionsRevoked: revokedSessions.length,
+        };
       },
+      context,
     );
-    this.logger.info('MFA enabled', { context: CONTEXT, authId });
+    this.logger.info('MFA enabled', {
+      context: CONTEXT,
+      authId,
+      sessionsRevoked,
+    });
     return {
       enabled: true,
       method: 'totp',
       recoveryCodesRemaining: recoveryCodes.length,
       enrollment: this.noEnrollment(),
       recoveryCodes,
+      sessionsRevoked,
     };
   }
 
@@ -220,6 +311,7 @@ export class MfaService {
     change: MfaChangeContext,
     now: Date = new Date(),
   ): Promise<MfaChangeView> {
+    const context = changeEventContext(change);
     const { revoked, notification } = await this.confirmPending(
       authId,
       code,
@@ -249,6 +341,25 @@ export class MfaService {
           ],
           metadata,
         );
+        if (change.sessionId) {
+          await uow.markSessionMfaVerified(change.sessionId, 'totp', now);
+        }
+        await uow.recordEvent({
+          type: 'MFA_AUTHENTICATOR_REPLACED',
+          context,
+          details: {
+            trustedDevicesRevoked: revokedDevices,
+            approvedWith: change.approvedWith ?? null,
+          },
+          now,
+        });
+        await recordDevicesRevoked(
+          uow,
+          revokedDevices,
+          'authenticator_replaced',
+          context,
+          now,
+        );
         return {
           revoked: revokedDevices,
           notification: await this.notifier.record(uow.tx, {
@@ -259,6 +370,7 @@ export class MfaService {
           }),
         };
       },
+      context,
     );
     await this.notifier.dispatch(notification);
     this.logger.info('MFA authenticator replaced', {
@@ -318,6 +430,18 @@ export class MfaService {
           ],
           metadata,
         );
+        const context = changeEventContext(change);
+        await uow.recordEvent({
+          type: 'MFA_DISABLED',
+          context,
+          details: {
+            recoveryCodesDeleted: codesBefore,
+            trustedDevicesRevoked: revoked,
+            approvedWith: change.approvedWith ?? null,
+          },
+          now,
+        });
+        await recordDevicesRevoked(uow, revoked, 'mfa_disabled', context, now);
         const notification = await this.notifier.record(uow.tx, {
           authId,
           event: 'MFA_DISABLED',
@@ -346,6 +470,7 @@ export class MfaService {
     authId: string,
     mode: PendingMode,
     now: Date,
+    context: SecurityEventContext,
   ): Promise<MfaEnrollmentStartView> {
     const outcome = await this.guard(() =>
       this.repository.withLock<StartOutcome>(authId, async (uow) => {
@@ -373,6 +498,15 @@ export class MfaService {
             now,
           ),
           blockedUntil: null,
+        });
+        await uow.recordEvent({
+          type:
+            mode === 'enrollment'
+              ? 'MFA_ENROLLMENT_STARTED'
+              : 'MFA_AUTHENTICATOR_REPLACEMENT_STARTED',
+          context,
+          details: { expiresAt: expiresAt.toISOString() },
+          now,
         });
         return {
           kind: 'STARTED',
@@ -422,6 +556,7 @@ export class MfaService {
       secret: string,
       step: number,
     ) => Promise<T>,
+    context: SecurityEventContext = {},
   ): Promise<T> {
     const outcome = await this.guard(() =>
       this.repository.withLock<ConfirmOutcome<T>>(authId, async (uow) => {
@@ -472,6 +607,25 @@ export class MfaService {
         const check = verifyTotp(secret, code, now);
         if (check.result !== 'VALID') {
           const failure = registerFailure(enrollment.failedAttemptsAt, now);
+          // History: never the code, only where it failed.
+          await uow.recordEvent({
+            type: failure.blockedUntil
+              ? 'MFA_VERIFICATION_BLOCKED'
+              : 'MFA_VERIFICATION_FAILED',
+            context,
+            details: failure.blockedUntil
+              ? {
+                  context: mode,
+                  method: 'totp',
+                  blockedUntil: failure.blockedUntil.toISOString(),
+                }
+              : {
+                  context: mode,
+                  method: 'totp',
+                  remainingAttempts: failure.remainingAttempts,
+                },
+            now,
+          });
           if (failure.blockedUntil) {
             // The pending secret is discarded; a new one can start after
             // the block.

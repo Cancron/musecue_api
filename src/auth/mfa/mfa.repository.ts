@@ -1,5 +1,16 @@
 import { Injectable } from '@nestjs/common';
-import type { mfaMethod, Prisma, userStatus } from '@prisma/client';
+import type {
+  mfaMethod,
+  Prisma,
+  SecurityEventType,
+  userStatus,
+} from '@prisma/client';
+import {
+  SecurityEventLog,
+  type SecurityEventContext,
+  type SecurityEventDetails,
+} from '../security-events/security-event.log';
+import { RefreshSessionRepository } from '../state/refresh-session.repository';
 import {
   ActivityLogService,
   type ActivityLogMetadata,
@@ -115,7 +126,7 @@ export interface MfaUnitOfWork {
   createTrustedDevice(
     input: TrustedDeviceInput,
     maxActive: number,
-  ): Promise<{ id: string }>;
+  ): Promise<{ id: string; revokedIds: string[] }>;
   /** Deletes every recovery code of the user and stores the new hashes. */
   replaceRecoveryCodes(codeHashes: string[]): Promise<void>;
   /** Unused recovery codes left. */
@@ -136,6 +147,28 @@ export interface MfaUnitOfWork {
   }): Promise<void>;
   /** Revokes every trusted device of the user; returns how many. */
   revokeTrustedDevices(now: Date): Promise<number>;
+  /**
+   * Ends every sign-in session of the user except `keepSessionId` (all of
+   * them without it), under the sessions lock; returns their IDs. Their
+   * step-up approvals and open sign-in challenges are removed too.
+   */
+  revokeOtherSessions(
+    keepSessionId: string | undefined,
+    now: Date,
+  ): Promise<string[]>;
+  /** Records that the sign-in session just proved MFA (and how). */
+  markSessionMfaVerified(
+    sessionId: string,
+    method: 'totp' | 'recovery_code',
+    now: Date,
+  ): Promise<void>;
+  /** Adds an entry to the user's security activity history. */
+  recordEvent(event: {
+    type: SecurityEventType;
+    context?: SecurityEventContext;
+    details?: SecurityEventDetails;
+    now: Date;
+  }): Promise<void>;
   audit(changes: FieldChange[], metadata: ActivityLogMetadata): Promise<void>;
 }
 
@@ -153,6 +186,8 @@ export class MfaRepository {
   constructor(
     private readonly prisma: PrismaService,
     private readonly activityLog: ActivityLogService,
+    private readonly sessions: RefreshSessionRepository,
+    private readonly events: SecurityEventLog,
   ) {}
 
   /** Unlocked read for the status endpoint. */
@@ -314,17 +349,29 @@ export class MfaRepository {
     authId: string,
     deviceId: string,
     now: Date,
+    context: SecurityEventContext = {},
   ): Promise<boolean> {
-    const device = await this.prisma.mfaTrustedDevice.findFirst({
-      where: { id: deviceId, authId },
-      select: { id: true },
+    return this.prisma.$transaction(async (tx) => {
+      const device = await tx.mfaTrustedDevice.findFirst({
+        where: { id: deviceId, authId },
+        select: { id: true, name: true },
+      });
+      if (!device) return false;
+      const { count } = await tx.mfaTrustedDevice.updateMany({
+        where: { id: deviceId, authId, revokedAt: null },
+        data: { revokedAt: now },
+      });
+      if (count > 0) {
+        await this.events.record(tx, {
+          authId,
+          type: 'TRUSTED_DEVICE_REVOKED',
+          context,
+          details: { reason: 'user', deviceId, name: device.name },
+          now,
+        });
+      }
+      return true;
     });
-    if (!device) return false;
-    await this.prisma.mfaTrustedDevice.updateMany({
-      where: { id: deviceId, authId, revokedAt: null },
-      data: { revokedAt: now },
-    });
-    return true;
   }
 
   private unitOfWork(
@@ -490,7 +537,7 @@ export class MfaRepository {
             data: { revokedAt: input.createdAt },
           });
         }
-        return device;
+        return { id: device.id, revokedIds: surplus.map((d) => d.id) };
       },
       replaceRecoveryCodes: async (codeHashes) => {
         await tx.mfaRecoveryCode.deleteMany({ where: { authId } });
@@ -528,6 +575,33 @@ export class MfaRepository {
           },
         });
       },
+      revokeOtherSessions: async (keepSessionId, now) => {
+        const revoked = await this.sessions.revokeSessions(
+          authId,
+          keepSessionId ? { except: keepSessionId } : {},
+          'MFA_ENABLED',
+          now,
+          tx,
+        );
+        await tx.stepUpApproval.deleteMany({
+          where: {
+            authId,
+            ...(keepSessionId ? { sessionId: { not: keepSessionId } } : {}),
+          },
+        });
+        await tx.mfaLoginChallenge.deleteMany({
+          where: { authId, consumedAt: null },
+        });
+        return revoked;
+      },
+      markSessionMfaVerified: async (sessionId, method, now) => {
+        await tx.refreshSession.updateMany({
+          where: { authId, familyId: sessionId, revokedAt: null },
+          data: { mfaVerifiedAt: now, mfaVerifiedWith: method },
+        });
+      },
+      recordEvent: ({ type, context, details, now }) =>
+        this.events.record(tx, { authId, type, context, details, now }),
       revokeTrustedDevices: async (now) => {
         const { count } = await tx.mfaTrustedDevice.updateMany({
           where: { authId, revokedAt: null },

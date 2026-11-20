@@ -45,6 +45,12 @@ export interface MfaRecoveryCodesView {
   recoveryCodesRemaining: number;
 }
 
+/** Where a factor is checked, and from which sign-in session. */
+export interface CheckOrigin {
+  source: 'sign_in' | 'verification' | 'step_up';
+  sessionId?: string;
+}
+
 export type CheckOutcome =
   | { kind: 'VERIFIED'; method: MfaMethodUsed }
   | { kind: 'NOT_ENABLED' }
@@ -86,6 +92,7 @@ export class MfaVerificationService {
     factor: MfaFactor,
     metadata: ActivityLogMetadata,
     now: Date = new Date(),
+    sessionId?: string,
   ): Promise<MfaVerificationView> {
     const result = await this.guard(() =>
       this.repository.withLock(authId, async (uow) => {
@@ -95,6 +102,7 @@ export class MfaVerificationService {
           factor,
           metadata,
           now,
+          { source: 'verification', sessionId },
         );
         const recoveryCodesRemaining =
           outcome.kind === 'VERIFIED' ? await uow.countRecoveryCodes() : 0;
@@ -151,6 +159,19 @@ export class MfaVerificationService {
           ],
           metadata,
         );
+        await uow.recordEvent({
+          type: 'MFA_RECOVERY_CODES_REGENERATED',
+          context: {
+            ip: change.metadata.ip,
+            userAgent: change.metadata.userAgent,
+            sessionId: change.sessionId ?? null,
+          },
+          details: {
+            count: recoveryCodes.length,
+            approvedWith: change.approvedWith ?? null,
+          },
+          now,
+        });
         // Recorded with the change; sent once it committed.
         const notification = await this.notifier.record(uow.tx, {
           authId,
@@ -186,7 +207,13 @@ export class MfaVerificationService {
     factor: MfaFactor,
     metadata: ActivityLogMetadata,
     now: Date,
+    origin: CheckOrigin = { source: 'verification' },
   ): Promise<CheckOutcome> {
+    const eventContext = {
+      ip: metadata.ip,
+      userAgent: metadata.userAgent,
+      sessionId: origin.sessionId ?? null,
+    };
     const account = requireActiveAccount(await uow.account());
     const state = account.mfaEnabled ? await uow.verificationState() : null;
     if (!state) return { kind: 'NOT_ENABLED' };
@@ -208,6 +235,25 @@ export class MfaVerificationService {
         failedAttemptsAt: failure.failedAttemptsAt,
         blockedUntil: failure.blockedUntil,
       });
+      // History: never the code, only where and how it failed.
+      await uow.recordEvent({
+        type: failure.blockedUntil
+          ? 'MFA_VERIFICATION_BLOCKED'
+          : 'MFA_VERIFICATION_FAILED',
+        context: eventContext,
+        details: failure.blockedUntil
+          ? {
+              context: origin.source,
+              method: factor.method,
+              blockedUntil: failure.blockedUntil.toISOString(),
+            }
+          : {
+              context: origin.source,
+              method: factor.method,
+              remainingAttempts: failure.remainingAttempts,
+            },
+        now,
+      });
       return failure.blockedUntil
         ? { kind: 'BLOCKED_NOW', until: failure.blockedUntil }
         : { kind: 'INVALID', remainingAttempts: failure.remainingAttempts };
@@ -218,6 +264,21 @@ export class MfaVerificationService {
         failedAttemptsAt: [],
         blockedUntil: null,
       });
+    }
+    if (factor.method === 'recovery_code') {
+      await uow.recordEvent({
+        type: 'MFA_RECOVERY_CODE_USED',
+        context: eventContext,
+        details: {
+          context: origin.source,
+          remaining: await uow.countRecoveryCodes(),
+        },
+        now,
+      });
+    }
+    // MFA proven in this session (sign-in records it on the new session).
+    if (origin.source !== 'sign_in' && origin.sessionId) {
+      await uow.markSessionMfaVerified(origin.sessionId, factor.method, now);
     }
     return { kind: 'VERIFIED', method: factor.method };
   }

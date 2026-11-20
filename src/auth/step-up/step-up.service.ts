@@ -347,6 +347,7 @@ export class StepUpService {
           factor,
           meta,
           now,
+          { source: 'step_up', sessionId },
         );
         if (checked.kind !== 'VERIFIED') {
           return { kind: 'DECLINED' as const, declined: checked };

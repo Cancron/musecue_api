@@ -76,6 +76,23 @@ export class FakeMfaRepository {
   readonly challenges: FakeLoginChallenge[] = [];
   readonly devices: FakeTrustedDevice[] = [];
   readonly audits: FakeMfaAudit[] = [];
+  /** Security activity history entries (committed). */
+  readonly securityEvents: Array<{
+    authId: string;
+    type: string;
+    context?: unknown;
+    details?: Record<string, unknown>;
+    now: Date;
+  }> = [];
+  /** Sign-in sessions revoked / marked MFA-verified (by user). */
+  readonly revokedSessionsOf = new Map<string, string[]>();
+  readonly verifiedSessions: Array<{
+    authId: string;
+    sessionId: string;
+    method: string;
+  }> = [];
+  /** Active sign-in sessions of each user (for revokeOtherSessions). */
+  readonly activeSessions = new Map<string, string[]>();
   /** Set to make the next call fail like an unreachable database. */
   failWith: Error | null = null;
   /** What `uow.tx` is inside withLock (e.g. an in-memory Prisma stand-in). */
@@ -179,12 +196,26 @@ export class FakeMfaRepository {
     );
   }
 
-  revokeTrustedDevice(authId: string, deviceId: string, now: Date) {
+  revokeTrustedDevice(
+    authId: string,
+    deviceId: string,
+    now: Date,
+    context?: unknown,
+  ) {
     const device = this.devices.find(
       (d) => d.id === deviceId && d.authId === authId,
     );
     if (!device) return Promise.resolve(false);
-    device.revokedAt ??= now;
+    if (!device.revokedAt) {
+      device.revokedAt = now;
+      this.securityEvents.push({
+        authId,
+        type: 'TRUSTED_DEVICE_REVOKED',
+        context,
+        details: { reason: 'user', deviceId, name: device.name },
+        now,
+      });
+    }
     return Promise.resolve(true);
   }
 
@@ -217,6 +248,10 @@ export class FakeMfaRepository {
     const challenges = cloneAll(this.challenges);
     const devices = cloneAll(this.devices);
     const audits: FakeMfaAudit[] = [];
+    const events: FakeMfaRepository['securityEvents'] = [];
+    let sessions = [...(this.activeSessions.get(authId) ?? [])];
+    const revokedSessions: string[] = [];
+    const verified: FakeMfaRepository['verifiedSessions'] = [];
     const reject = (message: string) => Promise.reject(new Error(message));
 
     const uow: MfaUnitOfWork = {
@@ -355,6 +390,20 @@ export class FakeMfaRepository {
         };
         return Promise.resolve();
       },
+      revokeOtherSessions: (keep) => {
+        const ended = sessions.filter((id) => id !== keep);
+        sessions = sessions.filter((id) => id === keep);
+        revokedSessions.push(...ended);
+        return Promise.resolve(ended);
+      },
+      markSessionMfaVerified: (sessionId, method) => {
+        verified.push({ authId, sessionId, method });
+        return Promise.resolve();
+      },
+      recordEvent: ({ type, context, details, now }) => {
+        events.push({ authId, type, context, details, now });
+        return Promise.resolve();
+      },
       revokeTrustedDevices: (now) => {
         let count = 0;
         for (const d of devices) {
@@ -414,10 +463,12 @@ export class FakeMfaRepository {
               d.expiresAt.getTime() > input.createdAt.getTime(),
           )
           .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+        const revokedIds: string[] = [];
         for (const surplus of active.slice(maxActive)) {
           surplus.revokedAt = input.createdAt;
+          revokedIds.push(surplus.id);
         }
-        return Promise.resolve({ id: device.id });
+        return Promise.resolve({ id: device.id, revokedIds });
       },
     };
 
@@ -430,6 +481,13 @@ export class FakeMfaRepository {
     this.challenges.splice(0, this.challenges.length, ...challenges);
     this.devices.splice(0, this.devices.length, ...devices);
     this.audits.push(...audits);
+    this.securityEvents.push(...events);
+    this.activeSessions.set(authId, sessions);
+    this.revokedSessionsOf.set(authId, [
+      ...(this.revokedSessionsOf.get(authId) ?? []),
+      ...revokedSessions,
+    ]);
+    this.verifiedSessions.push(...verified);
     return result;
   }
 

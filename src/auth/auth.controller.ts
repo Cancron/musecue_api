@@ -27,6 +27,8 @@ import { CustomLoggerService } from '../common/services/custom-logger.service';
 import { THROTTLER_CONFIG } from '../common/config/throttler.config';
 import { AuthGuard } from '../common/guards/auth.guard';
 import { LoginDto } from './dto/login.dto';
+import { SessionsService } from './sessions/sessions.service';
+import { requestMetadata } from '../subscription/request-metadata';
 import { MFA_LOGIN } from './mfa/mfa.constants';
 import { CompleteMfaLoginDto, toMfaFactor } from './mfa/mfa.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
@@ -46,6 +48,7 @@ interface AuthenticatedRequest extends Request {
     userId: string;
     role: string;
     tokenVersion: number;
+    sid?: string;
   };
 }
 
@@ -54,6 +57,7 @@ interface AuthenticatedRequest extends Request {
 export class AuthController {
   constructor(
     private readonly authService: AuthService,
+    private readonly sessionsService: SessionsService,
     private readonly googleOAuthService: GoogleOAuthService,
     private readonly customLogger: CustomLoggerService,
   ) {}
@@ -444,6 +448,14 @@ export class AuthController {
       'AuthController',
     );
 
-    return this.authService.logoutAllDevices(req.user.userId);
+    // Every session ends and every access token stops working (the token
+    // version changes); recorded in the security history.
+    const meta = requestMetadata(req);
+    await this.sessionsService.revokeAll(
+      req.user,
+      { ip: meta.ip, userAgent: meta.userAgent, sessionId: req.user.sid },
+      'logout_all',
+    );
+    return { message: 'Logged out from all devices successfully' };
   }
 }

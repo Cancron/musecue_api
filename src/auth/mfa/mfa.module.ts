@@ -10,6 +10,8 @@ import { MfaVerificationService } from './mfa-verification.service';
 import { MfaController } from './mfa.controller';
 import { MfaRepository } from './mfa.repository';
 import { MfaService } from './mfa.service';
+import { RefreshSessionRepository } from '../state/refresh-session.repository';
+import { SecurityEventLog } from '../security-events/security-event.log';
 import { StepUpGuard } from '../step-up/step-up.guard';
 
 /**
@@ -43,6 +45,10 @@ import { StepUpGuard } from '../step-up/step-up.guard';
     ActivityLogService,
     AuthGuard,
     StepUpGuard,
+    // Stateless, PrismaService only (also provided by AuthModule, which
+    // imports this module).
+    RefreshSessionRepository,
+    SecurityEventLog,
   ],
   exports: [MfaRepository, MfaVerificationService, MfaLoginService],
 })

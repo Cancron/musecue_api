@@ -102,6 +102,7 @@ const USER_DATA_TABLES = [
   'MfaLoginChallenge',
   'MfaTrustedDevice',
   'StepUpApproval',
+  'SecurityEvent',
   'InfrastructureJob',
 ] as const;
 
@@ -357,6 +358,13 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
             name: 'phone',
             createdAt: new Date(),
             expiresAt: new Date(Date.now() + 30 * 24 * 3600_000),
+          },
+        },
+        // An entry of the security activity history.
+        securityEvents: {
+          create: {
+            type: 'SESSION_REVOKED',
+            details: { scope: 'all', count: 1 },
           },
         },
         // A background job of the PostgreSQL queue driver (a failed email

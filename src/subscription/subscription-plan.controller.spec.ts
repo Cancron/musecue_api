@@ -20,6 +20,8 @@ import { PrismaService } from '../common/services/prisma.service';
 import { RateLimitStore } from '../infrastructure/rate-limit/rate-limit.store';
 import { TokenVersionCache } from '../infrastructure/token-version/token-version.cache';
 import { SubscriptionModule } from './subscription.module';
+import { AdminMfaGuard } from '../auth/admin/admin-mfa.guard';
+import { stepUpSatisfied } from '../../test/support/step-up-satisfied';
 
 const prisma = mockDeep<PrismaService>();
 const tokenVersions = mock<TokenVersionCache>();
@@ -58,7 +60,12 @@ describe('Subscription plan administration (HTTP)', () => {
 
     const moduleRef = await Test.createTestingModule({
       imports: [TestInfrastructureModule, SubscriptionModule],
-    }).compile();
+    })
+      // Administrator MFA is covered by src/auth/admin/admin-mfa.guard.spec.ts
+      // and test/mfa-admin-policy.e2e-spec.ts; here: roles and validation.
+      .overrideGuard(AdminMfaGuard)
+      .useValue(stepUpSatisfied)
+      .compile();
 
     app = moduleRef.createNestApplication();
     const logger = mock<Logger>();

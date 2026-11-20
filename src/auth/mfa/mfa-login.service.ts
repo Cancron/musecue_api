@@ -13,6 +13,7 @@ import {
 } from './mfa-verification.service';
 import { MFA_LOGIN } from './mfa.constants';
 import { MfaRepository, type TrustedDeviceView } from './mfa.repository';
+import type { SecurityEventContext } from '../security-events/security-event.log';
 
 export type FirstFactorProvider = 'local' | 'google';
 
@@ -213,6 +214,7 @@ export class MfaLoginService {
             device: input.meta.device,
           },
           now,
+          { source: 'sign_in' },
         );
         if (checked.kind !== 'VERIFIED') {
           return { kind: 'DECLINED', outcome: checked };
@@ -229,7 +231,7 @@ export class MfaLoginService {
           const expiresAt = new Date(
             now.getTime() + MFA_LOGIN.TRUSTED_DEVICE_TTL_MS,
           );
-          const { id } = await uow.createTrustedDevice(
+          const { id, revokedIds } = await uow.createTrustedDevice(
             {
               tokenHash: hashMfaToken(token),
               name,
@@ -241,6 +243,32 @@ export class MfaLoginService {
             MFA_LOGIN.MAX_TRUSTED_DEVICES,
           );
           trustedDevice = { id, token, name, expiresAt };
+          const context = {
+            ip: input.meta.ip,
+            userAgent: input.meta.userAgent,
+          };
+          await uow.recordEvent({
+            type: 'TRUSTED_DEVICE_ADDED',
+            context,
+            details: {
+              deviceId: id,
+              name,
+              expiresAt: expiresAt.toISOString(),
+            },
+            now,
+          });
+          if (revokedIds.length > 0) {
+            await uow.recordEvent({
+              type: 'TRUSTED_DEVICE_REVOKED',
+              context,
+              details: {
+                reason: 'device_limit',
+                count: revokedIds.length,
+                deviceIds: revokedIds,
+              },
+              now,
+            });
+          }
         }
         const completion: MfaLoginCompletion = {
           authId,
@@ -293,9 +321,10 @@ export class MfaLoginService {
     authId: string,
     deviceId: string,
     now: Date = new Date(),
+    context: SecurityEventContext = {},
   ): Promise<{ id: string; revoked: true }> {
     const found = await this.guard(() =>
-      this.repository.revokeTrustedDevice(authId, deviceId, now),
+      this.repository.revokeTrustedDevice(authId, deviceId, now, context),
     );
     if (!found) throw AppError.notFound('Trusted device not found');
     this.logger.info('Trusted device revoked', {

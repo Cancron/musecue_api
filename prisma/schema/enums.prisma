@@ -40,6 +40,26 @@ enum RefreshSessionRevocation {
   ACCOUNT_INACTIVE
   // A security event (e.g. account deletion) revoked every session.
   SECURITY_EVENT
+  // The user ended it from the session list (one, all others, or all).
+  USER_REVOKED
+  // MFA was enabled in another session: every other session ended.
+  MFA_ENABLED
+}
+
+// Entries of the security activity history (SecurityEvent).
+enum SecurityEventType {
+  MFA_ENROLLMENT_STARTED
+  MFA_ENABLED
+  MFA_DISABLED
+  MFA_AUTHENTICATOR_REPLACEMENT_STARTED
+  MFA_AUTHENTICATOR_REPLACED
+  MFA_RECOVERY_CODES_REGENERATED
+  MFA_RECOVERY_CODE_USED
+  MFA_VERIFICATION_FAILED
+  MFA_VERIFICATION_BLOCKED
+  TRUSTED_DEVICE_ADDED
+  TRUSTED_DEVICE_REVOKED
+  SESSION_REVOKED
 }
 
 // Sensitive actions that need a step-up approval (see StepUpApproval).

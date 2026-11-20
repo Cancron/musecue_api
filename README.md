@@ -22,6 +22,9 @@ The companion mobile application and detailed product specifications live in `..
 - account deletion: the owner confirms their identity (password and an emailed code, or the code alone for accounts without a password), the account is blocked and every token invalidated at once (`PENDING_DELETION`), and a background sweep hard-deletes the account and all its data and files (including its refresh sessions, one-time codes and queued or retained background jobs), keeping payment records detached (see "Account deletion" under API)
 - optional MFA with an authenticator app (TOTP): the signed-in owner starts an enrollment, confirms it with the app's current six-digit code within 10 minutes, and reads whether MFA is enabled; secrets are stored only encrypted, codes work only in their own 30 seconds and only once, and five incorrect codes within 15 minutes block enrollment for 15 minutes. Enabling MFA issues ten single-use recovery codes (shown once, stored only as salted scrypt hashes) that verify instead of the app's code, and can be regenerated with a second factor. Password and Google sign-in of an MFA user returns an MFA challenge instead of tokens, completed with the app's code or a recovery code; the device can then be trusted for 30 days (listed and revocable). MFA credentials use their own key (`MFA_ENCRYPTION_KEY`) and never depend on a JWT secret (see "Multi-factor authentication" under API)
 - step-up authentication for sensitive actions (MFA enrollment, recovery codes, subscription cancellation, personal data export and download, account deletion): a ten-minute approval bound to the user, the sign-in session and the action, proven with an authenticator or recovery code (MFA users), the password (others) or a new Google sign-in (Google-only accounts); trusted devices never replace it (see "Step-up authentication" under API)
+- active-session management: users list their sign-in sessions and end one, all others or all of them; an ended session's access and refresh tokens stop working at once and it can never be refreshed again. Enabling MFA keeps the session that enables it and ends every other session, approval, sign-in challenge and trusted device (see "Sessions, administrator MFA and security activity" under API)
+- administrators (`ADMIN`, `SUPERADMIN`) must have MFA enabled with an authenticator app and must have verified it in the current session within 12 hours before any administrator operation; trusted devices and other methods (SMS) never count
+- a paginated security activity history of each account (MFA enrollment and changes, failed MFA verifications and blocks, recovery-code use, trusted-device changes, session revocations), readable only by its owner and never containing a secret, code or token
 
 Migration `20260827174107_add_makeup_workflow` adds the makeup aggregate and removes the dormant job-tracker and subscription starter domains.
 
@@ -550,8 +553,13 @@ Authentication routes:
 | `POST` | `/auth/login`                     | Return access token, refresh token, and user; an MFA challenge instead for users with MFA |
 | `POST` | `/auth/login/mfa`                 | Complete the MFA challenge (app code or recovery code); optionally trust the device |
 | `POST` | `/auth/refresh-token`             | Rotate the refresh token                     |
-| `POST` | `/auth/logout`                    | Revoke the current session                   |
-| `POST` | `/auth/logout-all`                | Revoke all user sessions                     |
+| `POST` | `/auth/logout`                    | Revoke the current session (its access tokens stop working at once) |
+| `POST` | `/auth/logout-all`                | Revoke all user sessions and every access token |
+| `GET`  | `/auth/sessions`                  | List the caller's active sign-in sessions, the current one marked (bearer token) |
+| `DELETE` | `/auth/sessions/:sessionId`     | End one of the caller's sessions (bearer token) |
+| `POST` | `/auth/sessions/revoke-others`    | End every session except the current one (bearer token) |
+| `POST` | `/auth/sessions/revoke-all`       | End every session, the current one included (bearer token) |
+| `GET`  | `/v1/security/activity`           | The caller's security activity history, newest first, paginated (bearer token) |
 | `GET`  | `/auth/mfa`                       | Whether MFA is enabled; enrollment state (bearer token) |
 | `POST` | `/auth/mfa/enrollment`            | Start an authenticator-app enrollment (bearer token, step-up `MFA_ENROLLMENT`) |
 | `POST` | `/auth/mfa/enrollment/confirm`    | Confirm it with a six-digit code and enable MFA; shows the recovery codes once (bearer token, step-up `MFA_ENROLLMENT`) |
@@ -682,8 +690,6 @@ Rules:
 - **Concurrency:** verification takes the same per-user advisory lock as enrollment. Single use would hold without it (the conditional `UPDATE`), but the lock keeps the failure count exact when wrong codes arrive in parallel, so the lockout cannot be raced.
 - `409` when MFA is not enabled. `503` for database or key failures, never reported as a wrong code.
 
-Tests:
-
 #### MFA at sign-in
 
 Users without MFA sign in exactly as before (`POST /auth/login` and the Google callbacks return tokens; responses now also carry `"mfaRequired": false`). For a user with MFA enabled, a correct first factor (password, or Google) returns **no tokens**, only a challenge:
@@ -722,17 +728,19 @@ Tests:
 ```bash
 # Unit tests (no database or Redis), run with an empty JWT refresh secret:
 # TOTP (RFC 6238 vectors), keys and encryption, scrypt recovery codes, lockout,
-# the services (enrollment, verification, sign-in, trusted devices), HTTP contract
+# the services (enrollment, verification, sign-in, trusted devices), HTTP contract,
+# the administrator MFA guard, session management, AuthGuard's session check and
+# the security activity history
 npm test -- --runInBand mfa
 # Real endpoints of the whole application on a temporary PostgreSQL schema
 TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json test/mfa-
 ```
 
-`test/mfa-login.e2e-spec.ts` covers sign-in with and without MFA (password and Google, with Google's servers simulated), challenges, token issuance (including a refused session write that consumes nothing), trusted-device validity, expiry, revocation and ownership; `test/mfa-step-up.e2e-spec.ts` step-up authentication (including Google reauthentication without `auth_time`); `test/mfa-security.e2e-spec.ts` MFA management (refused and approved changes, PostgreSQL records, invalidation of old secrets, codes and devices, notifications, absence of sensitive information); `test/mfa-rekey.e2e-spec.ts` the upgrade command.
+`test/mfa-login.e2e-spec.ts` covers sign-in with and without MFA (password and Google, with Google's servers simulated), challenges, token issuance (including a refused session write that consumes nothing), trusted-device validity, expiry, revocation and ownership; `test/mfa-step-up.e2e-spec.ts` step-up authentication (including Google reauthentication without `auth_time`); `test/mfa-security.e2e-spec.ts` MFA management (refused and approved changes, PostgreSQL records, invalidation of old secrets, codes and devices, notifications, absence of sensitive information); `test/mfa-rekey.e2e-spec.ts` the upgrade command; `test/mfa-sessions.e2e-spec.ts` active-session management and the sessions ended by enabling MFA; `test/mfa-admin-policy.e2e-spec.ts` the administrator MFA policy (including trusted-device sessions, expired proofs and SMS); `test/mfa-audit.e2e-spec.ts` the security activity history (every event type, order, pagination, ownership, absence of secrets).
 
 Migrations: `20261122120000_mfa_totp_enrollment` adds `MfaEnrollment` (CHECK: a pending secret always has an expiry; at most five stored failures) and `authSecurity.mfaLastUsedStep`. `20261123120000_mfa_recovery_codes` adds `MfaRecoveryCode` (protecting trigger) and the verification lockout (`authSecurity.mfaFailedAttemptsAt`, `mfaBlockedUntil`). `20261124120000_mfa_login_and_independent_keys` adds `MfaLoginChallenge` and `MfaTrustedDevice` (CHECKs and trigger above) and switches recovery codes to scrypt (see "Upgrading"). Existing users keep MFA disabled.
 
-Not implemented yet: disabling MFA or resetting a lost authenticator (an administrator procedure is needed for users who lose both the app and their recovery codes), revoking all trusted devices at once or on a security event (for example `logout-all`), and re-encrypting secrets under a previous key without waiting for their next use.
+Disabling MFA and replacing the authenticator app are available (see "MFA management"). Not implemented yet: recovering an account whose owner lost both the authenticator app and every recovery code (an administrator procedure is needed; both self-service operations need a second factor), revoking all trusted devices at once or on `logout-all` (they are revoked one by one, and all of them when MFA is enabled, disabled or its app replaced), and re-encrypting secrets under a previous key without waiting for their next use.
 
 ### Step-up authentication
 
@@ -784,9 +792,64 @@ Responses of disable and replacement confirmation are the MFA status plus `trust
 
 **Security notification emails** (`templates/emails/security-notification.html`) are queued only after the change committed, so a rolled-back change is never announced. They state what changed and when (for example "Two-step verification was turned off") and what to do if it was not the owner; they contain no secret, code, token, IP address or device detail. Values are HTML-escaped. Trusted-device revocation on its own (`DELETE /auth/mfa/trusted-devices/:id`) only reduces access and needs neither a step-up nor a notification.
 
+### Sessions, administrator MFA and security activity
+
+#### Active sessions
+
+Every sign-in (password, MFA, Google) opens a **session**: its ID is `RefreshSession.familyId`, kept by every refresh-token rotation and carried by the access tokens as `sid`. All routes act on the token's user only and never accept a user ID.
+
+- `GET /auth/sessions` (`Cache-Control: no-store`) lists the caller's active sessions, most recently active first: `{ id, current, signedInAt, lastActiveAt, expiresAt, ipAddress, userAgent, device, mfaVerifiedAt }`. `current` marks the session making the request. Tokens and their hashes are never returned.
+- `DELETE /auth/sessions/:sessionId` ends one session (the current one too). Another user's session, an ended one or an unknown ID answers `404` (indistinguishable); a malformed ID `400`.
+- `POST /auth/sessions/revoke-others` (no body) ends every session except the current one.
+- `POST /auth/sessions/revoke-all` (no body) ends every session, the current one included, and changes the user's `tokenVersion` (so tokens without a `sid` stop working too). `POST /auth/logout-all` does the same.
+
+Each answers `200` `{ "revoked": N, "sessionIds": [...] }`. An ended session is revoked in PostgreSQL (`revokedReason: USER_REVOKED`; `LOGOUT_ALL`, `LOGOUT` or `MFA_ENABLED` for the other paths) under the user's session lock, so a refresh racing the revocation cannot keep it alive, and it can never be refreshed again (every earlier refresh token of it is refused too). **Access tokens stop working at once**: `AuthGuard` now checks, for every token with a `sid`, that the session still has an active row (`401 This session has ended. Please sign in again.`). This costs one indexed query per authenticated request. Tokens issued before sessions were identified (no `sid`) are not affected by this check; they are ended by `tokenVersion` (logout-all, revoke-all, security events) or expire within 15 minutes.
+
+**Enabling MFA** (`POST /auth/mfa/enrollment/confirm`) keeps the session that confirms it and, in the same transaction, ends every other session (`MFA_ENABLED`), deletes their step-up approvals and any open MFA sign-in challenge, and revokes every trusted device. The confirming session counts as MFA-verified. The response adds `sessionsRevoked`. A failed confirmation ends nothing.
+
+#### Administrator MFA policy
+
+`AdminMfaGuard` runs after `AuthGuard` and `RolesGuard` on every administrator route (today `GET`/`PATCH /v1/admin/subscription-plan`; an e2e test fails if a route allowing `ADMIN` or `SUPERADMIN` lacks it). An `ADMIN` or `SUPERADMIN` passes only when:
+
+1. MFA is enabled on the account with an authenticator app (`mfaEnabled`, `mfaMethod: totp`, a stored secret); otherwise `403 Administrators must enable MFA with an authenticator app before using administrator operations`;
+2. the current session (`sid`) proved MFA within the last **12 hours** with the authenticator or a recovery code; otherwise `403 Verify MFA in this session (POST /auth/mfa/verify) to use administrator operations`.
+
+A session gets its proof (`RefreshSession.mfaVerifiedAt`, `mfaVerifiedWith`) from an MFA sign-in, `POST /auth/mfa/verify`, an MFA step-up, confirming the enrollment or an authenticator replacement; refreshes keep it, and it ends with the session. A sign-in through a **trusted device** has no proof: the administrator verifies MFA in that session first. No other method counts: an account with `mfaMethod` `sms` is treated as without MFA, there is no SMS verification, and a database CHECK allows only `totp` and `recovery_code` as proofs. Tokens without a session never pass. Other roles are unaffected (non-administrator routes do not require MFA). The policy constants are in `src/auth/admin/admin-mfa.guard.ts` (`ADMIN_MFA_POLICY`). Before deploying, make sure every administrator has enabled MFA (through the normal enrollment, which works without administrator rights), or they lose access to administrator routes.
+
+#### Security activity history
+
+`GET /v1/security/activity?page=1&limit=20` (`Cache-Control: no-store`; `page` from 1, `limit` 1-100, default 20; any other parameter `400`) returns the caller's own history, newest first and then by ID, so pages are stable:
+
+```json
+{
+  "items": [
+    { "id": "...", "type": "SESSION_REVOKED", "createdAt": "2026-11-27T12:00:00.000Z", "ipAddress": "203.0.113.7", "userAgent": "...", "sessionId": "...", "currentSession": true,
+      "details": { "scope": "others", "count": 2, "sessionIds": ["..."], "includesCurrentSession": false } }
+  ],
+  "meta": { "page": 1, "limit": 20, "total": 41, "totalPages": 3, "hasPreviousPage": false, "hasNextPage": true }
+}
+```
+
+| `type` | Recorded when | `details` |
+| --- | --- | --- |
+| `MFA_ENROLLMENT_STARTED`, `MFA_AUTHENTICATOR_REPLACEMENT_STARTED` | an enrollment / replacement starts | `expiresAt` |
+| `MFA_ENABLED` | MFA is enabled | `method`, `recoveryCodes` (count), `sessionsRevoked`, `trustedDevicesRevoked` |
+| `MFA_AUTHENTICATOR_REPLACED`, `MFA_DISABLED` | the app is replaced / MFA is turned off | counts and `approvedWith` (step-up method) |
+| `MFA_RECOVERY_CODES_REGENERATED` | new recovery codes | `count`, `approvedWith` |
+| `MFA_RECOVERY_CODE_USED` | a recovery code is accepted | `context`, `remaining` |
+| `MFA_VERIFICATION_FAILED`, `MFA_VERIFICATION_BLOCKED` | a wrong code (the fifth in 15 minutes blocks) | `context` (`sign_in`, `step_up`, `verification`, `enrollment`, `replacement`), `method`, `remainingAttempts` or `blockedUntil` |
+| `TRUSTED_DEVICE_ADDED`, `TRUSTED_DEVICE_REVOKED` | a device is trusted / revoked | `deviceId`, `name`, `expiresAt`; or `reason` (`user`, `device_limit`, `mfa_enabled`, `mfa_disabled`, `authenticator_replaced`) and `count` |
+| `SESSION_REVOKED` | sessions are ended | `scope` (`one`, `others`, `all`, `logout`, `logout_all`, `mfa_enabled`), `count`, `sessionIds`, `includesCurrentSession` |
+
+Events are written in the same transaction as the change they describe (a failed verification is recorded with its counted failure), so they cannot disagree; the one exception is `POST /auth/logout`, whose event is written right after the revocation (without IP address and user agent) and is skipped if that write fails. They are stored in `SecurityEvent` (user, type, session, IP address, user agent, details, time; index on user, time and ID) and deleted with the account. They never contain a secret, code, token, hash or key: only types, counts, reasons, methods, IDs and device labels. The history is kept until the account is deleted (no retention sweep yet).
+
+Migration `20261127120000_sessions_admin_mfa_security_events` adds the `SecurityEventType` enum and `SecurityEvent` table, `RefreshSession.mfaVerifiedAt`/`mfaVerifiedWith` (CHECK: both or neither, method `totp` or `recovery_code`) and the `USER_REVOKED` and `MFA_ENABLED` revocation reasons. Existing sessions have no MFA proof, so administrators verify MFA once after the upgrade.
+
+Tests: `test/mfa-sessions.e2e-spec.ts`, `test/mfa-admin-policy.e2e-spec.ts` and `test/mfa-audit.e2e-spec.ts` (real endpoints, temporary PostgreSQL schema), and the unit tests matched by `npm test -- --runInBand mfa`.
+
 ### Subscriptions
 
-Administration routes require a bearer token for an `ADMIN` or `SUPERADMIN` account; other roles, including `MODERATOR`, receive `403`. The role is read from the verified access token (no extra database lookup), so a role change applies once the user's access token is replaced or revoked through `tokenVersion`. Role names are the Prisma `userRole` values (`USER`, `MODERATOR`, `ADMIN`, `SUPERADMIN`); the TypeScript `UserRole` is derived from that enum.
+Administration routes require a bearer token for an `ADMIN` or `SUPERADMIN` account; other roles, including `MODERATOR`, receive `403`. Administrators must also have MFA enabled and verified in the current session (see "Administrator MFA policy"); otherwise `403`. The role is read from the verified access token (no extra database lookup), so a role change applies once the user's access token is replaced or revoked through `tokenVersion`. Role names are the Prisma `userRole` values (`USER`, `MODERATOR`, `ADMIN`, `SUPERADMIN`); the TypeScript `UserRole` is derived from that enum.
 
 | Method  | Route                         | Purpose                                |
 | ------- | ----------------------------- | -------------------------------------- |
@@ -1110,7 +1173,7 @@ Migration `20261113120000_add_stripe_checkout` adds `PaymentCustomer` and `Check
 
 Not implemented yet: immediate cancellation (including canceling a past-due subscription to stop Stripe's retries), undoing a cancellation (a cancellation reversed in Stripe is not reflected), the customer portal (so users cannot update their card in-app; Stripe's own emails and hosted invoice page can be used), exposing the past-due state in `GET /v1/subscription`, requesting refunds from MuseCue, disputes (`charge.dispute.*`), canceling the Stripe subscription automatically when a payment is refunded, revoking an active free trial on refund (a trial is not a payment and keeps running), reactions to other `customer.subscription.updated` changes (e.g. `unpaid`), and automatic refunds or cancellation of duplicate payments and subscriptions. Renewal delays within Stripe's retry window (up to 3 days) are handled. If a renewal for an older period arrives after a newer one, the older period is recorded but cannot be merged into the term: the database allows one payment per term change.
 
-Database tests (`test/auth-state.e2e-spec.ts`, `test/mfa-enrollment.e2e-spec.ts`, `test/mfa-recovery.e2e-spec.ts`, `test/mfa-login.e2e-spec.ts`, `test/mfa-rekey.e2e-spec.ts`, `test/mfa-step-up.e2e-spec.ts`, `test/mfa-security.e2e-spec.ts`, `test/postgres-job-queue.e2e-spec.ts`, `test/postgres-mode.e2e-spec.ts`, `test/rate-limit-contract.e2e-spec.ts` (PostgreSQL part), `test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`, `test/privacy-export.e2e-spec.ts`, `test/account-deletion.e2e-spec.ts`, `test/account-erasure.e2e-spec.ts`, `test/stripe-checkout.e2e-spec.ts`, `test/stripe-renewal.e2e-spec.ts`, `test/stripe-payment-failure.e2e-spec.ts`, `test/stripe-cancellation.e2e-spec.ts`, `test/stripe-refund.e2e-spec.ts`, `test/subscription-billing.e2e-spec.ts`, `test/stripe-webhook-reliability.e2e-spec.ts`, `test/stripe-payment-lifecycle.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
+Database tests (`test/auth-state.e2e-spec.ts`, `test/mfa-enrollment.e2e-spec.ts`, `test/mfa-recovery.e2e-spec.ts`, `test/mfa-login.e2e-spec.ts`, `test/mfa-rekey.e2e-spec.ts`, `test/mfa-step-up.e2e-spec.ts`, `test/mfa-security.e2e-spec.ts`, `test/mfa-sessions.e2e-spec.ts`, `test/mfa-admin-policy.e2e-spec.ts`, `test/mfa-audit.e2e-spec.ts`, `test/postgres-job-queue.e2e-spec.ts`, `test/postgres-mode.e2e-spec.ts`, `test/rate-limit-contract.e2e-spec.ts` (PostgreSQL part), `test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`, `test/privacy-export.e2e-spec.ts`, `test/account-deletion.e2e-spec.ts`, `test/account-erasure.e2e-spec.ts`, `test/stripe-checkout.e2e-spec.ts`, `test/stripe-renewal.e2e-spec.ts`, `test/stripe-payment-failure.e2e-spec.ts`, `test/stripe-cancellation.e2e-spec.ts`, `test/stripe-refund.e2e-spec.ts`, `test/subscription-billing.e2e-spec.ts`, `test/stripe-webhook-reliability.e2e-spec.ts`, `test/stripe-payment-lifecycle.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
 
 ```bash
 TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json test/subscription-plan test/user-subscription test/subscription-trial test/subscription-status test/pro-access test/trial-lifecycle test/billing test/subscription-security test/privacy-export test/account-deletion test/account-erasure

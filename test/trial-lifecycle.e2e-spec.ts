@@ -32,6 +32,7 @@ import {
 import { addBillingInterval } from '../src/subscription/billing.validation';
 import { SubscriptionModule } from '../src/subscription/subscription.module';
 import { freezeTime } from './support/freeze-time';
+import { grantAdminMfa } from './support/step-up-fixtures';
 import {
   TEST_DATABASE_URL,
   applyMigrations,
@@ -82,8 +83,12 @@ describeWithDatabase(
     const T0 = new Date('2026-03-01T09:30:00.000Z');
     const day = (n: number, ms = 0) => new Date(daysFrom(T0, n).getTime() + ms);
 
-    const bearer = (userId: string, role: UserRole = UserRole.USER) =>
-      `Bearer ${tokens.createAccessToken({ userId, role, tokenVersion: 1 })}`;
+    const bearer = (
+      userId: string,
+      role: UserRole = UserRole.USER,
+      sid?: string,
+    ) =>
+      `Bearer ${tokens.createAccessToken({ userId, role, tokenVersion: 1, sid })}`;
     const http = () => request(app.getHttpServer());
 
     const activate = (userId: string, now: Date) => {
@@ -108,9 +113,12 @@ describeWithDatabase(
     };
     const setPlan = async (body: object, now: Date) => {
       freezeTime(now);
+      // Administrator routes need a session that proved MFA recently (at
+      // the frozen "now").
+      const sid = await grantAdminMfa(client, adminId, now);
       await http()
         .patch('/v1/admin/subscription-plan')
-        .set('Authorization', bearer(adminId, UserRole.ADMIN))
+        .set('Authorization', bearer(adminId, UserRole.ADMIN, sid))
         .send(body)
         .expect(200);
     };

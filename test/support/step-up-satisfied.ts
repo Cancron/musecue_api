@@ -1,11 +1,12 @@
 import type { CanActivate } from '@nestjs/common';
 
 /**
- * For HTTP specs of a sensitive route that test something else (export
- * contents, deletion rules, Stripe cancellation, ...) on in-memory fakes:
- * stands in for StepUpGuard as if a valid step-up approval was sent. Step-up
- * itself is covered by src/auth/step-up/*.spec.ts and
- * test/mfa-step-up.e2e-spec.ts (real guard, real PostgreSQL).
+ * For HTTP specs of a protected route that test something else (export
+ * contents, deletion rules, Stripe cancellation, plan administration, ...)
+ * on in-memory fakes: stands in for StepUpGuard (a valid step-up approval
+ * was sent) or AdminMfaGuard (the administrator verified MFA). The guards
+ * themselves are covered by their own specs and by test/mfa-step-up and
+ * test/mfa-admin-policy (real guards, real PostgreSQL).
  */
 export const stepUpSatisfied: CanActivate = {
   canActivate: () => true,

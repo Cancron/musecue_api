@@ -31,6 +31,7 @@ import {
 } from './mfa.dto';
 import { MfaService, type MfaChangeContext } from './mfa.service';
 import type { StepUpContext } from '../step-up/step-up.guard';
+import type { SecurityEventContext } from '../security-events/security-event.log';
 
 interface AuthenticatedRequest extends Request {
   user: IAccessTokenPayload;
@@ -41,8 +42,15 @@ interface AuthenticatedRequest extends Request {
 /** Request metadata and how the change was approved (never a secret). */
 const changeContext = (req: AuthenticatedRequest): MfaChangeContext => ({
   metadata: requestMetadata(req),
+  sessionId: req.user.sid,
   approvedWith: req.stepUp?.method,
 });
+
+/** Where a security event happened: request and sign-in session. */
+const eventContext = (req: AuthenticatedRequest): SecurityEventContext => {
+  const meta = requestMetadata(req);
+  return { ip: meta.ip, userAgent: meta.userAgent, sessionId: req.user.sid };
+};
 
 /**
  * Optional MFA (authenticator app) of the signed-in user's own account. The
@@ -83,7 +91,11 @@ export class MfaController {
     @Body(EmptyBodyPipe) _body: unknown,
     @Req() req: AuthenticatedRequest,
   ) {
-    return this.mfa.startEnrollment(req.user.userId);
+    return this.mfa.startEnrollment(
+      req.user.userId,
+      undefined,
+      eventContext(req),
+    );
   }
 
   /**
@@ -102,10 +114,13 @@ export class MfaController {
     @Body() dto: ConfirmMfaEnrollmentDto,
     @Req() req: AuthenticatedRequest,
   ) {
+    // This session stays signed in; every other one is ended.
     return this.mfa.confirmEnrollment(
       req.user.userId,
       dto.code,
       requestMetadata(req),
+      undefined,
+      req.user.sid,
     );
   }
 
@@ -118,10 +133,13 @@ export class MfaController {
   @Header('Cache-Control', 'no-store')
   @Throttle({ default: THROTTLER_CONFIG.STRICT })
   verify(@Body() dto: MfaVerificationDto, @Req() req: AuthenticatedRequest) {
+    // A success also counts as this session's MFA proof (administrators).
     return this.verification.verify(
       req.user.userId,
       toMfaFactor(dto),
       requestMetadata(req),
+      undefined,
+      req.user.sid,
     );
   }
 
@@ -180,7 +198,11 @@ export class MfaController {
     @Body(EmptyBodyPipe) _body: unknown,
     @Req() req: AuthenticatedRequest,
   ) {
-    return this.mfa.startReplacement(req.user.userId);
+    return this.mfa.startReplacement(
+      req.user.userId,
+      undefined,
+      eventContext(req),
+    );
   }
 
   /**
@@ -227,6 +249,11 @@ export class MfaController {
     @Param('deviceId', new ParseUUIDPipe()) deviceId: string,
     @Req() req: AuthenticatedRequest,
   ) {
-    return this.login.revokeTrustedDevice(req.user.userId, deviceId);
+    return this.login.revokeTrustedDevice(
+      req.user.userId,
+      deviceId,
+      undefined,
+      eventContext(req),
+    );
   }
 }

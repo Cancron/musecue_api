@@ -12,10 +12,14 @@ import { AuthStateCleanupService } from './state/auth-state-cleanup.service';
 import { OAuthStateRepository } from './state/oauth-state.repository';
 import { RefreshSessionRepository } from './state/refresh-session.repository';
 import { MfaModule } from './mfa/mfa.module';
+import { SecurityActivityController } from './security-events/security-activity.controller';
+import { SecurityEventLog } from './security-events/security-event.log';
+import { SessionsController } from './sessions/sessions.controller';
+import { SessionsService } from './sessions/sessions.service';
 
 @Module({
   imports: [QueueModule, MfaModule],
-  controllers: [AuthController],
+  controllers: [AuthController, SessionsController, SecurityActivityController],
   providers: [
     AuthService,
     AuthUtilsService,
@@ -29,6 +33,8 @@ import { MfaModule } from './mfa/mfa.module';
     AuthChallengeRepository,
     OAuthStateRepository,
     AuthStateCleanupService,
+    SessionsService,
+    SecurityEventLog,
   ],
   exports: [
     AuthService,

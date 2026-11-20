@@ -1,4 +1,5 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Optional } from '@nestjs/common';
+import { SecurityEventLog } from './security-events/security-event.log';
 import type { Prisma } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 import { CreateAuthDto } from './dto/create-auth.dto';
@@ -47,6 +48,7 @@ export class AuthService {
     private readonly emailQueueService: EmailQueueService,
     private readonly customLogger: CustomLoggerService,
     private readonly mfaLogin: MfaLoginService,
+    @Optional() private readonly securityEvents?: SecurityEventLog,
   ) {}
 
   async create(
@@ -657,7 +659,8 @@ export class AuthService {
     // cannot be stored, the challenge and the code are not consumed either.
     const { completion, result: tokens } = await this.mfaLogin.complete(
       { ...input, meta },
-      async (tx, { authId }) => {
+      async (tx, completion) => {
+        const { authId } = completion;
         const user = await tx.authUser.findUnique({
           where: { id: authId },
           select: {
@@ -673,7 +676,8 @@ export class AuthService {
         if (!user || user.status !== 'ACTIVE' || !user.verified) {
           throw AppError.unauthorized('User account is not active');
         }
-        return this.issueLoginTokens(user, meta, tx);
+        // The new session proved MFA (administrators rely on it).
+        return this.issueLoginTokens(user, meta, tx, completion.method);
       },
     );
 
@@ -709,6 +713,7 @@ export class AuthService {
     },
     meta: { ip: string; userAgent: string; device?: string },
     tx?: Prisma.TransactionClient,
+    mfaVerifiedWith?: 'totp' | 'recovery_code',
   ): Promise<ILoginResponse> {
     const { ip, userAgent, device } = meta;
 
@@ -742,7 +747,7 @@ export class AuthService {
       jti,
       refreshToken,
       { ip, userAgent, device },
-      { tx, familyId },
+      { tx, familyId, mfaVerifiedWith },
     );
 
     return {
@@ -910,7 +915,24 @@ export class AuthService {
 
     const { jti } = decoded;
     if (jti) {
+      const session = await this.sessions.find(jti);
       await this.sessions.revoke(userId, jti, 'LOGOUT');
+      if (session && session.authId === userId && !session.revokedAt) {
+        // History (the access tokens of this session stop working too).
+        await this.securityEvents
+          ?.record(this.prismaService, {
+            authId: userId,
+            type: 'SESSION_REVOKED',
+            context: { sessionId: session.familyId },
+            details: {
+              scope: 'logout',
+              count: 1,
+              sessionIds: [session.familyId],
+              includesCurrentSession: true,
+            },
+          })
+          .catch(() => undefined);
+      }
     }
 
     return { message: 'Logged out successfully' };

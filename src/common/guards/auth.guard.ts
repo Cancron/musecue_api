@@ -14,6 +14,8 @@ interface IAccessTokenPayload {
   userId: string;
   role: string;
   tokenVersion: number;
+  /** The sign-in session (RefreshSession.familyId). */
+  sid?: string;
 }
 
 @Injectable()
@@ -44,6 +46,27 @@ export class AuthGuard implements CanActivate {
         throw new UnauthorizedException(
           'Token has been revoked. Please login again.',
         );
+      }
+
+      // Step 3: the token's sign-in session must still be active. Ending a
+      // session (logout, the session list, logout-all, MFA activation)
+      // invalidates its access tokens at once, not only when they expire.
+      // (Tokens issued before sessions were identified carry no `sid`; they
+      // are ended by tokenVersion.)
+      if (payload.sid !== undefined) {
+        const active = await this.prismaService.refreshSession.count({
+          where: {
+            authId: payload.userId,
+            familyId: payload.sid,
+            revokedAt: null,
+            expiresAt: { gt: new Date() },
+          },
+        });
+        if (active === 0) {
+          throw new UnauthorizedException(
+            'This session has ended. Please sign in again.',
+          );
+        }
       }
 
       // Attach user to request for downstream use

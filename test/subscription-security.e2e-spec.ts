@@ -52,7 +52,7 @@ import {
   givenPaidProHistory,
   recordPayment,
 } from './support/subscription-fixtures';
-import { grantStepUp } from './support/step-up-fixtures';
+import { grantAdminMfa, grantStepUp } from './support/step-up-fixtures';
 
 jest.setTimeout(120_000);
 
@@ -82,8 +82,19 @@ describeWithDatabase('Subscription security (PostgreSQL, full stack)', () => {
   const tokens = new AuthUtilsService(mock<RateLimitStore>());
   const T0 = new Date('2026-03-01T09:30:00.000Z');
 
+  /**
+   * Sign-in sessions of administrators that proved MFA (administrator routes
+   * require it); their tokens carry that session by default.
+   */
+  const adminSessions = new Map<string, string>();
   const bearer = (userId: string, role: string = UserRole.USER, sid?: string) =>
-    `Bearer ${tokens.createAccessToken({ userId, role: role as UserRole, tokenVersion: 1, sid })}`;
+    `Bearer ${tokens.createAccessToken({ userId, role: role as UserRole, tokenVersion: 1, sid: sid ?? adminSessions.get(userId) })}`;
+  /** A user whose administrator tokens pass the admin MFA policy. */
+  const createAdmin = async () => {
+    const adminId = await createUser(client);
+    adminSessions.set(adminId, await grantAdminMfa(client, adminId));
+    return adminId;
+  };
   const http = () => request(app.getHttpServer());
   const dataOf = (r: { body: unknown }) => (r.body as { data: Data }).data;
   const plan = () =>
@@ -177,7 +188,7 @@ describeWithDatabase('Subscription security (PostgreSQL, full stack)', () => {
     it.each([UserRole.ADMIN, UserRole.SUPERADMIN])(
       '%s can change every plan setting, and each change is persisted and attributed',
       async (role) => {
-        const adminId = await createUser(client);
+        const adminId = await createAdmin();
         const settings = [
           { monthlyPriceUsdCents: 2400 },
           { yearlyPriceUsdCents: 24000 },
@@ -235,7 +246,7 @@ describeWithDatabase('Subscription security (PostgreSQL, full stack)', () => {
     );
 
     it('rejects missing, forged, expired and revoked admin tokens', async () => {
-      const adminId = await createUser(client);
+      const adminId = await createAdmin();
       await http()
         .patch('/v1/admin/subscription-plan')
         .send({ trialDays: 30 })
@@ -270,7 +281,7 @@ describeWithDatabase('Subscription security (PostgreSQL, full stack)', () => {
     it.each(['put', 'post', 'delete'] as const)(
       'exposes no %s route for the plan',
       async (method) => {
-        const adminId = await createUser(client);
+        const adminId = await createAdmin();
         await http()
           [method]('/v1/admin/subscription-plan')
           .set('Authorization', bearer(adminId, UserRole.SUPERADMIN))
@@ -284,7 +295,7 @@ describeWithDatabase('Subscription security (PostgreSQL, full stack)', () => {
   describe('plan settings: invalid requests', () => {
     let adminId: string;
     beforeAll(async () => {
-      adminId = await createUser(client);
+      adminId = await createAdmin();
     });
     const patchAsAdmin = (
       body: string | object,
@@ -416,7 +427,7 @@ describeWithDatabase('Subscription security (PostgreSQL, full stack)', () => {
     it.each([[{ trialEnabled: false }], [{ planEnabled: false }]])(
       'with %p a trial cannot be activated and nothing is recorded',
       async (settings) => {
-        const adminId = await createUser(client);
+        const adminId = await createAdmin();
         await http()
           .patch('/v1/admin/subscription-plan')
           .set('Authorization', bearer(adminId, UserRole.ADMIN))
@@ -587,7 +598,7 @@ describeWithDatabase('Subscription security (PostgreSQL, full stack)', () => {
     });
 
     it('does not grant Pro access from an elevated role claim', async () => {
-      const adminId = await createUser(client);
+      const adminId = await createAdmin();
       await http()
         .get('/v1/test-pro-feature')
         .set('Authorization', bearer(adminId, UserRole.SUPERADMIN))
@@ -733,7 +744,7 @@ describeWithDatabase('Subscription security (PostgreSQL, full stack)', () => {
 
     it('no API request can create a payment, a paid term or a lifecycle event', async () => {
       const userId = await createUser(client);
-      const adminId = await createUser(client);
+      const adminId = await createAdmin();
       const attempts = [
         http()
           .post('/v1/subscription/trial')

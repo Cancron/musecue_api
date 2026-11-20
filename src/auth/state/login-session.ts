@@ -30,7 +30,12 @@ export async function storeLoginSession(
   jti: string,
   refreshToken: string,
   meta: { ip: string; userAgent: string; device?: string },
-  options: { tx?: Prisma.TransactionClient; familyId?: string } = {},
+  options: {
+    tx?: Prisma.TransactionClient;
+    familyId?: string;
+    /** The sign-in proved MFA (the MFA challenge), and how. */
+    mfaVerifiedWith?: 'totp' | 'recovery_code';
+  } = {},
 ): Promise<void> {
   try {
     await sessions.createForLogin(
@@ -43,6 +48,12 @@ export async function storeLoginSession(
         device: meta.device,
         expiresAt: new Date(Date.now() + refreshTokenLifetimeMs()),
         familyId: options.familyId,
+        ...(options.mfaVerifiedWith
+          ? {
+              mfaVerifiedAt: new Date(),
+              mfaVerifiedWith: options.mfaVerifiedWith,
+            }
+          : {}),
       },
       AUTH_CONFIG.SESSION.MAX_DEVICES_PER_USER,
       undefined,

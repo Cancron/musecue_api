@@ -208,6 +208,7 @@ describe('MfaService', () => {
           remainingAttempts: 5,
         },
         recoveryCodes: expect.any(Array) as string[],
+        sessionsRevoked: 0,
       });
       const account = repo.accounts.get(USER)!;
       expect(account).toMatchObject({ mfaEnabled: true, mfaMethod: 'totp' });

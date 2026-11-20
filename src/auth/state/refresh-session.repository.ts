@@ -25,6 +25,23 @@ export interface NewRefreshSession {
    * always keeps the presented session's value.
    */
   familyId?: string;
+  /** The sign-in proved MFA (MFA challenge), and how. */
+  mfaVerifiedAt?: Date;
+  mfaVerifiedWith?: 'totp' | 'recovery_code';
+}
+
+/** An active sign-in session (never its tokens or their hashes). */
+export interface ActiveSession {
+  /** The session ID (RefreshSession.familyId, the access tokens' `sid`). */
+  id: string;
+  signedInAt: Date;
+  /** The last sign-in or token refresh. */
+  lastActiveAt: Date;
+  expiresAt: Date;
+  ipAddress: string | null;
+  userAgent: string | null;
+  device: string | null;
+  mfaVerifiedAt: Date | null;
 }
 
 export interface StoredRefreshSession {
@@ -128,7 +145,14 @@ export class RefreshSessionRepository {
       await this.lockSessions(tx, current.authId);
       const session = await tx.refreshSession.findUnique({
         where: { tokenId: current.tokenId },
-        select: { id: true, authId: true, tokenHash: true, familyId: true },
+        select: {
+          id: true,
+          authId: true,
+          tokenHash: true,
+          familyId: true,
+          mfaVerifiedAt: true,
+          mfaVerifiedWith: true,
+        },
       });
       if (
         !session ||
@@ -147,8 +171,11 @@ export class RefreshSessionRepository {
       await tx.refreshSession.create({
         data: {
           ...next,
-          // Same sign-in session, whatever the caller passed.
+          // Same sign-in session (and its MFA proof), whatever the caller
+          // passed.
           familyId: session.familyId,
+          mfaVerifiedAt: session.mfaVerifiedAt,
+          mfaVerifiedWith: session.mfaVerifiedWith,
           rotatedFromId: session.id,
           createdAt: now,
         },
@@ -195,6 +222,86 @@ export class RefreshSessionRepository {
       where: { expiresAt: { lt: before } },
     });
     return count;
+  }
+
+  /** The user's active sign-in sessions, most recently active first. */
+  async listActive(
+    authId: string,
+    now: Date = new Date(),
+  ): Promise<ActiveSession[]> {
+    // A session has exactly one active token row: its latest.
+    const active = await this.prisma.refreshSession.findMany({
+      where: { authId, revokedAt: null, expiresAt: { gt: now } },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      select: {
+        familyId: true,
+        createdAt: true,
+        expiresAt: true,
+        ipAddress: true,
+        userAgent: true,
+        device: true,
+        mfaVerifiedAt: true,
+      },
+    });
+    if (active.length === 0) return [];
+    const starts = await this.prisma.refreshSession.groupBy({
+      by: ['familyId'],
+      where: { authId, familyId: { in: active.map((a) => a.familyId) } },
+      _min: { createdAt: true },
+    });
+    const signedIn = new Map(
+      starts.map((s) => [s.familyId, s._min.createdAt as Date]),
+    );
+    return active.map((row) => ({
+      id: row.familyId,
+      signedInAt: signedIn.get(row.familyId) ?? row.createdAt,
+      lastActiveAt: row.createdAt,
+      expiresAt: row.expiresAt,
+      ipAddress: row.ipAddress,
+      userAgent: row.userAgent,
+      device: row.device,
+      mfaVerifiedAt: row.mfaVerifiedAt,
+    }));
+  }
+
+  /**
+   * Ends sessions of the user: one (`only`), all but one (`except`) or all.
+   * Every active token of those sessions is revoked under the user's
+   * sessions lock, so a concurrent refresh cannot keep one alive. Returns
+   * the IDs of the sessions that were active. With `client` it runs inside
+   * that transaction.
+   */
+  async revokeSessions(
+    authId: string,
+    scope: { only?: string; except?: string },
+    reason: RefreshSessionRevocation,
+    now: Date = new Date(),
+    client?: Prisma.TransactionClient,
+  ): Promise<string[]> {
+    const work = async (tx: Prisma.TransactionClient) => {
+      await this.lockSessions(tx, authId);
+      const familyFilter =
+        scope.only !== undefined
+          ? { familyId: scope.only }
+          : scope.except !== undefined
+            ? { familyId: { not: scope.except } }
+            : {};
+      const active = await tx.refreshSession.findMany({
+        where: {
+          authId,
+          ...familyFilter,
+          revokedAt: null,
+          expiresAt: { gt: now },
+        },
+        select: { familyId: true },
+      });
+      await tx.refreshSession.updateMany({
+        where: { authId, ...familyFilter, revokedAt: null },
+        data: { revokedAt: now, revokedReason: reason },
+      });
+      return [...new Set(active.map((a) => a.familyId))];
+    };
+    return client ? work(client) : this.prisma.$transaction(work);
   }
 
   /** Removes sessions that expired before `before` (cleanup sweep). */

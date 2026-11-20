@@ -8,6 +8,7 @@ import {
 import { Roles } from '../common/decorators/roles.decorator';
 import { AuthGuard } from '../common/guards/auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
+import { AdminMfaGuard } from '../auth/admin/admin-mfa.guard';
 import { UpdateSubscriptionPlanDto } from './dto/update-subscription-plan.dto';
 import { requestMetadata } from './request-metadata';
 import { SubscriptionPlanService } from './subscription-plan.service';
@@ -19,7 +20,8 @@ interface AuthenticatedRequest extends Request {
 /** Administration of the single Pro subscription plan. */
 @ApiTags('admin')
 @ApiBearerAuth('JWT-auth')
-@UseGuards(AuthGuard, RolesGuard)
+// Administrators must have verified MFA in this session (AdminMfaGuard).
+@UseGuards(AuthGuard, RolesGuard, AdminMfaGuard)
 @Roles(UserRole.ADMIN, UserRole.SUPERADMIN)
 @Controller('v1/admin/subscription-plan')
 export class SubscriptionPlanController {
