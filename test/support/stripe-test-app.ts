@@ -139,6 +139,31 @@ export async function createStripeTestApp(): Promise<StripeTestApp> {
   return harness;
 }
 
+/** Stripe settings of the tests (the webhook secret of FakeStripeApi). */
+export const FAKE_STRIPE_SETTINGS: StripeSettings = {
+  secretKey: 'sk_test_fake',
+  webhookSecret: FAKE_WEBHOOK_SECRET,
+  successUrl: 'https://app.example/checkout/success',
+  cancelUrl: 'https://app.example/checkout/cancel',
+  productId: null,
+  checkoutExpiresMinutes: 60,
+};
+
+/**
+ * The real Stripe SDK talking to `stripe.api` (a FakeStripeApi, swappable
+ * per test) instead of Stripe's servers.
+ */
+export function fakeStripeClient(stripe: { api: FakeStripeApi }): Stripe {
+  return new Stripe('sk_test_fake', {
+    httpClient: Stripe.createFetchHttpClient(
+      (input: string | URL | Request, init?: RequestInit) =>
+        stripe.api.fetch(input, init),
+    ),
+    maxNetworkRetries: 0,
+    telemetry: false,
+  });
+}
+
 /** A fresh Nest app and Prisma client on an existing migrated schema. */
 async function boot(
   schema: string,
@@ -165,30 +190,13 @@ async function boot(
   })
   class TestInfrastructureModule {}
 
-  const stripeClient = new Stripe('sk_test_fake', {
-    httpClient: Stripe.createFetchHttpClient(
-      (input: string | URL | Request, init?: RequestInit) =>
-        stripe.api.fetch(input, init),
-    ),
-    maxNetworkRetries: 0,
-    telemetry: false,
-  });
-  const settings: StripeSettings = {
-    secretKey: 'sk_test_fake',
-    webhookSecret: FAKE_WEBHOOK_SECRET,
-    successUrl: 'https://app.example/checkout/success',
-    cancelUrl: 'https://app.example/checkout/cancel',
-    productId: null,
-    checkoutExpiresMinutes: 60,
-  };
-
   const moduleRef = await Test.createTestingModule({
     imports: [TestInfrastructureModule, SubscriptionModule],
   })
     .overrideProvider(STRIPE_SETTINGS)
-    .useValue(settings)
+    .useValue(FAKE_STRIPE_SETTINGS)
     .overrideProvider(STRIPE_CLIENT)
-    .useValue(stripeClient)
+    .useValue(fakeStripeClient(stripe))
     .compile();
   // Same option as main.ts: keeps the raw body for webhook signatures.
   const app = moduleRef.createNestApplication<INestApplication<App>>({

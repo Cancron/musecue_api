@@ -188,7 +188,9 @@ export class MfaTestKit {
     action: string,
     proof?: Record<string, unknown>,
   ): Promise<string> {
-    const cacheKey = `${user.accessToken}|${action}`;
+    // Like the app: a password approval no longer counts once MFA is
+    // enabled, so approvals are cached per session, action and method.
+    const cacheKey = `${user.accessToken}|${action}|${user.totpSecret ? 'mfa' : 'password'}`;
     const cached = this.approvals.get(cacheKey);
     if (!proof && cached && cached.expiresAt - 5_000 > this.clock.getTime()) {
       return cached.token;

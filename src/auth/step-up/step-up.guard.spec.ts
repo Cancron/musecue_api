@@ -1,6 +1,6 @@
 import type { ExecutionContext } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
-import type { StepUpAction } from '@prisma/client';
+import type { StepUpAction, StepUpMethod } from '@prisma/client';
 import { createHash } from 'node:crypto';
 import type { PrismaService } from '../../common/services/prisma.service';
 import { STEP_UP_ACTION_KEY } from './step-up.constants';
@@ -15,12 +15,14 @@ interface StoredApproval {
   authId: string;
   sessionId: string;
   action: StepUpAction;
+  method: StepUpMethod;
   expiresAt: Date;
 }
 
 describe('StepUpGuard', () => {
   let approvals: StoredApproval[];
   let activeSessions: Array<{ authId: string; familyId: string }>;
+  let mfaEnabled: boolean;
   let guard: StepUpGuard;
 
   beforeEach(() => {
@@ -31,10 +33,12 @@ describe('StepUpGuard', () => {
         authId: 'alice',
         sessionId: 'session-1',
         action: 'SUBSCRIPTION_CANCEL',
+        method: 'PASSWORD',
         expiresAt: new Date(NOW.getTime() + 60_000),
       },
     ];
     activeSessions = [{ authId: 'alice', familyId: 'session-1' }];
+    mfaEnabled = false;
     const prisma = {
       stepUpApproval: {
         findUnique: jest.fn(({ where }: { where: { tokenHash: string } }) =>
@@ -53,6 +57,9 @@ describe('StepUpGuard', () => {
               ).length,
             ),
         ),
+      },
+      authSecurity: {
+        findUnique: jest.fn(() => Promise.resolve({ mfaEnabled })),
       },
     } as unknown as PrismaService;
     guard = new StepUpGuard(new Reflector(), prisma);

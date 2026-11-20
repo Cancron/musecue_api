@@ -48,7 +48,8 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
   const as = (user: TestUser) => kit.as(user);
   const getStatus = (user: TestUser) => kit.getStatus(user);
   const start = (user: TestUser) => kit.start(user);
-  const confirm = (user: TestUser, code: string) => kit.confirm(user, code);
+  const confirm = (user: TestUser, code: string, stepUpToken?: string) =>
+    kit.confirm(user, code, stepUpToken);
 
   beforeAll(async () => {
     ctx = await bootApplication();
@@ -212,13 +213,19 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
   it('never accepts an already used code again', async () => {
     const user = await createUser();
     const { secret } = await startOk(user);
+    // The approval that started and confirms it (given with the password).
+    const passwordApproval = await kit.approve(user, 'MFA_ENROLLMENT');
     const code = totpCode(secret, kit.clock);
     await confirm(user, code).expect(200);
     user.totpSecret = secret;
     const enabled = await securityOf(user);
 
-    // Replayed within the same 30 seconds, and later.
+    // Replayed within the same 30 seconds: the password approval of the
+    // enrollment no longer counts now that MFA is on (MFA step-up)...
     advance(5 * SECOND);
+    const refused = await confirm(user, code, passwordApproval).expect(403);
+    expect(messageOf(refused)).toMatch(/not valid for this action/);
+    // ...and later, with an authenticator step-up, the code is refused.
     expect(messageOf(await confirm(user, code).expect(409))).toBe(
       'MFA is already enabled for this account',
     );

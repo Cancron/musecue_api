@@ -16,12 +16,24 @@ export interface StepUpContext {
 }
 
 /**
+ * The approval methods that prove a second factor. Once MFA is enabled on an
+ * account, only these approve its sensitive actions.
+ */
+export const MFA_STEP_UP_METHODS: readonly StepUpMethod[] = [
+  'TOTP',
+  'RECOVERY_CODE',
+];
+
+/**
  * Requires a valid step-up approval (`X-Step-Up-Token`) for routes marked
  * with @RequireStepUp(action). Runs after AuthGuard and before any pipe or
  * handler, so a refused request changes nothing. The approval must belong
  * to the token's user and sign-in session (`sid`), be for this action, be
  * less than ten minutes old, and its session must still be active (logout
- * and logout-all end every approval of the session). Anything else: 403.
+ * and logout-all end every approval of the session). For an account with
+ * MFA enabled it must also have been proven with the authenticator or a
+ * recovery code (MFA step-up): an approval given with the password or
+ * Google before MFA was enabled no longer counts. Anything else: 403.
  */
 @Injectable()
 export class StepUpGuard implements CanActivate {
@@ -104,8 +116,14 @@ export class StepUpGuard implements CanActivate {
         expiresAt: { gt: now },
       },
     });
-    return activeSessions > 0
-      ? { id: approval.id, method: approval.method }
-      : null;
+    if (activeSessions === 0) return null;
+    if (!MFA_STEP_UP_METHODS.includes(approval.method)) {
+      const security = await this.prisma.authSecurity.findUnique({
+        where: { authId },
+        select: { mfaEnabled: true },
+      });
+      if (security?.mfaEnabled) return null;
+    }
+    return { id: approval.id, method: approval.method };
   }
 }

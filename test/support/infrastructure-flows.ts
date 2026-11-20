@@ -17,6 +17,9 @@ import { TransformInterceptor } from '../../src/common/interceptors/transform.in
 import { EmailService } from '../../src/common/services/email.service';
 import { PrismaService } from '../../src/common/services/prisma.service';
 import { AccountDeletionRecoveryService } from '../../src/privacy/account-deletion/account-deletion-recovery.service';
+import { STRIPE_SETTINGS } from '../../src/subscription/stripe/stripe.config';
+import { STRIPE_CLIENT } from '../../src/subscription/stripe/stripe.gateway';
+import type { FakeStripeApi } from './fake-stripe-api';
 import {
   TEST_DATABASE_URL,
   applyMigrations,
@@ -24,6 +27,7 @@ import {
   dropSchema,
   migrationNames,
 } from './migrated-schema';
+import { FAKE_STRIPE_SETTINGS, fakeStripeClient } from './stripe-test-app';
 
 /**
  * End-to-end flows through the complete application (AppModule, HTTP, the
@@ -92,8 +96,19 @@ export interface TestApplication {
   close(): Promise<void>;
 }
 
+export interface BootOptions {
+  /**
+   * Replaces Stripe's servers with this FakeStripeApi (behind the real
+   * Stripe SDK, with the webhook secret of the fake), so checkout,
+   * cancellation and webhooks work without any external service.
+   */
+  stripe?: { api: FakeStripeApi };
+}
+
 /** Boots AppModule against a freshly migrated schema. */
-export async function bootApplication(): Promise<TestApplication> {
+export async function bootApplication(
+  options: BootOptions = {},
+): Promise<TestApplication> {
   const schema = await createSchema();
   await applyMigrations(schema, migrationNames());
   const root = await mkdtemp(join(tmpdir(), 'infrastructure-e2e-'));
@@ -112,12 +127,19 @@ export async function bootApplication(): Promise<TestApplication> {
   });
   const emails = new CapturingEmailService();
 
-  const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
+  let builder = Test.createTestingModule({ imports: [AppModule] })
     .overrideProvider(PrismaService)
     .useValue(client)
     .overrideProvider(EmailService)
-    .useValue(emails)
-    .compile();
+    .useValue(emails);
+  if (options.stripe) {
+    builder = builder
+      .overrideProvider(STRIPE_SETTINGS)
+      .useValue(FAKE_STRIPE_SETTINGS)
+      .overrideProvider(STRIPE_CLIENT)
+      .useValue(fakeStripeClient(options.stripe));
+  }
+  const moduleRef = await builder.compile();
   const app = moduleRef.createNestApplication<INestApplication<App>>({
     rawBody: true,
   });
