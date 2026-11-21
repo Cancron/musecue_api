@@ -99,6 +99,8 @@ export const MODEL = 'openai/gpt-4.1-mini';
 
 export class FakeOpenRouter {
   readonly requests: FakeRequest[] = [];
+  /** Unexpected handler errors, without request content or credentials. */
+  readonly handlerErrors: string[] = [];
   /** Planned responses, per schema name, used in order. */
   private readonly plans = new Map<string, FakePlan[]>();
   /** Cost of unplanned responses, per schema name. */
@@ -111,10 +113,27 @@ export class FakeOpenRouter {
 
   async start(): Promise<void> {
     this.server = createServer((req, res) => {
-      void this.handle(req).then(({ status, body }) => {
-        res.writeHead(status, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(body));
-      });
+      void this.handle(req)
+        .then(({ status, body }) => {
+          if (res.destroyed) return;
+          res.writeHead(status, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(body));
+        })
+        .catch((error: unknown) => {
+          const name = error instanceof Error ? error.name : typeof error;
+          const code =
+            typeof error === 'object' && error !== null && 'code' in error
+              ? String(error.code)
+              : 'unknown';
+          this.handlerErrors.push(`${name}:${code}`);
+          if (res.destroyed) return;
+          if (!res.headersSent) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+          }
+          res.end(
+            JSON.stringify({ error: { message: 'Fake provider failed' } }),
+          );
+        });
     });
     await new Promise<void>((resolve) =>
       this.server?.listen(0, '127.0.0.1', resolve),

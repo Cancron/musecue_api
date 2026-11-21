@@ -30,6 +30,10 @@ import {
   dropSchema,
   migrationNames,
 } from './support/migrated-schema';
+import {
+  retryCreditRequest,
+  settledFailures,
+} from './support/retry-credit-request';
 
 jest.setTimeout(240_000);
 
@@ -122,17 +126,24 @@ describeWithDatabase('Session credit overage and concurrency (e2e)', () => {
   const finished = async (account: Account, runId: string) => {
     await eventually(
       async () => {
-        const run = await ctx.client.aiRun.findUnique({
-          where: { id: runId },
-          select: { status: true },
-        });
+        const run = await retryCreditRequest(
+          () =>
+            ctx.client.aiRun.findUnique({
+              where: { id: runId },
+              select: { status: true },
+            }),
+          `poll AI run ${runId}`,
+        );
         return run && ['COMPLETED', 'FAILED'].includes(run.status);
       },
       90_000,
       `AI run ${runId}`,
     );
     return dataOf<{ status: string; error: string | null }>(
-      await as(account, http().get(`/v1/jobs/${runId}`)).expect(200),
+      await retryCreditRequest(
+        () => as(account, http().get(`/v1/jobs/${runId}`)).expect(200),
+        `read AI run ${runId}`,
+      ),
     );
   };
 
@@ -294,6 +305,7 @@ describeWithDatabase('Session credit overage and concurrency (e2e)', () => {
     await ctx?.close();
     await openRouter.stop();
     delete process.env.AI_QUEUE_RATE_LIMIT_MAX;
+    expect(openRouter.handlerErrors).toEqual([]);
   });
 
   // Responses planned for requests that were refused are not carried over.
@@ -577,18 +589,32 @@ describeWithDatabase('Session credit overage and concurrency (e2e)', () => {
           delayMs: 200,
         });
       }
-      const queued = await Promise.all(
-        Array.from({ length: 10 }, (_, i) =>
-          requestQuestion(account, steps[0], `parallel-${i}`),
-        ),
+      const submitted = await Promise.allSettled(
+        Array.from({ length: 10 }, (_, i) => {
+          const key = `parallel-${i}`;
+          return retryCreditRequest(
+            () => requestQuestion(account, steps[0], key),
+            `question ${key}`,
+          );
+        }),
+      );
+      const queued = submitted.flatMap((result) =>
+        result.status === 'fulfilled' ? [result.value] : [],
       );
       // Queued while the session could still pay; refused (403) otherwise.
-      expect(queued.every((r) => [201, 403].includes(r.status))).toBe(true);
       const runIds = queued
         .filter((r) => r.status === 201)
         .map((r) => dataOf<{ id: string }>(r).id);
-      const results = await Promise.all(
+      const completed = await Promise.allSettled(
         runIds.map((runId) => finished(account, runId)),
+      );
+      // A rejected HTTP request must not leave its siblings running into the
+      // next test, where the fake's response plans are cleared.
+      expect(settledFailures(submitted, 'submission')).toEqual([]);
+      expect(settledFailures(completed, 'completion')).toEqual([]);
+      expect(queued.every((r) => [201, 403].includes(r.status))).toBe(true);
+      const results = completed.flatMap((result) =>
+        result.status === 'fulfilled' ? [result.value] : [],
       );
       // A run either completed (and was charged as far as possible) or was
       // refused before calling OpenRouter.

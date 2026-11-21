@@ -20,6 +20,10 @@ import {
   type TestApplication,
 } from './support/infrastructure-flows';
 import { describeWithDatabase } from './support/migrated-schema';
+import {
+  retryCreditRequest,
+  settledFailures,
+} from './support/retry-credit-request';
 
 jest.setTimeout(240_000);
 
@@ -91,17 +95,24 @@ describeWithDatabase('AI usage tracking and credit deductions (e2e)', () => {
   const finished = async (account: Account, runId: string) => {
     await eventually(
       async () => {
-        const run = await ctx.client.aiRun.findUnique({
-          where: { id: runId },
-          select: { status: true },
-        });
+        const run = await retryCreditRequest(
+          () =>
+            ctx.client.aiRun.findUnique({
+              where: { id: runId },
+              select: { status: true },
+            }),
+          `poll AI run ${runId}`,
+        );
         return run && ['COMPLETED', 'FAILED'].includes(run.status);
       },
       60_000,
       `AI run ${runId}`,
     );
     return dataOf<{ status: string; error: string | null }>(
-      await as(account, http().get(`/v1/jobs/${runId}`)).expect(200),
+      await retryCreditRequest(
+        () => as(account, http().get(`/v1/jobs/${runId}`)).expect(200),
+        `read AI run ${runId}`,
+      ),
     );
   };
 
@@ -190,6 +201,7 @@ describeWithDatabase('AI usage tracking and credit deductions (e2e)', () => {
     await ctx?.close();
     await openRouter.stop();
     delete process.env.AI_QUEUE_RATE_LIMIT_MAX;
+    expect(openRouter.handlerErrors).toEqual([]);
   });
 
   it('records every OpenRouter request of a session against the user, session and run, and deducts credits for the actual cost', async () => {
@@ -488,13 +500,26 @@ describeWithDatabase('AI usage tracking and credit deductions (e2e)', () => {
     const { stepId } = await sessionWithGuide(account); // 5 + 2.34 credits
     try {
       openRouter.costs.musecue_guide_question = 0.0071; // 1.42 credits
-      const runs = await Promise.all(
-        Array.from({ length: 10 }, (_, i) =>
-          ask(account, stepId, `parallel-${i}`),
-        ),
+      const submitted = await Promise.allSettled(
+        Array.from({ length: 10 }, (_, i) => {
+          const key = `parallel-${i}`;
+          return retryCreditRequest(
+            () => ask(account, stepId, key),
+            `question ${key}`,
+          );
+        }),
       );
-      const results = await Promise.all(
+      const runs = submitted.flatMap((result) =>
+        result.status === 'fulfilled' ? [result.value] : [],
+      );
+      const completed = await Promise.allSettled(
         runs.map((run) => finished(account, run.id)),
+      );
+      // Drain every accepted request before restoring the fake's price.
+      expect(settledFailures(submitted, 'submission')).toEqual([]);
+      expect(settledFailures(completed, 'completion')).toEqual([]);
+      const results = completed.flatMap((result) =>
+        result.status === 'fulfilled' ? [result.value] : [],
       );
       expect(results.every((r) => r.status === 'COMPLETED')).toBe(true);
     } finally {
