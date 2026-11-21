@@ -12,6 +12,8 @@ const D = (value: string | number) => new Prisma.Decimal(value);
 describe('creditsForCost', () => {
   it.each([
     // [cost USD, USD micros per credit, step micro-credits, exact, due]
+    // The default: $0.005 per credit, exact (step 1 = 0.000001 credit).
+    ['0.025', 5000, 1, '5', '5'],
     ['0.023', 5000, 1_000_000, '4.6', '5'],
     ['0.023', 5000, 100_000, '4.6', '4.6'],
     ['0.023', 5000, 1, '4.6', '4.6'],
@@ -112,6 +114,14 @@ describe('CreditUsageService', () => {
       });
 
       expect(settings.getSettings.mock.calls).toEqual([[tx]]);
+      // The run's usage rows are locked first, so charges of one run and the
+      // settling of its other attempts are serialized.
+      expect(tx.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+        tx.aiUsage.findUniqueOrThrow.mock.invocationCallOrder[0],
+      );
+      expect(
+        (tx.$queryRaw.mock.calls[0]?.[0] as unknown as string[]).join('?'),
+      ).toContain('FOR UPDATE');
       expect(wallet.debit.mock.calls).toEqual([
         [
           {
@@ -245,6 +255,34 @@ describe('CreditUsageService', () => {
       expect(wallet.debit.mock.calls).toHaveLength(0);
     });
 
+    it('keeps the result of a concurrent transaction that settled the usage first', async () => {
+      tx.aiUsage.findUniqueOrThrow
+        .mockResolvedValueOnce(usage())
+        .mockResolvedValueOnce(
+          usage({
+            chargeStatus: 'NOT_CHARGED',
+            chargeNote: 'SUPERSEDED_ATTEMPT',
+          }),
+        );
+      wallet.debit.mockResolvedValue(debit({ replayed: true }));
+      tx.aiUsage.update.mockRejectedValue(
+        new Prisma.PrismaClientKnownRequestError('not found', {
+          code: 'P2025',
+          clientVersion: 'test',
+        }),
+      );
+
+      await expect(service.chargeRun(tx, 'usage-1')).resolves.toMatchObject({
+        status: 'NOT_CHARGED',
+        note: 'SUPERSEDED_ATTEMPT',
+      });
+      // Only a PENDING usage is ever written.
+      expect(tx.aiUsage.update.mock.calls[0]?.[0].where).toEqual({
+        id: 'usage-1',
+        chargeStatus: 'PENDING',
+      });
+    });
+
     it('propagates other failures, so the publishing transaction rolls back', async () => {
       tx.aiUsage.findUniqueOrThrow.mockResolvedValue(usage());
       wallet.debit.mockRejectedValue(new Error('db down'));
@@ -323,6 +361,60 @@ describe('CreditUsageService', () => {
           },
         },
       });
+    });
+  });
+
+  describe('settling attempts that are never charged', () => {
+    it("settles the run's other pending attempts in the caller's transaction", async () => {
+      tx.aiUsage.updateMany.mockResolvedValue({ count: 2 });
+      await expect(
+        service.settleRunAttempts(tx, 'run-1', 'SUPERSEDED_ATTEMPT', 'usage-1'),
+      ).resolves.toBe(2);
+      expect(tx.aiUsage.updateMany.mock.calls[0]?.[0]).toEqual({
+        where: {
+          runId: 'run-1',
+          chargeStatus: 'PENDING',
+          id: { not: 'usage-1' },
+        },
+        data: { chargeStatus: 'NOT_CHARGED', chargeNote: 'SUPERSEDED_ATTEMPT' },
+      });
+    });
+
+    it('settles pending usage of interrupted attempts only once its run cannot publish any more', async () => {
+      const cutoff = new Date('2026-12-01T09:00:00.000Z');
+      prisma.aiUsage.findMany.mockResolvedValue([
+        { id: 'u-failed', runId: 'run-failed' },
+        { id: 'u-running', runId: 'run-running' },
+        { id: 'u-deleted', runId: 'run-deleted' },
+      ] as never);
+      prisma.aiRun.findMany.mockResolvedValue([{ id: 'run-running' }] as never);
+      prisma.aiUsage.updateMany.mockResolvedValue({ count: 2 });
+
+      await expect(service.settleInterruptedUsage(cutoff)).resolves.toBe(2);
+
+      expect(prisma.aiUsage.findMany.mock.calls[0]?.[0]).toMatchObject({
+        where: { chargeStatus: 'PENDING', occurredAt: { lt: cutoff } },
+      });
+      expect(prisma.aiRun.findMany.mock.calls[0]?.[0]).toEqual({
+        where: {
+          id: { in: ['run-failed', 'run-running', 'run-deleted'] },
+          status: { in: ['QUEUED', 'PROCESSING'] },
+        },
+        select: { id: true },
+      });
+      expect(prisma.aiUsage.updateMany.mock.calls[0]?.[0]).toEqual({
+        where: {
+          id: { in: ['u-failed', 'u-deleted'] },
+          chargeStatus: 'PENDING',
+        },
+        data: { chargeStatus: 'NOT_CHARGED', chargeNote: 'INTERRUPTED' },
+      });
+    });
+
+    it('does nothing when no usage is pending', async () => {
+      prisma.aiUsage.findMany.mockResolvedValue([]);
+      await expect(service.settleInterruptedUsage(new Date())).resolves.toBe(0);
+      expect(prisma.aiUsage.updateMany.mock.calls).toHaveLength(0);
     });
   });
 });

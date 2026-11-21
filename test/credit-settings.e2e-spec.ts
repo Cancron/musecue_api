@@ -34,7 +34,7 @@ const DEFAULTS = {
   proMonthlyCredits: 1000,
   creditCostUsdMicros: 5000,
   sessionOverageCredits: 5,
-  deductionStepMicroCredits: 1_000_000,
+  deductionStepMicroCredits: 1,
 };
 const PASSWORD = 'credit settings e2e password';
 
@@ -209,8 +209,8 @@ describeWithDatabase('AI credit settings (PostgreSQL, full stack)', () => {
           creditCostUsdMicros: 5000,
           creditCostUsd: '0.005',
           sessionOverageCredits: 5,
-          deductionStepMicroCredits: 1_000_000,
-          deductionStepCredits: '1',
+          deductionStepMicroCredits: 1,
+          deductionStepCredits: '0.000001',
           updatedAt: row?.updatedAt.toISOString(),
         },
       });
@@ -470,8 +470,8 @@ describeWithDatabase('AI credit settings (PostgreSQL, full stack)', () => {
         creditCostUsdMicros: 5000,
         creditCostUsd: '0.005',
         sessionOverageCredits: 5,
-        deductionStepMicroCredits: 1_000_000,
-        deductionStepCredits: '1',
+        deductionStepMicroCredits: 1,
+        deductionStepCredits: '0.000001',
         updatedAt: expect.any(String) as unknown,
       });
 
@@ -626,8 +626,9 @@ describeWithDatabase('AI credit settings (PostgreSQL, full stack)', () => {
         },
       );
       if (!usage) throw new Error('the usage was not recorded');
+      const sources = await credits.usableSources(account.id);
       const charge = await ctx.client.$transaction((tx) =>
-        credits.chargeRun(tx, usage),
+        credits.chargeRun(tx, usage, sources),
       );
       return { usageId: usage.id, runId, charge };
     };
@@ -662,8 +663,8 @@ describeWithDatabase('AI credit settings (PostgreSQL, full stack)', () => {
           .get<CreditWalletService>(CreditWalletService)
           .getBalance(account.id);
 
-      // At the default $0.005 per credit: $0.023 = 4.6 credits -> 5.
-      const before = await chargeOpenRouterRequest(account, sessionId, '0.023');
+      // At the default $0.005 per credit: $0.025 = 5 credits.
+      const before = await chargeOpenRouterRequest(account, sessionId, '0.025');
       expect(before.charge).toMatchObject({
         status: 'CHARGED',
         creditsDue: '5',
@@ -671,16 +672,16 @@ describeWithDatabase('AI credit settings (PostgreSQL, full stack)', () => {
       });
       const beforeHistory = await chargeHistory(before.usageId);
       expect(beforeHistory).toEqual({
-        costUsd: '0.023',
+        costUsd: '0.025',
         creditCostUsdMicros: 5000,
-        creditsExact: '4.6',
+        creditsExact: '5',
         creditsDue: '5',
         creditsCharged: '5',
         chargeStatus: 'CHARGED',
         debit: {
           type: 'DEBIT',
           amount: '-5',
-          usageCostUsd: '0.023',
+          usageCostUsd: '0.025',
           creditCostUsdMicros: 5000,
           idempotencyKey: `debit:ai-run:${before.runId}`,
         },
@@ -708,24 +709,24 @@ describeWithDatabase('AI credit settings (PostgreSQL, full stack)', () => {
         }),
       ]);
 
-      // The same cost now buys fewer requests: $0.023 = 11.5 credits -> 12.
-      const after = await chargeOpenRouterRequest(account, sessionId, '0.023');
+      // The same cost now buys fewer requests: $0.025 = 12.5 credits.
+      const after = await chargeOpenRouterRequest(account, sessionId, '0.025');
       expect(after.charge).toMatchObject({
         status: 'CHARGED',
-        creditsDue: '12',
-        creditsCharged: '12',
+        creditsDue: '12.5',
+        creditsCharged: '12.5',
       });
       await expect(chargeHistory(after.usageId)).resolves.toEqual({
-        costUsd: '0.023',
+        costUsd: '0.025',
         creditCostUsdMicros: 2000,
-        creditsExact: '11.5',
-        creditsDue: '12',
-        creditsCharged: '12',
+        creditsExact: '12.5',
+        creditsDue: '12.5',
+        creditsCharged: '12.5',
         chargeStatus: 'CHARGED',
         debit: {
           type: 'DEBIT',
-          amount: '-12',
-          usageCostUsd: '0.023',
+          amount: '-12.5',
+          usageCostUsd: '0.025',
           creditCostUsdMicros: 2000,
           idempotencyKey: `debit:ai-run:${after.runId}`,
         },
@@ -734,7 +735,7 @@ describeWithDatabase('AI credit settings (PostgreSQL, full stack)', () => {
       await expect(chargeHistory(before.usageId)).resolves.toEqual(
         beforeHistory,
       );
-      await expect(balance()).resolves.toMatchObject({ available: '83' });
+      await expect(balance()).resolves.toMatchObject({ available: '82.5' });
 
       // Charging the earlier run again (a retry) deducts nothing at any rate.
       const earlier = await ctx.client.aiUsage.findUniqueOrThrow({
@@ -744,13 +745,13 @@ describeWithDatabase('AI credit settings (PostgreSQL, full stack)', () => {
         ctx.client.$transaction((tx) =>
           ctx
             .get<MakeupCreditService>(MakeupCreditService)
-            .chargeRun(tx, earlier),
+            .chargeRun(tx, earlier, ['PURCHASE']),
         ),
       ).resolves.toMatchObject({ status: 'CHARGED', creditsCharged: '5' });
       await expect(chargeHistory(before.usageId)).resolves.toEqual(
         beforeHistory,
       );
-      await expect(balance()).resolves.toMatchObject({ available: '83' });
+      await expect(balance()).resolves.toMatchObject({ available: '82.5' });
 
       // The user sees both requests with the credits each one cost.
       const summary = await http()
@@ -765,13 +766,13 @@ describeWithDatabase('AI credit settings (PostgreSQL, full stack)', () => {
         }>
       ).data;
       expect(usage.usages.map((u) => [u.costUsd, u.creditsCharged])).toEqual([
-        ['0.023', '5'],
-        ['0.023', '12'],
+        ['0.025', '5'],
+        ['0.025', '12.5'],
       ]);
       expect(usage.totals).toMatchObject({
         requests: 2,
-        costUsd: '0.046',
-        creditsCharged: '17',
+        costUsd: '0.05',
+        creditsCharged: '17.5',
       });
       await expectConsistentLedger(ctx.client, account.id);
     });

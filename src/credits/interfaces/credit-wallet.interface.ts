@@ -42,8 +42,10 @@ export interface DebitCreditsInput {
   /** Unique per user: a retried debit with the same key is applied once. */
   idempotencyKey: string;
   /**
-   * The caller's makeup session the credits are used for. Only debits for a
-   * session may use the session overage allowance.
+   * The caller's makeup session the credits are used for. Only debits for
+   * an initialized (ACTIVE) session may use its overage allowance and its
+   * reserved credits; other debits cannot spend credits reserved by the
+   * user's sessions.
    */
   sessionId?: string;
   description?: string;
@@ -127,6 +129,34 @@ export interface CreditBalanceView {
   /** Allocations that still hold available credits, in spending order. */
   allocations: CreditAllocationView[];
   asOf: string;
+}
+
+/** A makeup session to initialize or to check before an AI request. */
+export interface SessionCreditInput {
+  authId: string;
+  sessionId: string;
+  /** Count only credits of these sources (the ones usable now); all if omitted. */
+  sources?: CreditSource[];
+}
+
+/** The credit state of one makeup session (CreditSessionOverage). */
+export interface SessionCreditView {
+  sessionId: string;
+  /** Credits reserved when the session was initialized and what is left. */
+  reservedCredits: CreditAmountString;
+  reservationRemaining: CreditAmountString;
+  overageLimit: CreditAmountString;
+  overageUsed: CreditAmountString;
+  overageRemaining: CreditAmountString;
+  initializedAt: string;
+}
+
+/** A session checked before an AI request (see prepareSessionUse). */
+export interface SessionUseView extends SessionCreditView {
+  /** Credits the session may take from the balance now (incl. its reservation). */
+  freeCredits: CreditAmountString;
+  /** Whether this call initialized the session. */
+  initialized: boolean;
 }
 
 export interface ExpireDueCreditsResult {

@@ -238,6 +238,7 @@ describeWithDatabase(
         storage,
         lifecycle,
         ai,
+        mock<MakeupCreditService>(),
       );
       profile = new ProfileService(prisma, validation, storage, lifecycle);
       processor = new MakeupJobHandler(
@@ -1753,6 +1754,7 @@ describeWithDatabase(
             storageService,
             lifecycleService,
             ai,
+            mock<MakeupCreditService>(),
           ),
           profile: new ProfileService(
             prisma,

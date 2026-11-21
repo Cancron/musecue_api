@@ -19,7 +19,9 @@ The companion mobile application and detailed product specifications live in `..
 - a provider-neutral AI gateway with OpenRouter live mode, multimodal private-image input, strict structured output, runtime validation, bounded retries, and deterministic mock mode
 - AI credit configuration: administrators can read and change the trial credit allowance, the monthly Pro allowance, the OpenRouter cost per credit and the per-session overage allowance; the defaults are stored in PostgreSQL by migration and at startup, never overwriting administrator changes (see "AI credit settings" under API)
 - AI credit wallet and ledger: per-user wallets, allocations by source (trial, subscription, purchase, referral) with expiry, exact fractional balances, an append-only transaction ledger with grants, debits and expirations (recorded for every wallet by a scheduled sweep), and per-session overage, all in PostgreSQL and safe under concurrency (see "AI credit wallet and ledger")
-- AI usage metering and credit deductions: every OpenRouter request of a makeup AI run is stored with its user, session, run, tokens and USD cost, and each run is charged once, in credits converted from its actual cost at the administrator's rate, with the cost and rate kept in the ledger history (see "AI usage and credit deductions")
+- AI usage metering and credit deductions: every OpenRouter request of a makeup AI run is stored with its user, session, run, tokens and USD cost. Each run is charged once, in exact (fractional) credits converted from its actual cost at the administrator's rate ($0.025 at $0.005 per credit = 5 credits), and the cost and rate are kept in the ledger history (see "AI usage and credit deductions")
+- credit balance and transaction history APIs: a signed-in user sees their own balance by source (granted, available, used, expired, expiry dates), their ledger (allocations, deductions with session overage, expirations, with sources, sessions and AI usage), and the AI usage of their sessions; nobody else's (see "Credit balance and transaction history")
+- session credit overage and concurrency control: a session initialized with credits can finish beyond the balance, up to the administrator's overage allowance (default 5 credits). The balance never goes negative, one credit can only start one session, and concurrent sessions and requests can neither spend a credit twice nor bypass the overage limit (see "Session credit overage and concurrency control")
 - credit-based access: creating a makeup session (`POST /v1/sessions`) requires usable credits, otherwise `403 Insufficient credits`; free sign-ups have none; activating the free trial allocates the trial allowance (ended at once if paid Pro is bought during the trial) every successful Stripe payment allocates monthly Pro credits, and yearly subscriptions receive theirs one month at a time from a restart-safe scheduler; purchased and referral credits (set up in PostgreSQL for now) work with or without Pro (see "Credit-based access to makeup sessions")
 - a single Pro subscription plan: admin-configured monthly/yearly pricing and free trial, one-time trial activation, date-based Pro access through `ProAccessGuard`, payment/lifecycle records protected by database rules, and Stripe checkout for the monthly and yearly options with webhook-verified activation, automatic renewals, failed-payment handling and recovery, cancellation at period end, and refunds made in Stripe with immediate access revocation (see "Subscriptions" and "Stripe checkout" under API); requesting refunds from MuseCue and disputes are not implemented yet
 - personal data export: an authenticated user can request an asynchronous ZIP archive of their own account, profile, makeup history, subscription records and private photos, poll its status, and download it through a signed link valid for at most 15 minutes; archives expire 24 hours after export and are deleted by a scheduled retention sweep (see "Personal data export" under API)
@@ -33,7 +35,7 @@ Intentionally deferred:
 - copying images stored on the filesystem before the Supabase migration into the bucket (they remain readable through the `local` provider while its directory is present)
 - additional S3-compatible storage providers (the provider interface is in place; see "Private image storage")
 - generated preview images (recommendation reasoning is live, while the existing curated preview-image contract remains in place)
-- production retention/deletion automation and further credit features: issuing purchased and referral credits through the API, and user-facing credit balance and history routes (see "Credit-based access to makeup sessions")
+- production retention/deletion automation and further credit features: issuing purchased and referral credits through the API (see "Credit-based access to makeup sessions")
 
 ## Requirements and setup
 
@@ -576,6 +578,8 @@ Makeup routes require a bearer token:
 | `POST`   | `/v1/guide-steps/:stepId/complete`                                 | Advance the authoritative guide                    |
 | `GET`    | `/v1/jobs/:runId`                                                  | Poll an asynchronous AI run                        |
 | `GET`    | `/v1/sessions/:sessionId/ai-usage`                                 | AI requests, cost and credits of the session       |
+| `GET`    | `/v1/credits/balance`                                              | The user's credit balance by source                |
+| `GET`    | `/v1/credits/transactions`                                         | The user's credit transaction history              |
 | `GET`    | `/v1/profile/stats`                                                | Return persisted statistics                        |
 | `GET`    | `/v1/profile`                                                      | Return the current user's profile                  |
 | `POST`   | `/v1/profile/avatar`                                               | Upload or replace a private avatar                 |
@@ -969,7 +973,7 @@ npm test -- --runInBand subscription-billing
 
 ### AI credit settings
 
-Configuration for the AI credit system. Credit features read it through `CreditSettingsService.getSettings()` (exported by `CreditsModule`): trial and monthly Pro allocations use the allowances, AI usage deductions use `creditCostUsdMicros` and `deductionStepMicroCredits` (see "AI usage and credit deductions"), and the wallet uses `sessionOverageCredits`. A change applies to later allocations and charges only.
+Configuration for the AI credit system. Credit features read it through `CreditSettingsService.getSettings()` (exported by `CreditsModule`): trial and monthly Pro allocations use the allowances, AI usage deductions use `creditCostUsdMicros` and `deductionStepMicroCredits` (see "AI usage and credit deductions"), and sessions use `sessionOverageCredits`, fixed when each session is initialized (see "Session credit overage and concurrency control"). A change applies to later allocations, charges and sessions only.
 
 | Method  | Route                        | Purpose                                |
 | ------- | ---------------------------- | -------------------------------------- |
@@ -980,15 +984,15 @@ Access works like the plan administration routes: a bearer token for an `ADMIN` 
 
 The settings are one row in the `CreditSettings` table (migration `20261122120000_add_credit_settings`). The defaults are the table's column defaults and are stored in PostgreSQL before any administrator change: migration `20261123120000_seed_credit_settings` inserts the row, and at startup the application inserts it again if it is missing (for example after a manual delete). Both use `INSERT ... ON CONFLICT DO NOTHING`, so a stored row, including every administrator change, is never overwritten by a deployment or restart. The application does not fall back to values in code. Defaults:
 
-| Field                       | Type    | Default              | Accepted values                                                        |
-| --------------------------- | ------- | -------------------- | ---------------------------------------------------------------------- |
-| `trialCredits`              | integer | `50`                 | `1`–`100000` (switch the trial off on the plan instead)                |
-| `proMonthlyCredits`         | integer | `1000`               | `1`–`1000000`                                                          |
-| `creditCostUsdMicros`       | integer | `5000` ($0.005)      | `1`–`1000000` millionths of a US dollar ($0.000001–$1)                 |
-| `sessionOverageCredits`     | integer | `5`                  | `0`–`1000` (`0` = no overage)                                          |
-| `deductionStepMicroCredits` | integer | `1000000` (1 credit) | `1`–`1000000` millionths of a credit (deductions are rounded up to it) |
+| Field                       | Type    | Default         | Accepted values                                                        |
+| --------------------------- | ------- | --------------- | ---------------------------------------------------------------------- |
+| `trialCredits`              | integer | `50`            | `1`–`100000` (switch the trial off on the plan instead)                |
+| `proMonthlyCredits`         | integer | `1000`          | `1`–`1000000`                                                          |
+| `creditCostUsdMicros`       | integer | `5000` ($0.005) | `1`–`1000000` millionths of a US dollar ($0.000001–$1)                 |
+| `sessionOverageCredits`     | integer | `5`             | `0`–`1000` (`0` = no overage)                                          |
+| `deductionStepMicroCredits` | integer | `1` (exact)     | `1`–`1000000` millionths of a credit (deductions are rounded up to it) |
 
-`creditCostUsdMicros` is the OpenRouter cost one credit covers, in millionths of a US dollar, so money is never stored as a floating-point number: `5000` is $0.005, `2500` is $0.0025. Responses also contain the read-only `creditCostUsd` (the same amount as an exact decimal string, e.g. `"0.005"`), `deductionStepCredits` (the step in credits, e.g. `"1"` or `"0.1"`) and `updatedAt` (when the row was last written). `deductionStepMicroCredits` (migration `20261126120000_ai_usage_credit_deductions`) is the granularity of AI usage deductions: `1000000` deducts whole credits ($0.023 -> 5 credits at the default rate), `100000` tenths (4.6), `1` the exact amount.
+`creditCostUsdMicros` is the OpenRouter cost one credit covers, in millionths of a US dollar, so money is never stored as a floating-point number: `5000` is $0.005, `2500` is $0.0025. Responses also contain the read-only `creditCostUsd` (the same amount as an exact decimal string, e.g. `"0.005"`), `deductionStepCredits` (the step in credits, e.g. `"0.000001"` or `"0.1"`) and `updatedAt` (when the row was last written). `deductionStepMicroCredits` (migration `20261126120000_ai_usage_credit_deductions`) is the granularity of AI usage deductions. The default `1` deducts the exact amount to the ledger's six decimal places: at the default rate, $0.025 -> 5 credits and $0.023 -> 4.6. `100000` rounds up to tenths, and `1000000` to whole credits ($0.023 -> 5). Migration `20261127120000_session_credit_overage` made `1` the default. It also changed a stored `1000000` to `1` if no administrator had ever set the step (audit log).
 
 `PATCH` accepts any subset of the five fields; omitted fields are unchanged. The row is locked during an update, so concurrent changes are applied one at a time. Empty bodies, negative or out-of-range values, zero where not allowed, fractions (including dollar amounts such as `0.005` for `creditCostUsdMicros`), `null`, numeric strings, read-only fields and unknown fields are rejected with `400`. A request with any invalid field changes nothing. CHECK constraints additionally stop any write path from storing a second row, negative allowances or a zero credit cost. Every change is recorded in `ActivityLogEvent` (old value, new value, administrator ID) in the same transaction as the update.
 
@@ -999,15 +1003,15 @@ The settings are one row in the `CreditSettings` table (migration `2026112212000
   "creditCostUsdMicros": 5000,
   "creditCostUsd": "0.005",
   "sessionOverageCredits": 5,
-  "deductionStepMicroCredits": 1000000,
-  "deductionStepCredits": "1",
+  "deductionStepMicroCredits": 1,
+  "deductionStepCredits": "0.000001",
   "updatedAt": "2026-11-23T12:00:00.000Z"
 }
 ```
 
 ### AI credit wallet and ledger
 
-The persistent store for AI credits, in `CreditWalletService` (exported by `CreditsModule`; no HTTP routes yet). Trial credits and monthly Pro credits are granted through it (see "Credit-based access to makeup sessions"), and AI usage is debited through it (see "AI usage and credit deductions"); issuing purchased and referral credits is future work. Migration `20261123130000_add_credit_wallet_ledger` adds:
+The persistent store for AI credits, in `CreditWalletService` (exported by `CreditsModule`; users read it through "Credit balance and transaction history"). Trial credits and monthly Pro credits are granted through it (see "Credit-based access to makeup sessions"), and AI usage is debited through it (see "AI usage and credit deductions"); issuing purchased and referral credits is future work. Migration `20261123130000_add_credit_wallet_ledger` adds:
 
 | Table                  | Holds                                                                                                                                |
 | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
@@ -1015,7 +1019,7 @@ The persistent store for AI credits, in `CreditWalletService` (exported by `Cred
 | `CreditAllocation`     | Credits granted from one source: `source` (`TRIAL`, `SUBSCRIPTION`, `PURCHASE`, `REFERRAL`), `sourceReference`, `amount`, `remaining`, `grantedAt`, `expiresAt`; for `SUBSCRIPTION` also `subscriptionId`, `paymentId` and `periodStart` |
 | `CreditTransaction`    | Append-only ledger: `GRANT`, `DEBIT`, `EXPIRATION`, signed `amount`, `overageAmount`, `balanceAfter`, `idempotencyKey`, `sessionId`, `occurredAt`, ordered by `sequence`; AI usage debits also `usageCostUsd` and `creditCostUsdMicros` |
 | `CreditLedgerEntry`    | How each transaction changed each allocation (signed amount)                                                                         |
-| `CreditSessionOverage` | Overage used per makeup session, with the limit that applied when the session first used overage                                    |
+| `CreditSessionOverage` | The credit record of each initialized makeup session: `status`, reserved credits, overage limit and overage used (see "Session credit overage and concurrency control") |
 
 Rules:
 
@@ -1023,20 +1027,20 @@ Rules:
 - **Sources and expiry.** `TRIAL` and `SUBSCRIPTION` credits must have an `expiresAt` after the grant; `PURCHASE` and `REFERRAL` credits never expire (`expiresAt` is `NULL`). A user receives `TRIAL` credits at most once. All of this is enforced by CHECK constraints and a partial unique index as well as by the service.
 - **Fractional amounts.** `NUMERIC(18, 6)` in PostgreSQL and `Prisma.Decimal` in the application, never floating point. Amounts with more than six decimal places are rejected, not rounded; views return exact decimal strings (`"0.3"`).
 - **Available balance** is the sum of `remaining` over allocations whose period has started (`periodStart IS NULL OR periodStart <= now`) and that have not expired (`expiresAt IS NULL OR expiresAt > now`). Expired credits stop counting at the exact expiry instant, even before their expiration has been recorded. Credits of a month that has not started yet (a renewal paid before its period) are reported as `upcoming`. Each transaction's `balanceAfter` is what the wallet holds after it: the available balance plus upcoming credits.
-- **Debits** spend the credits that expire soonest first, then never-expiring credits (oldest first). A debit the balance cannot cover is rejected (`403` `Insufficient credits`, the same response as `POST /v1/sessions` without credits; code `INSUFFICIENT_CREDITS`) and writes nothing, unless it is for one of the user's makeup sessions: then the shortfall may use the session overage allowance (`sessionOverageCredits`, fixed for the session when it first uses overage). Overage is recorded in `overageAmount` and `CreditSessionOverage`; it is not repaid from later grants.
+- **Debits** spend the credits that expire soonest first, then never-expiring credits (oldest first). A debit the balance cannot cover is rejected (`403` `Insufficient credits`, the same response as `POST /v1/sessions` without credits; code `INSUFFICIENT_CREDITS`) and writes nothing, unless it is for one of the user's initialized makeup sessions: then the shortfall may use the session's overage allowance (`sessionOverageCredits`, fixed when the session is initialized). Debits never spend credits reserved by the user's other sessions. Overage is recorded in `overageAmount` and `CreditSessionOverage`; it is not repaid from later grants (see "Session credit overage and concurrency control").
 - **Expirations.** Every expired allocation that still holds credits is closed with one `EXPIRATION` transaction (effective at the expiry time, `description` naming the source), so expired credits are traceable in the history of every wallet, including wallets nobody uses any more. `CreditExpirationSweepService` records them at startup and then every `CREDIT_EXPIRATION_SWEEP_INTERVAL_MS` (default 60 s, minimum 10 s; not started when `NODE_ENV=test`), in bounded batches, skipping and retrying wallets that fail; any change to a wallet also records its due expirations first. Several instances can sweep at once: each expiration is written once, under the wallet's lock.
 - **Concurrency.** Every change locks the user's wallet row (`SELECT ... FOR UPDATE`), so concurrent grants, debits and expirations of one user apply one at a time; different users do not block each other. Grants are idempotent per `(user, source, sourceReference)` (a repeat with the same values returns the original; different values are a `409` conflict) and debits per `(user, idempotencyKey)`; unique indexes enforce the same at the database level.
 - **Reliable history.** Transactions and entries cannot be updated or deleted; an allocation's grant details cannot change and its `remaining` can only decrease. At commit, database triggers check that each allocation's `remaining` and each transaction's `amount` equal the sum of their entries, that every `balanceAfter` continues the previous one, and that the latest `balanceAfter` equals what the wallet's allocations hold. Deleting the user deletes the wallet and its history (account erasure); nothing else can.
 
 ### Credit-based access to makeup sessions
 
-Creating a makeup session (`POST /v1/sessions`) requires usable credits. Without them the request is rejected with `403` and nothing is written:
+Creating a makeup session (`POST /v1/sessions`) requires usable credits that no other session has reserved (see "Session credit overage and concurrency control"). Without them the request is rejected with `403` and nothing is written:
 
 ```json
 { "success": false, "statusCode": 403, "message": "Insufficient credits" }
 ```
 
-Every other endpoint (listing and reading sessions, uploads, guides, profile, subscription, ...) stays open to signed-in users without credits, including for sessions they created earlier. Creating a session consumes no credits; its AI requests do (see "AI usage and credit deductions").
+Other endpoints (listing and reading sessions, uploads, completing steps, profile, subscription, ...) stay open to signed-in users without credits, including for sessions they created earlier. The exception is queueing AI requests, which need the session to be able to pay. Creating a session consumes no credits, but it reserves up to one. Its AI requests consume credits (see "AI usage and credit deductions").
 
 The check is `ProAccessGuard` in credit mode: `POST /v1/sessions` uses `@UseGuards(AuthGuard, ProAccessGuard)` with `@RequireCredits()`. Other handlers that use `ProAccessGuard` without `@RequireCredits()` keep the Pro check (`403 An active Pro subscription or free trial is required`). The decision is made by `CreditEligibilityService`:
 
@@ -1099,7 +1103,7 @@ Tests: the unit and HTTP tests in `src/credits` and `src/subscription/credit-*` 
 
 ```bash
 npm test -- --runInBand credit
-TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json --runInBand test/credit-settings test/credit-wallet test/credit-access test/credit-trial test/credit-subscription test/credit-scheduler test/credit-usage
+TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json --runInBand test/credit-settings test/credit-wallet test/credit-access test/credit-trial test/credit-subscription test/credit-scheduler test/credit-usage test/credit-overage test/credit-apis
 ```
 
 ### AI usage and credit deductions
@@ -1107,11 +1111,11 @@ TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --
 Every OpenRouter request made by a makeup AI run (analysis, guide generation, visual check, question) is metered and paid for with credits. Migration `20261126120000_ai_usage_credit_deductions` adds the `AiUsage` table, the `deductionStepMicroCredits` setting and the charge columns of `CreditTransaction`.
 
 - **Tracking.** The provider is asked for usage accounting (`usage: { include: true }`). For every response, `AiUsage` stores the user (`authId`), the makeup session (`sessionId`), the AI run (`runId`), the operation, the model, the OpenRouter generation ID (`providerRequestId`), input, output and total tokens and `usage.cost` in US dollars (`costUsd`, `NUMERIC(20, 10)`, parsed as an exact decimal and never as a float). A session can have any number of usage rows, and its totals are summed in PostgreSQL. Responses that OpenRouter billed but that failed (for example invalid structured output) are stored with `outcome` `FAILED`. A generation is stored once (unique `(provider, providerRequestId)`), so a redelivered job never duplicates it.
-- **Conversion.** credits = `costUsd` / `creditCostUsdMicros` (default $0.005 per credit), rounded up to the deduction step `deductionStepMicroCredits` (default `1000000`, whole credits). For $0.023 that is 4.6 credits, so 5 are deducted. The step allows fractional deductions: `100000` deducts in tenths (4.6), and `1` deducts the exact amount to six decimal places. Every usage row keeps the exact credits (`creditsExact`), the credits due after rounding (`creditsDue`) and the credits actually deducted (`creditsCharged`).
+- **Conversion.** credits = `costUsd` / `creditCostUsdMicros` (default $0.005 per credit), rounded up to the deduction step `deductionStepMicroCredits`. The default step `1` deducts the exact amount to six decimal places: $0.025 -> 5 credits, $0.023 -> 4.6, $0.000123 -> 0.0246. An administrator can choose a coarser step: `100000` rounds up to tenths, and `1000000` to whole credits. Every usage row keeps the exact credits (`creditsExact`), the credits due after rounding (`creditsDue`) and the credits actually deducted (`creditsCharged`).
 - **What is charged.** A run is charged once, for the response whose result it publishes. The charge happens in the same transaction that publishes the result: the `DEBIT` (idempotency key `ai-run:<runId>`) and the usage's charge are committed with the result or not at all. Failed attempts, retried requests and results that are never published (for example a cancelled run) are recorded as `NOT_CHARGED` with a `chargeNote` (`FAILED_ATTEMPT`, `RESULT_DISCARDED`, ...), and the platform absorbs their cost. A response without a reported cost is `NOT_CHARGED` (`COST_UNAVAILABLE`).
 - **History.** The `DEBIT` stores the OpenRouter cost (`usageCostUsd`) and the rate that was used (`creditCostUsdMicros`) next to the credits (`amount`). The usage row stores the same rate and its `transactionId`. A database trigger keeps the usage facts immutable and lets the charge be written only once (from `PENDING`). Changing the rate or the step therefore affects only later charges, never the ones already recorded.
 - **Retries, duplicates and concurrency.** Repeating a charge (a job retry, a redelivered job or a second worker) finds the run's `DEBIT` by its idempotency key and deducts nothing (`RUN_ALREADY_CHARGED`). Charges lock the user's wallet row, so parallel requests of a user are deducted one after another and exactly.
-- **Not enough credits.** Before calling OpenRouter, the worker checks that the user has usable credits (the same sources as `POST /v1/sessions`) or unused overage in the session. If they have neither, the run fails with `Insufficient credits` (`INSUFFICIENT_CREDITS`, not retried) and OpenRouter is not contacted. If a finished request costs more than the balance and the session's overage can cover, everything available is deducted, the usage is recorded as `UNCOLLECTED` with the shortfall (`creditsDue` > `creditsCharged`), and the result is still delivered, because OpenRouter has already been paid. Only credits the user may use now are spent (for example, no expired trial credits).
+- **Not enough credits.** When an AI run is queued, and again before the worker calls OpenRouter, the session must have free credits or unused overage. Otherwise the request is refused with `403 Insufficient credits`, or the run fails with `Insufficient credits` (`INSUFFICIENT_CREDITS`, not retried), and OpenRouter is not contacted. If a finished request costs more than the free balance and the session's overage can cover, everything available is deducted. The usage is recorded as `UNCOLLECTED` with the shortfall (`creditsDue` > `creditsCharged`), and the result is still delivered, because OpenRouter has already been paid. Only credits the user may use now are spent (for example, no expired trial credits; see "Session credit overage and concurrency control").
 - `AI_MODE=mock` reports no usage, so nothing is recorded or charged.
 
 `GET /v1/sessions/:sessionId/ai-usage` returns the caller's own session usage (`404` for another user's session). `costUsd` and the credit amounts are exact decimal strings:
@@ -1128,9 +1132,16 @@ Every OpenRouter request made by a makeup AI run (analysis, guide generation, vi
       "inputTokens": 1200,
       "outputTokens": 300,
       "totalTokens": 1500,
-      "costUsd": "0.023",
+      "costUsd": "0.025",
       "chargeStatus": "CHARGED",
+      "chargeNote": null,
+      "creditCostUsdMicros": 5000,
+      "creditCostUsd": "0.005",
+      "creditsExact": "5",
+      "creditsDue": "5",
       "creditsCharged": "5",
+      "overageCredits": "0",
+      "transactionId": "...",
       "occurredAt": "2026-11-26T12:00:00.000Z"
     }
   ],
@@ -1139,13 +1150,143 @@ Every OpenRouter request made by a makeup AI run (analysis, guide generation, vi
     "inputTokens": 1200,
     "outputTokens": 300,
     "totalTokens": 1500,
-    "costUsd": "0.023",
-    "creditsCharged": "5"
-  }
+    "costUsd": "0.025",
+    "creditsCharged": "5",
+    "overageCredits": "0",
+    "uncollectedCredits": "0"
+  },
+  "credits": { "reservedCredits": "1", "reservationRemaining": "0", "overageLimit": "5", "overageUsed": "0", "...": "..." }
 }
 ```
 
-Tests: `test/credit-usage.e2e-spec.ts` runs the complete application with `AI_MODE=live` against a local fake of the OpenRouter API (`test/support/fake-openrouter.ts`; no network access). It covers several requests per session with exact sums, the $0.023 -> 5 credit deduction and the stored history, fractional steps, retried requests (tracked, charged once), duplicated deliveries and repeated charges, parallel requests, and a user who runs out of credits (partial collection, then refusal without calling OpenRouter). `test/credit-settings.e2e-spec.ts` also changes the conversion rate through the admin API. Charges made after the change use the new rate ($0.023 at $0.002 per credit -> 12 credits), and earlier deductions keep their rate and credits. Unit tests: `src/credits/credit-usage.service.spec.ts`, `src/makeup/makeup-credit.service.spec.ts`, `src/makeup/queues/makeup-job-credit.spec.ts`, `src/makeup/ai/providers/openrouter-credit-usage.spec.ts`.
+Tests: `test/credit-usage.e2e-spec.ts` runs the complete application with `AI_MODE=live` against a local fake of the OpenRouter API (`test/support/fake-openrouter.ts`; no network access). It covers several requests per session with exact sums, the $0.025 -> 5 credit deduction, exact fractional deductions and the stored history, a configured rounding step, retried requests (tracked, charged once), duplicated deliveries and repeated charges, parallel requests, and a user who runs out of credits (partial collection, then refusal without calling OpenRouter). `test/credit-settings.e2e-spec.ts` also changes the conversion rate through the admin API. Charges made after the change use the new rate ($0.025 at $0.002 per credit -> 12.5 credits), and earlier deductions keep their rate and credits. Unit tests: `src/credits/credit-usage.service.spec.ts`, `src/makeup/makeup-credit.service.spec.ts`, `src/makeup/queues/makeup-job-credit.spec.ts`, `src/makeup/ai/providers/openrouter-credit-usage.spec.ts`.
+
+### Session credit overage and concurrency control
+
+A makeup session that starts with credits can finish even when its actual OpenRouter usage goes beyond the balance. The part the balance cannot cover becomes **session overage**, up to the administrator's `sessionOverageCredits` (default 5 credits per session). The balance itself never goes below zero. Migration `20261127120000_session_credit_overage` extends `CreditSessionOverage` into the session's credit record.
+
+- **Initialization.** `POST /v1/sessions` creates the session and initializes it in the same transaction, under the user's wallet lock. Initialization needs **free credits**: the usable balance minus the credits the user's other sessions have reserved. It reserves up to one of them for the session (`reservedCredits`) and fixes the session's overage limit (`overageLimit`, the setting at that moment). Without free credits nothing is created and the response is `403 Insufficient credits`. Because these steps run one at a time under the lock, one credit can only initialize one session. For example, six concurrent `POST /v1/sessions` with 1 credit give one `201` and five `403`.
+- **Charges.** A session's charges use its reservation and the free balance first, never credits reserved by the user's other sessions. The rest is covered by its overage, up to its limit, and what neither covers is recorded as `UNCOLLECTED`. Example: a session initialized with 1 credit that uses 6 credits is charged 1 credit from the balance and 5 as overage, and the balance ends at 0. A session that used 5 credits would be charged 1 from the balance and 4 as overage, keeping 1 credit of overage. Overage is recorded on the `DEBIT` (`overageAmount`, with `authId` and `sessionId`) and in the session's `CreditSessionOverage.overageUsed`. It is never repaid from later grants.
+- **AI requests.** Queueing an AI run (`analyze`, `select`, `check`, `questions`) checks, under the session and wallet locks, that the session can still pay: free credits or overage left. Otherwise the request fails with `403 Insufficient credits`, and no run is created or sent to OpenRouter. The worker checks again before it calls OpenRouter. If the session cannot pay, the run fails with `Insufficient credits` (not retried). A session that was never initialized (for example, created before this release) is initialized at its first AI request if free credits exist. Otherwise it is refused and gets no overage. Non-AI actions such as uploads and completing steps stay open, so a session whose overage is used up can still be completed.
+- **Every subsequent session** needs free credits again: once the balance and the reservations are used up, `POST /v1/sessions` answers `403 Insufficient credits` until new credits arrive.
+- **Releasing reservations.** An unfinished session keeps its reservation and its overage allowance however long it is idle, so it can always be continued. A completed or deleted session releases the unused rest of its reservation. A reservation only holds credits that still exist: once reserved credits expire, the reservations of unfinished sessions are reduced (oldest first) to the credits left, so new credits can start a new session. These releases are applied whenever the user's wallet is locked. (Migration `20261128120000_remove_session_reservation_lapse` removed an earlier idle lapse.)
+- **Concurrency control.** Initialization, AI-request checks, charges, grants and expirations of one user all lock the user's `CreditWallet` row, so they apply one at a time against the latest balance, reservations and overage. Charges of one run also lock the run's usage rows, in a fixed order. Each run is charged at most once (`DEBIT` idempotency key `ai-run:<runId>`). Under any number of concurrent sessions and requests, a credit is therefore never spent twice and a session never exceeds its overage limit.
+- **Interrupted and unsuccessful requests.** OpenRouter errors without a response are not recorded, and billed failures are recorded as `FAILED` (never charged). A retried run is charged once, for the response it publishes. Usage left `PENDING` by an attempt that stopped after OpenRouter answered is settled as `NOT_CHARGED`:
+  - `SUPERSEDED_ATTEMPT` when another attempt publishes the run's result;
+  - `RUN_FAILED` when the run fails;
+  - `INTERRUPTED` for anything left over, settled by the AI recovery sweep (`MakeupRecoveryService`).
+  
+  None of these writes a second deduction or overage record.
+- **Database rules.** CHECK constraints keep `0 <= overageUsed <= overageLimit` and `0 <= reservationRemaining <= reservedCredits`. A trigger fixes the limit, lets overage only grow, and lets a reservation only be used up or released. A deferred trigger checks at commit that every session's `overageUsed` equals the sum of the `overageAmount` of its `DEBIT`s, and that no `DEBIT` uses overage without the session's record.
+
+`GET /v1/sessions/:sessionId/ai-usage` shows the session's credit state next to its usage (`overageCredits` per request and in the totals):
+
+```json
+"credits": {
+  "sessionId": "...",
+  "reservedCredits": "1",
+  "reservationRemaining": "0",
+  "overageLimit": "5",
+  "overageUsed": "5",
+  "overageRemaining": "0",
+  "initializedAt": "2026-11-27T12:00:00.000Z"
+}
+```
+
+Tests: `test/credit-overage.e2e-spec.ts` runs the complete application with `AI_MODE=live` against the local OpenRouter fake and checks the stored rows. It covers:
+- a session initialized with 1 credit that uses 5 and then 6 credits (1 deducted + 4, then 5 overage) and is then completed;
+- `403 Insufficient credits` for later sessions and AI requests;
+- the administrator's overage limit, fixed at initialization;
+- concurrent session creation (1 credit gives exactly one session; 2.5 credits give three);
+- concurrent sessions and parallel AI requests without double spend or overage bypass, and 30 concurrent charges, including duplicated charges of one run;
+- retried, interrupted and failed OpenRouter requests;
+- reservation release for completed sessions, and unfinished sessions keeping theirs however long they are idle;
+- the PostgreSQL rules.
+
+Unit tests: `src/credits/credit-wallet.service.spec.ts` (sessions), `src/credits/credit-session.policy.spec.ts` and `src/makeup/makeup-session-credit.spec.ts`.
+
+### Credit balance and transaction history
+
+The signed-in user's own credits, read-only. Each route requires a bearer token (`401` without a valid one, including a token revoked by a security event such as logout-all). The user is always the token's user and is never a request parameter, so no route can show another user's credits: user parameters (e.g. `?userId=`) are rejected with `400`, and another user's session is `404 Session not found`. The routes are open to every signed-in user, with or without credits, Pro or a trial. History stays readable after credits expired, after the subscription ended and after a session was deleted (`CreditAccountModule`, `src/credits/account`).
+
+| Method | Route                                | Purpose                                                                 |
+| ------ | ------------------------------------ | ----------------------------------------------------------------------- |
+| `GET`  | `/v1/credits/balance`                | Balance by source: granted, available, used, expired, expiry dates      |
+| `GET`  | `/v1/credits/transactions`           | Allocations, deductions (with session overage) and expirations          |
+| `GET`  | `/v1/sessions/:sessionId/ai-usage`   | AI requests of a session: tokens, cost, rate, credits, overage          |
+
+**Balance.** Every allocation is split into `available`, `upcoming` (a month that has not started), `used` and `expired`, which add up to `granted`. Credits past their expiry count as `expired` at once, even before the expiration is written to the ledger, so expired credits never count towards `available`. `PURCHASE` and `REFERRAL` credits never expire (`expires: false`, `expiresAt: null`) and stay available. Response fields:
+- totals: `available` (all sources), `usable` (sources the user may spend now; trial credits only during the trial, subscription credits only during the paid term), `reserved` (held by unfinished sessions), `free` (usable minus reserved: what a new session can start with), `upcoming`, `granted`, `used`, `expired`, and `overageUsed` (session overage in total);
+- `nextExpiration`: the earliest expiry, with the amount and sources;
+- `sources`: all four sources, each with the same amounts, `expires`, `usableNow` and `nextExpiresAt`;
+- `allocations`: every allocation, newest first, with `state` (`AVAILABLE`, `UPCOMING`, `USED_UP`, `EXPIRED`), `grantedAt`, `expiresAt` and `expiredAt`.
+
+```json
+{
+  "available": "26", "usable": "26", "reserved": "0", "free": "26", "upcoming": "0",
+  "granted": "1085", "used": "219", "expired": "840", "overageUsed": "0",
+  "nextExpiration": null,
+  "sources": [
+    { "source": "TRIAL", "granted": "50", "available": "0", "upcoming": "0", "used": "10", "expired": "40", "expires": true, "usableNow": false, "nextExpiresAt": null },
+    { "source": "PURCHASE", "granted": "30", "available": "21", "upcoming": "0", "used": "9", "expired": "0", "expires": false, "usableNow": true, "nextExpiresAt": null }
+  ],
+  "allocations": [
+    { "id": "...", "source": "TRIAL", "state": "EXPIRED", "granted": "50", "available": "0", "upcoming": "0", "used": "10", "expired": "40",
+      "grantedAt": "2026-10-21T10:00:00.000Z", "periodStart": null, "expiresAt": "2026-10-28T10:00:00.000Z", "expiredAt": "2026-10-28T10:00:00.000Z" }
+  ],
+  "asOf": "2026-11-30T10:00:00.000Z"
+}
+```
+
+**Transaction history.** `GET /v1/credits/transactions?limit=&before=&type=&sessionId=` returns the ledger newest first:
+- `limit`: 1-100, default 50.
+- `before`: the previous page's `nextCursor`.
+- `type`: `ALLOCATION`, `DEDUCTION`, `EXPIRATION`, or `OVERAGE` (deductions that used session overage).
+- `sessionId`: one of the caller's sessions, also a deleted one.
+
+Each item has:
+- `type` (`ALLOCATION`, `DEDUCTION`, `EXPIRATION`), the signed `amount` (change to the balance), `overageAmount` and `creditsCharged` (the balance part plus overage), and `balanceAfter`;
+- the credit `source`: the allocation's source, or `MIXED` when a deduction took from several sources or used overage. `sources` details each part with its `allocationId` and `expiresAt`, and the overage part as `SESSION_OVERAGE`;
+- `occurredAt`: when the change took effect; an expiration takes effect at the expiry;
+- `sessionId` and `session` (`null` once the session is deleted; `sessionId` is kept);
+- for AI deductions, `aiUsage`: the run, operation, model, tokens, USD cost, conversion rate (`creditCostUsdMicros`, `creditCostUsd`) and credits.
+
+```json
+{
+  "items": [
+    {
+      "id": "...", "sequence": "42", "type": "DEDUCTION",
+      "amount": "-1", "overageAmount": "3", "creditsCharged": "4", "balanceAfter": "0",
+      "source": "MIXED",
+      "sources": [
+        { "source": "REFERRAL", "amount": "-1", "allocationId": "...", "expiresAt": null },
+        { "source": "SESSION_OVERAGE", "amount": "-3", "allocationId": null, "expiresAt": null }
+      ],
+      "description": "AI PERSONALIZATION (openai/gpt-4.1-mini)",
+      "occurredAt": "2026-11-30T10:00:00.000Z",
+      "sessionId": "...", "session": { "id": "...", "status": "RECOMMENDATIONS_READY", "createdAt": "..." },
+      "aiUsage": { "id": "...", "runId": "...", "operation": "PERSONALIZATION", "model": "openai/gpt-4.1-mini",
+                   "inputTokens": 1000, "outputTokens": 250, "totalTokens": 1250, "costUsd": "0.02",
+                   "creditCostUsdMicros": 5000, "creditCostUsd": "0.005", "creditsDue": "4", "creditsCharged": "4" }
+    }
+  ],
+  "nextCursor": null
+}
+```
+
+**Session AI usage.** `GET /v1/sessions/:sessionId/ai-usage` lists each OpenRouter request of the session once, oldest first. A retried or repeated request is never listed twice, and a billed failure is listed as `FAILED` / `NOT_CHARGED`. Each entry shows the input, output and total tokens, `costUsd`, the conversion rate used (`creditCostUsdMicros`, `creditCostUsd`), `creditsExact`, `creditsDue` and `creditsCharged`, `overageCredits`, `chargeStatus` and `chargeNote`, and the `transactionId` of its deduction in the history. The totals add `overageCredits` and `uncollectedCredits`, and `credits` shows the session's reservation and overage (see "AI usage and credit deductions"). Another user's session is `404`. A deleted session's usage stays readable.
+
+Tests: `test/credit-apis.e2e-spec.ts` runs the complete application with `AI_MODE=live` against the local OpenRouter fake. Earlier months are set up through the wallet with their own dates. It covers:
+- a user with an expired trial, an expired Pro month (and ended subscription), purchased and referral credits, and a makeup session with retried and repeated AI requests;
+- the balance by source and by allocation, with expiry dates;
+- credits with a next expiry, session overage, and reserved credits;
+- the full history with amounts, sources, types, dates, balances, sessions and AI usage;
+- the type and session filters, and paging;
+- the history after expiry, subscription end and session deletion;
+- the AI usage of sessions without duplicates;
+- `401` for missing, invalid and revoked tokens, `400` for user parameters and invalid queries, and `404` for another user's session.
+
+Unit tests: `src/credits/account/credit-account.policy.spec.ts` and `src/credits/account/credit-account.service.spec.ts`.
 
 ## Domain
 
@@ -1159,7 +1300,7 @@ authUser
 |-- CreditWallet (0..1)
 |   |-- CreditAllocation -> CreditLedgerEntry
 |   |-- CreditTransaction -> CreditLedgerEntry
-|   `-- CreditSessionOverage (references a MakeupSession id without a foreign key)
+|   `-- CreditSessionOverage (session credit record: reservation and overage; references a MakeupSession id without a foreign key)
 |-- DataExport
 |-- (AccountDeletionRequest -> AccountDeletionFile: references authId without a foreign key)
 `-- MakeupSession
@@ -1190,7 +1331,7 @@ TEST_DATABASE_URL=... REDIS_ENABLED=false npm run test:e2e -- --runInBand   # Po
 TEST_DATABASE_URL=... TEST_REDIS_URL=redis://127.0.0.1:6379 REDIS_ENABLED=true npm run test:e2e -- --runInBand   # adds Redis mode (see "Testing both modes")
 npx jest private-cloud   # private image storage unit tests
 npm test -- --runInBand credit   # AI credit unit/HTTP tests
-TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json --runInBand test/credit-settings test/credit-wallet test/credit-access test/credit-trial test/credit-subscription test/credit-scheduler test/credit-usage   # AI credits on PostgreSQL
+TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json --runInBand test/credit-settings test/credit-wallet test/credit-access test/credit-trial test/credit-subscription test/credit-scheduler test/credit-usage test/credit-overage test/credit-apis   # AI credits on PostgreSQL
 TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json test/private-cloud   # storage workflows + cleanup ledger on PostgreSQL (mocked Supabase)
 npm run test:e2e
 npx prisma generate

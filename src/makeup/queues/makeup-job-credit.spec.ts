@@ -155,6 +155,8 @@ describe('MakeupJobHandler AI usage and credits', () => {
       return Promise.resolve({});
     }) as never);
 
+    credits.usableSources.mockResolvedValue(['PURCHASE']);
+
     await handler.process(job());
 
     expect(credits.recordUsage.mock.calls).toEqual([
@@ -165,7 +167,11 @@ describe('MakeupJobHandler AI usage and credits', () => {
         metadata,
       ],
     ]);
-    expect(credits.chargeRun.mock.calls).toEqual([[prisma, usage]]);
+    // Only the credits the user may use now, read before the transaction.
+    expect(credits.usableSources.mock.calls).toEqual([['owner']]);
+    expect(credits.chargeRun.mock.calls).toEqual([
+      [prisma, usage, ['PURCHASE']],
+    ]);
     expect(order).toEqual(['publish', 'charge']);
     expect(credits.discard.mock.calls).toHaveLength(0);
   });

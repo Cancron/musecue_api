@@ -7,6 +7,7 @@ import { MakeupQueueService } from './queues/makeup.queue';
 import { ImageValidationService } from './services/image-validation.service';
 import { MakeupService } from './makeup.service';
 import type { AiGateway } from './ai/ai.gateway';
+import { MakeupCreditService } from './makeup-credit.service';
 
 describe('MakeupService history media and deletion', () => {
   const prisma = mockDeep<PrismaService>();
@@ -15,6 +16,7 @@ describe('MakeupService history media and deletion', () => {
   const imageStorage = mock<PrivateImageStorageService>();
   const imageLifecycle = mock<PrivateImageLifecycleService>();
   const aiGateway = mock<AiGateway>();
+  const credits = mock<MakeupCreditService>();
   const service = new MakeupService(
     prisma,
     queue,
@@ -22,6 +24,7 @@ describe('MakeupService history media and deletion', () => {
     imageStorage,
     imageLifecycle,
     aiGateway,
+    credits,
   );
   const runInline = ((
     callback: (tx: Prisma.TransactionClient) => Promise<unknown>,

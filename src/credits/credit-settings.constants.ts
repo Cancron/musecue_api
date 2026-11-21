@@ -24,11 +24,18 @@ export const CREDIT_SETTINGS_LIMITS = {
   /** Zero is valid: sessions may not go beyond the remaining balance. */
   SESSION_OVERAGE_CREDITS_MIN: 0,
   SESSION_OVERAGE_CREDITS_MAX: 1_000,
-  /** 0.000001 credit: charges are exact to the ledger's precision. */
+  /** 0.000001 credit: charges are exact to the ledger's precision (default). */
   DEDUCTION_STEP_MICRO_CREDITS_MIN: 1,
-  /** 1 credit: charges are rounded up to whole credits (the default). */
+  /** 1 credit: charges are rounded up to whole credits. */
   DEDUCTION_STEP_MICRO_CREDITS_MAX: 1_000_000,
 } as const;
+
+/**
+ * Credits a makeup session reserves from the free balance when it is
+ * initialized (fewer if less is free). One credit can therefore initialize
+ * only one session, and each initialized session may use its overage.
+ */
+export const SESSION_RESERVATION_CREDITS = 1;
 
 /**
  * Formats millionths of a US dollar as an exact decimal string without

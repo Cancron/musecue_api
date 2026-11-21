@@ -8,11 +8,15 @@ export interface CreditSettingsValues {
   proMonthlyCredits: number;
   /** OpenRouter cost covered by one credit, in millionths of a US dollar. */
   creditCostUsdMicros: number;
-  /** Credits a makeup session may use beyond the remaining balance. */
+  /**
+   * Credits a makeup session may use beyond the remaining balance (fixed
+   * for a session when it is initialized).
+   */
   sessionOverageCredits: number;
   /**
    * AI usage is charged in multiples of this many millionths of a credit,
-   * rounded up (1000000 = whole credits; 1 = exact fractional credits).
+   * rounded up (1 = exact fractional credits, the default; 1000000 = whole
+   * credits).
    */
   deductionStepMicroCredits: number;
 }

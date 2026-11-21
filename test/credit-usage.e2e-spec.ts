@@ -180,12 +180,16 @@ describeWithDatabase('AI usage tracking and credit deductions (e2e)', () => {
     process.env.OPENROUTER_API_KEY = 'sk-or-v1-e2e-test-key';
     process.env.OPENROUTER_BASE_URL = openRouter.url;
     process.env.OPENROUTER_MODEL = MODEL;
+    // The fake answers at once; the production AI rate limit (15 runs per
+    // minute) would only slow the many runs of this file down.
+    process.env.AI_QUEUE_RATE_LIMIT_MAX = '1000';
     ctx = await bootApplication();
   });
 
   afterAll(async () => {
     await ctx?.close();
     await openRouter.stop();
+    delete process.env.AI_QUEUE_RATE_LIMIT_MAX;
   });
 
   it('records every OpenRouter request of a session against the user, session and run, and deducts credits for the actual cost', async () => {
@@ -232,10 +236,10 @@ describeWithDatabase('AI usage tracking and credit deductions (e2e)', () => {
         1000,
         250,
         1250,
-        '0.023',
+        '0.025',
         'CHARGED',
         5000,
-        '4.6',
+        '5',
         '5',
         '5',
       ],
@@ -250,8 +254,8 @@ describeWithDatabase('AI usage tracking and credit deductions (e2e)', () => {
         'CHARGED',
         5000,
         '2.34',
-        '3',
-        '3',
+        '2.34',
+        '2.34',
       ],
       [
         allRuns[2],
@@ -264,8 +268,8 @@ describeWithDatabase('AI usage tracking and credit deductions (e2e)', () => {
         'CHARGED',
         5000,
         '0.0246',
-        '1',
-        '1',
+        '0.0246',
+        '0.0246',
       ],
       [
         allRuns[3],
@@ -278,8 +282,8 @@ describeWithDatabase('AI usage tracking and credit deductions (e2e)', () => {
         'CHARGED',
         5000,
         '0.9',
-        '1',
-        '1',
+        '0.9',
+        '0.9',
       ],
     ]);
     expect(usages.every((u) => u.authId === account.id)).toBe(true);
@@ -302,20 +306,22 @@ describeWithDatabase('AI usage tracking and credit deductions (e2e)', () => {
         t.amount.toFixed(),
       ]),
     ).toEqual([
-      [`debit:ai-run:${allRuns[0]}`, sessionId, '0.023', 5000, '-5'],
-      [`debit:ai-run:${allRuns[1]}`, sessionId, '0.0117', 5000, '-3'],
-      [`debit:ai-run:${allRuns[2]}`, sessionId, '0.000123', 5000, '-1'],
-      [`debit:ai-run:${allRuns[3]}`, sessionId, '0.0045', 5000, '-1'],
+      // $0.025 at the default $0.005 per credit: exactly 5 credits.
+      [`debit:ai-run:${allRuns[0]}`, sessionId, '0.025', 5000, '-5'],
+      [`debit:ai-run:${allRuns[1]}`, sessionId, '0.0117', 5000, '-2.34'],
+      [`debit:ai-run:${allRuns[2]}`, sessionId, '0.000123', 5000, '-0.0246'],
+      [`debit:ai-run:${allRuns[3]}`, sessionId, '0.0045', 5000, '-0.9'],
     ]);
     expect(usages.map((u) => u.transactionId)).toEqual(debits.map((t) => t.id));
     await expect(wallet().getBalance(account.id)).resolves.toMatchObject({
-      available: '90',
+      available: '91.7354',
     });
 
     // The session's totals, summed exactly.
     const summary = dataOf<{
       usages: unknown[];
       totals: Record<string, unknown>;
+      credits: Record<string, unknown>;
     }>(
       await as(
         account,
@@ -328,8 +334,17 @@ describeWithDatabase('AI usage tracking and credit deductions (e2e)', () => {
       inputTokens: 4000,
       outputTokens: 1000,
       totalTokens: 5000,
-      costUsd: '0.039323',
-      creditsCharged: '10',
+      costUsd: '0.041323',
+      creditsCharged: '8.2646',
+      overageCredits: '0',
+      uncollectedCredits: '0',
+    });
+    // Initialized with one reserved credit, used up by the first charge.
+    expect(summary.credits).toMatchObject({
+      reservedCredits: '1',
+      reservationRemaining: '0',
+      overageLimit: '5',
+      overageUsed: '0',
     });
     // Another user cannot read it.
     const stranger = await customer('1');
@@ -339,21 +354,22 @@ describeWithDatabase('AI usage tracking and credit deductions (e2e)', () => {
     await expectConsistentLedger(ctx.client, account.id);
   });
 
-  it('deducts fractional credits when the deduction step is fractional', async () => {
+  it('rounds deductions up to the deduction step an administrator configured', async () => {
     const account = await customer('100');
-    const { stepId } = await sessionWithGuide(account);
+    const { stepId } = await sessionWithGuide(account); // 5 + 2.34 credits
     const admin = account.id;
+    // Tenths of a credit instead of the exact default.
     await settings().updateSettings(
-      { deductionStepMicroCredits: 1 },
+      { deductionStepMicroCredits: 100_000 },
       { actionedBy: admin },
     );
     try {
-      openRouter.plan('musecue_guide_question', { cost: 0.023 });
-      const run = await ask(account, stepId, 'fractional');
+      openRouter.plan('musecue_guide_question', { cost: 0.0231 });
+      const run = await ask(account, stepId, 'stepped');
       await finished(account, run.id);
     } finally {
       await settings().updateSettings(
-        { deductionStepMicroCredits: 1_000_000 },
+        { deductionStepMicroCredits: 1 },
         { actionedBy: admin },
       );
     }
@@ -361,11 +377,12 @@ describeWithDatabase('AI usage tracking and credit deductions (e2e)', () => {
     const [usage] = await ctx.client.aiUsage.findMany({
       where: { authId: account.id, operation: 'GUIDE_QUESTION' },
     });
-    expect(usage.creditsDue?.toFixed()).toBe('4.6');
-    expect(usage.creditsCharged?.toFixed()).toBe('4.6');
-    // 100 - 5 (analysis) - 3 (guide) - 4.6
+    expect(usage.creditsExact?.toFixed()).toBe('4.62');
+    expect(usage.creditsDue?.toFixed()).toBe('4.7');
+    expect(usage.creditsCharged?.toFixed()).toBe('4.7');
+    // 100 - 5 (analysis) - 2.34 (guide) - 4.7
     await expect(wallet().getBalance(account.id)).resolves.toMatchObject({
-      available: '87.4',
+      available: '87.96',
     });
   });
 
@@ -402,7 +419,7 @@ describeWithDatabase('AI usage tracking and credit deductions (e2e)', () => {
     const debits = (await debitsOf(account.id)).filter(
       (t) => t.idempotencyKey === `debit:ai-run:${run.id}`,
     );
-    expect(debits.map((t) => t.amount.toFixed())).toEqual(['-1']);
+    expect(debits.map((t) => t.amount.toFixed())).toEqual(['-0.9']);
   });
 
   it('never charges again for duplicated requests or repeated charging of a run', async () => {
@@ -468,11 +485,7 @@ describeWithDatabase('AI usage tracking and credit deductions (e2e)', () => {
 
   it('keeps deductions exact when many AI requests of a user are processed in parallel', async () => {
     const account = await customer('30');
-    const { stepId } = await sessionWithGuide(account); // 5 + 3 credits
-    await settings().updateSettings(
-      { deductionStepMicroCredits: 1 },
-      { actionedBy: account.id },
-    );
+    const { stepId } = await sessionWithGuide(account); // 5 + 2.34 credits
     try {
       openRouter.costs.musecue_guide_question = 0.0071; // 1.42 credits
       const runs = await Promise.all(
@@ -486,10 +499,6 @@ describeWithDatabase('AI usage tracking and credit deductions (e2e)', () => {
       expect(results.every((r) => r.status === 'COMPLETED')).toBe(true);
     } finally {
       openRouter.costs.musecue_guide_question = 0.0045;
-      await settings().updateSettings(
-        { deductionStepMicroCredits: 1_000_000 },
-        { actionedBy: account.id },
-      );
     }
 
     const charged = await ctx.client.aiUsage.aggregate({
@@ -500,17 +509,18 @@ describeWithDatabase('AI usage tracking and credit deductions (e2e)', () => {
     expect(charged._count._all).toBe(10);
     expect(charged._sum.creditsCharged?.toFixed()).toBe('14.2');
     expect(charged._sum.costUsd?.toFixed()).toBe('0.071');
-    // 30 - 5 - 3 - 14.2, to the micro-credit.
+    // 30 - 5 - 2.34 - 14.2, to the micro-credit.
     await expect(wallet().getBalance(account.id)).resolves.toMatchObject({
-      available: '7.8',
+      available: '8.46',
     });
     await expectConsistentLedger(ctx.client, account.id);
   });
 
   it('collects what the user can pay, then refuses further AI requests without calling OpenRouter', async () => {
     const account = await customer('10');
-    const { stepId, sessionId } = await sessionWithGuide(account); // 8 credits
-    // 0.05 USD = 10 credits: 2 from the balance + 5 of session overage.
+    const { stepId, sessionId } = await sessionWithGuide(account); // 7.34 credits
+    // 0.05 USD = 10 credits: the remaining 2.66 from the balance, then the
+    // session's 5 overage credits; 2.34 cannot be collected.
     openRouter.plan('musecue_guide_question', { cost: 0.05 });
     const costly = await ask(account, stepId, 'costly');
     expect(await finished(account, costly.id)).toMatchObject({
@@ -522,24 +532,41 @@ describeWithDatabase('AI usage tracking and credit deductions (e2e)', () => {
       chargeNote: 'INSUFFICIENT_CREDITS',
     });
     expect(usage.creditsDue?.toFixed()).toBe('10');
-    expect(usage.creditsCharged?.toFixed()).toBe('7');
+    expect(usage.creditsCharged?.toFixed()).toBe('7.66');
     const [debit] = (await debitsOf(account.id)).filter(
       (t) => t.idempotencyKey === `debit:ai-run:${costly.id}`,
     );
-    expect([debit.amount.toFixed(), debit.overageAmount.toFixed()]).toEqual([
-      '-2',
-      '5',
-    ]);
-
-    const before = openRouter.count();
-    const refused = await ask(account, stepId, 'refused');
-    expect(await finished(account, refused.id)).toMatchObject({
-      status: 'FAILED',
-      error: 'Insufficient credits',
+    expect([
+      debit.amount.toFixed(),
+      debit.overageAmount.toFixed(),
+      debit.balanceAfter.toFixed(),
+    ]).toEqual(['-2.66', '5', '0']);
+    const summary = dataOf<{ totals: Record<string, unknown> }>(
+      await as(
+        account,
+        http().get(`/v1/sessions/${sessionId}/ai-usage`),
+      ).expect(200),
+    );
+    expect(summary.totals).toMatchObject({
+      overageCredits: '5',
+      uncollectedCredits: '2.34',
     });
+
+    // Nothing is queued and OpenRouter is not called any more.
+    const before = openRouter.count();
+    const refused = await as(
+      account,
+      http().post(`/v1/guide-steps/${stepId}/questions`),
+    )
+      .set('Idempotency-Key', 'refused')
+      .send({ question: 'And now?' })
+      .expect(403);
+    expect(refused.body).toMatchObject({ message: 'Insufficient credits' });
     expect(openRouter.count()).toBe(before);
     await expect(
-      ctx.client.aiUsage.count({ where: { runId: refused.id } }),
+      ctx.client.aiRun.count({
+        where: { sessionId, idempotencyKey: 'refused' },
+      }),
     ).resolves.toBe(0);
     await expect(
       ctx.client.creditSessionOverage.findFirst({ where: { sessionId } }),

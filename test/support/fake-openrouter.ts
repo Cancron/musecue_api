@@ -17,8 +17,10 @@ export type FakeOutcome =
   | 'invalid-json'
   /** 200 cut off at the token limit (billed, then rejected). */
   | 'truncated'
-  /** 502 without a generation (not billed). */
-  | 'http-502';
+  /** 502 without a generation (not billed; retried). */
+  | 'http-502'
+  /** 400 without a generation (not billed; the run fails at once). */
+  | 'http-400';
 
 export interface FakePlan {
   outcome?: FakeOutcome;
@@ -87,7 +89,7 @@ const CONTENT: Record<string, unknown> = {
 };
 
 export const DEFAULT_COSTS: Record<string, number> = {
-  musecue_personalization: 0.023,
+  musecue_personalization: 0.025,
   musecue_guide: 0.0117,
   musecue_makeup_check: 0.000123,
   musecue_guide_question: 0.0045,
@@ -133,6 +135,11 @@ export class FakeOpenRouter {
     ]);
   }
 
+  /** Drops planned responses that were not used. */
+  clearPlans(): void {
+    this.plans.clear();
+  }
+
   count(schemaName?: string): number {
     return schemaName
       ? this.requests.filter((r) => r.schemaName === schemaName).length
@@ -164,6 +171,9 @@ export class FakeOpenRouter {
     const outcome = plan.outcome ?? 'ok';
     if (outcome === 'http-502') {
       return { status: 502, body: { error: { message: 'Bad gateway' } } };
+    }
+    if (outcome === 'http-400') {
+      return { status: 400, body: { error: { message: 'Bad request' } } };
     }
     this.generation += 1;
     const promptTokens = plan.promptTokens ?? 1000;

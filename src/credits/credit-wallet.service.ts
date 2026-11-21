@@ -5,6 +5,7 @@ import {
   Prisma,
   type CreditAllocation,
   type CreditLedgerEntry,
+  type CreditSessionOverage,
   type CreditTransaction,
 } from '@prisma/client';
 import { PrismaService } from '../common/services/prisma.service';
@@ -17,7 +18,6 @@ import {
 } from './credit-amount';
 import {
   compareSpendingOrder,
-  decideOverage,
   getGrantExpiryRejection,
   getPaymentLinkRejection,
   hasAllocationStarted,
@@ -25,6 +25,13 @@ import {
   isAllocationAvailable,
   planDebit,
 } from './credit-ledger.policy';
+import {
+  capReservations,
+  freeCredits,
+  overageRemaining,
+  reservationAfterCharge,
+  reservationFor,
+} from './credit-session.policy';
 import { CreditSettingsService } from './credit-settings.service';
 import {
   CreditConflictError,
@@ -42,6 +49,9 @@ import type {
   ExpireDueCreditsResult,
   GrantCreditsInput,
   GrantCreditsResult,
+  SessionCreditInput,
+  SessionCreditView,
+  SessionUseView,
 } from './interfaces/credit-wallet.interface';
 
 type Tx = Prisma.TransactionClient;
@@ -93,6 +103,19 @@ const WALLET_TRANSACTION_OPTIONS = { maxWait: 10_000, timeout: 20_000 };
  * balance plus any credits allocated for a period that has not started yet.
  * Reads never count expired credits, even before their expiration has been
  * recorded, nor credits whose period has not started.
+ *
+ * Makeup sessions: a session is initialized (initializeSession, or
+ * prepareSessionUse before an AI request) under the same lock with free
+ * credits, i.e. the usable balance minus the credits the user's other
+ * sessions have reserved, and reserves up to one of them; without free
+ * credits it is refused (403 "Insufficient credits"). Debits for a session
+ * use its reservation and the free balance, then its overage allowance
+ * (fixed at initialization); other debits cannot spend reserved credits.
+ * Because every step runs under the wallet lock, concurrent sessions and
+ * requests can neither spend a credit twice nor obtain overage without
+ * credits of their own. An unfinished session keeps its reservation;
+ * reservations of completed or deleted sessions are released whenever the
+ * wallet is locked.
  */
 @Injectable()
 export class CreditWalletService {
@@ -266,12 +289,13 @@ export class CreditWalletService {
   }
 
   /**
-   * Debits credits, spending the credits that expire soonest first. If the
-   * balance cannot cover a debit for a makeup session, the rest may come
-   * from the session's overage allowance (the settings' sessionOverageCredits
-   * when the session first used overage); otherwise the debit is rejected
-   * and nothing is written. Retrying with the same idempotency key returns
-   * the original debit.
+   * Debits credits, spending the credits that expire soonest first, but
+   * never credits reserved by the user's other sessions. If the free
+   * balance cannot cover a debit for an initialized makeup session, the rest
+   * may come from the session's overage allowance (fixed when the session
+   * was initialized); otherwise the debit is rejected and nothing is
+   * written. Retrying with the same idempotency key returns the original
+   * debit.
    */
   async debit(
     input: DebitCreditsInput,
@@ -308,12 +332,16 @@ export class CreditWalletService {
           return this.toDebitResult(previous, true, requested);
         }
 
+        let sessionCredit: CreditSessionOverage | null = null;
         if (sessionId !== null) {
           const session = await tx.makeupSession.findFirst({
             where: { id: sessionId, authId: wallet.authId },
             select: { id: true },
           });
           if (!session) throw new CreditSessionNotFoundError();
+          sessionCredit = await tx.creditSessionOverage.findUnique({
+            where: { walletId_sessionId: { walletId: wallet.id, sessionId } },
+          });
         }
 
         const allocations = await tx.creditAllocation.findMany({
@@ -336,13 +364,23 @@ export class CreditWalletService {
         const held = sumCredits(
           allocations.map((allocation) => allocation.remaining),
         );
-        const plan = planDebit(spendable, requested, wallet.now);
+        // Credits reserved by the user's other sessions are not spendable.
+        const free = freeCredits(
+          available,
+          await this.reservedByOthers(tx, wallet.id, sessionId),
+        );
+        const plan = planDebit(
+          spendable,
+          Prisma.Decimal.min(requested, free),
+          wallet.now,
+        );
+        const shortfall = requested.minus(plan.consumed);
 
-        const overage = plan.shortfall.gt(0)
-          ? await this.useSessionOverage(tx, wallet, sessionId, {
+        const overage = shortfall.gt(0)
+          ? this.decideSessionOverage(sessionId, sessionCredit, {
               requested,
-              available,
-              shortfall: plan.shortfall,
+              free,
+              shortfall,
               partial: input.partial === true,
             })
           : ZERO_CREDITS;
@@ -380,6 +418,19 @@ export class CreditWalletService {
           },
           include: { entries: true },
         });
+        if (sessionCredit) {
+          await tx.creditSessionOverage.update({
+            where: { id: sessionCredit.id },
+            data: {
+              overageUsed: sessionCredit.overageUsed.plus(overage),
+              reservationRemaining: reservationAfterCharge(
+                sessionCredit.reservationRemaining,
+                plan.consumed,
+                overage,
+              ),
+            },
+          });
+        }
         return this.toDebitResult(transaction, false, requested);
       },
       options,
@@ -521,24 +572,72 @@ export class CreditWalletService {
   }
 
   /**
-   * Overage a makeup session could still use: its recorded limit (or the
-   * current setting if it has used none) minus what it used. Read-only.
+   * Initializes a makeup session of the user (when it is created): under
+   * the wallet lock it needs free credits (the usable balance minus what the
+   * user's other sessions have reserved), reserves up to one of them for
+   * the session and fixes its overage limit (the settings'
+   * sessionOverageCredits). Without free credits it throws
+   * InsufficientCreditsError (403 "Insufficient credits") and writes
+   * nothing. Initializing an initialized session only records activity.
+   * Pass the transaction that creates the session, so both commit together.
    */
-  async sessionOverageRemaining(
+  async initializeSession(
+    input: SessionCreditInput,
+    options: WalletOperationOptions = {},
+  ): Promise<SessionUseView> {
+    this.assertReference('sessionId', input.sessionId);
+    return this.withLockedWallet(
+      input.authId,
+      (tx, wallet) => this.admitSession(tx, wallet, input, false),
+      options,
+    );
+  }
+
+  /**
+   * Checks, before an AI request of a makeup session, that the session may
+   * use credits: it is initialized (a session that never was, e.g. one
+   * created before credits existed, is initialized now if free credits
+   * exist) and it has free credits or overage left. Otherwise throws
+   * InsufficientCreditsError.
+   */
+  async prepareSessionUse(
+    input: SessionCreditInput,
+    options: WalletOperationOptions = {},
+  ): Promise<SessionUseView> {
+    this.assertReference('sessionId', input.sessionId);
+    return this.withLockedWallet(
+      input.authId,
+      (tx, wallet) => this.admitSession(tx, wallet, input, true),
+      options,
+    );
+  }
+
+  /**
+   * The credit state of a makeup session, or null if it was never
+   * initialized. Read-only: the reservation of a completed or deleted
+   * session is shown as released.
+   */
+  async getSessionCredits(
     authId: string,
     sessionId: string,
-  ): Promise<Prisma.Decimal> {
-    const used = await this.prisma.creditSessionOverage.findFirst({
-      where: { authId, sessionId },
-    });
-    if (used) {
-      return Prisma.Decimal.max(
-        used.overageLimit.minus(used.overageUsed),
-        ZERO_CREDITS,
-      );
+  ): Promise<SessionCreditView | null> {
+    const [row, session] = await Promise.all([
+      this.prisma.creditSessionOverage.findFirst({
+        where: { authId, sessionId },
+      }),
+      this.prisma.makeupSession.findFirst({
+        where: { id: sessionId, authId },
+        select: { status: true },
+      }),
+    ]);
+    if (!row) return null;
+    if (!session || session.status === 'COMPLETED') {
+      return this.toSessionCreditView({
+        ...row,
+        reservationRemaining: ZERO_CREDITS,
+      });
     }
-    const settings = await this.settings.getSettings();
-    return new Prisma.Decimal(settings.sessionOverageCredits);
+    return this.toSessionCreditView(row);
   }
 
   /** Whether the user already received credits for this source event. */
@@ -587,6 +686,7 @@ export class CreditWalletService {
         authId,
         now,
       );
+      await this.releaseReservations(tx, locked.id, authId, now);
       return work(tx, { id: locked.id, authId, now, expired });
     };
     // Inside the caller's transaction the lock is held until it commits.
@@ -667,73 +767,189 @@ export class CreditWalletService {
   }
 
   /**
-   * Covers a shortfall from the session's overage allowance and returns the
-   * overage used, or rejects the debit. A `partial` debit uses whatever
-   * overage is left (the rest is uncollected) and is rejected only if
-   * nothing at all can be collected.
+   * The overage a debit may use for `shortfall` (what the free balance could
+   * not cover), or rejects the debit. Only an initialized (ACTIVE) session
+   * has an overage allowance. A `partial` debit uses whatever overage is
+   * left (the rest is uncollected) and is rejected only if nothing at all
+   * can be collected.
    */
-  private async useSessionOverage(
-    tx: Tx,
-    wallet: LockedWallet,
+  private decideSessionOverage(
     sessionId: string | null,
+    sessionCredit: CreditSessionOverage | null,
     debit: {
       requested: Prisma.Decimal;
-      available: Prisma.Decimal;
+      free: Prisma.Decimal;
       shortfall: Prisma.Decimal;
       partial: boolean;
     },
-  ): Promise<Prisma.Decimal> {
-    const reject = (overageRemaining: Prisma.Decimal) =>
-      new InsufficientCreditsError({
-        requested: formatCredits(debit.requested),
-        available: formatCredits(debit.available),
-        overageRemaining: formatCredits(overageRemaining),
-      });
+  ): Prisma.Decimal {
+    const remaining =
+      sessionId !== null && sessionCredit
+        ? overageRemaining(sessionCredit)
+        : ZERO_CREDITS;
+    if (debit.shortfall.lte(remaining)) return debit.shortfall;
+
     const collectedFromBalance = debit.requested.minus(debit.shortfall);
-    if (sessionId === null) {
-      if (debit.partial && collectedFromBalance.gt(0)) return ZERO_CREDITS;
-      throw reject(ZERO_CREDITS);
+    if (debit.partial && (remaining.gt(0) || collectedFromBalance.gt(0))) {
+      // Use the rest of the allowance; the remainder stays uncollected.
+      return remaining;
     }
+    throw new InsufficientCreditsError({
+      requested: formatCredits(debit.requested),
+      available: formatCredits(debit.free),
+      overageRemaining: formatCredits(remaining),
+    });
+  }
+
+  /**
+   * Initializes the session if it is not (or no longer) initialized, with
+   * free credits; then, if `requireCredits`, checks that it can pay for
+   * something now (free credits or overage left). Records the activity.
+   * Runs under the wallet lock.
+   */
+  private async admitSession(
+    tx: Tx,
+    wallet: LockedWallet,
+    input: SessionCreditInput,
+    requireCredits: boolean,
+  ): Promise<SessionUseView> {
+    const session = await tx.makeupSession.findFirst({
+      where: { id: input.sessionId, authId: wallet.authId },
+      select: { id: true },
+    });
+    if (!session) throw new CreditSessionNotFoundError();
 
     const existing = await tx.creditSessionOverage.findUnique({
-      where: { walletId_sessionId: { walletId: wallet.id, sessionId } },
+      where: {
+        walletId_sessionId: { walletId: wallet.id, sessionId: input.sessionId },
+      },
     });
-    const limit =
-      existing?.overageLimit ??
-      new Prisma.Decimal(
-        (await this.settings.getSettings(tx)).sessionOverageCredits,
-      );
-    const used = existing?.overageUsed ?? ZERO_CREDITS;
-    let decision = decideOverage(limit, used, debit.shortfall);
-    if (!decision.allowed) {
-      const remaining = decision.remainingBefore;
-      if (!debit.partial) throw reject(remaining);
-      if (remaining.lte(0)) {
-        if (collectedFromBalance.gt(0)) return ZERO_CREDITS;
-        throw reject(remaining);
-      }
-      // Use the rest of the allowance; the remainder stays uncollected.
-      decision = decideOverage(limit, used, remaining);
-    }
-    const overageUsed = decision.usedAfter.minus(used);
+    const allocations = await tx.creditAllocation.findMany({
+      where: {
+        walletId: wallet.id,
+        remaining: { gt: 0 },
+        ...(input.sources ? { source: { in: input.sources } } : {}),
+      },
+    });
+    const available = sumCredits(
+      allocations
+        .filter((allocation) => isAllocationAvailable(allocation, wallet.now))
+        .map((allocation) => allocation.remaining),
+    );
+    const free = freeCredits(
+      available,
+      await this.reservedByOthers(tx, wallet.id, input.sessionId),
+    );
 
     if (existing) {
-      await tx.creditSessionOverage.update({
-        where: { id: existing.id },
-        data: { overageUsed: decision.usedAfter },
-      });
-    } else {
-      await tx.creditSessionOverage.create({
-        data: {
-          walletId: wallet.id,
-          authId: wallet.authId,
-          sessionId,
-          overageLimit: limit,
-          overageUsed: decision.usedAfter,
-        },
+      const overageLeft = overageRemaining(existing);
+      if (requireCredits && free.lte(0) && overageLeft.lte(0)) {
+        throw new InsufficientCreditsError({
+          available: formatCredits(free),
+          overageRemaining: formatCredits(overageLeft),
+        });
+      }
+      return this.toSessionUseView(existing, free, false);
+    }
+
+    // Not initialized yet: one credit can initialize one session.
+    if (free.lte(0)) {
+      throw new InsufficientCreditsError({ available: formatCredits(free) });
+    }
+    const reserved = reservationFor(free);
+    const initialized = await tx.creditSessionOverage.create({
+      data: {
+        walletId: wallet.id,
+        authId: wallet.authId,
+        sessionId: input.sessionId,
+        overageLimit: new Prisma.Decimal(
+          (await this.settings.getSettings(tx)).sessionOverageCredits,
+        ),
+        reservedCredits: reserved,
+        reservationRemaining: reserved,
+        initializedAt: wallet.now,
+      },
+    });
+    return this.toSessionUseView(initialized, free, true);
+  }
+
+  /** Unused credits reserved by the wallet's sessions except `sessionId`. */
+  private async reservedByOthers(
+    tx: Tx,
+    walletId: string,
+    sessionId: string | null,
+  ): Promise<Prisma.Decimal> {
+    const { _sum } = await tx.creditSessionOverage.aggregate({
+      where: {
+        walletId,
+        ...(sessionId === null ? {} : { sessionId: { not: sessionId } }),
+      },
+      _sum: { reservationRemaining: true },
+    });
+    return _sum.reservationRemaining ?? ZERO_CREDITS;
+  }
+
+  /**
+   * Releases the unused reservations of sessions that were completed or
+   * deleted. Unfinished sessions keep theirs, however long they are idle,
+   * as far as the reserved credits still exist: once credits expired, the
+   * reservations are reduced to what is left (see capReservations). Runs
+   * under the wallet lock, before every change, after due expirations.
+   */
+  private async releaseReservations(
+    tx: Tx,
+    walletId: string,
+    authId: string,
+    now: Date,
+  ): Promise<void> {
+    const holding = await tx.creditSessionOverage.findMany({
+      where: { walletId, reservationRemaining: { gt: 0 } },
+      select: {
+        id: true,
+        sessionId: true,
+        reservationRemaining: true,
+        initializedAt: true,
+      },
+    });
+    if (holding.length === 0) return;
+
+    const open = new Set(
+      (
+        await tx.makeupSession.findMany({
+          where: {
+            id: { in: holding.map((row) => row.sessionId) },
+            authId,
+            status: { not: 'COMPLETED' },
+          },
+          select: { id: true },
+        })
+      ).map((session) => session.id),
+    );
+    const closed = holding.filter((row) => !open.has(row.sessionId));
+    if (closed.length > 0) {
+      await tx.creditSessionOverage.updateMany({
+        where: { id: { in: closed.map((row) => row.id) } },
+        data: { reservationRemaining: 0 },
       });
     }
-    return overageUsed;
+
+    const unfinished = holding.filter((row) => open.has(row.sessionId));
+    if (unfinished.length === 0) return;
+    const allocations = await tx.creditAllocation.findMany({
+      where: { walletId, remaining: { gt: 0 } },
+      select: { remaining: true, expiresAt: true, periodStart: true },
+    });
+    const available = sumCredits(
+      allocations
+        .filter((allocation) => isAllocationAvailable(allocation, now))
+        .map((allocation) => allocation.remaining),
+    );
+    for (const change of capReservations(unfinished, available)) {
+      await tx.creditSessionOverage.update({
+        where: { id: change.id },
+        data: { reservationRemaining: change.reservationRemaining },
+      });
+    }
   }
 
   private async remainingCredits(
@@ -790,6 +1006,30 @@ export class CreditWalletService {
         Prisma.Decimal.max(requested.minus(collected), ZERO_CREDITS),
       ),
       replayed,
+    };
+  }
+
+  private toSessionCreditView(row: CreditSessionOverage): SessionCreditView {
+    return {
+      sessionId: row.sessionId,
+      reservedCredits: formatCredits(row.reservedCredits),
+      reservationRemaining: formatCredits(row.reservationRemaining),
+      overageLimit: formatCredits(row.overageLimit),
+      overageUsed: formatCredits(row.overageUsed),
+      overageRemaining: formatCredits(overageRemaining(row)),
+      initializedAt: row.initializedAt.toISOString(),
+    };
+  }
+
+  private toSessionUseView(
+    row: CreditSessionOverage,
+    free: Prisma.Decimal,
+    initialized: boolean,
+  ): SessionUseView {
+    return {
+      ...this.toSessionCreditView(row),
+      freeCredits: formatCredits(free),
+      initialized,
     };
   }
 

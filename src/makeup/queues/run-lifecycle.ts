@@ -1,5 +1,6 @@
 import type { Prisma } from '@prisma/client';
 import type { PrismaService } from '../../common/services/prisma.service';
+import { USAGE_NOTE } from '../../credits/credit-usage.service';
 import { lockSession } from '../workflow-lock';
 import type { MakeupAiJob } from './makeup.queue';
 
@@ -84,6 +85,13 @@ export async function failRun(
       },
     });
     if (!changed.count) return;
+    // A run is only charged with its published result: usage its attempts
+    // recorded (e.g. an attempt interrupted after the provider answered) is
+    // settled as not charged, in the same transaction.
+    await tx.aiUsage.updateMany({
+      where: { runId, chargeStatus: 'PENDING' },
+      data: { chargeStatus: 'NOT_CHARGED', chargeNote: USAGE_NOTE.RUN_FAILED },
+    });
     if (
       run.operation === 'PERSONALIZATION' ||
       run.operation === 'GUIDE_GENERATION'

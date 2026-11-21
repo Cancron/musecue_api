@@ -44,8 +44,8 @@ export class UpdateCreditSettingsDto {
 
   /**
    * AI usage is charged in multiples of this step, rounded up, in millionths
-   * of a credit (1-1000000): 1000000 charges whole credits, 100000 tenths,
-   * 1 exact fractional credits.
+   * of a credit (1-1000000): 1 (default) charges exact fractional credits,
+   * 100000 tenths, 1000000 whole credits.
    */
   @ValidateIf(isPresent)
   @IsInt()

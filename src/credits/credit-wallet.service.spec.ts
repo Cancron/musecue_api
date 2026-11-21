@@ -4,6 +4,7 @@ import {
   Prisma,
   type CreditAllocation,
   type CreditLedgerEntry,
+  type CreditSessionOverage,
   type CreditTransaction,
 } from '@prisma/client';
 import { mock, mockDeep } from 'jest-mock-extended';
@@ -84,6 +85,24 @@ describe('CreditWalletService', () => {
     })),
   });
 
+  /** A session's stored credit state (CreditSessionOverage). */
+  const sessionCredit = (
+    overrides: Partial<CreditSessionOverage> = {},
+  ): CreditSessionOverage => ({
+    id: 'ov-1',
+    walletId: 'wallet-1',
+    authId: 'user-1',
+    sessionId: 's-1',
+    overageLimit: D(5),
+    overageUsed: D(0),
+    reservedCredits: D(1),
+    reservationRemaining: D(0),
+    initializedAt: later(-HOUR / 2),
+    createdAt: later(-HOUR / 2),
+    updatedAt: later(-HOUR / 4),
+    ...overrides,
+  });
+
   /** The data passed to creditTransaction.create, by call. */
   const createdTransactions = () =>
     prisma.creditTransaction.create.mock.calls.map(([args]) => args.data);
@@ -159,6 +178,11 @@ describe('CreditWalletService', () => {
       const { entries, ...data } = args.data;
       return Promise.resolve(storedTransaction(data, entries?.create ?? []));
     }) as never);
+    // No session holds reserved credits unless a test says so.
+    prisma.creditSessionOverage.findMany.mockResolvedValue([]);
+    prisma.creditSessionOverage.aggregate.mockResolvedValue({
+      _sum: { reservationRemaining: null },
+    } as never);
     settings.getSettings.mockResolvedValue({
       trialCredits: 50,
       proMonthlyCredits: 1000,
@@ -595,11 +619,9 @@ describe('CreditWalletService', () => {
     it('collects what the balance and the rest of the session overage cover in a partial debit', async () => {
       allocations = [allocation({ remaining: D(1) })];
       prisma.makeupSession.findFirst.mockResolvedValue({ id: 's-1' } as never);
-      prisma.creditSessionOverage.findUnique.mockResolvedValue({
-        id: 'ov-1',
-        overageLimit: D(5),
-        overageUsed: D(4),
-      } as never);
+      prisma.creditSessionOverage.findUnique.mockResolvedValue(
+        sessionCredit({ overageUsed: D(4) }),
+      );
 
       const result = await service.debit({
         authId: 'user-1',
@@ -620,7 +642,10 @@ describe('CreditWalletService', () => {
       });
       expect(prisma.creditSessionOverage.update.mock.calls[0]?.[0]).toEqual({
         where: { id: 'ov-1' },
-        data: { overageUsed: D(5) },
+        data: {
+          overageUsed: D(5),
+          reservationRemaining: D(0),
+        },
       });
     });
 
@@ -697,10 +722,12 @@ describe('CreditWalletService', () => {
       expectNothingWritten();
     });
 
-    it('covers a session shortfall from the overage allowance, snapshotting the configured limit', async () => {
+    it("covers an initialized session's shortfall from its overage allowance, never going negative", async () => {
       allocations = [allocation({ remaining: D('1') })];
       prisma.makeupSession.findFirst.mockResolvedValue({ id: 's-1' } as never);
-      prisma.creditSessionOverage.findUnique.mockResolvedValue(null);
+      prisma.creditSessionOverage.findUnique.mockResolvedValue(
+        sessionCredit({ reservationRemaining: D(1) }),
+      );
 
       const result = await service.debit({
         authId: 'user-1',
@@ -713,14 +740,14 @@ describe('CreditWalletService', () => {
         where: { id: 's-1', authId: 'user-1' },
         select: { id: true },
       });
-      expect(
-        prisma.creditSessionOverage.create.mock.calls[0]?.[0].data,
-      ).toEqual({
-        walletId: 'wallet-1',
-        authId: 'user-1',
-        sessionId: 's-1',
-        overageLimit: D(5),
-        overageUsed: D('2.5'),
+      // The limit is the one fixed at initialization; nothing is created.
+      expect(prisma.creditSessionOverage.create.mock.calls).toHaveLength(0);
+      expect(prisma.creditSessionOverage.update.mock.calls[0]?.[0]).toEqual({
+        where: { id: 'ov-1' },
+        data: {
+          overageUsed: D('2.5'),
+          reservationRemaining: D(0),
+        },
       });
       expect(createdTransactions()[0]).toMatchObject({
         amount: D(-1),
@@ -733,11 +760,9 @@ describe('CreditWalletService', () => {
 
     it('keeps the limit recorded for the session even if the setting changed since', async () => {
       prisma.makeupSession.findFirst.mockResolvedValue({ id: 's-1' } as never);
-      prisma.creditSessionOverage.findUnique.mockResolvedValue({
-        id: 'ov-1',
-        overageLimit: D(5),
-        overageUsed: D('4.5'),
-      } as never);
+      prisma.creditSessionOverage.findUnique.mockResolvedValue(
+        sessionCredit({ overageUsed: D('4.5') }),
+      );
       settings.getSettings.mockResolvedValue({
         sessionOverageCredits: 100,
       } as never);
@@ -903,6 +928,7 @@ describe('CreditWalletService', () => {
       outer.creditTransaction.create.mockResolvedValue(
         storedTransaction({ type: CreditTransactionType.GRANT }) as never,
       );
+      outer.creditSessionOverage.findMany.mockResolvedValue([]);
 
       await service.grant(
         {
@@ -919,6 +945,347 @@ describe('CreditWalletService', () => {
       expect(outer.$queryRaw.mock.calls).toHaveLength(1);
       expect(outer.creditAllocation.create.mock.calls).toHaveLength(1);
       expect(prisma.creditAllocation.create.mock.calls).toHaveLength(0);
+    });
+  });
+
+  describe('makeup sessions (reservation and overage)', () => {
+    const reservedByOthers = (amount: string) =>
+      prisma.creditSessionOverage.aggregate.mockResolvedValue({
+        _sum: { reservationRemaining: D(amount) },
+      } as never);
+
+    beforeEach(() => {
+      prisma.makeupSession.findFirst.mockResolvedValue({ id: 's-1' } as never);
+      prisma.creditSessionOverage.findUnique.mockResolvedValue(null);
+      prisma.creditSessionOverage.create.mockImplementation(((args: {
+        data: Partial<CreditSessionOverage>;
+      }) => {
+        calls.push('initialize-session');
+        return Promise.resolve(sessionCredit(args.data));
+      }) as never);
+      prisma.creditSessionOverage.update.mockImplementation(((args: {
+        data: Partial<CreditSessionOverage>;
+      }) => Promise.resolve(sessionCredit(args.data))) as never);
+    });
+
+    it('initializes a session under the wallet lock, reserving one free credit and fixing the overage limit', async () => {
+      allocations = [allocation({ remaining: D('3.5') })];
+      reservedByOthers('1');
+
+      const view = await service.initializeSession({
+        authId: 'user-1',
+        sessionId: 's-1',
+      });
+
+      expect(calls.indexOf('lock')).toBeLessThan(
+        calls.indexOf('initialize-session'),
+      );
+      // Reservations of the user's other sessions are not free.
+      expect(prisma.creditSessionOverage.aggregate.mock.calls[0]?.[0]).toEqual({
+        where: {
+          walletId: 'wallet-1',
+          sessionId: { not: 's-1' },
+        },
+        _sum: { reservationRemaining: true },
+      });
+      expect(
+        prisma.creditSessionOverage.create.mock.calls[0]?.[0].data,
+      ).toEqual({
+        walletId: 'wallet-1',
+        authId: 'user-1',
+        sessionId: 's-1',
+        overageLimit: D(5),
+        reservedCredits: D(1),
+        reservationRemaining: D(1),
+        initializedAt: NOW,
+      });
+      expect(view).toMatchObject({
+        freeCredits: '2.5',
+        initialized: true,
+        reservedCredits: '1',
+        overageLimit: '5',
+        overageRemaining: '5',
+      });
+    });
+
+    it('reserves what is free when that is less than one credit', async () => {
+      allocations = [allocation({ remaining: D('0.4') })];
+
+      await service.initializeSession({ authId: 'user-1', sessionId: 's-1' });
+
+      expect(
+        prisma.creditSessionOverage.create.mock.calls[0]?.[0].data,
+      ).toMatchObject({
+        reservedCredits: D('0.4'),
+        reservationRemaining: D('0.4'),
+      });
+    });
+
+    it.each([
+      ['no credits at all', '0', '0'],
+      ['credits that other sessions have reserved', '1', '1'],
+      ['credits that other sessions have more than reserved', '0.5', '1'],
+    ])(
+      'refuses to initialize a session with %s (403 "Insufficient credits")',
+      async (_case, balance, reserved) => {
+        allocations =
+          balance === '0' ? [] : [allocation({ remaining: D(balance) })];
+        reservedByOthers(reserved);
+
+        await expect(
+          service.initializeSession({ authId: 'user-1', sessionId: 's-1' }),
+        ).rejects.toMatchObject({
+          status: 403,
+          message: 'Insufficient credits',
+        });
+        expectNothingWritten();
+      },
+    );
+
+    it('counts only the given credit sources when initializing', async () => {
+      allocations = [allocation({ remaining: D(5) })];
+      await service.initializeSession({
+        authId: 'user-1',
+        sessionId: 's-1',
+        sources: [CreditSource.PURCHASE],
+      });
+      expect(prisma.creditAllocation.findMany.mock.calls.at(-1)?.[0]).toEqual({
+        where: {
+          walletId: 'wallet-1',
+          remaining: { gt: 0 },
+          source: { in: [CreditSource.PURCHASE] },
+        },
+      });
+    });
+
+    it("refuses a session that is not the user's", async () => {
+      prisma.makeupSession.findFirst.mockResolvedValue(null);
+      await expect(
+        service.initializeSession({ authId: 'user-1', sessionId: 's-2' }),
+      ).rejects.toBeInstanceOf(CreditSessionNotFoundError);
+      expectNothingWritten();
+    });
+
+    it('changes nothing when an initialized session is initialized again', async () => {
+      allocations = [];
+      prisma.creditSessionOverage.findUnique.mockResolvedValue(
+        sessionCredit({
+          reservationRemaining: D('0.3'),
+          reservedCredits: D(1),
+        }),
+      );
+
+      await service.initializeSession({ authId: 'user-1', sessionId: 's-1' });
+
+      expectNothingWritten();
+    });
+
+    describe('before an AI request (prepareSessionUse)', () => {
+      it('lets an initialized session without free credits use its overage', async () => {
+        allocations = [];
+        const stored = sessionCredit({ overageUsed: D('4.9') });
+        prisma.creditSessionOverage.findUnique.mockResolvedValue(stored);
+        prisma.creditSessionOverage.update.mockResolvedValue(stored);
+        await expect(
+          service.prepareSessionUse({ authId: 'user-1', sessionId: 's-1' }),
+        ).resolves.toMatchObject({
+          freeCredits: '0',
+          overageRemaining: '0.1',
+          initialized: false,
+        });
+      });
+
+      it('refuses an initialized session with neither free credits nor overage left', async () => {
+        allocations = [allocation({ remaining: D(1) })];
+        reservedByOthers('1');
+        prisma.creditSessionOverage.findUnique.mockResolvedValue(
+          sessionCredit({ overageUsed: D(5) }),
+        );
+        await expect(
+          service.prepareSessionUse({ authId: 'user-1', sessionId: 's-1' }),
+        ).rejects.toMatchObject({
+          response: {
+            errors: expect.objectContaining({
+              code: 'INSUFFICIENT_CREDITS',
+              available: '0',
+              overageRemaining: '0',
+            }) as unknown,
+          },
+        });
+        expectNothingWritten();
+      });
+
+      it('initializes a session that never was (created before credits) if credits are free', async () => {
+        allocations = [allocation({ remaining: D(2) })];
+        await expect(
+          service.prepareSessionUse({ authId: 'user-1', sessionId: 's-1' }),
+        ).resolves.toMatchObject({ initialized: true, reservedCredits: '1' });
+      });
+
+      it('gives a session that never was initialized no overage without free credits', async () => {
+        allocations = [];
+        await expect(
+          service.prepareSessionUse({ authId: 'user-1', sessionId: 's-1' }),
+        ).rejects.toBeInstanceOf(InsufficientCreditsError);
+        expectNothingWritten();
+      });
+    });
+
+    describe('debits', () => {
+      it("never spend credits reserved by the user's other sessions", async () => {
+        allocations = [allocation({ remaining: D('1.5') })];
+        reservedByOthers('1');
+
+        await expect(
+          service.debit({ authId: 'user-1', amount: '1', idempotencyKey: 'k' }),
+        ).rejects.toMatchObject({
+          response: {
+            errors: expect.objectContaining({ available: '0.5' }) as unknown,
+          },
+        });
+        expectNothingWritten();
+      });
+
+      it('use the free balance, then the overage, and reduce the session reservation', async () => {
+        allocations = [allocation({ remaining: D(2) })];
+        reservedByOthers('1');
+        prisma.creditSessionOverage.findUnique.mockResolvedValue(
+          sessionCredit({ reservationRemaining: D(1) }),
+        );
+
+        const result = await service.debit({
+          authId: 'user-1',
+          amount: '0.25',
+          idempotencyKey: 'k',
+          sessionId: 's-1',
+        });
+
+        expect(result).toMatchObject({ consumed: '0.25', overage: '0' });
+        expect(prisma.creditSessionOverage.update.mock.calls[0]?.[0]).toEqual({
+          where: { id: 'ov-1' },
+          data: {
+            overageUsed: D(0),
+            reservationRemaining: D('0.75'),
+          },
+        });
+      });
+
+      it('give a session that is not initialized no overage', async () => {
+        allocations = [allocation({ remaining: D(1) })];
+        prisma.creditSessionOverage.findUnique.mockResolvedValue(null);
+
+        await expect(
+          service.debit({
+            authId: 'user-1',
+            amount: '2',
+            idempotencyKey: 'k',
+            sessionId: 's-1',
+          }),
+        ).rejects.toMatchObject({
+          response: {
+            errors: expect.objectContaining({
+              overageRemaining: '0',
+            }) as unknown,
+          },
+        });
+        expectNothingWritten();
+      });
+    });
+
+    it('reduces the reservations of unfinished sessions to the credits left once credits expired', async () => {
+      // The only credits (1) expired; the unfinished session had reserved 1.
+      allocations = [
+        allocation({
+          remaining: D(1),
+          expiresAt: later(-HOUR),
+          source: CreditSource.TRIAL,
+        }),
+      ];
+      prisma.creditSessionOverage.findMany.mockResolvedValue([
+        sessionCredit({
+          id: 'open',
+          sessionId: 's-open',
+          reservationRemaining: D(1),
+        }),
+      ]);
+      prisma.makeupSession.findMany.mockResolvedValue([
+        { id: 's-open' },
+      ] as never);
+
+      prisma.creditWallet.findUnique.mockResolvedValue({
+        id: 'wallet-1',
+      } as never);
+      await service.expireCredits('user-1');
+
+      expect(prisma.creditSessionOverage.update.mock.calls.at(-1)?.[0]).toEqual(
+        {
+          where: { id: 'open' },
+          data: { reservationRemaining: D(0) },
+        },
+      );
+    });
+
+    it('releases reservations of completed or deleted sessions under the lock, never those of unfinished ones', async () => {
+      allocations = [allocation({ remaining: D(5) })];
+      prisma.creditSessionOverage.findMany.mockImplementation((() => {
+        calls.push('find-reservations');
+        return Promise.resolve([
+          sessionCredit({
+            id: 'done',
+            sessionId: 's-done',
+            reservationRemaining: D(1),
+          }),
+          sessionCredit({
+            id: 'gone',
+            sessionId: 's-gone',
+            reservationRemaining: D(1),
+          }),
+          // Unfinished, and idle for days: keeps its reservation.
+          sessionCredit({
+            id: 'idle',
+            sessionId: 's-idle',
+            reservationRemaining: D('0.5'),
+            initializedAt: later(-72 * HOUR),
+            updatedAt: later(-72 * HOUR),
+          }),
+          sessionCredit({
+            id: 'busy',
+            sessionId: 's-busy',
+            reservationRemaining: D(1),
+          }),
+        ]);
+      }) as never);
+      // s-done is COMPLETED and s-gone deleted: only these are open.
+      prisma.makeupSession.findMany.mockResolvedValue([
+        { id: 's-idle' },
+        { id: 's-busy' },
+      ] as never);
+
+      await service.debit({
+        authId: 'user-1',
+        amount: '1',
+        idempotencyKey: 'k',
+      });
+
+      expect(calls.indexOf('lock')).toBeLessThan(
+        calls.indexOf('find-reservations'),
+      );
+      expect(prisma.makeupSession.findMany.mock.calls[0]?.[0]).toEqual({
+        where: {
+          id: { in: ['s-done', 's-gone', 's-idle', 's-busy'] },
+          authId: 'user-1',
+          status: { not: 'COMPLETED' },
+        },
+        select: { id: true },
+      });
+      expect(prisma.creditSessionOverage.updateMany.mock.calls).toEqual([
+        [
+          {
+            where: { id: { in: ['done', 'gone'] } },
+            data: { reservationRemaining: 0 },
+          },
+        ],
+      ]);
     });
   });
 

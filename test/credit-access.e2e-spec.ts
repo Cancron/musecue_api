@@ -484,12 +484,14 @@ describeWithDatabase('Credit-based access to makeup sessions (e2e)', () => {
     const account = await signUp();
     await givenCreditsInPostgres(ctx.client, account.id, 'PURCHASE', '0.75');
     const auth = await signIn(account);
-    await createSession(auth).expect(201);
+    const created = await createSession(auth).expect(201);
 
+    // The session's AI usage uses the credits up (they are reserved for it).
     await ctx.get<CreditWalletService>(CreditWalletService).debit({
       authId: account.id,
       amount: '0.75',
       idempotencyKey: 'used-up',
+      sessionId: (created.body as { data: { id: string } }).data.id,
     });
 
     const response = await createSession(auth).expect(403);

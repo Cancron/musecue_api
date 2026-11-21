@@ -515,6 +515,8 @@ describeWithDatabase('Credit wallet and ledger (PostgreSQL)', () => {
         data: { authId: userId },
       });
       await grantPurchase(userId, '0.5');
+      // Initialized with the 0.5 credits, which fixes its overage limit.
+      await wallet.initializeSession({ authId: userId, sessionId: session.id });
 
       const results = await Promise.allSettled(
         Array.from({ length: 12 }, (_, i) =>
@@ -922,6 +924,7 @@ describeWithDatabase('Credit wallet and ledger (PostgreSQL)', () => {
         data: { authId: userId },
       });
       await grantPurchase(userId, '1');
+      await wallet.initializeSession({ authId: userId, sessionId: session.id });
       await wallet.debit({
         authId: userId,
         amount: '2',
@@ -941,33 +944,42 @@ describeWithDatabase('Credit wallet and ledger (PostgreSQL)', () => {
     });
   });
 
-  it('uses the session overage limit stored in the credit settings', async () => {
+  it('fixes the session overage limit from the credit settings when the session is initialized', async () => {
     const admin = await createUser(client);
+    const userId = await createUser(client);
+    const session = await client.makeupSession.create({
+      data: { authId: userId },
+    });
+    await grantPurchase(userId, '1');
     await settings.updateSettings(
       { sessionOverageCredits: 0 },
       { actionedBy: admin },
     );
     try {
-      const userId = await createUser(client);
-      const session = await client.makeupSession.create({
-        data: { authId: userId },
-      });
-      await expect(
-        wallet.debit({
-          authId: userId,
-          amount: '0.1',
-          idempotencyKey: 'no-overage',
-          sessionId: session.id,
-        }),
-      ).rejects.toBeInstanceOf(InsufficientCreditsError);
-      await expect(
-        client.creditTransaction.count({ where: { authId: userId } }),
-      ).resolves.toBe(0);
+      await wallet.initializeSession({ authId: userId, sessionId: session.id });
     } finally {
       await settings.updateSettings(
         { sessionOverageCredits: 5 },
         { actionedBy: admin },
       );
     }
+
+    // The setting is 5 again, but this session was initialized without overage.
+    await expect(
+      wallet.debit({
+        authId: userId,
+        amount: '1.1',
+        idempotencyKey: 'no-overage',
+        sessionId: session.id,
+      }),
+    ).rejects.toBeInstanceOf(InsufficientCreditsError);
+    await expect(
+      client.creditSessionOverage.findFirstOrThrow({
+        where: { authId: userId },
+      }),
+    ).resolves.toMatchObject({ overageLimit: D(0), overageUsed: D(0) });
+    await expect(
+      client.creditTransaction.count({ where: { authId: userId } }),
+    ).resolves.toBe(1);
   });
 });

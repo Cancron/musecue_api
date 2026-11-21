@@ -2,14 +2,12 @@
 // AI Credit Configuration
 // ================================
 
-// Administrator-managed settings of the AI credit system. There is at most
-// one row (id = 1, enforced by a CHECK constraint). Until an administrator
-// saves a change the table is empty and the API serves
-// CREDIT_SETTINGS_DEFAULTS from src/credits/credit-settings.constants.ts,
-// which must match the column defaults below.
-//
-// Configuration only: no code grants, deducts or enforces credits yet.
-// Value bounds are enforced by CHECK constraints in the migration.
+// Administrator-managed settings of the AI credit system. There is exactly
+// one row (id = 1, enforced by a CHECK constraint), stored with the column
+// defaults below by migration and at startup (never overwriting a stored
+// row). Trial and Pro allocations, AI usage deductions and session overage
+// read it; a change applies to later allocations, charges and sessions.
+// Value bounds are enforced by CHECK constraints in the migrations.
 model CreditSettings {
   id                    Int      @id @default(1)
   // Credits granted for the one-time free trial.
@@ -19,12 +17,13 @@ model CreditSettings {
   // OpenRouter cost covered by one credit, in millionths of a US dollar
   // (5000 = $0.005). Integer to avoid floating-point rounding.
   creditCostUsdMicros   Int      @default(5000)
-  // Credits a makeup session may use beyond the remaining balance.
+  // Credits a makeup session may use beyond the remaining balance; fixed
+  // for a session when it is initialized (CreditSessionOverage).
   sessionOverageCredits Int      @default(5)
   // AI usage is charged in multiples of this step, rounded up, in millionths
-  // of a credit: 1000000 = whole credits ($0.023 at $0.005 -> 5 credits),
-  // 1 = exact to the ledger's six decimal places (4.6 credits).
-  deductionStepMicroCredits Int  @default(1000000)
+  // of a credit: 1 (default) = exact to the ledger's six decimal places
+  // ($0.025 at $0.005 -> 5 credits, $0.023 -> 4.6), 1000000 = whole credits.
+  deductionStepMicroCredits Int  @default(1)
   createdAt             DateTime @default(now())
   updatedAt             DateTime @updatedAt
 }
@@ -170,10 +169,23 @@ model CreditLedgerEntry {
   @@index([walletId, allocationId])
 }
 
-// Overage used by one makeup session: credits it consumed beyond the
-// available balance. `overageLimit` is the settings' sessionOverageCredits
-// when the session first used overage; `overageUsed` never exceeds it and
-// only grows. Overage is recorded, not repaid from later grants.
+// The credit state of one makeup session of a user, created when the
+// session is initialized (POST /v1/sessions, or lazily before its first AI
+// request) under the wallet lock:
+// - Initialization needs free credits (the usable balance minus what the
+//   user's other sessions have reserved) and reserves up to one credit of
+//   them for the session (`reservedCredits`), so one credit can never
+//   initialize two sessions. The session's charges use its reservation and
+//   the free balance, never other sessions' reservations; what they use
+//   from the balance reduces `reservationRemaining`.
+// - Overage: the part of a charge the balance cannot cover, up to
+//   `overageLimit` (the settings' sessionOverageCredits when the session
+//   was initialized). `overageUsed` only grows, never exceeds the
+//   limit and always equals the sum of the session's DEBIT overageAmount
+//   (deferred trigger). Overage is recorded, not repaid from later grants.
+// - An unfinished session keeps its reservation and its overage allowance
+//   until it is completed; a completed or deleted session releases the
+//   unused rest of its reservation.
 model CreditSessionOverage {
   id           String   @id @default(uuid())
   walletId     String
@@ -182,6 +194,10 @@ model CreditSessionOverage {
   sessionId    String   @db.VarChar(64)
   overageLimit Decimal  @db.Decimal(18, 6)
   overageUsed  Decimal  @default(0) @db.Decimal(18, 6)
+  // Credits reserved when the session was initialized and what is left.
+  reservedCredits      Decimal  @default(0) @db.Decimal(18, 6)
+  reservationRemaining Decimal  @default(0) @db.Decimal(18, 6)
+  initializedAt        DateTime @default(now())
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 

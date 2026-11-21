@@ -63,6 +63,7 @@ describe('MakeupService private cloud storage lifecycle', () => {
     imageStorage,
     lifecycle,
     mock<AiGateway>(),
+    mock<MakeupCreditService>(),
   );
   let committed: boolean;
 

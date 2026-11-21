@@ -10,6 +10,7 @@ import type { Logger } from 'winston';
 import { PrismaService } from '../../common/services/prisma.service';
 import { MAKEUP_AI_QUEUE } from '../../infrastructure/jobs/job-queues';
 import { JobInspector } from '../../infrastructure/jobs/job.types';
+import { MakeupCreditService } from '../makeup-credit.service';
 import { failRun, INTERRUPTED_RUN_MESSAGE } from './run-lifecycle';
 
 /**
@@ -17,7 +18,8 @@ import { failRun, INTERRUPTED_RUN_MESSAGE } from './run-lifecycle';
  * finished or disappeared (for example it was lost with the queue), so
  * clients stop polling. Inspects the selected queue driver; healthy waiting,
  * delayed or active jobs are left alone, and a queue outage postpones
- * recovery.
+ * recovery. Also settles AI usage that interrupted attempts left pending
+ * once their run can no longer publish a result (never charged).
  */
 @Injectable()
 export class MakeupRecoveryService implements OnModuleInit, OnModuleDestroy {
@@ -28,6 +30,7 @@ export class MakeupRecoveryService implements OnModuleInit, OnModuleDestroy {
     private readonly jobs: JobInspector,
     private readonly config: ConfigService,
     @Inject(WINSTON_MODULE_PROVIDER) private readonly logger: Logger,
+    private readonly credits: MakeupCreditService,
   ) {}
 
   onModuleInit(): void {
@@ -77,6 +80,7 @@ export class MakeupRecoveryService implements OnModuleInit, OnModuleDestroy {
         if (runs.length < 100) break;
         cursor = runs[runs.length - 1].id;
       }
+      await this.credits.settleInterruptedUsage(new Date(Date.now() - graceMs));
     } catch {
       this.logger.warn('AI job recovery could not complete; it will retry', {
         context: 'MakeupRecovery',

@@ -172,10 +172,13 @@ export class MakeupJobHandler implements JobHandler<MakeupAiJob> {
     usage: AiUsage | null,
     write: (tx: Prisma.TransactionClient) => Promise<void>,
   ): Promise<void> {
+    const sources = usage
+      ? await this.credits.usableSources(data.authId)
+      : undefined;
     const published = await this.prisma.$transaction(async (tx) => {
       if (!(await canPublishRun(tx, data, startedAt))) return false;
       await write(tx);
-      if (usage) await this.credits.chargeRun(tx, usage);
+      if (usage && sources) await this.credits.chargeRun(tx, usage, sources);
       return true;
     }, PUBLISH_TRANSACTION_OPTIONS);
     if (!published && usage) await this.credits.discard(usage);

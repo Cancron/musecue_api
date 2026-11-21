@@ -214,6 +214,7 @@ describeWithDatabase(
         storage,
         lifecycle,
         new MockAiGateway(),
+        mock<MakeupCreditService>(),
       );
       profile = new ProfileService(prisma, validation, storage, lifecycle);
     });

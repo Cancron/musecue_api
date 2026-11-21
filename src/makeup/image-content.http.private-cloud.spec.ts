@@ -23,6 +23,7 @@ import type { SupabaseStorageConfig } from '../storage/private-storage.config';
 import { SupabaseStorageProvider } from '../storage/providers/supabase-storage.provider';
 import { AI_GATEWAY, type AiGateway } from './ai/ai.gateway';
 import { MakeupController } from './makeup.controller';
+import { MakeupCreditService } from './makeup-credit.service';
 import { ProAccessGuard } from '../subscription/pro-access.guard';
 import { MakeupService } from './makeup.service';
 import { MakeupQueueService } from './queues/makeup.queue';
@@ -187,6 +188,7 @@ describe('GET /v1/images/:imageId/content (HTTP, mocked providers)', () => {
           useValue: mock<ImageValidationService>(),
         },
         { provide: AI_GATEWAY, useValue: mock<AiGateway>() },
+        { provide: MakeupCreditService, useValue: mock<MakeupCreditService>() },
       ],
     })
       // POST /v1/sessions' credit check is not under test here.

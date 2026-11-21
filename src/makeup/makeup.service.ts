@@ -27,6 +27,13 @@ import { AI_GATEWAY, type AiGateway } from './ai/ai.gateway';
 import type { AiOperation } from './interfaces/makeup.interface';
 import { lockSession, requireSessionStatus } from './workflow-lock';
 import { failRun, toRunJobInput } from './queues/run-lifecycle';
+import { MakeupCreditService } from './makeup-credit.service';
+
+/**
+ * Transactions that initialize or check a session's credits wait for the
+ * user's wallet lock; other requests of the same user may hold it briefly.
+ */
+const CREDIT_TRANSACTION_OPTIONS = { maxWait: 10_000, timeout: 20_000 };
 
 /** Columns of an AI run that are never returned by the API. */
 const RUN_OMIT = { jobInput: true } as const satisfies Prisma.AiRunOmit;
@@ -81,13 +88,29 @@ export class MakeupService {
     private readonly imageStorage: PrivateImageStorageService,
     private readonly imageLifecycle: PrivateImageLifecycleService,
     @Inject(AI_GATEWAY) private readonly aiGateway: AiGateway,
+    private readonly credits: MakeupCreditService,
   ) {}
 
-  createSession(authId: string) {
-    return this.prisma.makeupSession.create({
-      data: { authId },
-      include: SESSION_INCLUDE,
-    });
+  /**
+   * Creates a session and, in the same transaction under the user's wallet
+   * lock, initializes it with free credits (reserving up to one credit and
+   * fixing its overage allowance). Without free credits nothing is created:
+   * 403 "Insufficient credits". Concurrent requests are applied one at a
+   * time, so one credit never initializes two sessions.
+   */
+  async createSession(authId: string) {
+    const sources = await this.credits.usableSources(authId);
+    return this.prisma.$transaction(async (tx) => {
+      const session = await tx.makeupSession.create({
+        data: { authId },
+        select: { id: true },
+      });
+      await this.credits.initializeSession(tx, authId, session.id, sources);
+      return tx.makeupSession.findUniqueOrThrow({
+        where: { id: session.id },
+        include: SESSION_INCLUDE,
+      });
+    }, CREDIT_TRANSACTION_OPTIONS);
   }
 
   async listSessions(authId: string, query: ListSessionsDto) {
@@ -716,6 +739,7 @@ export class MakeupService {
       return { run: existing, created: false };
     }
     const descriptor = this.aiGateway.describe(operation);
+    const sources = await this.credits.usableSources(authId);
     let run: AiRunView;
     let created = false;
     try {
@@ -757,6 +781,9 @@ export class MakeupService {
           if (!step || !['CURRENT', 'COMPLETED'].includes(step.status))
             throw AppError.conflict('This step is not available for coaching');
         }
+        // The session must be able to pay (403 "Insufficient credits"):
+        // checked under the wallet lock, so the decision holds for this run.
+        await this.credits.prepareAiRequest(tx, authId, sessionId, sources);
         if (nextStatus)
           await tx.makeupSession.update({
             where: { id: sessionId },
@@ -778,7 +805,7 @@ export class MakeupService {
           },
           omit: RUN_OMIT,
         });
-      });
+      }, CREDIT_TRANSACTION_OPTIONS);
     } catch (error) {
       if (this.isUniqueConstraintError(error)) {
         const concurrentRun = await this.prisma.aiRun.findUnique({

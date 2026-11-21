@@ -64,7 +64,10 @@ function setPrivateNoStoreHeaders(response: Response): void {
 export class MakeupController {
   constructor(private readonly makeup: MakeupService) {}
 
-  /** Requires usable credits (403 "Insufficient credits" otherwise). */
+  /**
+   * Requires free credits (403 "Insufficient credits" otherwise); the new
+   * session is initialized with them (see MakeupService.createSession).
+   */
   @Post('sessions')
   @UseGuards(ProAccessGuard)
   @RequireCredits()
