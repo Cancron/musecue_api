@@ -13,6 +13,7 @@ import { OpenRouterProvider } from '../src/makeup/ai/providers/openrouter.provid
 import type { StructuredGenerationRequest } from '../src/makeup/ai/providers/structured-ai.provider';
 import { MakeupService } from '../src/makeup/makeup.service';
 import { MakeupJobHandler } from '../src/makeup/queues/makeup-job.handler';
+import { MakeupCreditService } from '../src/makeup/makeup-credit.service';
 import type {
   MakeupAiJob,
   MakeupQueueService,
@@ -237,6 +238,7 @@ describeWithDatabase(
         storage,
         lifecycle,
         ai,
+        mock<MakeupCreditService>(),
       );
       profile = new ProfileService(prisma, validation, storage, lifecycle);
       processor = new MakeupJobHandler(
@@ -245,6 +247,7 @@ describeWithDatabase(
         storage,
         logger,
         new ConfigService(),
+        mock<MakeupCreditService>(),
       );
       owner = await createUser(client);
       intruder = await createUser(client);
@@ -1751,6 +1754,7 @@ describeWithDatabase(
             storageService,
             lifecycleService,
             ai,
+            mock<MakeupCreditService>(),
           ),
           profile: new ProfileService(
             prisma,
@@ -1764,6 +1768,7 @@ describeWithDatabase(
             storageService,
             logger,
             new ConfigService(),
+            mock<MakeupCreditService>(),
           ),
         };
       }
@@ -2148,6 +2153,7 @@ describeWithDatabase(
           storage,
           mock<Logger>(),
           new ConfigService(),
+          mock<MakeupCreditService>(),
         );
         openRouterCalls = [];
         spies = [

@@ -18,6 +18,9 @@ import type { Logger } from 'winston';
 import { ActivityLogService } from '../src/common/services/activity-log.service';
 import type { CustomLoggerService } from '../src/common/services/custom-logger.service';
 import type { PrismaService } from '../src/common/services/prisma.service';
+import { CreditSettingsService } from '../src/credits/credit-settings.service';
+import { CreditUsageService } from '../src/credits/credit-usage.service';
+import { CreditWalletService } from '../src/credits/credit-wallet.service';
 import { PrivacyExportArchiveService } from '../src/privacy/export/privacy-export-archive.service';
 import { PrivacyExportCollectorService } from '../src/privacy/export/privacy-export-collector.service';
 import type { PrivacyExportJob } from '../src/privacy/interfaces/privacy-export.interface';
@@ -71,6 +74,58 @@ const EXPORTED_FIELDS: Record<string, string[]> = {
     '.security.lastPasswordChange',
     '.security.mfaEnabled',
     '.security.mfaMethod',
+  ],
+  'data/credits.json': [
+    '.aiUsage',
+    '.aiUsage[].chargeNote',
+    '.aiUsage[].chargeStatus',
+    '.aiUsage[].costUsd',
+    '.aiUsage[].creditCostUsdMicros',
+    '.aiUsage[].creditsCharged',
+    '.aiUsage[].creditsDue',
+    '.aiUsage[].creditsExact',
+    '.aiUsage[].errorCode',
+    '.aiUsage[].id',
+    '.aiUsage[].inputTokens',
+    '.aiUsage[].model',
+    '.aiUsage[].occurredAt',
+    '.aiUsage[].operation',
+    '.aiUsage[].outcome',
+    '.aiUsage[].outputTokens',
+    '.aiUsage[].provider',
+    '.aiUsage[].runId',
+    '.aiUsage[].sessionId',
+    '.aiUsage[].totalTokens',
+    '.aiUsage[].transactionId',
+    '.allocations',
+    '.allocations[].amount',
+    '.allocations[].expiresAt',
+    '.allocations[].grantedAt',
+    '.allocations[].id',
+    '.allocations[].periodStart',
+    '.allocations[].remaining',
+    '.allocations[].source',
+    '.sessionOverage',
+    '.sessionOverage[].initializedAt',
+    '.sessionOverage[].overageLimit',
+    '.sessionOverage[].overageUsed',
+    '.sessionOverage[].reservationRemaining',
+    '.sessionOverage[].reservedCredits',
+    '.sessionOverage[].sessionId',
+    '.transactions',
+    '.transactions[].amount',
+    '.transactions[].balanceAfter',
+    '.transactions[].creditCostUsdMicros',
+    '.transactions[].description',
+    '.transactions[].entries',
+    '.transactions[].entries[].allocationId',
+    '.transactions[].entries[].amount',
+    '.transactions[].id',
+    '.transactions[].occurredAt',
+    '.transactions[].overageAmount',
+    '.transactions[].sessionId',
+    '.transactions[].type',
+    '.transactions[].usageCostUsd',
   ],
   'data/email-history.json': [
     '.entries',
@@ -264,6 +319,8 @@ describeWithDatabase('Personal data export (PostgreSQL)', () => {
   let lifecycle: PrivacyExportLifecycleService;
   let downloads: PrivacyExportDownloadService;
   let retention: PrivacyExportRetentionService;
+  let wallet: CreditWalletService;
+  let credits: CreditUsageService;
   const queued: PrivacyExportJob[] = [];
   const env = {
     images: process.env.PRIVATE_UPLOAD_DIR,
@@ -283,6 +340,13 @@ describeWithDatabase('Personal data export (PostgreSQL)', () => {
       ),
     });
     prisma = client as unknown as PrismaService;
+    const creditSettings = new CreditSettingsService(
+      prisma,
+      new ActivityLogService(prisma, mock<CustomLoggerService>()),
+      mock<CustomLoggerService>(),
+    );
+    wallet = new CreditWalletService(prisma, creditSettings);
+    credits = new CreditUsageService(prisma, wallet, creditSettings);
 
     root = await mkdtemp(join(tmpdir(), 'privacy-export-e2e-'));
     process.env.PRIVATE_UPLOAD_DIR = join(root, 'images');
@@ -418,6 +482,8 @@ describeWithDatabase('Personal data export (PostgreSQL)', () => {
       providerSubscriptionId: `sub_${label}_${tag}`,
       smtpMessageId: `${label}-SMTP-MESSAGE-${tag}`,
       emailError: `${label}-SMTP-ERROR-DETAIL-${tag}`,
+      creditReference: `${label}-CREDIT-REFERENCE-${tag}`,
+      generationId: `${label}-OPENROUTER-GENERATION-${tag}`,
     };
     const email = `${label.toLowerCase()}-${tag}@example.com`;
     const username = `${label.toLowerCase()}_${tag}`;
@@ -546,7 +612,7 @@ describeWithDatabase('Personal data export (PostgreSQL)', () => {
         },
       },
     });
-    await client.aiRun.create({
+    const run = await client.aiRun.create({
       data: {
         authId: user.id,
         sessionId: session.id,
@@ -558,6 +624,30 @@ describeWithDatabase('Personal data export (PostgreSQL)', () => {
         usage: { promptTokens: 10 },
       },
     });
+
+    // AI credits: purchased credits, the session's AI request and its charge.
+    await wallet.grant({
+      authId: user.id,
+      source: 'PURCHASE',
+      sourceReference: secrets.creditReference,
+      amount: '10',
+    });
+    await wallet.initializeSession({ authId: user.id, sessionId: session.id });
+    const usage = await credits.record({
+      authId: user.id,
+      sessionId: session.id,
+      runId: run.id,
+      operation: 'PERSONALIZATION',
+      provider: 'openrouter',
+      model: 'test-model',
+      providerRequestId: secrets.generationId,
+      outcome: 'SUCCEEDED',
+      inputTokens: 1000,
+      outputTokens: 250,
+      costUsd: '0.0125',
+      occurredAt: new Date(),
+    });
+    await client.$transaction((tx) => credits.chargeRun(tx, usage.id));
 
     await client.userSubscription.create({
       data: {
@@ -692,6 +782,7 @@ describeWithDatabase('Personal data export (PostgreSQL)', () => {
         'data/subscription.json',
         'data/sign-in-history.json',
         'data/email-history.json',
+        'data/credits.json',
         'photos/profile/avatar.png',
         `photos/sessions/${owner.sessionId}/${owner.imageId}.jpg`,
       ].sort(),
@@ -777,6 +868,35 @@ describeWithDatabase('Personal data export (PostgreSQL)', () => {
       ).entries.map((entry) => entry.emailTo),
     ).toEqual([owner.email]);
 
+    const credits = doc<{
+      allocations: Array<Record<string, unknown>>;
+      transactions: Array<Record<string, unknown>>;
+      sessionOverage: Array<Record<string, unknown>>;
+      aiUsage: Array<Record<string, unknown>>;
+    }>('data/credits.json');
+    expect(credits.allocations).toEqual([
+      expect.objectContaining({ source: 'PURCHASE', amount: '10' }),
+    ]);
+    expect(
+      credits.transactions.map((t) => [t.type, t.amount, t.sessionId]),
+    ).toEqual([
+      ['GRANT', '10', null],
+      ['DEBIT', '-2.5', owner.sessionId],
+    ]);
+    expect(credits.sessionOverage).toEqual([
+      expect.objectContaining({ sessionId: owner.sessionId }),
+    ]);
+    expect(credits.aiUsage).toEqual([
+      expect.objectContaining({
+        sessionId: owner.sessionId,
+        inputTokens: 1000,
+        outputTokens: 250,
+        costUsd: '0.0125',
+        creditCostUsdMicros: 5000,
+        creditsCharged: '2.5',
+      }),
+    ]);
+
     // --- Exactly the reviewed fields, nothing more ---------------------------
     const exported = Object.fromEntries(
       zip.names
@@ -799,9 +919,10 @@ describeWithDatabase('Personal data export (PostgreSQL)', () => {
     expect(archive.includes(other.photo)).toBe(false);
     expect(archive.includes(other.avatar)).toBe(false);
     const allKeys = Object.values(exported).flat();
+    // (AI usage token counts, `inputTokens` etc., are not credentials.)
     expect(
       allKeys.filter((path) =>
-        /password(?!Change)|token|secret|storageKey|idempotency|providerId|provider(Payment|Subscription)Id|messageId|errorMessage|failureMessage/i.test(
+        /password(?!Change)|token(?!s$)|secret|storageKey|idempotency|providerId|provider(Payment|Subscription)Id|messageId|errorMessage|failureMessage/i.test(
           path,
         ),
       ),

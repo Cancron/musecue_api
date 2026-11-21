@@ -301,3 +301,55 @@ enum InfrastructureJobStatus {
   COMPLETED
   FAILED
 }
+
+// ================================
+// AI Credit Related Enums
+// ================================
+
+// Where an allocation of credits came from. TRIAL and SUBSCRIPTION credits
+// always expire; PURCHASE and REFERRAL credits never expire (CHECK
+// constraint on CreditAllocation).
+enum CreditSource {
+  TRIAL
+  SUBSCRIPTION
+  PURCHASE
+  REFERRAL
+}
+
+// A CreditTransaction changes the available balance: GRANT adds an
+// allocation, DEBIT consumes credits (and records any session overage),
+// EXPIRATION removes the unused rest of an expired allocation.
+enum CreditTransactionType {
+  GRANT
+  DEBIT
+  EXPIRATION
+}
+
+// Progress of one scheduled month of Pro credits. Only moves forward:
+// PENDING -> ALLOCATED (credits granted) or SKIPPED (not entitled any more,
+// e.g. the payment was refunded or the paid term no longer covers it).
+enum CreditScheduleStatus {
+  PENDING
+  ALLOCATED
+  SKIPPED
+}
+
+// Whether an AI provider request produced the result of its run.
+enum AiUsageOutcome {
+  SUCCEEDED
+  FAILED
+}
+
+// Credits for one AI provider request. Only moves forward from PENDING.
+enum AiUsageChargeStatus {
+  // Recorded; the run's result has not been published yet.
+  PENDING
+  // Deducted (see CreditTransaction).
+  CHARGED
+  // Not deducted: a failed or retried attempt, a discarded result, a run
+  // already charged, or no cost (see chargeNote).
+  NOT_CHARGED
+  // Due but (partly) not collectible: the balance and the session's overage
+  // allowance did not cover it.
+  UNCOLLECTED
+}

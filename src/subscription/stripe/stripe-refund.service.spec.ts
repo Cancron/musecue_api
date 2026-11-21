@@ -1,5 +1,6 @@
 import { BillingInterval } from '@prisma/client';
 import { mock } from 'jest-mock-extended';
+import { CreditAllowanceService } from '../credit-allowance.service';
 import {
   FAKE_WEBHOOK_SECRET,
   FakeStripeApi,
@@ -32,6 +33,8 @@ describe('StripeRefundService (refund webhooks)', () => {
   const plans = mock<SubscriptionPlanService>();
   const activityLog = mock<ActivityLogService>();
   const logger = mock<CustomLoggerService>();
+  // Trial credits are covered by the credit tests.
+  const credits = mock<CreditAllowanceService>();
   const meta = { ip: '203.0.113.9', userAgent: 'Stripe/1.0' };
   let api: FakeStripeApi;
   let db: InMemoryBillingPrisma;
@@ -71,7 +74,8 @@ describe('StripeRefundService (refund webhooks)', () => {
       activityLog,
       logger,
       new StripeCancellationService(prisma, gateway, activityLog, logger),
-      new StripeRefundService(prisma, gateway, activityLog, logger),
+      new StripeRefundService(prisma, gateway, activityLog, logger, credits),
+      credits,
     );
   });
 
@@ -210,6 +214,10 @@ describe('StripeRefundService (refund webhooks)', () => {
       expect(hasAccess(authId, new Date(now.getTime() - 1))).toBe(true);
       expect(hasAccess(authId, now)).toBe(false);
       expect(eventsOf(authId)).toEqual(['CREATED', 'PAYMENT_REFUNDED']);
+      // The payment's Pro credits end with its access, in the same transaction.
+      expect(credits.endRefundedPaymentCredits.mock.calls).toEqual([
+        [expect.anything(), authId, paymentOf(invoiceId)?.id, now],
+      ]);
       expect(activityLog.logActivity.mock.calls.at(-1)?.[0]).toMatchObject({
         tableName: 'UserSubscription',
         changes: [
@@ -386,6 +394,8 @@ describe('StripeRefundService (refund webhooks)', () => {
         'RENEWED',
         'PAYMENT_REFUNDED',
       ]);
+      // Its month is over; the renewal's credits stay.
+      expect(credits.endRefundedPaymentCredits.mock.calls).toHaveLength(0);
     });
   });
 

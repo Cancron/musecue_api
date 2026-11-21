@@ -7,6 +7,7 @@ import { MakeupService } from './makeup.service';
 import { MakeupQueueService } from './queues/makeup.queue';
 import { ImageValidationService } from './services/image-validation.service';
 import type { AiGateway } from './ai/ai.gateway';
+import { MakeupCreditService } from './makeup-credit.service';
 
 describe('workflow concurrency guards', () => {
   const prisma = mockDeep<PrismaService>();
@@ -19,6 +20,7 @@ describe('workflow concurrency guards', () => {
     mock<PrivateImageStorageService>(),
     mock<PrivateImageLifecycleService>(),
     ai,
+    mock<MakeupCreditService>(),
   );
   beforeEach(() => {
     jest.resetAllMocks();

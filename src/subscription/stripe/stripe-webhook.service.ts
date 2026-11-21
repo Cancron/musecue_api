@@ -18,6 +18,7 @@ import {
 } from '../../common/services/activity-log.service';
 import { CustomLoggerService } from '../../common/services/custom-logger.service';
 import { PrismaService } from '../../common/services/prisma.service';
+import { CreditAllowanceService } from '../credit-allowance.service';
 import { isProActive } from '../subscription-access.policy';
 import { StripeCancellationService } from './stripe-cancellation.service';
 import { StripeRefundService } from './stripe-refund.service';
@@ -154,6 +155,7 @@ export class StripeWebhookService {
     private readonly logger: CustomLoggerService,
     private readonly cancellation: StripeCancellationService,
     private readonly refunds: StripeRefundService,
+    private readonly credits: CreditAllowanceService,
   ) {}
 
   /**
@@ -513,6 +515,18 @@ export class StripeWebhookService {
         },
       });
       await this.audit(tx, record, next, metadata);
+      // Buying Pro ends any unused trial credits, in the same transaction
+      // (purchased and referral credits are kept).
+      await this.credits.expireTrialCreditsOnUpgrade(tx, record.authId, now);
+      // The months of Pro credits this payment pays for are scheduled and
+      // the first is allocated, only now that the payment is verified and
+      // recorded (a yearly payment's later months as each begins).
+      await this.credits.recordPaidPeriod(
+        tx,
+        record.authId,
+        { ...payment, id: saved.id, subscriptionId: record.id },
+        now,
+      );
       return 'ACTIVATED';
     });
   }
@@ -766,6 +780,14 @@ export class StripeWebhookService {
       });
       await tx.subscriptionEvent.create({ data: renewedEvent });
       await this.audit(tx, record, next, metadata);
+      // Fresh Pro credits for the renewed period, with the payment. The
+      // previous month's credits expire at the boundary.
+      await this.credits.recordPaidPeriod(
+        tx,
+        record.authId,
+        { ...payment, id: saved.id, subscriptionId: record.id },
+        now,
+      );
       return 'RENEWED';
     });
   }

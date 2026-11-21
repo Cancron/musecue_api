@@ -16,6 +16,7 @@ import {
 } from '../../common/services/activity-log.service';
 import { CustomLoggerService } from '../../common/services/custom-logger.service';
 import { PrismaService } from '../../common/services/prisma.service';
+import { CreditAllowanceService } from '../credit-allowance.service';
 import { resolveSubscriptionAccess } from '../subscription-access.policy';
 import { STRIPE_PROVIDER, StripeGateway } from './stripe.gateway';
 
@@ -76,7 +77,10 @@ const fromSeconds = (seconds: number) => new Date(seconds * 1000);
  *   not ended. Only that payment's access is revoked: a payment whose period
  *   is already over, or one that never granted access (a duplicate), leaves
  *   the access of newer payments untouched. The term is only ever shortened,
- *   so repeated or delayed events never restore access.
+ *   so repeated or delayed events never restore access;
+ * - the monthly Pro credits that payment paid for end with it: unused
+ *   credits expire now and months not allocated yet are skipped
+ *   (CreditAllowanceService.endRefundedPaymentCredits).
  */
 @Injectable()
 export class StripeRefundService {
@@ -85,6 +89,7 @@ export class StripeRefundService {
     private readonly stripe: StripeGateway,
     private readonly activityLog: ActivityLogService,
     private readonly logger: CustomLoggerService,
+    private readonly credits: CreditAllowanceService,
   ) {}
 
   async syncCharge(
@@ -307,6 +312,13 @@ export class StripeRefundService {
     const record = await tx.userSubscription.findUniqueOrThrow({
       where: { id: payment.subscriptionId },
     });
+    // Its Pro credits end with the access they came with.
+    await this.credits.endRefundedPaymentCredits(
+      tx,
+      record.authId,
+      payment.id,
+      now,
+    );
     if (!record.proStartedAt || !record.proExpiresAt) return;
     // Access before a refunded future period was paid by earlier payments.
     const cut = Math.max(now.getTime(), payment.periodStart.getTime());

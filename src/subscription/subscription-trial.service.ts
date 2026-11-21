@@ -6,6 +6,7 @@ import {
   type ActivityLogMetadata,
 } from '../common/services/activity-log.service';
 import { PrismaService } from '../common/services/prisma.service';
+import { CreditAllowanceService } from './credit-allowance.service';
 import {
   getTrialIneligibility,
   isTrialAccountEligible,
@@ -46,14 +47,17 @@ export class SubscriptionTrialService {
     private readonly prisma: PrismaService,
     private readonly plans: SubscriptionPlanService,
     private readonly activityLog: ActivityLogService,
+    private readonly credits: CreditAllowanceService,
   ) {}
 
   /**
    * Starts the one-time free trial for an active user.
    *
    * Everything runs in one transaction: account check, plan settings,
-   * eligibility, the trial write and its audit record. Any failure rolls the
-   * whole activation back, so a failed attempt never consumes the trial.
+   * eligibility, the trial write, its audit record and the trial credits
+   * (the administrator's trialCredits, expiring with the trial). Any failure
+   * rolls the whole activation back, so a failed attempt never consumes the
+   * trial and a trial never exists without its credits.
    * The trial is claimed with a conditional update, so concurrent or repeated
    * requests cannot create a second trial or move the expiry date.
    */
@@ -139,6 +143,10 @@ export class SubscriptionTrialService {
         },
         tx,
       );
+      await this.credits.grantTrialCredits(tx, authId, {
+        startedAt: trialStartedAt,
+        expiresAt: trialExpiresAt,
+      });
 
       const access = resolveSubscriptionAccess(record, now);
       return {

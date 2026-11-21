@@ -37,6 +37,10 @@ export const FORBIDDEN_VALUES = [
   'pay_OWNER_PROVIDER_ID',
   'OWNER-SMTP-MESSAGE-ID',
   'OWNER-PAYMENT-FAILURE-DETAIL',
+  'OWNER-WALLET-ID',
+  'OWNER-CREDIT-REFERENCE',
+  'OWNER-CREDIT-IDEMPOTENCY-KEY',
+  'OWNER-GENERATION-ID',
   OWNER_AVATAR_KEY,
   OWNER_PHOTO_KEY,
   OWNER_MISSING_KEY,
@@ -47,6 +51,7 @@ export const FORBIDDEN_VALUES = [
   'other@example.com',
   'OTHER-USER-PRIVATE-NOTE',
   'OTHER-PASSWORD-HASH',
+  'OTHER-CREDIT-DESCRIPTION',
 ];
 
 export const PHOTO_BYTES = {
@@ -373,6 +378,143 @@ export const ROWS = {
       ],
     },
   ] as Row[],
+  creditAllocation: [
+    {
+      id: 'ca000000-0000-4000-8000-000000000001',
+      walletId: 'OWNER-WALLET-ID',
+      authId: OWNER_ID,
+      source: 'PURCHASE',
+      sourceReference: 'OWNER-CREDIT-REFERENCE',
+      amount: '10',
+      remaining: '7.5',
+      grantedAt: T(10),
+      periodStart: null,
+      expiresAt: null,
+      subscriptionId: null,
+      paymentId: null,
+    },
+    {
+      id: 'ca000000-0000-4000-8000-000000000002',
+      walletId: 'other-wallet',
+      authId: OTHER_ID,
+      source: 'REFERRAL',
+      sourceReference: 'other-reference',
+      amount: '1',
+      remaining: '1',
+      grantedAt: T(10),
+      periodStart: null,
+      expiresAt: null,
+      subscriptionId: null,
+      paymentId: null,
+    },
+  ] as Row[],
+  creditTransaction: [
+    {
+      id: 'ct000000-0000-4000-8000-000000000001',
+      walletId: 'OWNER-WALLET-ID',
+      authId: OWNER_ID,
+      type: 'GRANT',
+      amount: '10',
+      overageAmount: '0',
+      balanceAfter: '10',
+      idempotencyKey: 'OWNER-CREDIT-IDEMPOTENCY-KEY',
+      description: 'Purchased credits',
+      sessionId: null,
+      usageCostUsd: null,
+      creditCostUsdMicros: null,
+      occurredAt: T(10),
+      entries: [
+        { allocationId: 'ca000000-0000-4000-8000-000000000001', amount: '10' },
+      ],
+    },
+    {
+      id: 'ct000000-0000-4000-8000-000000000002',
+      walletId: 'OWNER-WALLET-ID',
+      authId: OWNER_ID,
+      type: 'DEBIT',
+      amount: '-2.5',
+      overageAmount: '0',
+      balanceAfter: '7.5',
+      idempotencyKey: 'debit:ai-run:ai000000-0000-4000-8000-000000000001',
+      description: 'AI PERSONALIZATION (test-model)',
+      sessionId: SESSION_ID,
+      usageCostUsd: '0.0125',
+      creditCostUsdMicros: 5000,
+      occurredAt: T(13),
+      entries: [
+        {
+          allocationId: 'ca000000-0000-4000-8000-000000000001',
+          amount: '-2.5',
+        },
+      ],
+    },
+    {
+      id: 'ct000000-0000-4000-8000-000000000003',
+      walletId: 'other-wallet',
+      authId: OTHER_ID,
+      type: 'GRANT',
+      amount: '1',
+      overageAmount: '0',
+      balanceAfter: '1',
+      idempotencyKey: 'other-key',
+      description: 'OTHER-CREDIT-DESCRIPTION',
+      sessionId: null,
+      usageCostUsd: null,
+      creditCostUsdMicros: null,
+      occurredAt: T(10),
+      entries: [
+        { allocationId: 'ca000000-0000-4000-8000-000000000002', amount: '1' },
+      ],
+    },
+  ] as Row[],
+  creditSessionOverage: [
+    {
+      walletId: 'OWNER-WALLET-ID',
+      authId: OWNER_ID,
+      sessionId: SESSION_ID,
+      reservedCredits: '1',
+      reservationRemaining: '0',
+      overageLimit: '5',
+      overageUsed: '0',
+      initializedAt: T(11),
+    },
+    {
+      walletId: 'other-wallet',
+      authId: OTHER_ID,
+      sessionId: OTHER_SESSION_ID,
+      reservedCredits: '1',
+      reservationRemaining: '1',
+      overageLimit: '5',
+      overageUsed: '0',
+      initializedAt: T(11),
+    },
+  ] as Row[],
+  aiUsage: [
+    {
+      id: 'au000000-0000-4000-8000-000000000001',
+      authId: OWNER_ID,
+      sessionId: SESSION_ID,
+      runId: 'ai000000-0000-4000-8000-000000000001',
+      operation: 'PERSONALIZATION',
+      provider: 'openrouter',
+      model: 'test-model',
+      providerRequestId: 'OWNER-GENERATION-ID',
+      outcome: 'SUCCEEDED',
+      errorCode: null,
+      inputTokens: 1000,
+      outputTokens: 250,
+      totalTokens: 1250,
+      costUsd: '0.0125',
+      chargeStatus: 'CHARGED',
+      chargeNote: null,
+      creditCostUsdMicros: 5000,
+      creditsExact: '2.5',
+      creditsDue: '2.5',
+      creditsCharged: '2.5',
+      transactionId: 'ct000000-0000-4000-8000-000000000002',
+      occurredAt: T(13),
+    },
+  ] as Row[],
   loginHistory: [
     {
       authId: OWNER_ID,
@@ -520,5 +662,15 @@ export function privacyPrismaFake(): PrivacyPrismaFake {
   prisma.emailHistory.findMany.mockImplementation(
     many(ROWS.emailHistory) as never,
   );
+  prisma.creditAllocation.findMany.mockImplementation(
+    many(ROWS.creditAllocation) as never,
+  );
+  prisma.creditTransaction.findMany.mockImplementation(
+    many(ROWS.creditTransaction) as never,
+  );
+  prisma.creditSessionOverage.findMany.mockImplementation(
+    many(ROWS.creditSessionOverage) as never,
+  );
+  prisma.aiUsage.findMany.mockImplementation(many(ROWS.aiUsage) as never);
   return prisma;
 }

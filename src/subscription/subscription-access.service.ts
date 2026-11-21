@@ -42,6 +42,21 @@ export class SubscriptionAccessService {
     return resolveSubscriptionAccess(await this.findRecord(authId), now);
   }
 
+  /**
+   * The access decision together with the dates it was made from, for rules
+   * that follow the same windows (e.g. which credits are usable).
+   */
+  async getAccessDetails(
+    authId: string,
+    now: Date = new Date(),
+  ): Promise<{
+    access: SubscriptionAccess;
+    record: SubscriptionRecord | null;
+  }> {
+    const record = await this.findRecord(authId);
+    return { access: resolveSubscriptionAccess(record, now), record };
+  }
+
   async hasProAccess(authId: string, now: Date = new Date()): Promise<boolean> {
     return (await this.getAccess(authId, now)).hasProAccess;
   }

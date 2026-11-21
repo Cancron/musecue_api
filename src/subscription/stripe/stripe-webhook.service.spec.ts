@@ -1,5 +1,6 @@
 import { BillingInterval } from '@prisma/client';
 import { mock } from 'jest-mock-extended';
+import { CreditAllowanceService } from '../credit-allowance.service';
 import {
   FAKE_WEBHOOK_SECRET,
   FakeStripeApi,
@@ -31,6 +32,8 @@ describe('StripeWebhookService', () => {
   const plans = mock<SubscriptionPlanService>();
   const activityLog = mock<ActivityLogService>();
   const logger = mock<CustomLoggerService>();
+  // Trial credits are covered by the credit tests.
+  const credits = mock<CreditAllowanceService>();
   const meta = { ip: '203.0.113.5', userAgent: 'Stripe/1.0' };
   let api: FakeStripeApi;
   let db: InMemoryBillingPrisma;
@@ -71,7 +74,8 @@ describe('StripeWebhookService', () => {
       activityLog,
       logger,
       new StripeCancellationService(prisma, gateway, activityLog, logger),
-      new StripeRefundService(prisma, gateway, activityLog, logger),
+      new StripeRefundService(prisma, gateway, activityLog, logger, credits),
+      credits,
     );
   });
 
@@ -223,6 +227,10 @@ describe('StripeWebhookService', () => {
         trialStartedAt,
         trialExpiresAt,
       });
+      // Unused trial credits end in the activation's transaction.
+      expect(credits.expireTrialCreditsOnUpgrade.mock.calls).toEqual([
+        [db, authId, expect.any(Date)],
+      ]);
     });
 
     it('trusts Stripe, not the webhook payload, for the payment status', async () => {
@@ -346,6 +354,8 @@ describe('StripeWebhookService', () => {
       expect(db.paymentTransaction.rows).toHaveLength(1);
       expect(db.subscriptionEvent.rows).toHaveLength(1);
       expect(recordOf(authId)).toEqual(before);
+      expect(credits.expireTrialCreditsOnUpgrade.mock.calls).toHaveLength(1);
+      expect(credits.recordPaidPeriod.mock.calls).toHaveLength(1);
     });
 
     it('records the payment once for concurrent deliveries', async () => {
@@ -392,6 +402,9 @@ describe('StripeWebhookService', () => {
       expect(db.subscriptionEvent.rows).toHaveLength(0);
       expect(recordOf(authId)).toMatchObject(existingTerm);
       expect(checkoutRow(checkoutId)?.status).toBe('COMPLETED');
+      // No new term, so nothing to end and no Pro credits.
+      expect(credits.expireTrialCreditsOnUpgrade.mock.calls).toHaveLength(0);
+      expect(credits.recordPaidPeriod.mock.calls).toHaveLength(0);
       expect(logger.logWithMetadata.mock.calls).toContainEqual([
         'error',
         expect.stringContaining('Duplicate paid Pro checkout'),
@@ -521,6 +534,21 @@ describe('StripeWebhookService', () => {
       expect(eventsOf(authId)).toEqual(['CREATED', 'RENEWED']);
       const renewed = db.subscriptionEvent.rows.at(-1);
       expect(renewed?.paymentId).toBe(db.paymentTransaction.rows.at(-1)?.id);
+      // Pro credits for the first payment and for the renewal, each with the
+      // recorded payment and the period it paid for.
+      expect(credits.recordPaidPeriod.mock.calls).toHaveLength(2);
+      expect(credits.recordPaidPeriod.mock.calls[1]).toEqual([
+        db,
+        authId,
+        expect.objectContaining({
+          id: db.paymentTransaction.rows.at(-1)?.id,
+          subscriptionId: recordOf(authId)?.id,
+          billingInterval: 'MONTHLY',
+          periodStart: new Date('2026-02-28T10:00:00.000Z'),
+          periodEnd: new Date('2026-03-31T10:00:00.000Z'),
+        }),
+        expect.any(Date),
+      ]);
 
       const secondRenewal = renew(subscriptionId);
       await expect(deliverInvoice(secondRenewal)).resolves.toBe('RENEWED');
@@ -583,6 +611,8 @@ describe('StripeWebhookService', () => {
       expect(paymentsOf(authId)).toHaveLength(2);
       expect(eventsOf(authId)).toEqual(['CREATED', 'RENEWED']);
       expect(recordOf(authId)).toEqual(afterFirst);
+      // Activation and one renewal: replays allocate nothing.
+      expect(credits.recordPaidPeriod.mock.calls).toHaveLength(2);
     });
 
     it('records a renewal once for concurrent deliveries', async () => {
@@ -921,6 +951,8 @@ describe('StripeWebhookService', () => {
         });
         expect(attempt?.paidAt).toBeUndefined();
         expect(eventsOf(authId)).toEqual(['CREATED', 'PAYMENT_FAILED']);
+        // Only the first (successful) payment allocated Pro credits.
+        expect(credits.recordPaidPeriod.mock.calls).toHaveLength(1);
         // Only the past-due marker changes; the paid term does not.
         expect(recordOf(authId)).toEqual({
           ...before,

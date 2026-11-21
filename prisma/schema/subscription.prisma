@@ -107,6 +107,10 @@ model PaymentTransaction {
 
   subscription UserSubscription?  @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
   event           SubscriptionEvent?
+  // Monthly Pro credits paid for by this payment (see CreditAllocation),
+  // and the months they are scheduled for (CreditAllocationSchedule).
+  creditAllocations CreditAllocation[]
+  creditSchedule    CreditAllocationSchedule[]
   checkoutSession CheckoutSession?
   refunds         PaymentRefund[]
 

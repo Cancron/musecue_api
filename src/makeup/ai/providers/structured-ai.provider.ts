@@ -23,6 +23,8 @@ export interface StructuredGenerationResponse {
     promptTokens?: number;
     completionTokens?: number;
     totalTokens?: number;
+    /** usage.cost reported by the provider, in USD (exact decimal string). */
+    costUsd?: string;
   };
 }
 

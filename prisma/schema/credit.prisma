@@ -1,0 +1,296 @@
+// ================================
+// AI Credit Configuration
+// ================================
+
+// Administrator-managed settings of the AI credit system. There is exactly
+// one row (id = 1, enforced by a CHECK constraint), stored with the column
+// defaults below by migration and at startup (never overwriting a stored
+// row). Trial and Pro allocations, AI usage deductions and session overage
+// read it; a change applies to later allocations, charges and sessions.
+// Value bounds are enforced by CHECK constraints in the migrations.
+model CreditSettings {
+  id                    Int      @id @default(1)
+  // Credits granted for the one-time free trial.
+  trialCredits          Int      @default(50)
+  // Credits granted per monthly Pro billing period.
+  proMonthlyCredits     Int      @default(1000)
+  // OpenRouter cost covered by one credit, in millionths of a US dollar
+  // (5000 = $0.005). Integer to avoid floating-point rounding.
+  creditCostUsdMicros   Int      @default(5000)
+  // Credits a makeup session may use beyond the remaining balance; fixed
+  // for a session when it is initialized (CreditSessionOverage).
+  sessionOverageCredits Int      @default(5)
+  // AI usage is charged in multiples of this step, rounded up, in millionths
+  // of a credit: 1 (default) = exact to the ledger's six decimal places
+  // ($0.025 at $0.005 -> 5 credits, $0.023 -> 4.6), 1000000 = whole credits.
+  deductionStepMicroCredits Int  @default(1)
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+}
+
+// ================================
+// AI Credit Wallet and Ledger
+// ================================
+//
+// Amounts are NUMERIC(18, 6): fractional credits with six decimal places,
+// handled as Prisma.Decimal in the application (never floating point).
+// Every change to a user's credits runs in one transaction that first locks
+// the user's CreditWallet row (SELECT ... FOR UPDATE), so concurrent
+// operations on one wallet are serialized. Consistency rules that Prisma
+// cannot express (CHECK constraints, composite ownership keys, append-only
+// and balance-consistency triggers) are in migration
+// 20261123130000_add_credit_wallet_ledger. Deleting the user deletes the
+// wallet and its history (ON DELETE CASCADE); nothing else may delete it.
+
+// One wallet per user, created on first use.
+model CreditWallet {
+  id        String   @id @default(uuid())
+  authId    String   @unique
+  createdAt DateTime @default(now())
+
+  authUser        authUser               @relation(fields: [authId], references: [id], onDelete: Cascade)
+  allocations     CreditAllocation[]
+  transactions    CreditTransaction[]
+  sessionOverages CreditSessionOverage[]
+
+  // Target of the (walletId, authId) keys below: a row can only be attached
+  // to the wallet of the same user.
+  @@unique([id, authId])
+}
+
+// Credits granted to a user from one source. `remaining` is what is left;
+// it only decreases (debits, expiration). An allocation counts towards the
+// available balance while remaining > 0, its period has started
+// (periodStart IS NULL OR periodStart <= now) and it has not expired
+// (expiresAt IS NULL OR expiresAt > now), even before its expiration has
+// been recorded in the ledger.
+//
+// SUBSCRIPTION allocations are the monthly Pro credits of one successful
+// Stripe payment: they record the UserSubscription, the PaymentTransaction
+// and the month [periodStart, expiresAt) they are for, one allocation per
+// payment and month. A database trigger only accepts them for a SUCCEEDED
+// payment of the same user's subscription that created or renewed the paid
+// term, within the payment's period (migration
+// 20261124120000_subscription_credit_allocations).
+model CreditAllocation {
+  id              String       @id @default(uuid())
+  walletId        String
+  authId          String
+  source          CreditSource
+  // What the credits were granted for, unique per wallet and source:
+  // e.g. the subscription and billing period, payment or referral ID.
+  sourceReference String       @db.VarChar(255)
+  amount          Decimal      @db.Decimal(18, 6)
+  remaining       Decimal      @db.Decimal(18, 6)
+  grantedAt       DateTime
+  // Required for TRIAL and SUBSCRIPTION, NULL for PURCHASE and REFERRAL.
+  expiresAt       DateTime?
+  // SUBSCRIPTION only (NULL otherwise): the subscription record (not a
+  // foreign key; the payment links it), the paying transaction, and the
+  // start of the month the credits are for (they count from then).
+  subscriptionId  String?
+  paymentId       String?
+  periodStart     DateTime?
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  wallet   CreditWallet              @relation(fields: [walletId, authId], references: [id, authId], onDelete: Cascade)
+  payment  PaymentTransaction?       @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  entries  CreditLedgerEntry[]
+  schedule CreditAllocationSchedule?
+
+  // One allocation per payment and month.
+  @@unique([paymentId, periodStart])
+  // One allocation per source event: repeated or concurrent grants of the
+  // same event cannot add credits twice. At most one TRIAL allocation per
+  // wallet (partial unique index in the migration).
+  @@unique([walletId, source, sourceReference])
+  @@unique([walletId, id])
+  @@index([walletId, expiresAt])
+}
+
+// Append-only ledger of every change to a wallet's available balance.
+// `amount` is the signed change (GRANT > 0, DEBIT <= 0, EXPIRATION < 0) and
+// equals the sum of the transaction's ledger entries; `balanceAfter` is the
+// available balance right after the transaction. Rows are never updated or
+// deleted (database trigger).
+model CreditTransaction {
+  id             String                @id @default(uuid())
+  // Commit order within a wallet (operations on one wallet are serialized).
+  sequence       BigInt                @unique @default(autoincrement())
+  walletId       String
+  authId         String
+  type           CreditTransactionType
+  amount         Decimal               @db.Decimal(18, 6)
+  // DEBIT only: the part of the requested amount covered by the session
+  // overage allowance instead of the balance.
+  overageAmount  Decimal               @default(0) @db.Decimal(18, 6)
+  balanceAfter   Decimal               @db.Decimal(18, 6)
+  // Unique per wallet: a retried or concurrent operation is applied once.
+  idempotencyKey String                @db.VarChar(255)
+  // The makeup session a DEBIT was for. Not a foreign key: the ledger keeps
+  // it after the session is deleted.
+  sessionId      String?               @db.VarChar(64)
+  description    String?               @db.VarChar(255)
+  // DEBIT for AI usage only: the provider's cost in USD and the conversion
+  // rate in force (USD micros per credit), fixed with the transaction, so
+  // later rate changes never alter history. See AiUsage.
+  usageCostUsd        Decimal?         @db.Decimal(20, 10)
+  creditCostUsdMicros Int?
+  // When the change took effect (an EXPIRATION: the allocation's expiry).
+  occurredAt     DateTime
+  createdAt      DateTime              @default(now())
+
+  wallet   CreditWallet        @relation(fields: [walletId, authId], references: [id, authId], onDelete: Cascade)
+  entries  CreditLedgerEntry[]
+  aiUsage  AiUsage?
+
+  @@unique([walletId, idempotencyKey])
+  @@unique([walletId, id])
+  @@index([walletId, sequence])
+  @@index([sessionId])
+}
+
+// How one transaction changed one allocation (signed amount). For every
+// allocation, the sum of its entries equals `remaining`; for every
+// transaction, it equals `amount` (deferred database triggers).
+model CreditLedgerEntry {
+  id            String   @id @default(uuid())
+  walletId      String
+  transactionId String
+  allocationId  String
+  amount        Decimal  @db.Decimal(18, 6)
+  createdAt     DateTime @default(now())
+
+  transaction CreditTransaction @relation(fields: [walletId, transactionId], references: [walletId, id], onDelete: Cascade)
+  allocation  CreditAllocation  @relation(fields: [walletId, allocationId], references: [walletId, id], onDelete: Cascade)
+
+  @@unique([transactionId, allocationId])
+  @@index([walletId, allocationId])
+}
+
+// The credit state of one makeup session of a user, created when the
+// session is initialized (POST /v1/sessions, or lazily before its first AI
+// request) under the wallet lock:
+// - Initialization needs free credits (the usable balance minus what the
+//   user's other sessions have reserved) and reserves up to one credit of
+//   them for the session (`reservedCredits`), so one credit can never
+//   initialize two sessions. The session's charges use its reservation and
+//   the free balance, never other sessions' reservations; what they use
+//   from the balance reduces `reservationRemaining`.
+// - Overage: the part of a charge the balance cannot cover, up to
+//   `overageLimit` (the settings' sessionOverageCredits when the session
+//   was initialized). `overageUsed` only grows, never exceeds the
+//   limit and always equals the sum of the session's DEBIT overageAmount
+//   (deferred trigger). Overage is recorded, not repaid from later grants.
+// - An unfinished session keeps its reservation and its overage allowance
+//   until it is completed; a completed or deleted session releases the
+//   unused rest of its reservation.
+model CreditSessionOverage {
+  id           String   @id @default(uuid())
+  walletId     String
+  authId       String
+  // Not a foreign key, like CreditTransaction.sessionId.
+  sessionId    String   @db.VarChar(64)
+  overageLimit Decimal  @db.Decimal(18, 6)
+  overageUsed  Decimal  @default(0) @db.Decimal(18, 6)
+  // Credits reserved when the session was initialized and what is left.
+  reservedCredits      Decimal  @default(0) @db.Decimal(18, 6)
+  reservationRemaining Decimal  @default(0) @db.Decimal(18, 6)
+  initializedAt        DateTime @default(now())
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  wallet CreditWallet @relation(fields: [walletId, authId], references: [id, authId], onDelete: Cascade)
+
+  @@unique([walletId, sessionId])
+}
+
+// The months of Pro credits a successful payment entitles its user to: one
+// row per month (one for a monthly payment, twelve for a yearly one),
+// written in the webhook transaction that records the payment. The first
+// month is allocated with the payment; each later month when it begins, by
+// CreditAllocationScheduler, which also allocates months it missed while it
+// was not running. A month is allocated only while its payment is
+// SUCCEEDED and the paid term covers the month's start; otherwise it is
+// SKIPPED. Status only moves forward (database trigger), and one row per
+// payment and month plus one allocation per row prevent double allocation.
+model CreditAllocationSchedule {
+  id             String               @id @default(uuid())
+  authId         String
+  // The user's UserSubscription (not a foreign key; the payment links it).
+  subscriptionId String
+  paymentId      String
+  periodStart    DateTime
+  periodEnd      DateTime
+  status         CreditScheduleStatus @default(PENDING)
+  allocationId   String?              @unique
+  // Why a month was skipped, e.g. PAYMENT_NOT_SUCCEEDED, OUTSIDE_PAID_TERM.
+  skipReason     String?              @db.VarChar(50)
+  // Failed allocation attempts (retried while PENDING) and the last error.
+  attempts       Int                  @default(0)
+  lastError      String?              @db.VarChar(255)
+  processedAt    DateTime?
+  createdAt      DateTime             @default(now())
+  updatedAt      DateTime             @updatedAt
+
+  authUser   authUser           @relation(fields: [authId], references: [id], onDelete: Cascade)
+  payment    PaymentTransaction @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  allocation CreditAllocation?  @relation(fields: [allocationId], references: [id], onDelete: Cascade)
+
+  @@unique([paymentId, periodStart])
+  @@index([status, periodStart])
+  @@index([authId, status])
+}
+
+// One AI provider request (an OpenRouter chat completion) that the provider
+// reported usage for: who it was for (user, makeup session, AI run), what it
+// used (tokens, the provider's cost in USD) and whether it was charged.
+// Requests that failed after the provider produced (and billed) a response
+// are recorded too (outcome FAILED, never charged). A run is charged once,
+// for the request that produced its result: credits = cost / rate, rounded
+// up to the configured step, with the rate fixed on the usage and its DEBIT.
+// Usage facts never change; the charge fields are written once (database
+// trigger).
+model AiUsage {
+  id                String              @id @default(uuid())
+  authId            String
+  // The makeup session and AI run (not foreign keys: usage is kept as
+  // billing history when a session is deleted).
+  sessionId         String              @db.VarChar(64)
+  runId             String              @db.VarChar(64)
+  operation         AiOperation
+  provider          String              @db.VarChar(50)
+  model             String              @db.VarChar(255)
+  // The provider's generation ID; unique per provider.
+  providerRequestId String?             @db.VarChar(255)
+  outcome           AiUsageOutcome
+  // Why the request failed (an AiProviderError code), when it did.
+  errorCode         String?             @db.VarChar(100)
+  inputTokens       Int
+  outputTokens      Int
+  totalTokens       Int
+  // usage.cost reported by the provider, in USD; NULL if not reported.
+  costUsd           Decimal?            @db.Decimal(20, 10)
+  chargeStatus      AiUsageChargeStatus @default(PENDING)
+  // Why a usage was not (fully) charged, e.g. FAILED_ATTEMPT.
+  chargeNote        String?             @db.VarChar(50)
+  // Conversion rate used (USD micros per credit) and the resulting credits:
+  // exact, due (rounded up to the step), and actually deducted.
+  creditCostUsdMicros Int?
+  creditsExact      Decimal?            @db.Decimal(30, 12)
+  creditsDue        Decimal?            @db.Decimal(18, 6)
+  creditsCharged    Decimal?            @db.Decimal(18, 6)
+  transactionId     String?             @unique
+  occurredAt        DateTime
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+
+  authUser    authUser           @relation(fields: [authId], references: [id], onDelete: Cascade)
+  transaction CreditTransaction? @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerRequestId])
+  @@index([sessionId, occurredAt])
+  @@index([authId, occurredAt])
+  @@index([runId])
+}

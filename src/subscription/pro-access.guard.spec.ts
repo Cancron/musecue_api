@@ -1,4 +1,5 @@
 import { ExecutionContext, UnauthorizedException } from '@nestjs/common';
+import { Reflector } from '@nestjs/core';
 import {
   BillingInterval,
   SubscriptionStatus,
@@ -8,9 +9,16 @@ import { mock, mockDeep } from 'jest-mock-extended';
 import { freezeTime } from '../../test/support/freeze-time';
 import { PrismaService } from '../common/services/prisma.service';
 import {
+  CreditEligibilityService,
+  type CreditEligibility,
+} from './credit-eligibility.service';
+import {
+  INSUFFICIENT_CREDITS_MESSAGE,
   PRO_ACCESS_REQUIRED_MESSAGE,
   ProAccessGuard,
 } from './pro-access.guard';
+import { RequireCredits } from './require-credits.decorator';
+import { InsufficientCreditsError } from '../credits/credit-wallet.errors';
 import { SubscriptionAccessService } from './subscription-access.service';
 import { SubscriptionPlanService } from './subscription-plan.service';
 
@@ -49,20 +57,37 @@ const paid = (
   proExpiresAt: at(end),
 });
 
+/** Handlers as a controller would declare them. */
+class Handlers {
+  proFeature(this: void) {}
+
+  @RequireCredits()
+  createSession(this: void) {}
+}
+
 /**
- * The guard runs with the real SubscriptionAccessService and policy; only the
- * database is mocked, so these tests exercise the actual access decision.
+ * The guard runs with the real SubscriptionAccessService, policy and
+ * Reflector; only the database (and, in credit mode, the credit decision)
+ * is mocked, so these tests exercise the actual access decision.
  */
 describe('ProAccessGuard', () => {
   const prisma = mockDeep<PrismaService>();
+  const credits = mock<CreditEligibilityService>();
   const guard = new ProAccessGuard(
     new SubscriptionAccessService(prisma, mock<SubscriptionPlanService>()),
+    credits,
+    new Reflector(),
   );
   let stored: Row | null;
 
-  const contextFor = (request: Record<string, unknown>) =>
+  const contextFor = (
+    request: Record<string, unknown>,
+    handler: () => void = Handlers.prototype.proFeature,
+  ) =>
     ({
       switchToHttp: () => ({ getRequest: () => request }),
+      getHandler: () => handler,
+      getClass: () => Handlers,
     }) as unknown as ExecutionContext;
 
   /** Runs the guard for `user-1` at `now`; returns the request on success. */
@@ -231,6 +256,83 @@ describe('ProAccessGuard', () => {
         new Error('db down'),
       );
       await expect(check(at(10))).rejects.toThrow('db down');
+    });
+
+    it('never consults credits on handlers without @RequireCredits()', async () => {
+      stored = row({ status: SubscriptionStatus.TRIAL, ...trial(5, 12) });
+      await check(at(10));
+      await expect(check(at(40))).rejects.toMatchObject({
+        message: PRO_ACCESS_REQUIRED_MESSAGE,
+      });
+      expect(credits.getEligibility.mock.calls).toHaveLength(0);
+    });
+  });
+
+  describe('credit mode (@RequireCredits())', () => {
+    const decision = (
+      eligible: boolean,
+      hasProAccess = false,
+    ): CreditEligibility => ({
+      eligible,
+      usableCredits: eligible ? '12.5' : '0',
+      usableBySource: {
+        TRIAL: '0',
+        SUBSCRIPTION: '0',
+        PURCHASE: eligible ? '12.5' : '0',
+        REFERRAL: '0',
+      },
+      proAccess: {
+        status: hasProAccess ? 'PRO' : 'EXPIRED',
+        hasProAccess,
+        accessSource: hasProAccess ? 'PRO' : null,
+        accessExpiresAt: null,
+      },
+    });
+    const checkCredits = async (request: Record<string, unknown>) => {
+      await guard.canActivate(
+        contextFor(request, Handlers.prototype.createSession),
+      );
+      return request;
+    };
+
+    it('lets a user with usable credits through without Pro and attaches both decisions', async () => {
+      credits.getEligibility.mockResolvedValue(decision(true, false));
+
+      const request = await checkCredits({ user: { userId: 'user-1' } });
+
+      expect(credits.getEligibility.mock.calls).toEqual([['user-1']]);
+      expect(request.creditAccess).toEqual(decision(true, false));
+      expect(request.proAccess).toMatchObject({ hasProAccess: false });
+      // The Pro-only decision is not what gates this handler.
+      expect(prisma.userSubscription.findUnique.mock.calls).toHaveLength(0);
+    });
+
+    it('rejects a user without usable credits with 403 "Insufficient credits", even with Pro', async () => {
+      credits.getEligibility.mockResolvedValue(decision(false, true));
+
+      const error = await checkCredits({ user: { userId: 'user-1' } }).catch(
+        (caught: unknown) => caught,
+      );
+      // The same error a wallet debit throws beyond the balance and overage.
+      expect(error).toBeInstanceOf(InsufficientCreditsError);
+      expect(error).toMatchObject({
+        status: 403,
+        message: INSUFFICIENT_CREDITS_MESSAGE,
+      });
+    });
+
+    it('rejects a request that did not pass AuthGuard, without a lookup', async () => {
+      await expect(checkCredits({})).rejects.toBeInstanceOf(
+        UnauthorizedException,
+      );
+      expect(credits.getEligibility.mock.calls).toHaveLength(0);
+    });
+
+    it('fails closed when the credit lookup fails', async () => {
+      credits.getEligibility.mockRejectedValue(new Error('db down'));
+      await expect(
+        checkCredits({ user: { userId: 'user-1' } }),
+      ).rejects.toThrow('db down');
     });
   });
 });

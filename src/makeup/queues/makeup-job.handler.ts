@@ -1,6 +1,6 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Prisma } from '@prisma/client';
+import { Prisma, type AiUsage } from '@prisma/client';
 import { WINSTON_MODULE_PROVIDER } from 'nest-winston';
 import { Logger } from 'winston';
 import { PrismaService } from '../../common/services/prisma.service';
@@ -38,6 +38,16 @@ import {
   readRunJobInput,
 } from './run-lifecycle';
 import { lockSession } from '../workflow-lock';
+import { USAGE_NOTE } from '../../credits/credit-usage.service';
+import { MakeupCreditService } from '../makeup-credit.service';
+
+/** Usage recorded during the current attempt of a run. */
+interface AttemptUsage {
+  usage?: AiUsage;
+}
+
+/** Publishing a result waits for the user's wallet (charging the run). */
+const PUBLISH_TRANSACTION_OPTIONS = { maxWait: 10_000, timeout: 30_000 };
 
 /** A Prisma/driver error code (e.g. P1001) for logs; never the message. */
 function errorCodeOf(error: unknown): string | undefined {
@@ -63,6 +73,7 @@ export class MakeupJobHandler implements JobHandler<MakeupAiJob> {
     private readonly imageStorage: PrivateImageStorageService,
     @Inject(WINSTON_MODULE_PROVIDER) private readonly logger: Logger,
     private readonly config: ConfigService,
+    private readonly credits: MakeupCreditService,
   ) {}
 
   async process(job: JobExecution<MakeupAiJob>): Promise<void> {
@@ -98,26 +109,112 @@ export class MakeupJobHandler implements JobHandler<MakeupAiJob> {
     });
     if (!claim.count) return;
 
+    const attempt: AttemptUsage = {};
     try {
+      // No provider request (and no cost) for a user who cannot pay.
+      await this.credits.assertCanUseAi(data.authId, data.sessionId);
       switch (job.name) {
         case 'PERSONALIZATION':
-          await this.personalize(data, startedAt);
+          await this.personalize(data, startedAt, attempt);
           break;
         case 'GUIDE_GENERATION':
-          await this.generateGuide(data, startedAt);
+          await this.generateGuide(data, startedAt, attempt);
           break;
         case 'VISION_CHECK':
-          await this.evaluateStep(data, startedAt);
+          await this.evaluateStep(data, startedAt, attempt);
           break;
         case 'GUIDE_QUESTION':
-          await this.answerQuestion(data, startedAt);
+          await this.answerQuestion(data, startedAt, attempt);
           break;
         default:
           throw new Error(`Unsupported makeup job: ${job.name}`);
       }
     } catch (error) {
+      await this.recordFailedAttempt(
+        data,
+        job.name as AiOperation,
+        error,
+        attempt,
+      );
       const propagatedError = await this.handleFailure(job, error, startedAt);
       throw propagatedError;
+    }
+  }
+
+  /**
+   * Records the usage of a provider response of this run (the provider
+   * billed it); the run is charged for it when its result is published.
+   */
+  private async recordUsage(
+    data: MakeupAiJob,
+    operation: AiOperation,
+    metadata: AiCallMetadata | undefined,
+    attempt: AttemptUsage,
+  ): Promise<AiUsage | null> {
+    const usage = await this.credits.recordUsage(
+      data,
+      operation,
+      this.ai.describe(operation).provider,
+      metadata,
+    );
+    attempt.usage = usage ?? undefined;
+    return usage;
+  }
+
+  /**
+   * Publishes a run's result and, in the same transaction, charges the run
+   * for the provider request that produced it (once per run). A result
+   * that can no longer be published is not charged.
+   */
+  private async publish(
+    data: MakeupAiJob,
+    startedAt: number,
+    usage: AiUsage | null,
+    write: (tx: Prisma.TransactionClient) => Promise<void>,
+  ): Promise<void> {
+    const sources = usage
+      ? await this.credits.usableSources(data.authId)
+      : undefined;
+    const published = await this.prisma.$transaction(async (tx) => {
+      if (!(await canPublishRun(tx, data, startedAt))) return false;
+      await write(tx);
+      if (usage && sources) await this.credits.chargeRun(tx, usage, sources);
+      return true;
+    }, PUBLISH_TRANSACTION_OPTIONS);
+    if (!published && usage) await this.credits.discard(usage);
+  }
+
+  /**
+   * A failed attempt is never charged: usage recorded for a response whose
+   * result could not be published is settled as not charged, and a response
+   * the provider billed before the request failed (e.g. invalid output) is
+   * recorded as a failed request. Never hides the original failure.
+   */
+  private async recordFailedAttempt(
+    data: MakeupAiJob,
+    operation: AiOperation,
+    error: unknown,
+    attempt: AttemptUsage,
+  ): Promise<void> {
+    try {
+      if (attempt.usage) {
+        await this.credits.discard(attempt.usage, USAGE_NOTE.FAILED_ATTEMPT);
+      }
+      if (error instanceof AiProviderError && error.billedResponse) {
+        await this.credits.recordUsage(
+          data,
+          operation,
+          this.ai.describe(operation).provider,
+          error.billedResponse,
+          error,
+        );
+      }
+    } catch (recordError) {
+      this.logger.warn('AI usage of a failed attempt could not be recorded', {
+        context: 'MakeupProcessor',
+        runId: data.runId,
+        errorCode: errorCodeOf(recordError),
+      });
     }
   }
 
@@ -134,7 +231,11 @@ export class MakeupJobHandler implements JobHandler<MakeupAiJob> {
     );
   }
 
-  private async personalize(data: MakeupAiJob, startedAt: number) {
+  private async personalize(
+    data: MakeupAiJob,
+    startedAt: number,
+    attempt: AttemptUsage,
+  ) {
     const session = await this.prisma.makeupSession.findFirstOrThrow({
       where: { id: data.sessionId, authId: data.authId },
       include: {
@@ -162,8 +263,13 @@ export class MakeupJobHandler implements JobHandler<MakeupAiJob> {
       },
     });
     const result = response.data;
-    await this.prisma.$transaction(async (tx) => {
-      if (!(await canPublishRun(tx, data, startedAt))) return;
+    const usage = await this.recordUsage(
+      data,
+      'PERSONALIZATION',
+      response.metadata,
+      attempt,
+    );
+    await this.publish(data, startedAt, usage, async (tx) => {
       await tx.faceAnalysis.upsert({
         where: { sessionId: data.sessionId },
         create: { sessionId: data.sessionId, ...result.analysis },
@@ -198,7 +304,11 @@ export class MakeupJobHandler implements JobHandler<MakeupAiJob> {
     });
   }
 
-  private async generateGuide(data: MakeupAiJob, startedAt: number) {
+  private async generateGuide(
+    data: MakeupAiJob,
+    startedAt: number,
+    attempt: AttemptUsage,
+  ) {
     const session = await this.prisma.makeupSession.findFirstOrThrow({
       where: { id: data.sessionId, authId: data.authId },
       include: {
@@ -234,8 +344,13 @@ export class MakeupJobHandler implements JobHandler<MakeupAiJob> {
         : null,
     });
     const result = response.data;
-    await this.prisma.$transaction(async (tx) => {
-      if (!(await canPublishRun(tx, data, startedAt))) return;
+    const usage = await this.recordUsage(
+      data,
+      'GUIDE_GENERATION',
+      response.metadata,
+      attempt,
+    );
+    await this.publish(data, startedAt, usage, async (tx) => {
       const existing = await tx.guide.findUnique({
         where: { sessionId: data.sessionId },
       });
@@ -267,7 +382,11 @@ export class MakeupJobHandler implements JobHandler<MakeupAiJob> {
     });
   }
 
-  private async evaluateStep(data: MakeupAiJob, startedAt: number) {
+  private async evaluateStep(
+    data: MakeupAiJob,
+    startedAt: number,
+    attempt: AttemptUsage,
+  ) {
     if (!data.stepId || !data.imageId) {
       throw new Error('Guide step or progress image is missing');
     }
@@ -304,8 +423,13 @@ export class MakeupJobHandler implements JobHandler<MakeupAiJob> {
         : null,
     });
     const result = response.data;
-    await this.prisma.$transaction(async (tx) => {
-      if (!(await canPublishRun(tx, data, startedAt))) return;
+    const usage = await this.recordUsage(
+      data,
+      'VISION_CHECK',
+      response.metadata,
+      attempt,
+    );
+    await this.publish(data, startedAt, usage, async (tx) => {
       await tx.stepAttempt.create({
         data: { stepId: step.id, imageId: data.imageId, ...result },
       });
@@ -319,7 +443,11 @@ export class MakeupJobHandler implements JobHandler<MakeupAiJob> {
     });
   }
 
-  private async answerQuestion(data: MakeupAiJob, startedAt: number) {
+  private async answerQuestion(
+    data: MakeupAiJob,
+    startedAt: number,
+    attempt: AttemptUsage,
+  ) {
     if (!data.stepId || !data.question) {
       throw new Error('Guide step or question is missing');
     }
@@ -357,8 +485,13 @@ export class MakeupJobHandler implements JobHandler<MakeupAiJob> {
         : undefined,
     });
     const result = response.data;
-    await this.prisma.$transaction(async (tx) => {
-      if (!(await canPublishRun(tx, data, startedAt))) return;
+    const usage = await this.recordUsage(
+      data,
+      'GUIDE_QUESTION',
+      response.metadata,
+      attempt,
+    );
+    await this.publish(data, startedAt, usage, async (tx) => {
       await tx.question.create({
         data: {
           stepId: step.id,

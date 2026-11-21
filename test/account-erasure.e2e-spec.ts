@@ -97,6 +97,13 @@ const USER_DATA_TABLES = [
   'RefreshSession',
   'AuthChallenge',
   'InfrastructureJob',
+  'CreditWallet',
+  'CreditAllocation',
+  'CreditTransaction',
+  'CreditLedgerEntry',
+  'CreditSessionOverage',
+  'CreditAllocationSchedule',
+  'AiUsage',
 ] as const;
 
 describeWithDatabase('Account erasure (PostgreSQL)', () => {
@@ -420,6 +427,85 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
       },
     });
 
+    // AI credits: a purchased grant, then a session debit that used overage
+    // for a metered OpenRouter request.
+    // One transaction, as the ledger's consistency checks run at commit.
+    await client.$transaction(async (tx) => {
+      const wallet = await tx.creditWallet.create({
+        data: { authId: user.id },
+      });
+      const allocation = await tx.creditAllocation.create({
+        data: {
+          walletId: wallet.id,
+          authId: user.id,
+          source: 'PURCHASE',
+          sourceReference: `pay-${tag}`,
+          amount: 10,
+          remaining: 8,
+          grantedAt: new Date(),
+        },
+      });
+      const ledger = { walletId: wallet.id, authId: user.id };
+      await tx.creditTransaction.create({
+        data: {
+          ...ledger,
+          type: 'GRANT',
+          amount: 10,
+          balanceAfter: 10,
+          idempotencyKey: `grant:PURCHASE:pay-${tag}`,
+          occurredAt: new Date(),
+          entries: { create: [{ allocationId: allocation.id, amount: 10 }] },
+        },
+      });
+      const debit = await tx.creditTransaction.create({
+        data: {
+          ...ledger,
+          type: 'DEBIT',
+          amount: -2,
+          overageAmount: '0.5',
+          balanceAfter: 8,
+          idempotencyKey: `debit:${tag}`,
+          sessionId: session.id,
+          usageCostUsd: '0.0125',
+          creditCostUsdMicros: 5000,
+          occurredAt: new Date(),
+          entries: { create: [{ allocationId: allocation.id, amount: -2 }] },
+        },
+      });
+      await tx.aiUsage.create({
+        data: {
+          authId: user.id,
+          sessionId: session.id,
+          runId: `run-${tag}`,
+          operation: 'GUIDE_QUESTION',
+          provider: 'openrouter',
+          model: 'openai/gpt-4o-mini',
+          providerRequestId: `gen-${tag}`,
+          outcome: 'SUCCEEDED',
+          inputTokens: 900,
+          outputTokens: 100,
+          totalTokens: 1000,
+          costUsd: '0.0125',
+          chargeStatus: 'CHARGED',
+          creditCostUsdMicros: 5000,
+          // 2 credits from the balance and 0.5 of session overage.
+          creditsExact: '2.5',
+          creditsDue: '2.5',
+          creditsCharged: '2.5',
+          transactionId: debit.id,
+          occurredAt: new Date(),
+        },
+      });
+      await tx.creditSessionOverage.create({
+        data: {
+          ...ledger,
+          sessionId: session.id,
+          overageLimit: 5,
+          overageUsed: '0.5',
+        },
+      });
+    });
+
     const running = await client.dataExport.create({
       data: {
         authId: user.id,
@@ -458,6 +544,16 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
     });
     const payment = await client.paymentTransaction.findFirstOrThrow({
       where: { subscriptionId: subscription.id },
+    });
+    // A scheduled month of Pro credits for that payment.
+    await client.creditAllocationSchedule.create({
+      data: {
+        authId: user.id,
+        subscriptionId: subscription.id,
+        paymentId: payment.id,
+        periodStart: payment.periodStart,
+        periodEnd: payment.periodEnd,
+      },
     });
     const providerCustomerId = `cus_erasure_${tag}`;
     await client.paymentCustomer.create({
@@ -525,7 +621,9 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
                   ? `"guideId" IN (SELECT g."id" FROM "Guide" g JOIN "MakeupSession" s ON s."id" = g."sessionId" WHERE s."authId" = '${authId}')`
                   : ['StepAttempt', 'Question'].includes(table)
                     ? `"stepId" IN (SELECT st."id" FROM "GuideStep" st JOIN "Guide" g ON g."id" = st."guideId" JOIN "MakeupSession" s ON s."id" = g."sessionId" WHERE s."authId" = '${authId}')`
-                    : `"authId" = '${authId}'`;
+                    : table === 'CreditLedgerEntry'
+                      ? `"walletId" IN (SELECT "id" FROM "CreditWallet" WHERE "authId" = '${authId}')`
+                      : `"authId" = '${authId}'`;
         const { rows } = await pg.query<{ count: string }>(
           `SELECT count(*)::text AS count FROM "${table}" WHERE ${where}`,
         );

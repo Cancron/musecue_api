@@ -4,6 +4,7 @@ import type { Prisma } from '@prisma/client';
 import type { Logger } from 'winston';
 import { PrismaService } from '../../common/services/prisma.service';
 import { JobInspector } from '../../infrastructure/jobs/job.types';
+import { MakeupCreditService } from '../makeup-credit.service';
 import { MakeupRecoveryService } from './makeup-recovery.service';
 import { canPublishRun } from './run-lifecycle';
 
@@ -15,6 +16,7 @@ describe('AI job recovery', () => {
     jobs,
     new ConfigService(),
     mock<Logger>(),
+    mock<MakeupCreditService>(),
   );
   const run = {
     id: 'run',

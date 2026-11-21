@@ -2,6 +2,7 @@ import { BillingInterval, type UserSubscription } from '@prisma/client';
 import { mock, mockDeep } from 'jest-mock-extended';
 import { ActivityLogService } from '../common/services/activity-log.service';
 import { PrismaService } from '../common/services/prisma.service';
+import { CreditAllowanceService } from './credit-allowance.service';
 import type { SubscriptionPlanView } from './interfaces/subscription-plan.interface';
 import { SubscriptionPlanService } from './subscription-plan.service';
 import { SubscriptionTrialService } from './subscription-trial.service';
@@ -10,7 +11,13 @@ describe('SubscriptionTrialService', () => {
   const prisma = mockDeep<PrismaService>();
   const plans = mock<SubscriptionPlanService>();
   const activityLog = mock<ActivityLogService>();
-  const service = new SubscriptionTrialService(prisma, plans, activityLog);
+  const credits = mock<CreditAllowanceService>();
+  const service = new SubscriptionTrialService(
+    prisma,
+    plans,
+    activityLog,
+    credits,
+  );
   const now = new Date('2026-03-01T09:30:00.000Z');
   const meta = { ip: '127.0.0.1', userAgent: 'jest' };
 
@@ -250,6 +257,56 @@ describe('SubscriptionTrialService', () => {
         service.activateTrial('user-1', meta, now),
       ).rejects.toMatchObject({ status: 409 });
       expect(activityLog.logActivity.mock.calls).toHaveLength(0);
+    });
+  });
+
+  describe('trial credits', () => {
+    it('grants the trial credits inside the activation transaction, for the trial dates, after claiming it', async () => {
+      const order: string[] = [];
+      prisma.userSubscription.updateMany.mockImplementation((() => {
+        order.push('claim');
+        return Promise.resolve({ count: 1 });
+      }) as never);
+      credits.grantTrialCredits.mockImplementation((() => {
+        order.push('credits');
+        return Promise.resolve();
+      }) as never);
+
+      await service.activateTrial('user-1', meta, now);
+
+      expect(credits.grantTrialCredits.mock.calls).toEqual([
+        [
+          prisma,
+          'user-1',
+          {
+            startedAt: now,
+            expiresAt: new Date('2026-03-08T09:30:00.000Z'),
+          },
+        ],
+      ]);
+      expect(order).toEqual(['claim', 'credits']);
+    });
+
+    it('grants no credits when the trial cannot be started', async () => {
+      prisma.userSubscription.findUnique.mockResolvedValue({
+        ...emptyRecord,
+        trialUsed: true,
+        trialStartedAt: new Date('2026-01-01T00:00:00.000Z'),
+        trialExpiresAt: new Date('2026-01-08T00:00:00.000Z'),
+      } as never);
+
+      await expect(
+        service.activateTrial('user-1', meta, now),
+      ).rejects.toMatchObject({ status: 409 });
+      expect(credits.grantTrialCredits.mock.calls).toHaveLength(0);
+    });
+
+    it('fails the activation (rolling the trial back) when the credits cannot be granted', async () => {
+      credits.grantTrialCredits.mockRejectedValue(new Error('wallet down'));
+
+      await expect(service.activateTrial('user-1', meta, now)).rejects.toThrow(
+        'wallet down',
+      );
     });
   });
 

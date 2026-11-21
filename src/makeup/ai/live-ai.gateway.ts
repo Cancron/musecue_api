@@ -35,6 +35,15 @@ import {
   type StructuredAiProvider,
 } from './providers/structured-ai.provider';
 
+/** A failure after the provider produced (and billed) a response. */
+function billedFailure(
+  error: AiProviderError,
+  metadata: AiGatewayResponse<unknown>['metadata'],
+): AiProviderError {
+  if (metadata?.usage) error.billedResponse = metadata;
+  return error;
+}
+
 const PREVIEW_IMAGES = [
   'https://images.pexels.com/photos/33334711/pexels-photo-33334711.jpeg?auto=compress&cs=tinysrgb&h=900&w=1200',
   'https://images.pexels.com/photos/6756279/pexels-photo-6756279.jpeg?auto=compress&cs=tinysrgb&h=900&w=1200',
@@ -75,10 +84,13 @@ export class LiveAiGateway implements AiGateway {
       response.data.recommendations.map((item) => item.name),
     );
     if (names.size !== response.data.recommendations.length) {
-      throw new AiProviderError(
-        'AI_DUPLICATE_RECOMMENDATIONS',
-        'AI returned duplicate recommendations',
-        true,
+      throw billedFailure(
+        new AiProviderError(
+          'AI_DUPLICATE_RECOMMENDATIONS',
+          'AI returned duplicate recommendations',
+          true,
+        ),
+        response.metadata,
       );
     }
     const recommendations = [...response.data.recommendations]
@@ -109,10 +121,13 @@ export class LiveAiGateway implements AiGateway {
         (step) => step.substeps.length !== step.spokenSubsteps.length,
       )
     ) {
-      throw new AiProviderError(
-        'AI_SCHEMA_VALIDATION_FAILED',
-        'Spoken instructions do not match guide substeps',
-        true,
+      throw billedFailure(
+        new AiProviderError(
+          'AI_SCHEMA_VALIDATION_FAILED',
+          'Spoken instructions do not match guide substeps',
+          true,
+        ),
+        response.metadata,
       );
     }
     return {
@@ -180,21 +195,22 @@ When an image is supplied, use it only to answer the current question. Give a sh
       userContext,
       image,
     });
+    const metadata = {
+      responseId: response.responseId,
+      model: response.model,
+      usage: response.usage,
+    };
     const parsed = schema.safeParse(response.value);
     if (!parsed.success) {
-      throw new AiProviderError(
-        'AI_SCHEMA_VALIDATION_FAILED',
-        'AI output failed application validation',
-        true,
+      throw billedFailure(
+        new AiProviderError(
+          'AI_SCHEMA_VALIDATION_FAILED',
+          'AI output failed application validation',
+          true,
+        ),
+        metadata,
       );
     }
-    return {
-      data: parsed.data,
-      metadata: {
-        responseId: response.responseId,
-        model: response.model,
-        usage: response.usage,
-      },
-    };
+    return { data: parsed.data, metadata };
   }
 }

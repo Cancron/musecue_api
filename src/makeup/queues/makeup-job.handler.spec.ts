@@ -8,6 +8,7 @@ import type { AiGateway } from '../ai/ai.gateway';
 import { AiProviderError } from '../ai/ai-provider.error';
 import { MockAiGateway } from '../ai/mock-ai.gateway';
 import { MakeupJobHandler } from './makeup-job.handler';
+import { MakeupCreditService } from '../makeup-credit.service';
 import type { JobExecution } from '../../infrastructure/jobs/job.types';
 import type { MakeupAiJob } from './makeup.queue';
 
@@ -65,6 +66,7 @@ describe('MakeupJobHandler delivery semantics', () => {
         mock<PrivateImageStorageService>(),
         logger,
         new ConfigService(),
+        mock<MakeupCreditService>(),
       );
       const discard = jest.fn();
       await expect(
@@ -139,6 +141,7 @@ describe('MakeupJobHandler delivery semantics', () => {
       mock<PrivateImageStorageService>(),
       mock<Logger>(),
       new ConfigService(),
+      mock<MakeupCreditService>(),
     );
     await processor.process({
       name: 'GUIDE_GENERATION',
@@ -197,6 +200,7 @@ describe('MakeupJobHandler delivery semantics', () => {
       storage,
       mock<Logger>(),
       new ConfigService(),
+      mock<MakeupCreditService>(),
     );
     await processor.process({
       name: 'VISION_CHECK',
@@ -231,6 +235,7 @@ describe('MakeupJobHandler delivery semantics', () => {
       storage,
       logger,
       new ConfigService(),
+      mock<MakeupCreditService>(),
     );
     prisma.aiRun.findUnique.mockResolvedValue({ status: 'COMPLETED' } as never);
     const job = {
@@ -260,6 +265,7 @@ describe('MakeupJobHandler delivery semantics', () => {
       storage,
       logger,
       new ConfigService({ AI_QUEUE_MAX_PROVIDER_PAUSE_MS: '120000' }),
+      mock<MakeupCreditService>(),
     );
     prisma.aiRun.findUnique.mockResolvedValue({
       id: 'run-id',
@@ -375,6 +381,7 @@ describe('MakeupJobHandler delivery semantics', () => {
         storage,
         mock<Logger>(),
         new ConfigService(),
+        mock<MakeupCreditService>(),
       );
       const job = {
         id: 'run',
@@ -448,6 +455,7 @@ describe('MakeupJobHandler delivery semantics', () => {
         mock<PrivateImageStorageService>(),
         mock<Logger>(),
         new ConfigService(),
+        mock<MakeupCreditService>(),
       );
 
       await expect(
@@ -492,6 +500,7 @@ describe('MakeupJobHandler delivery semantics', () => {
         mock<PrivateImageStorageService>(),
         mock<Logger>(),
         new ConfigService(),
+        mock<MakeupCreditService>(),
       );
 
       await handler.onAbandoned({

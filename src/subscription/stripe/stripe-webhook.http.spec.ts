@@ -25,6 +25,9 @@ import { STRIPE_SETTINGS, type StripeSettings } from './stripe.config';
 import { STRIPE_CLIENT } from './stripe.gateway';
 
 const prisma = mockDeep<PrismaService>();
+// SubscriptionModule imports CreditsModule, which stores the default credit
+// settings at startup (insert unless present).
+prisma.creditSettings.createMany.mockResolvedValue({ count: 0 });
 
 @Global()
 @Module({

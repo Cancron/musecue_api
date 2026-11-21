@@ -17,6 +17,7 @@ import { TransformInterceptor } from '../../src/common/interceptors/transform.in
 import { EmailService } from '../../src/common/services/email.service';
 import { PrismaService } from '../../src/common/services/prisma.service';
 import { AccountDeletionRecoveryService } from '../../src/privacy/account-deletion/account-deletion-recovery.service';
+import { givenCreditsInPostgres } from './credit-fixtures';
 import {
   TEST_DATABASE_URL,
   applyMigrations,
@@ -64,16 +65,30 @@ export class CapturingEmailService {
 export interface TestApplication {
   app: INestApplication<App>;
   client: PrismaClient;
+  /** The PostgreSQL schema the application runs against. */
+  schema: string;
   emails: CapturingEmailService;
   /** Resolves the application's provider for `token`. */
   get<T>(token: unknown): T;
   close(): Promise<void>;
 }
 
-/** Boots AppModule against a freshly migrated schema. */
-export async function bootApplication(): Promise<TestApplication> {
-  const schema = await createSchema();
-  await applyMigrations(schema, migrationNames());
+export interface BootOptions {
+  /**
+   * An existing, migrated schema to run against instead of a fresh one, e.g.
+   * to boot a second application on the same data as a process restart
+   * would. The caller owns it: `close()` does not drop it.
+   */
+  schema?: string;
+}
+
+/** Boots AppModule against a freshly migrated (or the given) schema. */
+export async function bootApplication(
+  options: BootOptions = {},
+): Promise<TestApplication> {
+  const ownsSchema = options.schema === undefined;
+  const schema = options.schema ?? (await createSchema());
+  if (ownsSchema) await applyMigrations(schema, migrationNames());
   const root = await mkdtemp(join(tmpdir(), 'infrastructure-e2e-'));
   process.env.PRIVATE_UPLOAD_DIR = join(root, 'images');
   process.env.PRIVATE_EXPORT_DIR = join(root, 'exports');
@@ -119,13 +134,14 @@ export async function bootApplication(): Promise<TestApplication> {
   return {
     app,
     client,
+    schema,
     emails,
     get: <T>(token: unknown) =>
       moduleRef.get<T>(token as string, { strict: false }),
     close: async () => {
       await app.close();
       await client.$disconnect();
-      await dropSchema(schema);
+      if (ownsSchema) await dropSchema(schema);
       await rm(root, { recursive: true, force: true });
     },
   };
@@ -386,6 +402,9 @@ export async function makeupFlow(
     );
   const runIds: string[] = [];
 
+  // Creating a session requires credits; free sign-ups have none. Purchased
+  // credits are set up directly in PostgreSQL (not issued by the API yet).
+  await givenCreditsInPostgres(ctx.client, user.id, 'PURCHASE', '100');
   const session = data<{ id: string }>(
     await http().post('/v1/sessions').set('Authorization', auth).expect(201),
   );

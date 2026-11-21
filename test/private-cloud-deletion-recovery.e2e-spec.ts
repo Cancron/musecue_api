@@ -9,6 +9,7 @@ import type { PrismaService } from '../src/common/services/prisma.service';
 import { MockAiGateway } from '../src/makeup/ai/mock-ai.gateway';
 import { MakeupService } from '../src/makeup/makeup.service';
 import { MakeupJobHandler } from '../src/makeup/queues/makeup-job.handler';
+import { MakeupCreditService } from '../src/makeup/makeup-credit.service';
 import type {
   MakeupAiJob,
   MakeupQueueService,
@@ -213,6 +214,7 @@ describeWithDatabase(
         storage,
         lifecycle,
         new MockAiGateway(),
+        mock<MakeupCreditService>(),
       );
       profile = new ProfileService(prisma, validation, storage, lifecycle);
     });
@@ -807,6 +809,7 @@ describeWithDatabase(
           storage,
           mock<Logger>(),
           new ConfigService(),
+          mock<MakeupCreditService>(),
         );
 
         await expect(

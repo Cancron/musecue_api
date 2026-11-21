@@ -33,6 +33,9 @@ import { ProAccessGuard, type ProAccessRequest } from './pro-access.guard';
 import { SubscriptionModule } from './subscription.module';
 
 const prisma = mockDeep<PrismaService>();
+// SubscriptionModule imports CreditsModule, which stores the default credit
+// settings at startup (insert unless present).
+prisma.creditSettings.createMany.mockResolvedValue({ count: 0 });
 const tokenVersions = mock<TokenVersionCache>();
 const proHandler = jest.fn();
 

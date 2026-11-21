@@ -1,3 +1,5 @@
+import type { AiCallMetadata } from './ai.gateway';
+
 /** Allowlisted metadata only: never provider text, prompts, images or headers. */
 export interface AiFailureDiagnostics {
   httpStatus?: number;
@@ -18,6 +20,12 @@ export interface AiFailureDiagnostics {
 
 export class AiProviderError extends Error {
   diagnostics?: AiFailureDiagnostics;
+  /**
+   * Set when the provider already produced (and billed) a response before
+   * the request failed (e.g. truncated, filtered or invalid output): its
+   * generation ID, model and usage, so the usage can be recorded.
+   */
+  billedResponse?: AiCallMetadata;
 
   constructor(
     readonly code: string,

@@ -5,6 +5,10 @@ import { QueueModule } from '../common/modules';
 import { MAKEUP_AI_QUEUE } from '../infrastructure/jobs/job-queues';
 import { registerJobHandler } from '../infrastructure/jobs/job-handler.registry';
 import { StorageModule } from '../storage/storage.module';
+import { SubscriptionModule } from '../subscription/subscription.module';
+import { CreditsModule } from '../credits/credits.module';
+import { MakeupCreditService } from './makeup-credit.service';
+import { MakeupUsageController } from './makeup-usage.controller';
 import { MockAiGateway } from './ai/mock-ai.gateway';
 import { AI_GATEWAY, type AiGateway } from './ai/ai.gateway';
 import { LiveAiGateway } from './ai/live-ai.gateway';
@@ -18,14 +22,17 @@ import { ImageValidationService } from './services/image-validation.service';
 import { MakeupRecoveryService } from './queues/makeup-recovery.service';
 
 @Module({
-  imports: [QueueModule, StorageModule],
-  controllers: [MakeupController],
+  // SubscriptionModule: ProAccessGuard (credit eligibility for POST /v1/sessions).
+  // CreditsModule: AI usage metering and credit deductions.
+  imports: [QueueModule, StorageModule, SubscriptionModule, CreditsModule],
+  controllers: [MakeupController, MakeupUsageController],
   providers: [
     MakeupService,
     MakeupQueueService,
     MakeupJobHandler,
     registerJobHandler(MAKEUP_AI_QUEUE, MakeupJobHandler),
     MakeupRecoveryService,
+    MakeupCreditService,
     MockAiGateway,
     OpenRouterProvider,
     { provide: STRUCTURED_AI_PROVIDER, useExisting: OpenRouterProvider },
