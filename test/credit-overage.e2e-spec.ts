@@ -22,7 +22,14 @@ import {
   photo,
   type TestApplication,
 } from './support/infrastructure-flows';
-import { describeWithDatabase } from './support/migrated-schema';
+import {
+  applyMigrations,
+  connectToSchema,
+  createSchema,
+  describeWithDatabase,
+  dropSchema,
+  migrationNames,
+} from './support/migrated-schema';
 
 jest.setTimeout(240_000);
 
@@ -989,5 +996,217 @@ describeWithDatabase('Session credit overage and concurrency (e2e)', () => {
       await expect(storedSessionCredits(sessionId)).resolves.toEqual(row);
       await expectConsistentCredits(account.id);
     });
+  });
+});
+
+/**
+ * The migrations of session overage, the removed idle lapse and the review
+ * constraints, applied to data written by the releases before them (raw
+ * SQL on a schema migrated up to that point).
+ */
+describeWithDatabase('Session credit migrations (PostgreSQL)', () => {
+  const OVERAGE = '20261127120000_session_credit_overage';
+  const NO_LAPSE = '20261128120000_remove_session_reservation_lapse';
+  const REVIEW = '20261129120000_credit_review_constraints';
+  const schemas: string[] = [];
+  let pg: Awaited<ReturnType<typeof connectToSchema>> | undefined;
+
+  /** A schema with the migrations before `migration` applied. */
+  const schemaBefore = async (migration: string) => {
+    const schema = await createSchema();
+    schemas.push(schema);
+    const names = migrationNames();
+    await applyMigrations(schema, names.slice(0, names.indexOf(migration)));
+    pg = await connectToSchema(schema);
+    return schema;
+  };
+  /** Applies `migration` and the ones after it. */
+  const migrateFrom = async (schema: string, migration: string) => {
+    const names = migrationNames();
+    await applyMigrations(schema, names.slice(names.indexOf(migration)));
+  };
+  const user = async () => {
+    const id = randomUUID();
+    await pg!.query(
+      `INSERT INTO "authUser" ("id", "email", "password", "username", "updatedAt")
+       VALUES ('${id}', '${id}@example.com', 'x', 'u_${id}', now())`,
+    );
+    return id;
+  };
+  /**
+   * A wallet as an earlier release wrote it: 1 purchased credit and a
+   * session debit that took it and `overage` more as session overage, with
+   * the session's overage record (`recorded` overage used).
+   */
+  const legacySessionDebit = async (
+    authId: string,
+    overage: string,
+    recorded: string,
+  ) => {
+    await pg!.query(`
+      DO $$
+      DECLARE w text := gen_random_uuid()::text; a text := gen_random_uuid()::text;
+              g text := gen_random_uuid()::text; d text := gen_random_uuid()::text;
+      BEGIN
+        INSERT INTO "CreditWallet" ("id", "authId") VALUES (w, '${authId}');
+        INSERT INTO "CreditAllocation" ("id", "walletId", "authId", "source", "sourceReference", "amount", "remaining", "grantedAt", "updatedAt")
+        VALUES (a, w, '${authId}', 'PURCHASE', 'legacy', 1, 0, now() - interval '1 day', now());
+        INSERT INTO "CreditTransaction" ("id", "walletId", "authId", "type", "amount", "balanceAfter", "idempotencyKey", "occurredAt")
+        VALUES (g, w, '${authId}', 'GRANT', 1, 1, 'grant:PURCHASE:legacy', now() - interval '1 day');
+        INSERT INTO "CreditLedgerEntry" ("id", "walletId", "transactionId", "allocationId", "amount")
+        VALUES (gen_random_uuid()::text, w, g, a, 1);
+        INSERT INTO "CreditTransaction" ("id", "walletId", "authId", "type", "amount", "overageAmount", "balanceAfter", "idempotencyKey", "sessionId", "occurredAt")
+        VALUES (d, w, '${authId}', 'DEBIT', -1, ${overage}, 0, 'debit:legacy', 'legacy-session', now());
+        INSERT INTO "CreditLedgerEntry" ("id", "walletId", "transactionId", "allocationId", "amount")
+        VALUES (gen_random_uuid()::text, w, d, a, -1);
+        INSERT INTO "CreditSessionOverage" ("id", "walletId", "authId", "sessionId", "overageLimit", "overageUsed", "createdAt", "updatedAt")
+        VALUES (gen_random_uuid()::text, w, '${authId}', 'legacy-session', 5, ${recorded}, now() - interval '2 hours', now() - interval '1 hour');
+      END $$;`);
+  };
+  const step = async () =>
+    (
+      await pg!.query<{ step: number }>(
+        'SELECT "deductionStepMicroCredits" AS "step" FROM "CreditSettings"',
+      )
+    ).rows[0].step;
+
+  afterEach(async () => {
+    await pg?.end();
+    pg = undefined;
+    for (const schema of schemas.splice(0)) await dropSchema(schema);
+  });
+
+  it('makes exact deductions the default, unless an administrator chose the step', async () => {
+    const untouched = await schemaBefore(OVERAGE);
+    expect(await step()).toBe(1_000_000);
+    await migrateFrom(untouched, OVERAGE);
+    expect(await step()).toBe(1);
+    await pg!.end();
+
+    const chosen = await schemaBefore(OVERAGE);
+    await pg!.query(`
+      WITH e AS (
+        INSERT INTO "ActivityLogEvent" ("id", "tableName", "recordId", "action")
+        VALUES (gen_random_uuid()::text, 'CreditSettings', '1', 'update') RETURNING "id"
+      )
+      INSERT INTO "ActivityLogEventDetail" ("id", "eventId", "fieldName", "oldValue", "newValue")
+      SELECT gen_random_uuid()::text, e."id", 'deductionStepMicroCredits', '100000', '1000000' FROM e`);
+    await migrateFrom(chosen, OVERAGE);
+    expect(await step()).toBe(1_000_000);
+    // At most one credit (the API's bound), also for direct writes.
+    await expect(
+      pg!.query(
+        'UPDATE "CreditSettings" SET "deductionStepMicroCredits" = 1000001',
+      ),
+    ).rejects.toThrow('CreditSettings_deductionStepMicroCredits_max');
+  });
+
+  it('keeps the overage of sessions that used it before, as initialized sessions, and holds it to their debits from then on', async () => {
+    const schema = await schemaBefore(OVERAGE);
+    const authId = await user();
+    await legacySessionDebit(authId, '2', '2');
+
+    await migrateFrom(schema, OVERAGE);
+
+    const { rows } = await pg!.query<Record<string, unknown>>(
+      'SELECT "overageLimit"::text, "overageUsed"::text, "reservedCredits"::text, "reservationRemaining"::text, "initializedAt" = "createdAt" AS "initializedAtCreation" FROM "CreditSessionOverage"',
+    );
+    expect(rows).toEqual([
+      {
+        overageLimit: '5.000000',
+        overageUsed: '2.000000',
+        reservedCredits: '0.000000',
+        reservationRemaining: '0.000000',
+        initializedAtCreation: true,
+      },
+    ]);
+    await expect(
+      pg!.query('UPDATE "CreditSessionOverage" SET "overageUsed" = 3'),
+    ).rejects.toThrow('but its debits used');
+  });
+
+  it('refuses to migrate overage records that do not match their debits', async () => {
+    const schema = await schemaBefore(OVERAGE);
+    const authId = await user();
+    await legacySessionDebit(authId, '2', '3');
+
+    await expect(migrateFrom(schema, OVERAGE)).rejects.toThrow(
+      'session overage records do not match their debits',
+    );
+  });
+
+  it('keeps sessions that had lapsed (initialized again) when the idle lapse is removed', async () => {
+    const schema = await schemaBefore(NO_LAPSE);
+    const authId = await user();
+    await pg!.query(`
+      DO $$
+      DECLARE w text := gen_random_uuid()::text;
+      BEGIN
+        INSERT INTO "CreditWallet" ("id", "authId") VALUES (w, '${authId}');
+        INSERT INTO "CreditSessionOverage" ("id", "walletId", "authId", "sessionId", "status", "overageLimit", "reservedCredits", "reservationRemaining", "updatedAt")
+        VALUES (gen_random_uuid()::text, w, '${authId}', 'lapsed', 'LAPSED', 5, 1, 0, now()),
+               (gen_random_uuid()::text, w, '${authId}', 'active', 'ACTIVE', 5, 1, 1, now());
+      END $$;`);
+
+    await migrateFrom(schema, NO_LAPSE);
+
+    const { rows } = await pg!.query<Record<string, unknown>>(
+      'SELECT "sessionId", "reservationRemaining"::text FROM "CreditSessionOverage" ORDER BY "sessionId"',
+    );
+    expect(rows).toEqual([
+      { sessionId: 'active', reservationRemaining: '1.000000' },
+      { sessionId: 'lapsed', reservationRemaining: '0.000000' },
+    ]);
+    const columns = await pg!.query<{ column_name: string }>(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_schema = current_schema() AND table_name = 'CreditSessionOverage'`,
+    );
+    expect(columns.rows.map((c) => c.column_name)).not.toEqual(
+      expect.arrayContaining(['status']),
+    );
+    expect(columns.rows.map((c) => c.column_name)).not.toContain(
+      'lastActivityAt',
+    );
+    // A reservation is only used up or released, never renewed.
+    await expect(
+      pg!.query(
+        `UPDATE "CreditSessionOverage" SET "reservationRemaining" = 1 WHERE "sessionId" = 'lapsed'`,
+      ),
+    ).rejects.toThrow('reservation can only be used up or released');
+  });
+
+  it('refuses to migrate AI usage charges that do not match their debits', async () => {
+    const schema = await schemaBefore(REVIEW);
+    const authId = await user();
+    await legacySessionDebit(authId, '0', '0');
+    // A charged usage claiming 2 credits for a debit of 1.
+    await pg!.query(`
+      INSERT INTO "AiUsage" ("id", "authId", "sessionId", "runId", "operation", "provider", "model", "outcome",
+                             "inputTokens", "outputTokens", "totalTokens", "costUsd", "chargeStatus",
+                             "creditCostUsdMicros", "creditsExact", "creditsDue", "creditsCharged", "transactionId", "occurredAt", "updatedAt")
+      SELECT gen_random_uuid()::text, '${authId}', 'legacy-session', 'run', 'GUIDE_QUESTION', 'openrouter', 'm', 'SUCCEEDED',
+             10, 5, 15, NULL, 'CHARGED', 5000, 2, 2, 2, t."id", now(), now()
+      FROM "CreditTransaction" t WHERE t."idempotencyKey" = 'debit:legacy'`);
+
+    await expect(migrateFrom(schema, REVIEW)).rejects.toThrow(
+      'AI usage charges do not match their DEBIT transactions',
+    );
+  });
+
+  it('refuses an AI usage charge that does not match its DEBIT', async () => {
+    const schema = await schemaBefore(REVIEW);
+    const authId = await user();
+    await legacySessionDebit(authId, '0', '0');
+    await migrateFrom(schema, REVIEW);
+
+    await expect(
+      pg!.query(`
+        INSERT INTO "AiUsage" ("id", "authId", "sessionId", "runId", "operation", "provider", "model", "outcome",
+                               "inputTokens", "outputTokens", "totalTokens", "costUsd", "chargeStatus",
+                               "creditCostUsdMicros", "creditsExact", "creditsDue", "creditsCharged", "transactionId", "occurredAt", "updatedAt")
+        SELECT gen_random_uuid()::text, '${authId}', 'legacy-session', 'run', 'GUIDE_QUESTION', 'openrouter', 'm', 'SUCCEEDED',
+               10, 5, 15, 0.005, 'CHARGED', 5000, 1, 1, 1, t."id", now(), now()
+        FROM "CreditTransaction" t WHERE t."idempotencyKey" = 'debit:legacy'`),
+    ).rejects.toThrow('does not match its DEBIT transaction');
   });
 });

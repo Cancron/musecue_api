@@ -74,7 +74,7 @@ describe('StripeWebhookService', () => {
       activityLog,
       logger,
       new StripeCancellationService(prisma, gateway, activityLog, logger),
-      new StripeRefundService(prisma, gateway, activityLog, logger),
+      new StripeRefundService(prisma, gateway, activityLog, logger, credits),
       credits,
     );
   });

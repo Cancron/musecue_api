@@ -86,7 +86,7 @@ describe('SubscriptionBillingService', () => {
       activityLog,
       logger,
       cancellation,
-      new StripeRefundService(prisma, gateway, activityLog, logger),
+      new StripeRefundService(prisma, gateway, activityLog, logger, credits),
       credits,
     );
     billing = new SubscriptionBillingService(prisma);

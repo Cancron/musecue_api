@@ -64,7 +64,7 @@ describe('Stripe webhooks: security and reliability', () => {
       activityLog,
       logger,
       new StripeCancellationService(prisma, gateway, activityLog, logger),
-      new StripeRefundService(prisma, gateway, activityLog, logger),
+      new StripeRefundService(prisma, gateway, activityLog, logger, credits),
       credits,
     );
     access = new SubscriptionAccessService(prisma, plans);

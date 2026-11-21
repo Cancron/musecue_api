@@ -430,6 +430,46 @@ describeWithDatabase(
         await expect(harness.status(authId)).resolves.toMatchObject({
           hasProAccess: false,
         });
+        // The payment's Pro credits end with its access, at once: the
+        // current month's unused credits expire (logged with the reason)
+        // and the months not allocated yet are skipped.
+        const refundedAt = new Date(months[1].getTime() + 2 * 24 * HOUR);
+        const expirations = await client.creditTransaction.findMany({
+          where: { authId, type: 'EXPIRATION' },
+          orderBy: { sequence: 'asc' },
+        });
+        expect(
+          expirations.map((t) => [
+            t.amount.toFixed(),
+            t.occurredAt.toISOString(),
+            t.description,
+          ]),
+        ).toEqual([
+          ['-1000', months[1].toISOString(), 'SUBSCRIPTION credits expired'],
+          [
+            '-1000',
+            refundedAt.toISOString(),
+            'SUBSCRIPTION credits expired: payment refunded',
+          ],
+        ]);
+        expect(
+          (await scheduleOf(authId)).filter((m) => m.status === 'PENDING'),
+        ).toEqual([]);
+        await expect(wallet().getBalance(authId)).resolves.toMatchObject({
+          available: '0',
+        });
+        // A redelivered refund event changes nothing.
+        await send(
+          api.signedChargeEvent(
+            'charge.refunded',
+            api.chargeOf(firstInvoiceId),
+          ),
+        ).expect(200);
+        await expect(
+          client.creditTransaction.count({
+            where: { authId, type: 'EXPIRATION' },
+          }),
+        ).resolves.toBe(2);
 
         freezeTime(months[2]);
         await scheduler().run();
@@ -446,6 +486,7 @@ describeWithDatabase(
           ]),
         ]);
         await expect(subscriptionAllocations(authId)).resolves.toHaveLength(2);
+        await expectConsistentLedger(client, authId);
       });
 
       it('gives monthly subscriptions nothing from the scheduler beyond their paid month', async () => {

@@ -13,8 +13,10 @@ import { PrivacyExportPermanentError } from './privacy-export.errors';
  * authUser.password, authUser.tokenVersion, authUser.providerId,
  * authSecurity.mfaSecret, ImageAsset.storageKey (read separately, only to
  * locate photo bytes), AiRun.idempotencyKey/result/usage, payment-provider
- * IDs, email message IDs, and activity-log rows (which can describe other
- * users' records when the requester is an administrator).
+ * IDs, email message IDs, activity-log rows (which can describe other
+ * users' records when the requester is an administrator), and the credit
+ * ledger's internal references (wallet IDs, grant source references,
+ * idempotency keys, OpenRouter generation IDs, payment links).
  */
 
 const ACCOUNT_SELECT = {
@@ -200,6 +202,65 @@ const SUBSCRIPTION_SELECT = {
   },
 } satisfies Prisma.UserSubscriptionSelect;
 
+const CREDIT_ALLOCATION_SELECT = {
+  id: true,
+  source: true,
+  amount: true,
+  remaining: true,
+  grantedAt: true,
+  periodStart: true,
+  expiresAt: true,
+} satisfies Prisma.CreditAllocationSelect;
+
+const CREDIT_TRANSACTION_SELECT = {
+  id: true,
+  type: true,
+  amount: true,
+  overageAmount: true,
+  balanceAfter: true,
+  description: true,
+  sessionId: true,
+  usageCostUsd: true,
+  creditCostUsdMicros: true,
+  occurredAt: true,
+  entries: {
+    orderBy: { id: 'asc' },
+    select: { allocationId: true, amount: true },
+  },
+} satisfies Prisma.CreditTransactionSelect;
+
+const CREDIT_SESSION_SELECT = {
+  sessionId: true,
+  reservedCredits: true,
+  reservationRemaining: true,
+  overageLimit: true,
+  overageUsed: true,
+  initializedAt: true,
+} satisfies Prisma.CreditSessionOverageSelect;
+
+const AI_USAGE_SELECT = {
+  id: true,
+  sessionId: true,
+  runId: true,
+  operation: true,
+  provider: true,
+  model: true,
+  outcome: true,
+  errorCode: true,
+  inputTokens: true,
+  outputTokens: true,
+  totalTokens: true,
+  costUsd: true,
+  chargeStatus: true,
+  chargeNote: true,
+  creditCostUsdMicros: true,
+  creditsExact: true,
+  creditsDue: true,
+  creditsCharged: true,
+  transactionId: true,
+  occurredAt: true,
+} satisfies Prisma.AiUsageSelect;
+
 const LOGIN_HISTORY_SELECT = {
   createdAt: true,
   action: true,
@@ -241,6 +302,18 @@ export type ExportAiRun = Prisma.AiRunGetPayload<{
 export type ExportSubscription = Prisma.UserSubscriptionGetPayload<{
   select: typeof SUBSCRIPTION_SELECT;
 }>;
+export interface ExportCredits {
+  allocations: Prisma.CreditAllocationGetPayload<{
+    select: typeof CREDIT_ALLOCATION_SELECT;
+  }>[];
+  transactions: Prisma.CreditTransactionGetPayload<{
+    select: typeof CREDIT_TRANSACTION_SELECT;
+  }>[];
+  sessions: Prisma.CreditSessionOverageGetPayload<{
+    select: typeof CREDIT_SESSION_SELECT;
+  }>[];
+  aiUsage: Prisma.AiUsageGetPayload<{ select: typeof AI_USAGE_SELECT }>[];
+}
 export type ExportLogin = Prisma.loginHistoryGetPayload<{
   select: typeof LOGIN_HISTORY_SELECT;
 }>;
@@ -290,6 +363,8 @@ export interface PrivacyExportSnapshot {
   aiRuns: ExportAiRun[];
   subscriptionStatus: SubscriptionStatusView;
   subscription: ExportSubscription | null;
+  /** AI credits: allocations, ledger, session overage and AI usage. */
+  credits: ExportCredits;
   loginHistory: ExportLogin[];
   emailHistory: ExportEmail[];
   photos: ExportPhoto[];
@@ -325,6 +400,10 @@ export class PrivacyExportCollectorService {
       subscriptionStatus,
       loginHistory,
       emailHistory,
+      creditAllocations,
+      creditTransactions,
+      creditSessions,
+      aiUsage,
     ] = await Promise.all([
       this.prisma.makeupSession.findMany({
         where: { authId },
@@ -362,6 +441,26 @@ export class PrivacyExportCollectorService {
         where: { authId },
         orderBy: { sentAt: 'asc' },
         select: EMAIL_HISTORY_SELECT,
+      }),
+      this.prisma.creditAllocation.findMany({
+        where: { authId },
+        orderBy: { grantedAt: 'asc' },
+        select: CREDIT_ALLOCATION_SELECT,
+      }),
+      this.prisma.creditTransaction.findMany({
+        where: { authId },
+        orderBy: { sequence: 'asc' },
+        select: CREDIT_TRANSACTION_SELECT,
+      }),
+      this.prisma.creditSessionOverage.findMany({
+        where: { authId },
+        orderBy: { initializedAt: 'asc' },
+        select: CREDIT_SESSION_SELECT,
+      }),
+      this.prisma.aiUsage.findMany({
+        where: { authId },
+        orderBy: { occurredAt: 'asc' },
+        select: AI_USAGE_SELECT,
       }),
     ]);
 
@@ -444,6 +543,12 @@ export class PrivacyExportCollectorService {
       aiRuns,
       subscriptionStatus,
       subscription,
+      credits: {
+        allocations: creditAllocations,
+        transactions: creditTransactions,
+        sessions: creditSessions,
+        aiUsage,
+      },
       loginHistory,
       emailHistory,
       photos,

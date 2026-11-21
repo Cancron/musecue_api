@@ -134,6 +134,7 @@ describe('PrivacyExportArchiveService (privacy ZIP archive)', () => {
       [
         'README.txt',
         'data/account.json',
+        'data/credits.json',
         'data/email-history.json',
         'data/makeup-history.json',
         'data/profile.json',
@@ -245,6 +246,50 @@ describe('PrivacyExportArchiveService (privacy ZIP archive)', () => {
     expect(
       json<{ entries: unknown[] }>(zip, 'data/email-history.json').entries,
     ).toHaveLength(1);
+
+    // AI credits: allocations, the ledger with its sessions and AI usage.
+    const credits = json<{
+      allocations: Array<Record<string, unknown>>;
+      transactions: Array<Record<string, unknown>>;
+      sessionOverage: Array<Record<string, unknown>>;
+      aiUsage: Array<Record<string, unknown>>;
+    }>(zip, 'data/credits.json');
+    expect(credits.allocations).toEqual([
+      expect.objectContaining({
+        source: 'PURCHASE',
+        amount: '10',
+        remaining: '7.5',
+        expiresAt: null,
+      }),
+    ]);
+    expect(
+      credits.transactions.map((t) => [t.type, t.amount, t.sessionId]),
+    ).toEqual([
+      ['GRANT', '10', null],
+      ['DEBIT', '-2.5', SESSION_ID],
+    ]);
+    expect(credits.sessionOverage).toEqual([
+      expect.objectContaining({ sessionId: SESSION_ID, overageLimit: '5' }),
+    ]);
+    expect(credits.aiUsage).toEqual([
+      expect.objectContaining({
+        sessionId: SESSION_ID,
+        inputTokens: 1000,
+        outputTokens: 250,
+        costUsd: '0.0125',
+        creditCostUsdMicros: 5000,
+        creditsCharged: '2.5',
+      }),
+    ]);
+    for (const internal of [
+      'walletId',
+      'authId',
+      'sourceReference',
+      'idempotencyKey',
+      'providerRequestId',
+    ]) {
+      expect(JSON.stringify(credits)).not.toContain(`"${internal}"`);
+    }
   });
 
   it('never contains credentials, internal references or another user’s data', async () => {

@@ -75,6 +75,15 @@ export function renderExportDocuments(
       },
     },
     {
+      path: 'data/credits.json',
+      data: {
+        allocations: snapshot.credits.allocations,
+        transactions: snapshot.credits.transactions,
+        sessionOverage: snapshot.credits.sessions,
+        aiUsage: snapshot.credits.aiUsage,
+      },
+    },
+    {
       path: 'data/sign-in-history.json',
       data: {
         entries: snapshot.loginHistory.map((entry) => ({
@@ -133,6 +142,8 @@ export function renderReadme(snapshot: PrivacyExportSnapshot): string {
     '                           recommendations, guides, step checks,',
     '                           questions and AI processing records',
     'data/subscription.json     Subscription status, trial, payments and events',
+    'data/credits.json          AI credit allocations, transaction history,',
+    '                           session overage and AI usage',
     'data/sign-in-history.json  Sign-in and sign-out activity',
     'data/email-history.json    Account emails sent to you',
     'photos/profile/            Your profile avatar',

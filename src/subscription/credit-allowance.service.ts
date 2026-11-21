@@ -26,6 +26,8 @@ export const TRIAL_CREDITS_DESCRIPTION = 'Free trial credits';
 export const TRIAL_CREDITS_ENDED_BY_UPGRADE =
   'TRIAL credits expired: upgraded to Pro';
 export const PRO_CREDITS_DESCRIPTION = 'Monthly Pro credits';
+export const PRO_CREDITS_ENDED_BY_REFUND =
+  'SUBSCRIPTION credits expired: payment refunded';
 
 /** Why a scheduled month was not allocated. */
 export const SKIP_PAYMENT_NOT_SUCCEEDED = 'PAYMENT_NOT_SUCCEEDED';
@@ -136,6 +138,36 @@ export class CreditAllowanceService {
   }
 
   /**
+   * In the transaction that applies a refund ending the access a payment
+   * paid for: the unused credits of its months expire now (EXPIRATION,
+   * effective at the refund) and its months not allocated yet are SKIPPED,
+   * so the history shows when and why the credits ended. Credits of other
+   * payments and sources are untouched. Idempotent. Returns how many
+   * allocations were ended.
+   */
+  async endRefundedPaymentCredits(
+    tx: Prisma.TransactionClient,
+    authId: string,
+    paymentId: string,
+    now: Date,
+  ): Promise<number> {
+    await tx.creditAllocationSchedule.updateMany({
+      where: { paymentId, status: CreditScheduleStatus.PENDING },
+      data: {
+        status: CreditScheduleStatus.SKIPPED,
+        skipReason: SKIP_PAYMENT_NOT_SUCCEEDED,
+        processedAt: now,
+      },
+    });
+    return this.wallet.expirePaymentCreditsNow(
+      authId,
+      paymentId,
+      PRO_CREDITS_ENDED_BY_REFUND,
+      { tx, at: now },
+    );
+  }
+
+  /**
    * In the transaction that records a successful payment creating or
    * renewing the paid term: schedules every month the payment pays for and
    * allocates the first one (an early renewal's first month counts from its
@@ -228,6 +260,31 @@ export class CreditAllowanceService {
         },
       });
       return 'SKIPPED';
+    }
+
+    // Credits for this payment and month that already exist (e.g. granted
+    // under another reference by an earlier release) are linked, never
+    // granted twice: the database allows one allocation per payment and
+    // month, so granting again would fail on every run.
+    const existing = await tx.creditAllocation.findUnique({
+      where: {
+        paymentId_periodStart: {
+          paymentId: month.paymentId,
+          periodStart: month.periodStart,
+        },
+      },
+      select: { id: true, authId: true },
+    });
+    if (existing && existing.authId === month.authId) {
+      await tx.creditAllocationSchedule.update({
+        where: { id: month.id },
+        data: {
+          status: CreditScheduleStatus.ALLOCATED,
+          allocationId: existing.id,
+          processedAt: now,
+        },
+      });
+      return 'ALLOCATED';
     }
 
     // Amounts are the settings when the month is allocated.

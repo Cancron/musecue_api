@@ -254,11 +254,35 @@ export class CreditWalletService {
    * Pass the caller's transaction to commit it together with the event that
    * ends the credits.
    */
-  async expireSourceNow(
+  expireSourceNow(
     authId: string,
     source: CreditSource,
     description: string,
     options: WalletOperationOptions = {},
+  ): Promise<number> {
+    return this.expireNow(authId, { source }, description, options);
+  }
+
+  /**
+   * Expires the unused credits of one payment now (SUBSCRIPTION months it
+   * paid for), e.g. when the payment was refunded: one EXPIRATION
+   * transaction per allocation, effective now. Returns how many allocations
+   * were closed.
+   */
+  expirePaymentCreditsNow(
+    authId: string,
+    paymentId: string,
+    description: string,
+    options: WalletOperationOptions = {},
+  ): Promise<number> {
+    return this.expireNow(authId, { paymentId }, description, options);
+  }
+
+  private async expireNow(
+    authId: string,
+    filter: { source?: CreditSource; paymentId?: string },
+    description: string,
+    options: WalletOperationOptions,
   ): Promise<number> {
     const client = options.tx ?? this.prisma;
     const hasWallet = await client.creditWallet.findUnique({
@@ -270,7 +294,7 @@ export class CreditWalletService {
       authId,
       async (tx, wallet) => {
         const open = await tx.creditAllocation.findMany({
-          where: { walletId: wallet.id, source, remaining: { gt: 0 } },
+          where: { walletId: wallet.id, ...filter, remaining: { gt: 0 } },
           orderBy: [{ grantedAt: 'asc' }, { id: 'asc' }],
         });
         let balance = await this.remainingCredits(tx, wallet.id);

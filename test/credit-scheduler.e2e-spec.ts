@@ -408,6 +408,44 @@ describeWithDatabase('Monthly credit allocation scheduler (PostgreSQL)', () => {
       await expectConsistentLedger(client(), authId);
     });
 
+    it('links credits that already exist for a month (granted under another reference) instead of failing or granting them again', async () => {
+      const T0 = new Date('2038-06-15T00:00:00.000Z');
+      const months = monthStarts(T0);
+      const authId = await yearlySubscriber(T0);
+      const second = (await scheduleOf(authId))[1];
+
+      // Month 2's credits were granted by other means (e.g. an earlier
+      // release) before the scheduler reached the month.
+      freezeTime(months[1]);
+      const earlier = await wallet().grant({
+        authId,
+        source: CreditSource.SUBSCRIPTION,
+        sourceReference: 'granted-earlier',
+        amount: 1000,
+        expiresAt: second.periodEnd,
+        payment: {
+          subscriptionId: second.subscriptionId,
+          paymentId: second.paymentId,
+          periodStart: second.periodStart,
+        },
+      });
+      await scheduler().run();
+      await scheduler().run();
+
+      const schedule = await scheduleOf(authId);
+      expect(schedule[1]).toMatchObject({
+        status: 'ALLOCATED',
+        allocationId: earlier.allocation.id,
+        attempts: 0,
+        lastError: null,
+      });
+      await expect(allocationsOf(authId)).resolves.toHaveLength(2);
+      await expect(wallet().getBalance(authId)).resolves.toMatchObject({
+        available: '1000',
+      });
+      await expectConsistentLedger(client(), authId);
+    });
+
     it('has PostgreSQL refuse to schedule or allocate a month twice, or to reopen an allocated month', async () => {
       const T0 = new Date('2038-09-01T00:00:00.000Z');
       const authId = await yearlySubscriber(T0);

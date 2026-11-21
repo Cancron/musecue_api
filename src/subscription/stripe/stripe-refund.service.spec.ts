@@ -74,7 +74,7 @@ describe('StripeRefundService (refund webhooks)', () => {
       activityLog,
       logger,
       new StripeCancellationService(prisma, gateway, activityLog, logger),
-      new StripeRefundService(prisma, gateway, activityLog, logger),
+      new StripeRefundService(prisma, gateway, activityLog, logger, credits),
       credits,
     );
   });
@@ -214,6 +214,10 @@ describe('StripeRefundService (refund webhooks)', () => {
       expect(hasAccess(authId, new Date(now.getTime() - 1))).toBe(true);
       expect(hasAccess(authId, now)).toBe(false);
       expect(eventsOf(authId)).toEqual(['CREATED', 'PAYMENT_REFUNDED']);
+      // The payment's Pro credits end with its access, in the same transaction.
+      expect(credits.endRefundedPaymentCredits.mock.calls).toEqual([
+        [expect.anything(), authId, paymentOf(invoiceId)?.id, now],
+      ]);
       expect(activityLog.logActivity.mock.calls.at(-1)?.[0]).toMatchObject({
         tableName: 'UserSubscription',
         changes: [
@@ -390,6 +394,8 @@ describe('StripeRefundService (refund webhooks)', () => {
         'RENEWED',
         'PAYMENT_REFUNDED',
       ]);
+      // Its month is over; the renewal's credits stay.
+      expect(credits.endRefundedPaymentCredits.mock.calls).toHaveLength(0);
     });
   });
 

@@ -614,6 +614,37 @@ describeWithDatabase(
         });
       });
 
+      it('shows a new user without credits all four sources at zero, and an empty history', async () => {
+        const newcomer = await signIn();
+        const balance = await getBalance(newcomer);
+        expect(balance).toMatchObject({
+          available: '0',
+          usable: '0',
+          reserved: '0',
+          free: '0',
+          granted: '0',
+          used: '0',
+          expired: '0',
+          overageUsed: '0',
+          nextExpiration: null,
+          allocations: [],
+        });
+        expect(balance.sources.map((s) => [s.source, s.granted])).toEqual([
+          ['TRIAL', '0'],
+          ['SUBSCRIPTION', '0'],
+          ['PURCHASE', '0'],
+          ['REFERRAL', '0'],
+        ]);
+        await expect(getHistory(newcomer)).resolves.toEqual({
+          items: [],
+          nextCursor: null,
+        });
+        // Reading creates nothing.
+        await expect(
+          ctx.client.creditWallet.count({ where: { authId: newcomer.id } }),
+        ).resolves.toBe(0);
+      });
+
       it('shows the credits reserved by an unfinished session', async () => {
         const dave = await signIn();
         await givenCreditsInPostgres(ctx.client, dave.id, 'PURCHASE', '2.5');

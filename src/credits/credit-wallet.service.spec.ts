@@ -1337,6 +1337,49 @@ describe('CreditWalletService', () => {
       ]);
     });
 
+    it("expires only one payment's credits, now (a refund)", async () => {
+      prisma.creditWallet.findUnique.mockResolvedValue({
+        id: 'wallet-1',
+      } as never);
+      allocations = [
+        allocation({
+          id: 'month-1',
+          source: CreditSource.SUBSCRIPTION,
+          remaining: D('990'),
+          expiresAt: later(20 * 24 * HOUR),
+          paymentId: 'pay-1',
+        }),
+        allocation({
+          id: 'month-2',
+          source: CreditSource.SUBSCRIPTION,
+          remaining: D('1000'),
+          expiresAt: later(50 * 24 * HOUR),
+          paymentId: 'pay-2',
+        }),
+      ];
+      prisma.creditAllocation.findMany.mockImplementation(((args: {
+        where: { paymentId?: string; expiresAt?: unknown };
+      }) =>
+        Promise.resolve(
+          args.where.expiresAt
+            ? []
+            : allocations.filter((a) => a.paymentId === args.where.paymentId),
+        )) as never);
+
+      await expect(
+        service.expirePaymentCreditsNow('user-1', 'pay-1', 'refunded'),
+      ).resolves.toBe(1);
+      expect(createdTransactions()).toEqual([
+        expect.objectContaining({
+          type: CreditTransactionType.EXPIRATION,
+          amount: D('-990'),
+          balanceAfter: D('1000'),
+          description: 'refunded',
+          occurredAt: NOW,
+        }),
+      ]);
+    });
+
     it('creates no wallet for a user who has none', async () => {
       prisma.creditWallet.findUnique.mockResolvedValue(null);
 

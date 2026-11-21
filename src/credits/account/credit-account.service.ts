@@ -136,6 +136,9 @@ export class CreditAccountService {
         .filter((summary) => usableSources.includes(summary.source))
         .map((summary) => summary.available),
     );
+    // Reservations only hold credits that can still be spent (they are
+    // reduced once their credits expire; see CreditWalletService).
+    const held = Prisma.Decimal.min(reserved, usable);
 
     const expiring = summaries
       .filter((summary) => summary.expiresAt && summary.available.gt(0))
@@ -153,10 +156,8 @@ export class CreditAccountService {
     return {
       available: formatCredits(total((s) => s.available)),
       usable: formatCredits(usable),
-      reserved: formatCredits(reserved),
-      free: formatCredits(
-        Prisma.Decimal.max(usable.minus(reserved), ZERO_CREDITS),
-      ),
+      reserved: formatCredits(held),
+      free: formatCredits(usable.minus(held)),
       upcoming: formatCredits(total((s) => s.upcoming)),
       granted: formatCredits(total((s) => s.granted)),
       used: formatCredits(total((s) => s.used)),

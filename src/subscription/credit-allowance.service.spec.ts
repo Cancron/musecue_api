@@ -270,6 +270,40 @@ describe('CreditAllowanceService', () => {
       ]);
     });
 
+    it('links credits that already exist for the payment and month instead of granting them again', async () => {
+      const now = new Date('2026-08-10T00:01:00.000Z');
+      tx.creditAllocation.findUnique.mockResolvedValue({
+        id: 'granted-earlier',
+        authId: 'user-1',
+      } as never);
+
+      await expect(
+        service.allocateScheduledMonth(tx, 'month-2', now),
+      ).resolves.toBe('ALLOCATED');
+
+      expect(tx.creditAllocation.findUnique.mock.calls[0]?.[0]).toMatchObject({
+        where: {
+          paymentId_periodStart: {
+            paymentId: 'pay-1',
+            periodStart: month.periodStart,
+          },
+        },
+      });
+      expect(wallet.grant.mock.calls).toHaveLength(0);
+      expect(tx.creditAllocationSchedule.update.mock.calls).toEqual([
+        [
+          {
+            where: { id: 'month-2' },
+            data: {
+              status: 'ALLOCATED',
+              allocationId: 'granted-earlier',
+              processedAt: now,
+            },
+          },
+        ],
+      ]);
+    });
+
     it('allocates a month that ended while nothing ran as of its start', async () => {
       const now = new Date('2026-10-01T00:00:00.000Z');
       await service.allocateScheduledMonth(tx, 'month-2', now);
@@ -480,6 +514,38 @@ describe('CreditAllowanceService', () => {
       await service.catchUpPaidMonths('user-1', null, now);
       expect(prisma.paymentTransaction.findMany.mock.calls).toHaveLength(0);
       expect(due.mock.calls).toHaveLength(1);
+    });
+  });
+
+  describe('endRefundedPaymentCredits', () => {
+    it("skips the payment's months not allocated yet and expires its unused credits now, in the caller's transaction", async () => {
+      const now = new Date('2026-08-20T10:00:00.000Z');
+      wallet.expirePaymentCreditsNow.mockResolvedValue(1);
+
+      await expect(
+        service.endRefundedPaymentCredits(tx, 'user-1', 'pay-1', now),
+      ).resolves.toBe(1);
+
+      expect(tx.creditAllocationSchedule.updateMany.mock.calls).toEqual([
+        [
+          {
+            where: { paymentId: 'pay-1', status: 'PENDING' },
+            data: {
+              status: 'SKIPPED',
+              skipReason: 'PAYMENT_NOT_SUCCEEDED',
+              processedAt: now,
+            },
+          },
+        ],
+      ]);
+      expect(wallet.expirePaymentCreditsNow.mock.calls).toEqual([
+        [
+          'user-1',
+          'pay-1',
+          'SUBSCRIPTION credits expired: payment refunded',
+          { tx, at: now },
+        ],
+      ]);
     });
   });
 
