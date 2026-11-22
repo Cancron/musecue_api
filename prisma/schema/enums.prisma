@@ -353,3 +353,14 @@ enum AiUsageChargeStatus {
   // allowance did not cover it.
   UNCOLLECTED
 }
+
+// ================================
+// Credit Package Related Enums
+// ================================
+
+// The fixed set of purchasable credit packages, in display order.
+enum CreditPackageCode {
+  SMALL
+  MEDIUM
+  LARGE
+}

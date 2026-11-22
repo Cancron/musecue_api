@@ -18,6 +18,7 @@ The companion mobile application and detailed product specifications live in `..
 - `AiRun` audit records containing operation, provider, model, prompt version, latency, progress, result/error, and status
 - a provider-neutral AI gateway with OpenRouter live mode, multimodal private-image input, strict structured output, runtime validation, bounded retries, and deterministic mock mode
 - AI credit configuration: administrators can read and change the trial credit allowance, the monthly Pro allowance, the OpenRouter cost per credit and the per-session overage allowance; the defaults are stored in PostgreSQL by migration and at startup, never overwriting administrator changes (see "AI credit settings" under API)
+- discount, referral, daily reward and credit package configuration: administrators can read and change the first-purchase discount, the referral discount and the referrer's reward credits (all `0` = off by default), the daily reward amounts (10 credits, +10 per day, at most 50; at most 600 daily reward credits per user per UTC calendar month) and the three credit packages (250 credits for $5, 500 for $10, 1,000 for $20: credits, price in cents, availability); stored in PostgreSQL by migration and at startup, never overwriting administrator changes (see "Discount, referral, daily reward and credit package settings" under API). Configuration only: discounts are not applied, and rewards and packages are not granted or sold yet
 - AI credit wallet and ledger: per-user wallets, allocations by source (trial, subscription, purchase, referral) with expiry, exact fractional balances, an append-only transaction ledger with grants, debits and expirations (recorded for every wallet by a scheduled sweep), and per-session overage, all in PostgreSQL and safe under concurrency (see "AI credit wallet and ledger")
 - AI usage metering and credit deductions: every OpenRouter request of a makeup AI run is stored with its user, session, run, tokens and USD cost. Each run is charged once, in exact (fractional) credits converted from its actual cost at the administrator's rate ($0.025 at $0.005 per credit = 5 credits), and the cost and rate are kept in the ledger history (see "AI usage and credit deductions")
 - credit balance and transaction history APIs: a signed-in user sees their own balance by source (granted, available, used, expired, expiry dates), their ledger (allocations, deductions with session overage, expirations, with sources, sessions and AI usage), and the AI usage of their sessions; nobody else's (see "Credit balance and transaction history")
@@ -36,6 +37,7 @@ Intentionally deferred:
 - additional S3-compatible storage providers (the provider interface is in place; see "Private image storage")
 - generated preview images (recommendation reasoning is live, while the existing curated preview-image contract remains in place)
 - production retention/deletion automation and further credit features: issuing purchased and referral credits through the API (see "Credit-based access to makeup sessions")
+- using the discount, referral, daily reward and credit package settings: applying discounts at checkout, referral sign-ups and rewards, claiming daily rewards (and enforcing the monthly cap), and buying credit packages through Stripe
 
 ## Requirements and setup
 
@@ -1009,6 +1011,68 @@ The settings are one row in the `CreditSettings` table (migration `2026112212000
 }
 ```
 
+### Discount, referral, daily reward and credit package settings
+
+Administrator-managed configuration for promotions and credit purchases. For now these routes only store and validate the configuration; nothing applies discounts, grants rewards or sells packages yet. Later features read it through `DiscountSettingsService.getSettings()`, `DailyRewardSettingsService.getSettings()` and `CreditPackageSettingsService.listPackages()` (exported by `DiscountsModule`, `DailyRewardsModule` and `CreditPackagesModule`).
+
+| Method  | Route                                     | Purpose                                         |
+| ------- | ----------------------------------------- | ----------------------------------------------- |
+| `GET`   | `/v1/admin/discount-settings`             | Read the discount and referral configuration    |
+| `PATCH` | `/v1/admin/discount-settings`             | Change any subset of it                         |
+| `GET`   | `/v1/admin/daily-reward-settings`         | Read the daily reward configuration             |
+| `PATCH` | `/v1/admin/daily-reward-settings`         | Change any subset of it                         |
+| `GET`   | `/v1/admin/credit-package-settings`       | List the credit packages (SMALL, MEDIUM, LARGE) |
+| `GET`   | `/v1/admin/credit-package-settings/:code` | Read one package                                |
+| `PATCH` | `/v1/admin/credit-package-settings/:code` | Change any subset of one package                |
+
+Access works like the other administration routes: a bearer token for an `ADMIN` or `SUPERADMIN` account is required. Missing, invalid or revoked tokens receive `401`, and other roles (`USER`, `MODERATOR`) receive `403` for both reading and changing.
+
+Storage (migration `20261130120000_add_promotion_settings`): `DiscountSettings` and `DailyRewardSettings` are single-row tables (`id = 1`) and `CreditPackage` has one row per package code. The migration stores the defaults, and at startup the application inserts any missing row again (for example after a manual delete). Both use `INSERT ... ON CONFLICT DO NOTHING`, so administrator changes are never overwritten by a deployment or restart.
+
+**Discount settings.** `0` switches the corresponding offer off; all three default to `0`.
+
+| Field                          | Type    | Default | Accepted values                                                            |
+| ------------------------------ | ------- | ------- | -------------------------------------------------------------------------- |
+| `firstPurchaseDiscountPercent` | integer | `0`     | `0`–`100` whole percent off a user's first paying purchase                 |
+| `referralDiscountPercent`      | integer | `0`     | `0`–`100` whole percent off the purchase of a referred user                |
+| `referrerRewardCredits`        | integer | `0`     | `0`–`100000` credits for the referring user after the referred user's first paying purchase succeeds |
+
+Responses also contain the read-only `firstPurchaseDiscountActive`, `referralDiscountActive` and `referrerRewardActive` (whether the value is above `0`) and `updatedAt`.
+
+**Daily reward settings.** The reward for the n-th consecutive day is `min(startingRewardCredits + (n - 1) × dailyIncrementCredits, maxDailyRewardCredits)`: with the defaults 10, 20, 30, 40, 50, 50, … credits.
+
+| Field                   | Type    | Default | Accepted values                              |
+| ----------------------- | ------- | ------- | -------------------------------------------- |
+| `startingRewardCredits` | integer | `10`    | `1`–`600`, at most `maxDailyRewardCredits`   |
+| `dailyIncrementCredits` | integer | `10`    | `0`–`600` (`0` = the same reward every day)  |
+| `maxDailyRewardCredits` | integer | `50`    | `1`–`600`, at least `startingRewardCredits`  |
+
+A user can receive at most **600** daily reward credits per UTC calendar month. This is a fixed product rule (`DAILY_REWARD_MONTHLY_CAP_CREDITS`), not a setting: responses show it as the read-only `monthlyCapCredits`, and no single day's reward may exceed it. The rule `startingRewardCredits <= maxDailyRewardCredits` is checked on the combined result of the stored values and the request, with the row locked, so a partial update (or two concurrent ones) can never store an invalid combination; a violation answers `400` (e.g. `startingRewardCredits (60) cannot exceed maxDailyRewardCredits (50)`) and changes nothing.
+
+**Credit packages.** The set of packages is fixed; a package is withdrawn from sale with `available: false`, never deleted.
+
+| Code     | Default `credits` | Default `priceUsdCents` | Default `available` |
+| -------- | ----------------- | ----------------------- | ------------------- |
+| `SMALL`  | `250`             | `500` ($5.00)           | `true`              |
+| `MEDIUM` | `500`             | `1000` ($10.00)         | `true`              |
+| `LARGE`  | `1000`            | `2000` ($20.00)         | `true`              |
+
+`credits` accepts whole credits `1`–`1000000`, `priceUsdCents` whole US cents `50`–`999999` (`$0.50`, Stripe's minimum charge, to `$9,999.99`; never dollar amounts such as `4.99`), and `available` a boolean. Responses also contain `code`, `currency` (`"USD"`), the read-only `priceUsd` (e.g. `"5.00"`) and `updatedAt`. An unknown code (codes are upper case) answers `404 Credit package not found`.
+
+```json
+{
+  "code": "SMALL",
+  "currency": "USD",
+  "credits": 250,
+  "priceUsdCents": 500,
+  "priceUsd": "5.00",
+  "available": true,
+  "updatedAt": "2026-11-30T12:00:00.000Z"
+}
+```
+
+For all three, `PATCH` accepts any subset of the editable fields; omitted fields are unchanged. Empty bodies, negative or out-of-range values, fractions (credits, percentages and cents are whole numbers), `null`, numeric or boolean strings, read-only fields and unknown fields are rejected with `400`. A request with any invalid field changes nothing. The row is locked during an update, so concurrent changes apply one at a time. CHECK constraints additionally stop any write path from storing a second settings row, a negative amount, a percentage outside 0–100, a zero package credit amount or price, or a daily reward above 600 or below the starting reward. Every change is recorded in `ActivityLogEvent` (table `DiscountSettings`, `DailyRewardSettings` or `CreditPackage` with the package code; old value, new value, administrator ID) in the same transaction as the update.
+
 ### AI credit wallet and ledger
 
 The persistent store for AI credits, in `CreditWalletService` (exported by `CreditsModule`; users read it through "Credit balance and transaction history"). Trial credits and monthly Pro credits are granted through it (see "Credit-based access to makeup sessions"), and AI usage is debited through it (see "AI usage and credit deductions"); issuing purchased and referral credits is future work. Migration `20261123130000_add_credit_wallet_ledger` adds:
@@ -1317,7 +1381,8 @@ authUser
             `-- Question
 
 OAuthState, RateLimitBucket: short-lived, keyed by hashes, no owner
-SubscriptionPlan, CreditSettings: single-row administrator configuration, no owner
+SubscriptionPlan, CreditSettings, DiscountSettings, DailyRewardSettings: single-row administrator configuration, no owner
+CreditPackage: administrator configuration, one row per package code (SMALL, MEDIUM, LARGE), no owner
 ```
 
 Mock and live gateways implement the same application-owned operations. The live gateway delegates transport to an OpenRouter provider adapter, workers validate and normalize model-shaped output, and NestJS alone persists it transactionally and advances workflow state. No frontend or public API contract changes are required to switch modes or add another provider adapter.
@@ -1334,6 +1399,8 @@ TEST_DATABASE_URL=... TEST_REDIS_URL=redis://127.0.0.1:6379 REDIS_ENABLED=true n
 npx jest private-cloud   # private image storage unit tests
 npm test -- --runInBand credit   # AI credit unit/HTTP tests
 TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json --runInBand test/credit-settings test/credit-wallet test/credit-access test/credit-trial test/credit-subscription test/credit-scheduler test/credit-usage test/credit-overage test/credit-apis   # AI credits on PostgreSQL
+npx jest discount   # discount and referral settings unit/HTTP tests (likewise: daily, credit-package)
+TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json discount   # discount settings on PostgreSQL (likewise: daily, credit-package)
 TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json test/private-cloud   # storage workflows + cleanup ledger on PostgreSQL (mocked Supabase)
 npm run test:e2e
 npx prisma generate

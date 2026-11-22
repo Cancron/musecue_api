@@ -15,6 +15,9 @@ import { ProfileModule } from './profile/profile.module';
 import { SubscriptionModule } from './subscription/subscription.module';
 import { CreditsModule } from './credits/credits.module';
 import { CreditAccountModule } from './credits/account/credit-account.module';
+import { DiscountsModule } from './discounts/discounts.module';
+import { DailyRewardsModule } from './daily-rewards/daily-rewards.module';
+import { CreditPackagesModule } from './credit-packages/credit-packages.module';
 import { PrivacyModule } from './privacy/privacy.module';
 import { AccountDeletionModule } from './privacy/account-deletion/account-deletion.module';
 
@@ -45,6 +48,9 @@ import { AccountDeletionModule } from './privacy/account-deletion/account-deleti
     SubscriptionModule,
     CreditsModule,
     CreditAccountModule,
+    DiscountsModule,
+    DailyRewardsModule,
+    CreditPackagesModule,
     PrivacyModule,
     AccountDeletionModule,
   ],

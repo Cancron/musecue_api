@@ -1,0 +1,58 @@
+// ================================
+// Discount, Referral, Daily Reward and Credit Package Configuration
+// ================================
+//
+// Administrator-managed configuration only: nothing here grants credits,
+// applies discounts or sells packages yet. Each table is stored with its
+// defaults by migration 20261130120000_add_promotion_settings and again at
+// startup if missing (INSERT ... ON CONFLICT DO NOTHING), so administrator
+// changes are never overwritten by a deployment or restart. Value bounds
+// are enforced by CHECK constraints in that migration as well as by request
+// validation.
+
+// Discount and referral offers. There is exactly one row (id = 1). A value
+// of 0 switches the corresponding offer off (the default for all three).
+model DiscountSettings {
+  id                           Int      @id @default(1)
+  // Percentage off a user's first paying purchase (0-100, whole percent).
+  firstPurchaseDiscountPercent Int      @default(0)
+  // Percentage off the purchase of a user who signed up with a referral
+  // (0-100, whole percent).
+  referralDiscountPercent      Int      @default(0)
+  // Credits granted to the referring user once the referred user's first
+  // paying purchase has succeeded.
+  referrerRewardCredits        Int      @default(0)
+  createdAt                    DateTime @default(now())
+  updatedAt                    DateTime @updatedAt
+}
+
+// Daily reward amounts. There is exactly one row (id = 1). The reward for
+// the n-th consecutive day is min(starting + (n - 1) * increment, max).
+// Independently of these values, a user receives at most 600 daily reward
+// credits per UTC calendar month (DAILY_REWARD_MONTHLY_CAP_CREDITS), so
+// maxDailyRewardCredits can never exceed 600 (CHECK constraint).
+model DailyRewardSettings {
+  id                    Int      @id @default(1)
+  startingRewardCredits Int      @default(10)
+  dailyIncrementCredits Int      @default(10)
+  maxDailyRewardCredits Int      @default(50)
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+}
+
+// The credit packages offered for purchase, one row per package code. The
+// set of packages is fixed (CreditPackageCode); a package is withdrawn from
+// sale with available = false rather than deleted. Defaults (seeded by the
+// migration and restored at startup if a row is missing) must match
+// CREDIT_PACKAGE_DEFAULTS in src/credit-packages/credit-package-settings.constants.ts.
+model CreditPackage {
+  code          CreditPackageCode @id
+  // Whole credits the package grants.
+  credits       Int
+  // Price in whole US cents (500 = $5.00).
+  priceUsdCents Int
+  // Whether the package is offered for purchase.
+  available     Boolean           @default(true)
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+}
