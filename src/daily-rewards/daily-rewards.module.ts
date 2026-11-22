@@ -2,19 +2,24 @@ import { Module } from '@nestjs/common';
 import { AuthGuard } from '../common/guards/auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { ActivityLogService } from '../common/services/activity-log.service';
+import { CreditsModule } from '../credits/credits.module';
+import { DailyRewardClaimService } from './daily-reward-claim.service';
+import { DailyRewardController } from './daily-reward.controller';
 import { DailyRewardSettingsController } from './daily-reward-settings.controller';
 import { DailyRewardSettingsService } from './daily-reward-settings.service';
 
 /**
- * The administrator-managed daily reward configuration (starting reward,
- * daily increment, maximum daily reward) and the fixed 600-credit monthly
- * cap. Configuration only: claiming daily rewards is future work; it reads
- * the settings through DailyRewardSettingsService.getSettings().
+ * Daily rewards: the administrator-managed configuration (starting reward,
+ * daily increment, maximum daily reward) and the users' daily claims,
+ * granted as DAILY_REWARD credits through CreditWalletService, with the
+ * fixed cap of 600 daily reward credits per user and UTC calendar month.
  */
 @Module({
-  controllers: [DailyRewardSettingsController],
+  imports: [CreditsModule],
+  controllers: [DailyRewardSettingsController, DailyRewardController],
   providers: [
     DailyRewardSettingsService,
+    DailyRewardClaimService,
     ActivityLogService,
     AuthGuard,
     RolesGuard,

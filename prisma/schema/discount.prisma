@@ -1,0 +1,78 @@
+// ================================
+// Discount Codes and Campaigns
+// ================================
+//
+// Administrator-managed discount offers and their redemptions. A redemption
+// prices one credit package (CreditPackage) with the offer's discount and
+// counts towards the offer's limits. Rules Prisma cannot express (CHECK
+// constraints, the redemption trigger that enforces every limit under a
+// lock of the offer row) are in migration 20261202120000_add_discount_offers.
+
+// A discount code (kind CODE, with a unique upper-case `code`) or a
+// promotional campaign (kind CAMPAIGN, no code). An offer is redeemable
+// while it is active with a discount above 0%, within [startsAt, endsAt),
+// for an eligible user below `maxRedemptionsPerUser`, and while fewer than
+// `maxTotalRedemptions` (NULL = unlimited) redemptions have been made.
+// Offers are deactivated, never deleted.
+model DiscountOffer {
+  id                    String            @id @default(uuid())
+  kind                  DiscountOfferKind
+  // CODE only: upper case, 3-32 of A-Z, 0-9, "_" and "-"; unique.
+  code                  String?           @unique @db.VarChar(32)
+  name                  String            @db.VarChar(100)
+  // 0-100; 0 switches the offer off like active = false.
+  discountPercent       Int
+  active                Boolean           @default(true)
+  startsAt              DateTime
+  endsAt                DateTime
+  audience              DiscountAudience  @default(ALL_USERS)
+  maxRedemptionsPerUser Int               @default(1)
+  maxTotalRedemptions   Int?
+  // Redemptions ever made (kept when a redeeming account is deleted, so a
+  // depleted offer stays depleted). Maintained by the redemption trigger.
+  redemptionCount       Int               @default(0)
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+
+  targets     DiscountOfferTarget[]
+  redemptions DiscountRedemption[]
+
+  @@index([kind, createdAt])
+}
+
+// The users a SELECTED_USERS offer is for.
+model DiscountOfferTarget {
+  offerId   String
+  authId    String
+  createdAt DateTime @default(now())
+
+  offer    DiscountOffer @relation(fields: [offerId], references: [id], onDelete: Cascade)
+  authUser authUser      @relation(fields: [authId], references: [id], onDelete: Cascade)
+
+  @@id([offerId, authId])
+  @@index([authId])
+}
+
+// One redemption of an offer by a user, for one credit package, with the
+// price terms fixed at redemption time. Unique per user and idempotency key,
+// so a retried or duplicated request is counted once. Rows never change.
+model DiscountRedemption {
+  id                    String            @id @default(uuid())
+  offerId               String
+  authId                String
+  idempotencyKey        String            @db.VarChar(200)
+  packageCode           CreditPackageCode
+  credits               Int
+  discountPercent       Int
+  originalPriceUsdCents Int
+  discountUsdCents      Int
+  finalPriceUsdCents    Int
+  redeemedAt            DateTime
+  createdAt             DateTime          @default(now())
+
+  offer    DiscountOffer @relation(fields: [offerId], references: [id], onDelete: Restrict)
+  authUser authUser      @relation(fields: [authId], references: [id], onDelete: Cascade)
+
+  @@unique([authId, idempotencyKey])
+  @@index([offerId, authId])
+}

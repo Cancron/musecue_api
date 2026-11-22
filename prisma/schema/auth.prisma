@@ -34,6 +34,10 @@ model authUser {
   creditWallet       CreditWallet?
   creditSchedules    CreditAllocationSchedule[]
   aiUsages           AiUsage[]
+  dailyRewardClaims  DailyRewardClaim[]
+  dailyRewardTotals  DailyRewardMonthlyTotal[]
+  discountTargets    DiscountOfferTarget[]
+  discountRedemptions DiscountRedemption[]
 
   @@index([email, id, providerId])
   @@index([username])

@@ -307,13 +307,15 @@ enum InfrastructureJobStatus {
 // ================================
 
 // Where an allocation of credits came from. TRIAL and SUBSCRIPTION credits
-// always expire; PURCHASE and REFERRAL credits never expire (CHECK
-// constraint on CreditAllocation).
+// always expire; PURCHASE, REFERRAL and DAILY_REWARD credits never expire
+// (CHECK constraint on CreditAllocation).
 enum CreditSource {
   TRIAL
   SUBSCRIPTION
   PURCHASE
   REFERRAL
+  // Daily reward claims (never expire; at most 600 per user and UTC month).
+  DAILY_REWARD
 }
 
 // A CreditTransaction changes the available balance: GRANT adds an
@@ -363,4 +365,23 @@ enum CreditPackageCode {
   SMALL
   MEDIUM
   LARGE
+}
+
+// ================================
+// Discount Offer Related Enums
+// ================================
+
+// A discount code is redeemed by entering its code; a campaign (e.g. a
+// holiday promotion) has no code and is offered to every eligible user
+// while it runs.
+enum DiscountOfferKind {
+  CODE
+  CAMPAIGN
+}
+
+// Who may redeem an offer: everyone, or only the users listed in
+// DiscountOfferTarget (nobody, if all of them have been deleted).
+enum DiscountAudience {
+  ALL_USERS
+  SELECTED_USERS
 }

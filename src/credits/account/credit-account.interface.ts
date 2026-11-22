@@ -76,7 +76,7 @@ export interface CreditAccountBalanceView {
     amount: CreditAmountString;
     sources: CreditSource[];
   } | null;
-  /** TRIAL, SUBSCRIPTION, PURCHASE and REFERRAL, always all four. */
+  /** Every source (TRIAL, SUBSCRIPTION, PURCHASE, REFERRAL, DAILY_REWARD). */
   sources: CreditSourceBalanceView[];
   /** Every allocation, newest first. */
   allocations: CreditAccountAllocationView[];

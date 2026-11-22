@@ -70,6 +70,8 @@ describe('Daily reward settings administration (HTTP)', () => {
     config.jwt_access_secret = 'daily-reward-settings-spec-secret';
 
     prisma.dailyRewardSettings.createMany.mockResolvedValue({ count: 1 });
+    // Startup of the imported CreditsModule (settings already stored).
+    prisma.creditSettings.createMany.mockResolvedValue({ count: 0 });
     const moduleRef = await Test.createTestingModule({
       imports: [TestInfrastructureModule, DailyRewardsModule],
     }).compile();

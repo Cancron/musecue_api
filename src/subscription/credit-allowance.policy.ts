@@ -23,7 +23,8 @@ import {
  * - TRIAL credits are usable only while the trial is active (and Pro has
  *   not been bought) and SUBSCRIPTION credits only while the paid term is
  *   active, so a refund that ends the term early also ends its credits.
- *   PURCHASE and REFERRAL credits are usable with or without Pro.
+ *   PURCHASE, REFERRAL and DAILY_REWARD credits are usable with or without
+ *   Pro.
  */
 
 export interface AllowanceAmounts {
@@ -154,6 +155,7 @@ export function isCreditSourceUsable(
   switch (source) {
     case CreditSource.PURCHASE:
     case CreditSource.REFERRAL:
+    case CreditSource.DAILY_REWARD:
       return true;
     case CreditSource.TRIAL:
       return trialCreditsApply(record, now);

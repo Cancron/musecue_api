@@ -104,6 +104,10 @@ const USER_DATA_TABLES = [
   'CreditSessionOverage',
   'CreditAllocationSchedule',
   'AiUsage',
+  'DailyRewardClaim',
+  'DailyRewardMonthlyTotal',
+  'DiscountOfferTarget',
+  'DiscountRedemption',
 ] as const;
 
 describeWithDatabase('Account erasure (PostgreSQL)', () => {
@@ -570,6 +574,47 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
       },
     });
 
+    // A daily reward claim (the trigger also stores the month's total), and
+    // a redemption of a discount code targeted at the user. The code is
+    // shared administrator configuration: it must survive the erasure.
+    await client.dailyRewardClaim.create({
+      data: {
+        authId: user.id,
+        claimDate: new Date('2031-01-05T00:00:00.000Z'),
+        monthStart: new Date('2031-01-01T00:00:00.000Z'),
+        streakDay: 1,
+        rewardCredits: 10,
+        grantedCredits: 10,
+        claimedAt: new Date(),
+      },
+    });
+    const offer = await client.discountOffer.create({
+      data: {
+        kind: 'CODE',
+        code: `ERASURE-${tag}`.toUpperCase().slice(0, 32),
+        name: 'Erasure test code',
+        discountPercent: 20,
+        startsAt: new Date(Date.now() - 60_000),
+        endsAt: new Date(Date.now() + 86_400_000),
+        audience: 'SELECTED_USERS',
+        targets: { create: { authId: user.id } },
+      },
+    });
+    await client.discountRedemption.create({
+      data: {
+        offerId: offer.id,
+        authId: user.id,
+        idempotencyKey: `erasure-${tag}`,
+        packageCode: 'SMALL',
+        credits: 250,
+        discountPercent: 20,
+        originalPriceUsdCents: 500,
+        discountUsdCents: 100,
+        finalPriceUsdCents: 400,
+        redeemedAt: new Date(),
+      },
+    });
+
     await client.activityLogEvent.create({
       data: {
         tableName: 'authUser',
@@ -750,6 +795,15 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
       device: null,
       details: [expect.objectContaining({ fieldName: 'trialDays' })],
     });
+
+    // Shared discount offers stay, and keep counting the erased account's
+    // redemption (a depleted offer must not reopen).
+    await expect(
+      client.discountOffer.findFirstOrThrow({
+        where: { code: { startsWith: 'ERASURE-' }, redemptions: { none: {} } },
+        select: { redemptionCount: true },
+      }),
+    ).resolves.toEqual({ redemptionCount: 1 });
 
     // 4. Another account is not affected in any way.
     expect(await userRowCounts(bystander.id, bystander.subscriptionId)).toEqual(

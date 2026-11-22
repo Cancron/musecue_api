@@ -280,6 +280,7 @@ describe('ProAccessGuard', () => {
         SUBSCRIPTION: '0',
         PURCHASE: eligible ? '12.5' : '0',
         REFERRAL: '0',
+        DAILY_REWARD: '0',
       },
       proAccess: {
         status: hasProAccess ? 'PRO' : 'EXPIRED',

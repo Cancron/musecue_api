@@ -495,6 +495,17 @@ describeWithDatabase(
             usableNow: true,
             nextExpiresAt: null,
           },
+          {
+            source: 'DAILY_REWARD',
+            granted: '0',
+            available: '0',
+            upcoming: '0',
+            used: '0',
+            expired: '0',
+            expires: false,
+            usableNow: true,
+            nextExpiresAt: null,
+          },
         ]);
 
         // Each allocation with its dates; granted = available + used + expired.
@@ -614,7 +625,7 @@ describeWithDatabase(
         });
       });
 
-      it('shows a new user without credits all four sources at zero, and an empty history', async () => {
+      it('shows a new user without credits every source at zero, and an empty history', async () => {
         const newcomer = await signIn();
         const balance = await getBalance(newcomer);
         expect(balance).toMatchObject({
@@ -634,6 +645,7 @@ describeWithDatabase(
           ['SUBSCRIPTION', '0'],
           ['PURCHASE', '0'],
           ['REFERRAL', '0'],
+          ['DAILY_REWARD', '0'],
         ]);
         await expect(getHistory(newcomer)).resolves.toEqual({
           items: [],

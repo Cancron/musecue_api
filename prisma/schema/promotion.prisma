@@ -56,3 +56,47 @@ model CreditPackage {
   createdAt     DateTime          @default(now())
   updatedAt     DateTime          @updatedAt
 }
+
+// ================================
+// Daily Reward Claims
+// ================================
+
+// One claim per user and UTC calendar day. The reward follows the user's
+// streak of consecutive claimed days (DailyRewardSettings at claim time);
+// `grantedCredits` is what was actually granted after the monthly cap (less
+// than `rewardCredits` only for the claim that reaches the cap). The credits
+// are a DAILY_REWARD allocation in the user's wallet (sourceReference
+// `daily-reward:<claimDate>`). Claims never change (database trigger).
+model DailyRewardClaim {
+  id             String   @id @default(uuid())
+  authId         String
+  // The UTC calendar day claimed, and the first day of its month.
+  claimDate      DateTime @db.Date
+  monthStart     DateTime @db.Date
+  // 1 for the first day of a streak, +1 for each further consecutive day.
+  streakDay      Int
+  rewardCredits  Int
+  grantedCredits Int
+  claimedAt      DateTime
+  createdAt      DateTime @default(now())
+
+  authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
+
+  @@unique([authId, claimDate])
+  @@index([authId, monthStart])
+}
+
+// Daily reward credits granted per user and UTC calendar month. Maintained
+// by a trigger on DailyRewardClaim (every claim adds its grantedCredits) and
+// capped at 600 by a CHECK constraint, so no write path can exceed the
+// monthly cap. The row is also the lock that serializes a user's claims.
+model DailyRewardMonthlyTotal {
+  authId       String
+  monthStart   DateTime @db.Date
+  totalCredits Int      @default(0)
+  updatedAt    DateTime @default(now())
+
+  authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
+
+  @@id([authId, monthStart])
+}

@@ -71,6 +71,8 @@ describe('Discount settings administration (HTTP)', () => {
     config.jwt_access_secret = 'discount-settings-spec-secret';
 
     prisma.discountSettings.createMany.mockResolvedValue({ count: 1 });
+    // Startup of the imported CreditPackagesModule (packages already stored).
+    prisma.creditPackage.createMany.mockResolvedValue({ count: 0 });
     const moduleRef = await Test.createTestingModule({
       imports: [TestInfrastructureModule, DiscountsModule],
     }).compile();

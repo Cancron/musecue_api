@@ -2,24 +2,41 @@ import { Module } from '@nestjs/common';
 import { AuthGuard } from '../common/guards/auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { ActivityLogService } from '../common/services/activity-log.service';
+import { CreditPackagesModule } from '../credit-packages/credit-packages.module';
+import {
+  DiscountCampaignsAdminController,
+  DiscountCodesAdminController,
+} from './discount-offer-admin.controllers';
+import { DiscountOfferAdminService } from './discount-offer-admin.service';
+import { DiscountRedemptionController } from './discount-redemption.controller';
+import { DiscountRedemptionService } from './discount-redemption.service';
 import { DiscountSettingsController } from './discount-settings.controller';
 import { DiscountSettingsService } from './discount-settings.service';
 
 /**
- * The administrator-managed discount and referral configuration
- * (first-purchase discount, referral discount, referrer reward credits).
- * Configuration only: applying discounts at checkout and granting referral
- * rewards are future work; they read the settings through
- * DiscountSettingsService.getSettings().
+ * Discounts: the administrator-managed discount and referral settings
+ * (first-purchase discount, referral discount, referrer reward credits),
+ * discount codes and promotional campaigns (DiscountOfferAdminService), and
+ * their redemption by users for a configured credit package
+ * (DiscountRedemptionService). Charging the discounted price at checkout is
+ * future work; it reads the redemption.
  */
 @Module({
-  controllers: [DiscountSettingsController],
+  imports: [CreditPackagesModule],
+  controllers: [
+    DiscountSettingsController,
+    DiscountCodesAdminController,
+    DiscountCampaignsAdminController,
+    DiscountRedemptionController,
+  ],
   providers: [
     DiscountSettingsService,
+    DiscountOfferAdminService,
+    DiscountRedemptionService,
     ActivityLogService,
     AuthGuard,
     RolesGuard,
   ],
-  exports: [DiscountSettingsService],
+  exports: [DiscountSettingsService, DiscountRedemptionService],
 })
 export class DiscountsModule {}
