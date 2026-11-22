@@ -1,11 +1,17 @@
 import { DiscountAudience } from '@prisma/client';
 import {
+  applyCheckoutDiscount,
   applyDiscount,
   discountOfferStatus,
+  lateRedemptionFits,
   normalizeDiscountCode,
+  packageProduct,
+  proProduct,
   redemptionRejection,
+  remainingBudget,
   remainingRedemptions,
   type RedeemableOffer,
+  type RedemptionContext,
 } from './discount-offer.policy';
 
 const START = new Date('2026-12-20T00:00:00.000Z');
@@ -18,15 +24,27 @@ const offer = (overrides: Partial<RedeemableOffer> = {}): RedeemableOffer => ({
   startsAt: START,
   endsAt: END,
   audience: DiscountAudience.ALL_USERS,
+  customerEligibility: 'ALL_CUSTOMERS',
+  eligibleProducts: [],
+  minSpendCents: 0,
   maxRedemptionsPerUser: 1,
   maxTotalRedemptions: 100,
   redemptionCount: 0,
+  budgetCents: null,
+  budgetSpentCents: 0,
+  budgetReservedCents: 0,
   ...overrides,
 });
-const context = (overrides = {}) => ({
+const context = (
+  overrides: Partial<RedemptionContext> = {},
+): RedemptionContext => ({
   now: DURING,
   isTargeted: false,
   userRedemptions: 0,
+  hasPaidPurchase: false,
+  product: 'PRO_MONTHLY',
+  listPriceCents: 1900,
+  discountCents: 475,
   ...overrides,
 });
 
@@ -53,6 +71,30 @@ describe('discount offer policy', () => {
         'NOT_ELIGIBLE',
       ],
       [
+        'a new-customer offer for a user who already paid',
+        offer({ customerEligibility: 'NEW_CUSTOMERS' }),
+        context({ hasPaidPurchase: true }),
+        'CUSTOMER_NOT_ELIGIBLE',
+      ],
+      [
+        'a returning-customer offer for a user who never paid',
+        offer({ customerEligibility: 'RETURNING_CUSTOMERS' }),
+        context({ hasPaidPurchase: false }),
+        'CUSTOMER_NOT_ELIGIBLE',
+      ],
+      [
+        'a product the offer does not cover',
+        offer({ eligibleProducts: ['PRO_YEARLY', 'CREDITS_LARGE'] }),
+        context({ product: 'PRO_MONTHLY' }),
+        'PRODUCT_NOT_ELIGIBLE',
+      ],
+      [
+        'a purchase below the minimum spend',
+        offer({ minSpendCents: 5000 }),
+        context({ listPriceCents: 1900 }),
+        'MIN_SPEND_NOT_MET',
+      ],
+      [
         'a user at the per-user limit',
         offer({ maxRedemptionsPerUser: 2 }),
         context({ userRedemptions: 2 }),
@@ -64,8 +106,34 @@ describe('discount offer policy', () => {
         context(),
         'DEPLETED',
       ],
+      [
+        'a discount above the budget left',
+        offer({
+          budgetCents: 1000,
+          budgetSpentCents: 400,
+          budgetReservedCents: 200,
+        }),
+        context({ discountCents: 401 }),
+        'BUDGET_EXHAUSTED',
+      ],
     ] as const)('rejects %s', (_case, subject, ctx, reason) => {
       expect(redemptionRejection(subject, ctx)).toBe(reason);
+    });
+
+    it('accepts the exact budget left, an eligible product and the exact minimum spend', () => {
+      expect(
+        redemptionRejection(
+          offer({
+            budgetCents: 1000,
+            budgetSpentCents: 400,
+            budgetReservedCents: 200,
+            eligibleProducts: ['PRO_MONTHLY'],
+            minSpendCents: 1900,
+            customerEligibility: 'RETURNING_CUSTOMERS',
+          }),
+          context({ discountCents: 400, hasPaidPurchase: true }),
+        ),
+      ).toBeNull();
     });
 
     it('accepts the exact start instant and a targeted user', () => {
@@ -102,6 +170,35 @@ describe('discount offer policy', () => {
     });
   });
 
+  it('lets a late payment of a released reservation count only within the limits and the budget', () => {
+    expect(lateRedemptionFits(offer(), 0, 475)).toBe(true);
+    expect(lateRedemptionFits(offer(), 1, 475)).toBe(false);
+    expect(
+      lateRedemptionFits(
+        offer({ maxTotalRedemptions: 3, redemptionCount: 3 }),
+        0,
+        1,
+      ),
+    ).toBe(false);
+    expect(
+      lateRedemptionFits(
+        offer({ budgetCents: 500, budgetSpentCents: 100 }),
+        0,
+        400,
+      ),
+    ).toBe(true);
+    expect(
+      lateRedemptionFits(
+        offer({ budgetCents: 500, budgetSpentCents: 101 }),
+        0,
+        400,
+      ),
+    ).toBe(false);
+    // Switched off or expired by now: the payment was made on the terms of
+    // its reservation, so only capacity matters.
+    expect(lateRedemptionFits(offer({ active: false }), 0, 475)).toBe(true);
+  });
+
   describe('discountOfferStatus', () => {
     it.each([
       [offer(), DURING, 'ACTIVE'],
@@ -114,16 +211,36 @@ describe('discount offer policy', () => {
         DURING,
         'DEPLETED',
       ],
+      [
+        offer({
+          budgetCents: 500,
+          budgetSpentCents: 300,
+          budgetReservedCents: 200,
+        }),
+        DURING,
+        'DEPLETED',
+      ],
+      [offer({ budgetCents: 500, budgetSpentCents: 300 }), DURING, 'ACTIVE'],
     ] as const)('%o at %s is %s', (subject, now, status) => {
       expect(discountOfferStatus(subject, now)).toBe(status);
     });
   });
 
-  it('reports the redemptions left, or null when unlimited', () => {
+  it('reports the redemptions and budget left, or null when unlimited', () => {
     expect(remainingRedemptions(offer({ redemptionCount: 40 }))).toBe(60);
     expect(remainingRedemptions(offer({ maxTotalRedemptions: null }))).toBe(
       null,
     );
+    expect(
+      remainingBudget(
+        offer({
+          budgetCents: 1000,
+          budgetSpentCents: 250,
+          budgetReservedCents: 100,
+        }),
+      ),
+    ).toBe(650);
+    expect(remainingBudget(offer())).toBeNull();
   });
 
   describe('applyDiscount', () => {
@@ -155,6 +272,38 @@ describe('discount offer policy', () => {
     ])('refuses %p cents at %p%%', (price, percent) => {
       expect(() => applyDiscount(price, percent)).toThrow(RangeError);
     });
+  });
+
+  describe('applyCheckoutDiscount (never below Stripe’s $0.50 minimum charge)', () => {
+    it.each([
+      [1900, 20, 380, 1520],
+      [19000, 15, 2850, 16150],
+      [1900, 100, 1850, 50],
+      [60, 50, 10, 50],
+      [50, 90, 0, 50],
+      [1999, 33, 659, 1340],
+    ])(
+      '%i cents at %i%% off: %i discount, %i charged',
+      (price, percent, discount, final) => {
+        expect(applyCheckoutDiscount(price, percent)).toEqual({
+          originalPriceUsdCents: price,
+          discountUsdCents: discount,
+          finalPriceUsdCents: final,
+        });
+      },
+    );
+  });
+
+  it('maps billing options and credit packages to products', () => {
+    expect([proProduct('MONTHLY'), proProduct('YEARLY')]).toEqual([
+      'PRO_MONTHLY',
+      'PRO_YEARLY',
+    ]);
+    expect(
+      (['SMALL', 'MEDIUM', 'LARGE'] as const).map((code) =>
+        packageProduct(code),
+      ),
+    ).toEqual(['CREDITS_SMALL', 'CREDITS_MEDIUM', 'CREDITS_LARGE']);
   });
 
   it('compares codes case-insensitively', () => {

@@ -24,6 +24,7 @@ import {
   type WebhookOutcome,
 } from './stripe-webhook.service';
 import { StripeGateway } from './stripe.gateway';
+import { noCheckoutDiscounts } from '../../../test/support/no-checkout-discounts';
 
 const { MONTHLY, YEARLY } = BillingInterval;
 const DAY = 24 * 60 * 60 * 1000;
@@ -67,7 +68,13 @@ describe('StripeWebhookService', () => {
       api.client(),
     );
     const prisma = db as unknown as PrismaService;
-    checkout = new StripeCheckoutService(prisma, plans, gateway, logger);
+    checkout = new StripeCheckoutService(
+      prisma,
+      plans,
+      gateway,
+      logger,
+      noCheckoutDiscounts(),
+    );
     webhooks = new StripeWebhookService(
       prisma,
       gateway,
@@ -76,6 +83,7 @@ describe('StripeWebhookService', () => {
       new StripeCancellationService(prisma, gateway, activityLog, logger),
       new StripeRefundService(prisma, gateway, activityLog, logger, credits),
       credits,
+      noCheckoutDiscounts(),
     );
   });
 

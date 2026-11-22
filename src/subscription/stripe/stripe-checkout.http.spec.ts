@@ -62,6 +62,8 @@ describe('POST /v1/subscription/checkout (Stripe checkout HTTP)', () => {
     status: 'OPEN',
     billingInterval: 'MONTHLY',
     amountCents: 1900,
+    discount: null,
+    amountDueCents: 1900,
     currency: 'USD',
     url: 'https://checkout.stripe.com/c/pay/cs_test_1',
     expiresAt: '2026-03-01T10:30:00.000Z',
@@ -129,7 +131,7 @@ describe('POST /v1/subscription/checkout (Stripe checkout HTTP)', () => {
         data: view,
       });
       expect(checkout.createCheckout.mock.calls).toEqual([
-        ['user-1', billingInterval],
+        ['user-1', billingInterval, expect.any(Date), { discountCode: null }],
       ]);
     },
   );

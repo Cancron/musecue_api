@@ -9,6 +9,11 @@ export const DISCOUNT_OFFER_LIMITS = {
   MAX_REDEMPTIONS_PER_USER_MAX: 1_000,
   MAX_TOTAL_REDEMPTIONS_MIN: 1,
   MAX_TOTAL_REDEMPTIONS_MAX: 10_000_000,
+  MIN_SPEND_CENTS_MIN: 0,
+  MIN_SPEND_CENTS_MAX: 999_999,
+  BUDGET_CENTS_MIN: 1,
+  /** $1,000,000. */
+  BUDGET_CENTS_MAX: 100_000_000,
   TARGET_USERS_MAX: 1_000,
   USER_ID_MAX_LENGTH: 64,
   /** Longest code a user may submit (longer input is rejected with 400). */
@@ -32,6 +37,13 @@ export const DISCOUNT_MESSAGES = {
   NOT_STARTED: 'This discount has not started yet',
   EXPIRED: 'This discount has expired',
   NOT_ELIGIBLE: 'This discount is not available for your account',
+  NEW_CUSTOMERS_ONLY: 'This discount is only available to new customers',
+  RETURNING_CUSTOMERS_ONLY:
+    'This discount is only available to returning customers',
+  PRODUCT_NOT_ELIGIBLE: 'This discount does not apply to this purchase',
+  MIN_SPEND_NOT_MET:
+    'This purchase does not reach the minimum spend of this discount',
+  BUDGET_EXHAUSTED: 'This discount has no budget left',
   USER_LIMIT_REACHED:
     'You have already redeemed this discount the maximum number of times',
   DEPLETED: 'This discount has no redemptions left',

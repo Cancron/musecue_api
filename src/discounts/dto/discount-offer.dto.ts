@@ -1,5 +1,9 @@
 import { applyDecorators } from '@nestjs/common';
-import { CreditPackageCode } from '@prisma/client';
+import {
+  CreditPackageCode,
+  DiscountCustomerEligibility,
+  DiscountProduct,
+} from '@prisma/client';
 import {
   ArrayMaxSize,
   ArrayMinSize,
@@ -57,6 +61,28 @@ const TotalField = () =>
     Min(LIMITS.MAX_TOTAL_REDEMPTIONS_MIN),
     Max(LIMITS.MAX_TOTAL_REDEMPTIONS_MAX),
   );
+const MinSpendField = () =>
+  applyDecorators(
+    IsInt(),
+    Min(LIMITS.MIN_SPEND_CENTS_MIN),
+    Max(LIMITS.MIN_SPEND_CENTS_MAX),
+  );
+const BudgetField = () =>
+  applyDecorators(
+    IsInt(),
+    Min(LIMITS.BUDGET_CENTS_MIN),
+    Max(LIMITS.BUDGET_CENTS_MAX),
+  );
+const ProductsField = () =>
+  applyDecorators(
+    IsArray(),
+    ArrayMinSize(1, {
+      message:
+        'eligibleProducts must list at least one product; use null for every product',
+    }),
+    ArrayUnique(),
+    IsEnum(DiscountProduct, { each: true }),
+  );
 const TargetsField = () =>
   applyDecorators(
     IsArray(),
@@ -95,6 +121,26 @@ class DiscountOfferOptionsDto {
   @ValidateIf(isSet)
   @TargetsField()
   targetUserIds?: string[] | null;
+
+  /** New customers (no paid purchase yet), returning ones, or all (default). */
+  @ValidateIf(isPresent)
+  @IsEnum(DiscountCustomerEligibility)
+  customerEligibility?: DiscountCustomerEligibility;
+
+  /** Products it applies to; null = every product (default). */
+  @ValidateIf(isSet)
+  @ProductsField()
+  eligibleProducts?: DiscountProduct[] | null;
+
+  /** Minimum list price of the purchase in cents (0-999999, default 0). */
+  @ValidateIf(isPresent)
+  @MinSpendField()
+  minSpendCents?: number;
+
+  /** USD budget for the discounts in cents (1-100000000; null = unlimited). */
+  @ValidateIf(isSet)
+  @BudgetField()
+  budgetCents?: number | null;
 }
 
 /**

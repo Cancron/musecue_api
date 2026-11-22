@@ -2,6 +2,7 @@
 // storage, set before any application module reads the environment.
 import './support/env-postgres-mode';
 import { userRole } from '@prisma/client';
+import { CreditWalletService } from '../src/credits/credit-wallet.service';
 import { DailyRewardSettingsService } from '../src/daily-rewards/daily-reward-settings.service';
 import { expectConsistentLedger } from './support/credit-fixtures';
 import {
@@ -463,6 +464,102 @@ describeWithDatabase('Daily reward claims (PostgreSQL, full stack)', () => {
       // The API agrees: nothing is left this month.
       freezeTime(noon('2032-05-03'));
       expect(messageOf(await claim(user).expect(409))).toBe(CAP_REACHED);
+    });
+  });
+
+  describe('DAILY_REWARD credits outside claims', () => {
+    const wallet = () => ctx.get<CreditWalletService>(CreditWalletService);
+    const grantDaily = (authId: string, day: string, amount: string) =>
+      wallet().grant({
+        authId,
+        source: 'DAILY_REWARD',
+        sourceReference: `daily-reward:${day}`,
+        amount,
+      });
+
+    it('the wallet refuses DAILY_REWARD credits without a matching claim', async () => {
+      const user = await createAccount(ctx);
+      expect(await claimOn(user, '2032-08-01')).toBe(10);
+
+      // No claim for that day.
+      await expect(grantDaily(user.id, '2032-08-02', '50')).rejects.toThrow(
+        'recorded daily reward claim',
+      );
+      // A claimed day, but another amount than the claim granted.
+      await expect(grantDaily(user.id, '2032-08-01', '600')).rejects.toThrow(
+        'already granted with a different amount',
+      );
+      // A reference that names no day.
+      await expect(
+        wallet().grant({
+          authId: user.id,
+          source: 'DAILY_REWARD',
+          sourceReference: 'bonus-600',
+          amount: '600',
+        }),
+      ).rejects.toThrow('recorded daily reward claim');
+      // Repeating the claim's own grant adds nothing.
+      await expect(
+        grantDaily(user.id, '2032-08-01', '10'),
+      ).resolves.toMatchObject({
+        replayed: true,
+      });
+
+      await expect(walletGrantsByMonth(user.id)).resolves.toEqual({
+        '2032-08': 10,
+      });
+      await expectConsistentLedger(ctx.client, user.id);
+    });
+
+    it('keeps the monthly total at 600 even when credits are added outside claims', async () => {
+      await setSettings({
+        startingRewardCredits: 300,
+        dailyIncrementCredits: 0,
+        maxDailyRewardCredits: 300,
+      });
+      const user = await createAccount(ctx);
+      expect(await claimOn(user, '2032-09-01')).toBe(300);
+      expect(await claimOn(user, '2032-09-02')).toBe(300);
+
+      await expect(grantDaily(user.id, '2032-09-03', '300')).rejects.toThrow(
+        'recorded daily reward claim',
+      );
+      expect(await claimOn(user, '2032-09-03')).toBe(0);
+      await expect(walletGrantsByMonth(user.id)).resolves.toEqual({
+        '2032-09': 600,
+      });
+    });
+
+    it('has PostgreSQL refuse DAILY_REWARD allocations without a matching claim from any write path', async () => {
+      const user = await createAccount(ctx);
+      expect(await claimOn(user, '2032-10-01')).toBe(10);
+      const wallet = await ctx.client.creditWallet.findUniqueOrThrow({
+        where: { authId: user.id },
+      });
+      const insert = (reference: string, amount: number) =>
+        ctx.client.creditAllocation.create({
+          data: {
+            walletId: wallet.id,
+            authId: user.id,
+            source: 'DAILY_REWARD',
+            sourceReference: reference,
+            amount,
+            remaining: amount,
+            grantedAt: new Date(),
+          },
+        });
+
+      await expect(insert('daily-reward:2032-10-02', 600)).rejects.toThrow(
+        'require a recorded daily reward claim',
+      );
+      await expect(insert('manual-bonus', 600)).rejects.toThrow(
+        'must reference a claimed day',
+      );
+      await expect(
+        ctx.client.creditAllocation.count({
+          where: { authId: user.id, source: 'DAILY_REWARD' },
+        }),
+      ).resolves.toBe(1);
     });
   });
 

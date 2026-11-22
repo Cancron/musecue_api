@@ -20,6 +20,7 @@ import { StripeWebhookService } from './stripe/stripe-webhook.service';
 import { StripeGateway } from './stripe/stripe.gateway';
 import { SubscriptionBillingService } from './subscription-billing.service';
 import { SubscriptionPlanService } from './subscription-plan.service';
+import { noCheckoutDiscounts } from '../../test/support/no-checkout-discounts';
 
 const { MONTHLY, YEARLY } = BillingInterval;
 const DAY = 24 * 60 * 60 * 1000;
@@ -73,7 +74,13 @@ describe('SubscriptionBillingService', () => {
       },
       api.client(),
     );
-    checkout = new StripeCheckoutService(prisma, plans, gateway, logger);
+    checkout = new StripeCheckoutService(
+      prisma,
+      plans,
+      gateway,
+      logger,
+      noCheckoutDiscounts(),
+    );
     cancellation = new StripeCancellationService(
       prisma,
       gateway,
@@ -88,6 +95,7 @@ describe('SubscriptionBillingService', () => {
       cancellation,
       new StripeRefundService(prisma, gateway, activityLog, logger, credits),
       credits,
+      noCheckoutDiscounts(),
     );
     billing = new SubscriptionBillingService(prisma);
   });

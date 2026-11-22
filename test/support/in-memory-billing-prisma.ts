@@ -221,6 +221,13 @@ export function createInMemoryBillingPrisma() {
         closedAt: null,
         closedReason: null,
         paymentId: null,
+        // Column defaults of the checkout discount (migration
+        // 20261204120000_add_checkout_discounts).
+        discountSource: null,
+        discountOfferId: null,
+        discountPercent: 0,
+        discountCents: 0,
+        requestedDiscountCode: null,
         createdAt: now(),
         updatedAt: now(),
         ...data,

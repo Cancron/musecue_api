@@ -24,8 +24,21 @@ export interface CheckoutSessionRequest {
   authId: string;
   customerId: string;
   billingInterval: BillingInterval;
+  /** The plan price: the subscription's price for every period. */
   amountCents: number;
   expiresAt: Date;
+  /**
+   * A discount off the first payment only (the subscription price stays
+   * `amountCents`): a one-time Stripe coupon created for this checkout.
+   */
+  discount?: CheckoutDiscountRequest | null;
+}
+
+export interface CheckoutDiscountRequest {
+  /** Cents off the first invoice. */
+  amountOffCents: number;
+  /** Shown to the customer on the Stripe checkout page and invoice. */
+  name: string;
 }
 
 /** Why a collection attempt failed, as reported by Stripe. */
@@ -48,6 +61,7 @@ export interface ProviderCheckoutSession {
 export const stripeIdempotencyKeys = {
   customer: (authId: string) => `musecue-customer-${authId}`,
   checkout: (checkoutId: string) => `musecue-checkout-${checkoutId}`,
+  coupon: (checkoutId: string) => `musecue-coupon-${checkoutId}`,
   /** One cancellation per subscription and paid term. */
   cancel: (subscriptionId: string, termEndsAt: Date) =>
     `musecue-cancel-${subscriptionId}-${termEndsAt.getTime()}`,
@@ -123,11 +137,40 @@ export class StripeGateway {
   async createCheckoutSession(
     request: CheckoutSessionRequest,
   ): Promise<ProviderCheckoutSession> {
+    const couponId = request.discount
+      ? await this.createCheckoutCoupon(request.checkoutId, request.discount)
+      : null;
     const session = await this.requireClient().checkout.sessions.create(
-      this.checkoutParams(request),
+      this.checkoutParams(request, couponId),
       { idempotencyKey: stripeIdempotencyKeys.checkout(request.checkoutId) },
     );
     return toProviderSession(session);
+  }
+
+  /**
+   * A coupon for one checkout: a fixed amount off the first invoice only
+   * (`duration: once`), usable once, with an id derived from the checkout.
+   * The idempotency key makes retries return the same coupon, so the Stripe
+   * charge is exactly the backend's discounted amount while the price of
+   * the subscription (and of every renewal) stays the plan price.
+   */
+  private async createCheckoutCoupon(
+    checkoutId: string,
+    discount: CheckoutDiscountRequest,
+  ): Promise<string> {
+    const coupon = await this.requireClient().coupons.create(
+      {
+        id: `musecue-${checkoutId}`,
+        amount_off: discount.amountOffCents,
+        currency: 'usd',
+        duration: 'once',
+        max_redemptions: 1,
+        name: discount.name.slice(0, 40),
+        metadata: { [CHECKOUT_METADATA.CHECKOUT_ID]: checkoutId },
+      },
+      { idempotencyKey: stripeIdempotencyKeys.coupon(checkoutId) },
+    );
+    return coupon.id;
   }
 
   async retrieveCheckoutSession(
@@ -324,6 +367,7 @@ export class StripeGateway {
 
   private checkoutParams(
     request: CheckoutSessionRequest,
+    couponId: string | null,
   ): Stripe.Checkout.SessionCreateParams {
     const metadata = {
       [CHECKOUT_METADATA.CHECKOUT_ID]: request.checkoutId,
@@ -350,8 +394,12 @@ export class StripeGateway {
           },
         },
       ],
-      // The charged amount must equal the backend price in USD.
-      allow_promotion_codes: false,
+      // The charged amount must equal the backend price in USD, less the
+      // backend's discount (Stripe accepts either a discount or the
+      // promotion-code switch, not both; customers never enter codes there).
+      ...(couponId
+        ? { discounts: [{ coupon: couponId }] }
+        : { allow_promotion_codes: false }),
       adaptive_pricing: { enabled: false },
       success_url: this.settings.successUrl ?? undefined,
       cancel_url: this.settings.cancelUrl ?? undefined,

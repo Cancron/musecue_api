@@ -86,7 +86,12 @@ export class SubscriptionController {
     @Req() req: AuthenticatedRequest,
     @Body() dto: CreateCheckoutSessionDto,
   ) {
-    return this.checkout.createCheckout(req.user.userId, dto.billingInterval);
+    return this.checkout.createCheckout(
+      req.user.userId,
+      dto.billingInterval,
+      new Date(),
+      { discountCode: dto.discountCode ?? null },
+    );
   }
 
   /**

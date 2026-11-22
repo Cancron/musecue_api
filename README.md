@@ -21,6 +21,8 @@ The companion mobile application and detailed product specifications live in `..
 - discount, referral, daily reward and credit package configuration: administrators can read and change the first-purchase discount, the referral discount and the referrer's reward credits (all `0` = off by default), the daily reward amounts (10 credits, +10 per day, at most 50; at most 600 daily reward credits per user per UTC calendar month) and the three credit packages (250 credits for $5, 500 for $10, 1,000 for $20: credits, price in cents, availability); stored in PostgreSQL by migration and at startup, never overwriting administrator changes (see "Discount, referral, daily reward and credit package settings" under API). Discounts are priced but not charged, and packages are not sold yet
 - daily reward claims: a signed-in user claims once per UTC day (`POST /v1/daily-rewards/claim`); the reward follows the streak of consecutive days and is granted as never-expiring `DAILY_REWARD` credits. A user never receives more than 600 daily reward credits per UTC calendar month: the claim that reaches the cap grants only the rest and later claims that month are refused, enforced by the service and by PostgreSQL (see "Daily reward claims")
 - discount codes and promotional campaigns: administrators create, view, change and deactivate codes and campaigns (discount percentage, active flag, start and end, optional user targeting, per-user and total redemption limits; 0% switches an offer off). Users redeem them for a credit package at the discounted price; invalid, inactive, not yet started, expired, depleted and ineligible offers are refused, and concurrent or repeated requests never exceed a limit or count twice (see "Discount codes and campaigns")
+- discounts in the Stripe checkout: each Pro checkout gets the best available discount (the highest percentage of the first-purchase discount, the referral discount, an entered discount code and running campaigns), charged through a one-time Stripe coupon so the first payment reflects it while the plan price and renewals stay unchanged. The first-purchase and referral discounts stay available until the first successful paid purchase (trials and failed, canceled or abandoned checkouts do not use them up); every discount is used at most once despite repeated, out-of-order or concurrent payments, subscriptions or checkouts. Campaigns support minimum spend, new/returning customer and product targeting and a USD budget that is reserved with each checkout, spent by its payment and given back only when the checkout can no longer be paid (see "Discounts in the Stripe checkout")
+- referrals: every user has a referral code; a user applies someone else's code once, before their first purchase, to get the referral discount (see "Discounts in the Stripe checkout")
 - AI credit wallet and ledger: per-user wallets, allocations by source (trial, subscription, purchase, referral) with expiry, exact fractional balances, an append-only transaction ledger with grants, debits and expirations (recorded for every wallet by a scheduled sweep), and per-session overage, all in PostgreSQL and safe under concurrency (see "AI credit wallet and ledger")
 - AI usage metering and credit deductions: every OpenRouter request of a makeup AI run is stored with its user, session, run, tokens and USD cost. Each run is charged once, in exact (fractional) credits converted from its actual cost at the administrator's rate ($0.025 at $0.005 per credit = 5 credits), and the cost and rate are kept in the ledger history (see "AI usage and credit deductions")
 - credit balance and transaction history APIs: a signed-in user sees their own balance by source (granted, available, used, expired, expiry dates), their ledger (allocations, deductions with session overage, expirations, with sources, sessions and AI usage), and the AI usage of their sessions; nobody else's (see "Credit balance and transaction history")
@@ -39,7 +41,7 @@ Intentionally deferred:
 - additional S3-compatible storage providers (the provider interface is in place; see "Private image storage")
 - generated preview images (recommendation reasoning is live, while the existing curated preview-image contract remains in place)
 - production retention/deletion automation and further credit features: issuing purchased and referral credits through the API (see "Credit-based access to makeup sessions")
-- using the discount settings, codes and packages: buying credit packages through Stripe (charging a redemption's discounted price), applying the first-purchase and referral discounts, and referral sign-ups and rewards
+- buying credit packages through Stripe (a package redemption is priced but not charged), granting the referrer's reward credits after the referred user's first purchase, and a scheduled release of reservations held by checkouts whose Stripe session never reported back (they are released when the user checks out again or when Stripe's expiry webhook arrives)
 
 ## Requirements and setup
 
@@ -720,7 +722,7 @@ The guard delegates to `SubscriptionAccessService`, the single Pro access decisi
 | `GET`  | `/v1/subscription/payments` | bearer token              | The caller's payment history (paged)               |
 | `POST` | `/v1/webhooks/stripe`       | `Stripe-Signature` header | Stripe events; the only way paid Pro is granted    |
 
-`POST /v1/subscription/checkout` accepts exactly `{ "billingInterval": "MONTHLY" }` or `{ "billingInterval": "YEARLY" }`. Any other value, `null`, lowercase values and extra fields (a price, currency, user ID or "paid" flag) are rejected with `400`. The user comes from the access token, and the price from the plan configuration (`monthlyPriceUsdCents` / `yearlyPriceUsdCents`) at the moment the checkout is created. The response (`201`) is:
+`POST /v1/subscription/checkout` accepts exactly `{ "billingInterval": "MONTHLY" }` or `{ "billingInterval": "YEARLY" }`, optionally with a `"discountCode"` (see "Discounts in the Stripe checkout"). Any other value, `null`, lowercase values and extra fields (a price, currency, user ID or "paid" flag) are rejected with `400`. The user comes from the access token, and the price from the plan configuration (`monthlyPriceUsdCents` / `yearlyPriceUsdCents`) at the moment the checkout is created. The response (`201`) is:
 
 ```json
 {
@@ -729,6 +731,8 @@ The guard delegates to `SubscriptionAccessService`, the single Pro access decisi
   "status": "OPEN",
   "billingInterval": "MONTHLY",
   "amountCents": 1900,
+  "discount": { "source": "FIRST_PURCHASE", "percent": 20, "amountOffCents": 380 },
+  "amountDueCents": 1520,
   "currency": "USD",
   "url": "https://checkout.stripe.com/c/pay/cs_…",
   "expiresAt": "2026-11-13T13:00:00.000Z",
@@ -1088,6 +1092,7 @@ A signed-in user (any role) claims a daily reward once per UTC calendar day:
 - **Credits.** The reward is a `DAILY_REWARD` allocation in the user's wallet (reference `daily-reward:<YYYY-MM-DD>`), granted in the same transaction as the claim. Daily reward credits never expire and are usable with or without Pro, like purchased credits, and appear in `GET /v1/credits/balance` and the transaction history.
 - **Monthly cap: 600 credits per user and UTC calendar month.** The claim that reaches the cap grants only the rest (e.g. a reward of 70 with 580 already granted grants 20, recorded as `rewardCredits: 70, grantedCredits: 20`), and later claims that month are refused with `409` `The monthly limit of 600 daily reward credits has been reached`. The next UTC month starts again at 0.
 - **Rejections** write nothing: a second claim the same UTC day answers `409` `Today's daily reward has already been claimed`; no token answers `401`.
+- **Credits only through claims.** `CreditWalletService.grant` accepts `DAILY_REWARD` credits only for a recorded claim: the reference must name the claimed day and the amount must equal the claim's `grantedCredits`. A trigger on `CreditAllocation` enforces the same (migration `20261203120000_daily_reward_allocation_guard`), so credits added outside claims, even by manual SQL, cannot take a user past 600 in a month.
 - **Guarantees** (migrations `20261201120000_add_daily_reward_credit_source`, `20261201130000_add_daily_reward_claims`). A claim runs in one transaction that first locks the user's `DailyRewardMonthlyTotal` row for the month, so concurrent claims of one user apply one at a time (exactly one succeeds per day). Independently of the application, PostgreSQL enforces the cap: every inserted `DailyRewardClaim` recomputes the month's total from the month's claims under the same lock, and a CHECK constraint refuses a total above 600, so no write path (including manual SQL, or deleting the total row) can exceed it. `(authId, claimDate)` is unique and claims cannot be changed. Deleting the account deletes its claims and totals.
 
 ### Discount codes and campaigns
@@ -1115,8 +1120,12 @@ Administration routes (bearer token of an `ADMIN` or `SUPERADMIN`; `401` without
 | `targetUserIds`         | string[] \| null  | `null` (everyone)   | 1–1000 existing user IDs: only they may redeem it; `null` opens it to everyone again |
 | `maxRedemptionsPerUser` | integer           | `1`                 | `1`–`1000`                                                           |
 | `maxTotalRedemptions`   | integer \| null   | `null` (unlimited)  | `1`–`10000000`, never below the redemptions already made (`409`)     |
+| `minSpendCents`         | integer           | `0`                 | `0`–`999999`: the purchase's list price must be at least this        |
+| `customerEligibility`   | enum              | `ALL_CUSTOMERS`     | `NEW_CUSTOMERS` (no successful paid purchase yet), `RETURNING_CUSTOMERS` (at least one), `ALL_CUSTOMERS` |
+| `eligibleProducts`      | enum[] \| null    | `null` (every product) | 1–5 of `PRO_MONTHLY`, `PRO_YEARLY`, `CREDITS_SMALL`, `CREDITS_MEDIUM`, `CREDITS_LARGE` |
+| `budgetCents`           | integer \| null   | `null` (unlimited)  | `1`–`100000000` US cents for the discounts granted; never below what is already spent or reserved (`409`) |
 
-Responses also contain `id`, `kind`, `audience` (`ALL_USERS` or `SELECTED_USERS`), `redemptionCount`, `remainingRedemptions` (`null` = unlimited), `createdAt`, `updatedAt` and a derived `status`: `INACTIVE` (deactivated or 0%), `EXPIRED`, `DEPLETED`, `SCHEDULED` or `ACTIVE`. Invalid bodies (out-of-range or fractional numbers, `null` where not allowed, strings for numbers or booleans, date-times without a time zone, impossible dates, unknown fields such as `redemptionCount`, unknown users) are rejected with `400` and change nothing. Offers are never deleted, so their redemptions stay attached. Every creation and change is recorded in `ActivityLogEvent` (table `DiscountOffer`) in the same transaction; changes of the targeted users are recorded as counts, never as user IDs.
+Responses also contain `id`, `kind`, `audience` (`ALL_USERS` or `SELECTED_USERS`), `redemptionCount` (reserved + redeemed), `reservedRedemptions`, `redeemedRedemptions`, `remainingRedemptions` (`null` = unlimited), the budget usage `budgetSpentCents` (redeemed), `budgetReservedCents` (held by unpaid checkouts) and `budgetRemainingCents` (`null` = unlimited), `createdAt`, `updatedAt` and a derived `status`: `INACTIVE` (deactivated or 0%), `EXPIRED`, `DEPLETED` (redemption limit reached or no budget left), `SCHEDULED` or `ACTIVE`. Invalid bodies (out-of-range or fractional numbers, `null` where not allowed, strings for numbers or booleans, date-times without a time zone, impossible dates, unknown fields such as `redemptionCount`, unknown users) are rejected with `400` and change nothing. Offers are never deleted, so their redemptions stay attached. Every creation and change is recorded in `ActivityLogEvent` (table `DiscountOffer`) in the same transaction; changes of the targeted users are recorded as counts, never as user IDs.
 
 User routes (any signed-in user):
 
@@ -1126,7 +1135,7 @@ User routes (any signed-in user):
 | `GET`  | `/v1/discount-campaigns`               | The campaigns the caller can redeem now, ending soonest first, with `remainingRedemptionsForYou` |
 | `POST` | `/v1/discount-campaigns/:id/redeem`    | Body `{ "packageCode" }`; redeem a campaign (`201`)            |
 
-A redemption is for one credit package (`SMALL`, `MEDIUM`, `LARGE`; see the package settings above) and stores its terms at that moment: `credits`, `discountPercent`, `originalPriceUsdCents`, `discountUsdCents` (rounded down to a whole cent) and `finalPriceUsdCents` (e.g. 20% off `SMALL`: 500 → 400, `"finalPriceUsd": "4.00"`). Later changes to the offer or package never alter it. Charging the discounted price (package checkout) is not implemented yet.
+These routes redeem an offer for one credit package (the Pro checkout applies offers itself, see "Discounts in the Stripe checkout"). The same rules apply (product, minimum spend, customer group and budget included), and the redemption is `REDEEMED` at once. It stores its terms at that moment: `credits`, `discountPercent`, `originalPriceUsdCents`, `discountUsdCents` (rounded down to a whole cent) and `finalPriceUsdCents` (e.g. 20% off `SMALL`: 500 → 400, `"finalPriceUsd": "4.00"`). Later changes to the offer or package never alter it. Charging the discounted price (package checkout) is not implemented yet.
 
 Redemptions require an `Idempotency-Key` header (1–200 characters; otherwise `400`). Repeating a request with the same key returns the original redemption with `"replayed": true` and counts nothing, even when the repeats arrive at the same time or after the offer ended; reusing a key for a different offer or package answers `409`. Rejections write nothing:
 
@@ -1137,11 +1146,53 @@ Redemptions require an `Idempotency-Key` header (1–200 characters; otherwise `
 | `409`  | `This discount has not started yet`                                  | Before `startsAt`                           |
 | `409`  | `This discount has expired`                                          | From `endsAt`                               |
 | `403`  | `This discount is not available for your account`                    | Targeted at other users (ineligible)        |
+| `403`  | `This discount is only available to new customers` / `… returning customers` | `customerEligibility` excludes the caller |
+| `409`  | `This discount does not apply to this purchase`                      | The product is not in `eligibleProducts`    |
+| `409`  | `This purchase does not reach the minimum spend of this discount`    | The list price is below `minSpendCents`     |
+| `409`  | `This discount has no budget left`                                   | The discount exceeds the budget left        |
 | `409`  | `You have already redeemed this discount the maximum number of times`| The caller reached `maxRedemptionsPerUser`  |
 | `409`  | `This discount has no redemptions left`                              | `maxTotalRedemptions` reached (depleted)    |
 | `409`  | `This credit package is not available`                               | The package's `available` is `false`        |
 
 **Concurrency.** A redemption runs in one transaction that locks the offer row before checking anything, so the redemptions of one offer (and administrator changes to it) are applied one at a time: any number of concurrent requests yields at most `maxTotalRedemptions` redemptions, at most `maxRedemptionsPerUser` per user, and one redemption per idempotency key. PostgreSQL enforces the same independently: a trigger on `DiscountRedemption` locks the offer, repeats every check (active, above 0%, within the period, targeted user, both limits) and increments `redemptionCount`; CHECK constraints keep `redemptionCount <= maxTotalRedemptions`; the count never decreases (it keeps counting redemptions of deleted accounts, so a depleted offer stays depleted); redemptions cannot be changed, and `(authId, idempotencyKey)` is unique.
+
+### Discounts in the Stripe checkout
+
+`POST /v1/subscription/checkout` applies the **best available discount** to the first payment of the Pro subscription. The candidates are:
+
+| Source           | Available when                                                                                       |
+| ---------------- | ---------------------------------------------------------------------------------------------------- |
+| `FIRST_PURCHASE` | `firstPurchaseDiscountPercent` > 0 and the user never made a successful paid purchase                 |
+| `REFERRAL`       | `referralDiscountPercent` > 0, the user applied a referral code, and never made a successful paid purchase |
+| `CODE`           | The user sent `"discountCode"` and the code can be used (otherwise the checkout is refused with the code's reason, see the table above, and nothing is created at Stripe or in PostgreSQL) |
+| `CAMPAIGN`       | Every running campaign the user and the purchase qualify for (targeting, customer group, product, minimum spend, limits, budget); campaigns that do not apply are skipped |
+
+The highest percentage wins. Ties go to the first-purchase, then the referral discount (they are gone after the first purchase anyway), then the entered code, then the campaign ending soonest. Only the chosen discount is used; an entered code that was not chosen is not used up. The response shows it (`discount`: `source`, `percent`, `amountOffCents`, and `code`/`offerId` for offers) with `amountDueCents`, the first charge.
+
+**Stripe charge.** The subscription's line item keeps the plan price (`amountCents`, unchanged in the plan configuration). The discount is a Stripe coupon created for the checkout: a fixed `amount_off` in cents, `duration: once`, `max_redemptions: 1`, and an id and idempotency key derived from the checkout, so retries reuse it. Stripe charges `amountCents - amountOffCents` for the first period and the full plan price for renewals. Payment verification requires exactly that amount (session total and first invoice), and a charge that does not reflect the discount grants nothing. The discount is rounded down to a whole cent and never takes the charge below Stripe's $0.50 minimum (a 100% discount on $19.00 charges $0.50).
+
+**First purchase.** A purchase counts once a payment is `SUCCEEDED` (also if it is refunded later). Starting a free trial, failed payment attempts, and canceled, abandoned or expired checkouts do not count, so the first-purchase and referral discounts stay available for the next checkout.
+
+**Reservation lifecycle** (`DiscountRedemption`, migration `20261204120000_add_checkout_discounts`):
+
+1. `RESERVED` in the same transaction that creates the checkout, under the user's lock and a lock of every offer considered (taken in id order). It counts towards the offer's limits and its `budgetReservedCents` at once, so concurrent checkouts can never exceed the redemption limit or the budget: a campaign without enough budget left is skipped, an entered code is refused.
+2. `REDEEMED` in the transaction that records the checkout's verified payment, whichever webhook records it first (`checkout.session.completed`, `async_payment_succeeded` or `invoice.paid`). The reserved budget becomes `budgetSpentCents`. Replayed, duplicated, out-of-order or concurrent deliveries record the payment once, so the discount is redeemed once.
+3. `RELEASED` only when the checkout can no longer be paid, as Stripe reports it (the session and its subscription are read from Stripe): the session expired (`checkout.session.expired`, or the API confirmed the expiry when the user switched billing option or code) and no subscription created by a failed attempt can still be paid, or that subscription ended with its first invoice void (`customer.subscription.deleted`/`updated` with `incomplete_expired`). A failed delayed payment (`async_payment_failed`) keeps the reservation, because the first invoice may still be paid. Definitively rejected checkouts (no Stripe session) release at once. The limits and budget are given back.
+
+A repeated request with the same billing option and code reuses the pending checkout with its discount. Another option or code replaces it (after Stripe confirms the old session expired), releasing the old reservation before the new one is made. An administrator's later changes to an offer never alter a reservation.
+
+**Late payments.** A payment recorded while its reservation is still `RESERVED` (for example a delayed payment that failed and was then paid) is redeemed normally. A payment of a reservation already `RELEASED` (for example an invoice paid outside the normal flow) is redeemed only if the offer's limits and budget still allow it. Otherwise it stays `RELEASED` with its `paymentId`, is logged for review, and is never counted, so the budget is never exceeded and nothing is redeemed twice. The customer keeps the purchase they paid for.
+
+**Guarantees in PostgreSQL.** A partial unique index allows one `RESERVED` or `REDEEMED` first-purchase and one referral discount per user, and a trigger refuses them after a paid purchase. The redemption trigger locks the offer and re-checks eligibility when a discount is reserved (active, running, targeting, customer group, product, minimum spend), then checks the per-user and total limits and the budget (`spent + reserved <= budgetCents`). Status may only move `RESERVED -> REDEEMED | RELEASED` or `RELEASED -> REDEEMED` (re-checking capacity), and the trigger keeps the offer's counters in step. The counters cannot be changed any other way, and a checkout's discount and a redemption's terms never change. Deleting an account gives its reservations back and keeps its redeemed discounts counted.
+
+**Referrals** (any signed-in user):
+
+| Method | Route                   | Purpose                                                                   |
+| ------ | ----------------------- | ------------------------------------------------------------------------- |
+| `GET`  | `/v1/referrals`         | The caller's own `code` (created on first use), `referred`, and the `referralDiscountPercent` they would get |
+| `POST` | `/v1/referrals/apply`   | Body `{ "code" }` (case-insensitive): sign up under another user's code  |
+
+A code can be applied once per user (`409` afterwards), never the caller's own (`400`), only before the caller's first successful paid purchase (`409`); unknown codes answer `404`. If the referrer's account is deleted, the referred user keeps the referral.
 
 ### AI credit wallet and ledger
 
@@ -1435,7 +1486,8 @@ authUser
 |-- PaymentCustomer (0..1 per provider)
 |-- UserSubscription (0..1)
 |-- DailyRewardClaim, DailyRewardMonthlyTotal (per UTC day / month)
-|-- DiscountOfferTarget, DiscountRedemption
+|-- DiscountOfferTarget, DiscountRedemption (-> CheckoutSession, PaymentTransaction)
+|-- ReferralCode (0..1), Referral (0..1; referrerAuthId SET NULL when the referrer is deleted)
 |-- CreditWallet (0..1)
 |   |-- CreditAllocation -> CreditLedgerEntry
 |   |-- CreditTransaction -> CreditLedgerEntry
@@ -1474,7 +1526,7 @@ npx jest private-cloud   # private image storage unit tests
 npm test -- --runInBand credit   # AI credit unit/HTTP tests
 TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json --runInBand test/credit-settings test/credit-wallet test/credit-access test/credit-trial test/credit-subscription test/credit-scheduler test/credit-usage test/credit-overage test/credit-apis   # AI credits on PostgreSQL
 npx jest discount   # discount settings, codes and campaigns unit/HTTP tests (likewise: daily, credit-package)
-TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json discount   # discount settings, codes and campaigns on PostgreSQL (discount-codes, discount-campaigns run one suite each; likewise: daily, credit-package)
+TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json discount   # every discount suite on PostgreSQL; one suite: discount-first-purchase, discount-payments, discount-campaign-budget, discount-codes, discount-campaigns (likewise: daily, credit-package)
 TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json test/private-cloud   # storage workflows + cleanup ledger on PostgreSQL (mocked Supabase)
 npm run test:e2e
 npx prisma generate

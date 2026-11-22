@@ -15,6 +15,7 @@ import { DISCOUNT_MESSAGES } from './discount-offer.constants';
 import {
   discountOfferStatus,
   normalizeDiscountCode,
+  remainingBudget,
   remainingRedemptions,
 } from './discount-offer.policy';
 import type {
@@ -35,6 +36,10 @@ const CHANGE_FIELDS: readonly (keyof DiscountOfferInput)[] = [
   'maxRedemptionsPerUser',
   'maxTotalRedemptions',
   'targetUserIds',
+  'customerEligibility',
+  'eligibleProducts',
+  'minSpendCents',
+  'budgetCents',
 ];
 
 /** Audited fields, as strings (null when unset). */
@@ -95,6 +100,10 @@ export class DiscountOfferAdminService {
               : DiscountAudience.ALL_USERS,
             maxRedemptionsPerUser: input.maxRedemptionsPerUser ?? 1,
             maxTotalRedemptions: input.maxTotalRedemptions ?? null,
+            customerEligibility: input.customerEligibility,
+            eligibleProducts: input.eligibleProducts ?? [],
+            minSpendCents: input.minSpendCents ?? 0,
+            budgetCents: input.budgetCents ?? null,
             targets: targets
               ? { create: targets.map((authId) => ({ authId })) }
               : undefined,
@@ -177,6 +186,16 @@ export class DiscountOfferAdminService {
         );
       }
 
+      const committed = before.budgetSpentCents + before.budgetReservedCents;
+      if (
+        typeof input.budgetCents === 'number' &&
+        input.budgetCents < committed
+      ) {
+        throw AppError.conflict(
+          `budgetCents cannot be lower than the ${committed} cents already spent or reserved`,
+        );
+      }
+
       const data: Prisma.DiscountOfferUpdateInput = {
         name: input.name?.trim(),
         discountPercent: input.discountPercent,
@@ -185,6 +204,13 @@ export class DiscountOfferAdminService {
         endsAt: input.endsAt !== undefined ? endsAt : undefined,
         maxRedemptionsPerUser: input.maxRedemptionsPerUser,
         maxTotalRedemptions: input.maxTotalRedemptions,
+        customerEligibility: input.customerEligibility,
+        eligibleProducts:
+          input.eligibleProducts === undefined
+            ? undefined
+            : (input.eligibleProducts ?? []),
+        minSpendCents: input.minSpendCents,
+        budgetCents: input.budgetCents,
       };
       if (input.targetUserIds !== undefined) {
         const targets = input.targetUserIds;
@@ -310,6 +336,14 @@ export class DiscountOfferAdminService {
         offer.maxTotalRedemptions === null
           ? null
           : String(offer.maxTotalRedemptions),
+      customerEligibility: offer.customerEligibility,
+      eligibleProducts:
+        offer.eligibleProducts.length > 0
+          ? [...offer.eligibleProducts].sort().join(',')
+          : null,
+      minSpendCents: String(offer.minSpendCents),
+      budgetCents:
+        offer.budgetCents === null ? null : String(offer.budgetCents),
     };
   }
 
@@ -369,7 +403,16 @@ export class DiscountOfferAdminService {
       maxRedemptionsPerUser: offer.maxRedemptionsPerUser,
       maxTotalRedemptions: offer.maxTotalRedemptions,
       redemptionCount: offer.redemptionCount,
+      reservedRedemptions: offer.reservedCount,
+      redeemedRedemptions: offer.redemptionCount - offer.reservedCount,
       remainingRedemptions: remainingRedemptions(offer),
+      customerEligibility: offer.customerEligibility,
+      eligibleProducts: [...offer.eligibleProducts].sort(),
+      minSpendCents: offer.minSpendCents,
+      budgetCents: offer.budgetCents,
+      budgetSpentCents: offer.budgetSpentCents,
+      budgetReservedCents: offer.budgetReservedCents,
+      budgetRemainingCents: remainingBudget(offer),
       createdAt: offer.createdAt.toISOString(),
       updatedAt: offer.updatedAt.toISOString(),
     };

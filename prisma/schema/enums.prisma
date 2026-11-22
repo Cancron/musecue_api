@@ -385,3 +385,38 @@ enum DiscountAudience {
   ALL_USERS
   SELECTED_USERS
 }
+
+// Where the discount of a redemption came from: the first-purchase or
+// referral discount of DiscountSettings (no DiscountOffer), or an offer.
+enum DiscountSource {
+  FIRST_PURCHASE
+  REFERRAL
+  CODE
+  CAMPAIGN
+}
+
+// RESERVED: held by an unpaid checkout (counts towards the limits and the
+// budget); REDEEMED: paid for (or redeemed for a credit package); RELEASED:
+// the checkout can no longer be paid, nothing is counted.
+enum DiscountRedemptionStatus {
+  RESERVED
+  REDEEMED
+  RELEASED
+}
+
+// What a discount applies to: a Pro billing option or a credit package.
+enum DiscountProduct {
+  PRO_MONTHLY
+  PRO_YEARLY
+  CREDITS_SMALL
+  CREDITS_MEDIUM
+  CREDITS_LARGE
+}
+
+// Which customers may redeem an offer: everyone, users who never made a
+// successful paid purchase, or users who did.
+enum DiscountCustomerEligibility {
+  ALL_CUSTOMERS
+  NEW_CUSTOMERS
+  RETURNING_CUSTOMERS
+}

@@ -1,7 +1,9 @@
 import type {
   CreditPackageCode,
   DiscountAudience,
+  DiscountCustomerEligibility,
   DiscountOfferKind,
+  DiscountProduct,
 } from '@prisma/client';
 import type { ActivityLogMetadata } from '../../common/services/activity-log.service';
 import type { DiscountOfferStatus } from '../discount-offer.policy';
@@ -19,6 +21,12 @@ export interface DiscountOfferInput {
   maxTotalRedemptions?: number | null;
   /** null = every user; a list = only these users. */
   targetUserIds?: string[] | null;
+  customerEligibility?: DiscountCustomerEligibility;
+  /** null = every product. */
+  eligibleProducts?: DiscountProduct[] | null;
+  minSpendCents?: number;
+  /** null = unlimited. */
+  budgetCents?: number | null;
 }
 
 export interface CreateDiscountOfferInput extends DiscountOfferInput {
@@ -48,9 +56,21 @@ export interface DiscountOfferView {
   maxRedemptionsPerUser: number;
   /** null = unlimited. */
   maxTotalRedemptions: number | null;
+  /** RESERVED (held by unpaid checkouts) + REDEEMED redemptions. */
   redemptionCount: number;
+  reservedRedemptions: number;
+  redeemedRedemptions: number;
   /** null = unlimited. */
   remainingRedemptions: number | null;
+  customerEligibility: DiscountCustomerEligibility;
+  /** Empty = every product. */
+  eligibleProducts: DiscountProduct[];
+  minSpendCents: number;
+  /** Budget usage in cents; budgetCents and budgetRemainingCents null = unlimited. */
+  budgetCents: number | null;
+  budgetSpentCents: number;
+  budgetReservedCents: number;
+  budgetRemainingCents: number | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -64,6 +84,10 @@ export interface AvailableCampaignView {
   endsAt: string;
   /** How many more times the user may redeem it. */
   remainingRedemptionsForYou: number;
+  /** Products it applies to (empty = every product). */
+  eligibleProducts: DiscountProduct[];
+  /** Minimum list price of the purchase in cents. */
+  minSpendCents: number;
 }
 
 /** One redemption, with the price terms fixed when it was made. */

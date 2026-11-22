@@ -55,6 +55,7 @@ describe('verifyStripeCheckout', () => {
       providerCustomerId: customerId,
       billingInterval: interval,
       amountCents,
+      discountCents: 0,
       currency: 'USD',
     };
     return {

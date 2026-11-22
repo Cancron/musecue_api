@@ -38,6 +38,9 @@ model authUser {
   dailyRewardTotals  DailyRewardMonthlyTotal[]
   discountTargets    DiscountOfferTarget[]
   discountRedemptions DiscountRedemption[]
+  referralCode        ReferralCode?
+  referral            Referral?  @relation("ReferralReferred")
+  referrals           Referral[] @relation("ReferralReferrer")
 
   @@index([email, id, providerId])
   @@index([username])

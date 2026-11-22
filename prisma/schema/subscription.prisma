@@ -113,6 +113,8 @@ model PaymentTransaction {
   creditSchedule    CreditAllocationSchedule[]
   checkoutSession CheckoutSession?
   refunds         PaymentRefund[]
+  // The checkout discount this payment redeemed (at most one).
+  discountRedemptions DiscountRedemption[]
 
   @@unique([provider, providerPaymentId])
   @@index([subscriptionId, createdAt])
@@ -187,11 +189,24 @@ model CheckoutSession {
   closedAt               DateTime?
   closedReason           String?               @db.VarChar(100)
   paymentId              String?               @unique
+  // The discount applied to the first payment (the best one available when
+  // the checkout was created), fixed with the checkout: the first charge is
+  // amountCents - discountCents (a one-time Stripe coupon); renewals are
+  // charged amountCents. `requestedDiscountCode` is the code the user
+  // entered, if any (a repeated request with another code replaces the
+  // checkout). Never changes (database trigger).
+  discountSource         DiscountSource?
+  discountOfferId        String?
+  discountPercent        Int                   @default(0)
+  discountCents          Int                   @default(0)
+  requestedDiscountCode  String?               @db.VarChar(32)
   createdAt              DateTime              @default(now())
   updatedAt              DateTime              @updatedAt
 
-  subscription UserSubscription    @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
-  payment      PaymentTransaction? @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  subscription        UserSubscription    @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  payment             PaymentTransaction? @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  discountOffer       DiscountOffer?      @relation(fields: [discountOfferId], references: [id], onDelete: Restrict)
+  discountRedemption  DiscountRedemption?
 
   @@unique([provider, providerSessionId])
   @@index([subscriptionId, createdAt])

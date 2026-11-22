@@ -2,6 +2,7 @@ import {
   Global,
   INestApplication,
   Module,
+  type Type,
   ValidationPipe,
 } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
@@ -46,7 +47,8 @@ export interface StripeTestApp {
   app: INestApplication<App>;
   client: PrismaClient;
   stripe: { api: FakeStripeApi };
-  bearer(userId: string): string;
+  /** A token for `userId` (role USER unless given). */
+  bearer(userId: string, role?: UserRole): string;
   /** POST /v1/subscription/checkout as `userId`. */
   startCheckout(userId: string, billingInterval: string): request.Test;
   /** GET /v1/subscription as `userId`; resolves the response data. */
@@ -66,7 +68,17 @@ export interface StripeTestApp {
 export const dataOf = (response: { body: unknown }) =>
   (response.body as { data: Record<string, string> }).data;
 
-export async function createStripeTestApp(): Promise<StripeTestApp> {
+export interface StripeTestAppOptions {
+  /**
+   * Feature modules to load next to SubscriptionModule (e.g. DiscountsModule
+   * for the discount administration and referral routes).
+   */
+  imports?: Type[];
+}
+
+export async function createStripeTestApp(
+  options: StripeTestAppOptions = {},
+): Promise<StripeTestApp> {
   const schema = await createSchema();
   await applyMigrations(schema, migrationNames());
 
@@ -74,10 +86,11 @@ export async function createStripeTestApp(): Promise<StripeTestApp> {
   const originalSecret = config.jwt_access_secret;
   config.jwt_access_secret = `stripe-e2e-${schema}`;
   const tokens = new AuthUtilsService(mock<RateLimitStore>());
-  const bearer = (userId: string) =>
-    `Bearer ${tokens.createAccessToken({ userId, role: UserRole.USER, tokenVersion: 1 })}`;
+  const bearer = (userId: string, role: UserRole = UserRole.USER) =>
+    `Bearer ${tokens.createAccessToken({ userId, role, tokenVersion: 1 })}`;
+  const imports = options.imports ?? [];
 
-  let booted = await boot(schema, stripe);
+  let booted = await boot(schema, stripe, imports);
   const harness: StripeTestApp = {
     app: booted.app,
     client: booted.client,
@@ -104,7 +117,7 @@ export async function createStripeTestApp(): Promise<StripeTestApp> {
     restart: async () => {
       await booted.app.close();
       await booted.client.$disconnect();
-      booted = await boot(schema, stripe);
+      booted = await boot(schema, stripe, imports);
       harness.app = booted.app;
       harness.client = booted.client;
     },
@@ -122,6 +135,7 @@ export async function createStripeTestApp(): Promise<StripeTestApp> {
 async function boot(
   schema: string,
   stripe: { api: FakeStripeApi },
+  imports: Type[],
 ): Promise<{ app: INestApplication<App>; client: PrismaClient }> {
   // Raw SQL (the FOR UPDATE row locks) resolves tables via search_path.
   const url = new URL(TEST_DATABASE_URL as string);
@@ -162,7 +176,7 @@ async function boot(
   };
 
   const moduleRef = await Test.createTestingModule({
-    imports: [TestInfrastructureModule, SubscriptionModule],
+    imports: [TestInfrastructureModule, SubscriptionModule, ...imports],
   })
     .overrideProvider(STRIPE_SETTINGS)
     .useValue(settings)

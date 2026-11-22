@@ -16,6 +16,7 @@ import { SubscriptionPlanService } from '../subscription-plan.service';
 import { StripeCheckoutService } from './stripe-checkout.service';
 import type { StripeSettings } from './stripe.config';
 import { StripeGateway } from './stripe.gateway';
+import { noCheckoutDiscounts } from '../../../test/support/no-checkout-discounts';
 
 const { MONTHLY, YEARLY } = BillingInterval;
 const MINUTE = 60_000;
@@ -61,6 +62,7 @@ describe('StripeCheckoutService', () => {
       plans,
       gateway,
       logger,
+      noCheckoutDiscounts(),
     );
   };
 
@@ -126,6 +128,8 @@ describe('StripeCheckoutService', () => {
         status: 'OPEN',
         billingInterval: 'MONTHLY',
         amountCents: 1900,
+        discount: null,
+        amountDueCents: 1900,
         currency: 'USD',
         url: expect.stringMatching(
           /^https:\/\/checkout\.stripe\.com\//,

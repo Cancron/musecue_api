@@ -108,6 +108,8 @@ const USER_DATA_TABLES = [
   'DailyRewardMonthlyTotal',
   'DiscountOfferTarget',
   'DiscountRedemption',
+  'Referral',
+  'ReferralCode',
 ] as const;
 
 describeWithDatabase('Account erasure (PostgreSQL)', () => {
@@ -604,6 +606,8 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
       data: {
         offerId: offer.id,
         authId: user.id,
+        source: 'CODE',
+        product: 'CREDITS_SMALL',
         idempotencyKey: `erasure-${tag}`,
         packageCode: 'SMALL',
         credits: 250,
@@ -613,6 +617,32 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
         finalPriceUsdCents: 400,
         redeemedAt: new Date(),
       },
+    });
+
+    // The account's referral code, the referral it signed up with, and a
+    // friend it referred (who keeps the referral when the account is erased).
+    await client.referralCode.create({
+      data: { authId: user.id, code: `REF${tag.toUpperCase()}` },
+    });
+    const referrer = await client.authUser.create({
+      data: {
+        email: `referrer_${tag}@example.com`,
+        username: `referrer_${tag}`,
+        password: 'not-a-real-hash',
+      },
+    });
+    await client.referral.create({
+      data: { authId: user.id, referrerAuthId: referrer.id },
+    });
+    const friend = await client.authUser.create({
+      data: {
+        email: `friend_${tag}@example.com`,
+        username: `friend_${tag}`,
+        password: 'not-a-real-hash',
+      },
+    });
+    await client.referral.create({
+      data: { authId: friend.id, referrerAuthId: user.id },
     });
 
     await client.activityLogEvent.create({
@@ -795,6 +825,15 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
       device: null,
       details: [expect.objectContaining({ fieldName: 'trialDays' })],
     });
+
+    // A user the erased account referred keeps the referral (and so the
+    // referral discount); only the link to the deleted referrer is gone.
+    await expect(
+      client.referral.findMany({
+        where: { authUser: { username: { startsWith: 'friend_' } } },
+        select: { referrerAuthId: true },
+      }),
+    ).resolves.toEqual(expect.arrayContaining([{ referrerAuthId: null }]));
 
     // Shared discount offers stay, and keep counting the erased account's
     // redemption (a depleted offer must not reopen).

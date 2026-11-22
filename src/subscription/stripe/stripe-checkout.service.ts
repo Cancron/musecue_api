@@ -9,7 +9,9 @@ import Stripe from 'stripe';
 import AppError from '../../common/errors/app.error';
 import { CustomLoggerService } from '../../common/services/custom-logger.service';
 import { PrismaService } from '../../common/services/prisma.service';
+import { normalizeDiscountCode } from '../../discounts/discount-offer.policy';
 import { planPriceCents } from '../billing.validation';
+import { CheckoutDiscountService } from '../discounts/checkout-discount.service';
 import type { CheckoutSessionView } from '../interfaces/checkout.interface';
 import {
   isProActive,
@@ -88,6 +90,17 @@ interface PendingClose {
   /** Only close it if it is still in one of these states. */
   from: CheckoutSessionStatus[];
   reason: 'REPLACED' | 'PROVIDER_EXPIRED' | 'NEVER_OPENED';
+  /**
+   * Give its discount reservation back with it: Stripe confirmed nothing
+   * can be paid for it any more. Otherwise the reservation is held until a
+   * webhook confirms that (StripeWebhookService).
+   */
+  release: boolean;
+}
+
+export interface CheckoutOptions {
+  /** A discount code the user entered (case-insensitive). */
+  discountCode?: string | null;
 }
 
 type SettleResult =
@@ -129,32 +142,69 @@ export class StripeCheckoutService {
     private readonly plans: SubscriptionPlanService,
     private readonly stripe: StripeGateway,
     private readonly logger: CustomLoggerService,
+    private readonly discounts: CheckoutDiscountService,
   ) {}
 
   async createCheckout(
     authId: string,
     billingInterval: BillingInterval,
     now: Date = new Date(),
+    options: CheckoutOptions = {},
   ): Promise<CheckoutSessionView> {
     if (!this.stripe.checkoutConfigured) throw CHECKOUT_ERRORS.notConfigured();
+    const discountCode = options.discountCode
+      ? normalizeDiscountCode(options.discountCode)
+      : null;
 
     // Fail fast before creating anything at Stripe; repeated under the lock.
-    const { email, record } = await this.assertCanPurchase(
+    const { email, plan, record } = await this.assertCanPurchase(
       this.prisma,
       authId,
       now,
     );
     await this.assertLinkedSubscriptionEnded(authId, record);
+    if (discountCode) {
+      // An entered code that cannot be used is refused before an open
+      // checkout is replaced (checked again when the checkout is created).
+      // The pending checkout's own reservation is not held against the
+      // user: it is reused or replaced by this request.
+      await this.prisma.$transaction(async (tx) => {
+        const pending = record
+          ? await tx.checkoutSession.findFirst({
+              where: {
+                subscriptionId: record.id,
+                status: { in: PENDING_CHECKOUT_STATUSES },
+              },
+              select: { id: true },
+            })
+          : null;
+        return this.discounts.select(tx, {
+          authId,
+          billingInterval,
+          listPriceCents: planPriceCents(plan, billingInterval),
+          code: discountCode,
+          now,
+          ignoreCheckoutId: pending?.id ?? null,
+        });
+      });
+    }
     const customerId = await this.ensureCustomer(authId, email);
 
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-      let claim = await this.claim(authId, billingInterval, customerId, now);
+      let claim = await this.claim(
+        authId,
+        billingInterval,
+        customerId,
+        discountCode,
+        now,
+      );
       if (claim === null) continue;
       if (!claim.created) {
         const settled = await this.settlePending(
           claim.checkout,
           authId,
           billingInterval,
+          discountCode,
           now,
         );
         if (settled.kind === 'reuse')
@@ -166,6 +216,7 @@ export class StripeCheckoutService {
           authId,
           billingInterval,
           customerId,
+          discountCode,
           now,
           settled.close,
         );
@@ -315,15 +366,17 @@ export class StripeCheckoutService {
 
   /**
    * Under the user's UserSubscription row lock: re-checks eligibility,
-   * closes `close` if given (and still in the expected state), then either
-   * returns the pending checkout or creates a CREATING one at the current
-   * backend price. Returns null if a concurrent claim won the partial unique
-   * index (the caller retries).
+   * closes `close` if given (and still in the expected state, giving its
+   * discount reservation back when allowed), then either returns the pending
+   * checkout or creates a CREATING one at the current backend price with the
+   * best available discount, reserved in the same transaction. Returns null
+   * if a concurrent claim won the partial unique index (the caller retries).
    */
   private async claim(
     authId: string,
     billingInterval: BillingInterval,
     customerId: string,
+    discountCode: string | null,
     now: Date,
     close?: PendingClose,
   ): Promise<ClaimResult | null> {
@@ -341,7 +394,7 @@ export class StripeCheckoutService {
         const amountCents = planPriceCents(plan, billingInterval);
 
         if (close) {
-          await tx.checkoutSession.updateMany({
+          const closed = await tx.checkoutSession.updateMany({
             where: { id: close.checkoutId, status: { in: close.from } },
             data: {
               status: CheckoutSessionStatus.EXPIRED,
@@ -349,6 +402,16 @@ export class StripeCheckoutService {
               closedReason: close.reason,
             },
           });
+          // Released before the new checkout reserves, so the same one-time
+          // discount can move to the replacement.
+          if (closed.count === 1 && close.release) {
+            await this.discounts.release(
+              tx,
+              close.checkoutId,
+              close.reason,
+              now,
+            );
+          }
         }
 
         const pending = await tx.checkoutSession.findFirst({
@@ -359,6 +422,13 @@ export class StripeCheckoutService {
         });
         if (pending) return { created: false, checkout: pending };
 
+        const discount = await this.discounts.select(tx, {
+          authId,
+          billingInterval,
+          listPriceCents: amountCents,
+          code: discountCode,
+          now,
+        });
         const checkout = await tx.checkoutSession.create({
           data: {
             subscriptionId: record.id,
@@ -370,8 +440,20 @@ export class StripeCheckoutService {
             expiresAt: new Date(
               now.getTime() + this.stripe.checkoutExpiresMinutes * 60_000,
             ),
+            requestedDiscountCode: discountCode,
+            ...(discount
+              ? {
+                  discountSource: discount.source,
+                  discountOfferId: discount.offerId,
+                  discountPercent: discount.percent,
+                  discountCents: discount.discountCents,
+                }
+              : {}),
           },
         });
+        if (discount) {
+          await this.discounts.reserve(tx, checkout, authId, discount, now);
+        }
         return { created: true, checkout };
       });
     } catch (error) {
@@ -399,6 +481,13 @@ export class StripeCheckoutService {
         billingInterval: checkout.billingInterval,
         amountCents: checkout.amountCents,
         expiresAt: checkout.expiresAt,
+        discount:
+          checkout.discountCents > 0
+            ? {
+                amountOffCents: checkout.discountCents,
+                name: `${checkout.discountPercent}% off your first payment`,
+              }
+            : null,
       });
     } catch (error) {
       if (error instanceof HttpException) throw error;
@@ -447,6 +536,7 @@ export class StripeCheckoutService {
     pending: CheckoutSession,
     authId: string,
     billingInterval: BillingInterval,
+    discountCode: string | null,
     now: Date,
   ): Promise<SettleResult> {
     let checkout = pending;
@@ -454,10 +544,12 @@ export class StripeCheckoutService {
       if (checkout.expiresAt.getTime() <= now.getTime()) {
         // Past its expiry Stripe cannot accept payment for it, and its URL
         // was never handed out.
+        // Nothing can be paid for it: its reservation is given back.
         return closeResult(
           checkout,
           [CheckoutSessionStatus.CREATING],
           'NEVER_OPENED',
+          true,
         );
       }
       checkout = await this.openProviderSession(checkout, authId);
@@ -480,13 +572,17 @@ export class StripeCheckoutService {
         checkout,
         [CheckoutSessionStatus.OPEN],
         'PROVIDER_EXPIRED',
+        await this.canRelease(checkout),
       );
     }
 
-    // A valid session for the same option is always reused, with the price
-    // and expiry it was created with (admin price changes apply to new
-    // checkouts only).
-    if (checkout.billingInterval === billingInterval) {
+    // A valid session for the same option (and the same entered discount
+    // code) is always reused, with the price, discount and expiry it was
+    // created with (admin price changes apply to new checkouts only).
+    if (
+      checkout.billingInterval === billingInterval &&
+      (checkout.requestedDiscountCode ?? null) === discountCode
+    ) {
       return { kind: 'reuse', checkout };
     }
 
@@ -515,7 +611,31 @@ export class StripeCheckoutService {
       );
       throw CHECKOUT_ERRORS.previousNotExpired();
     }
-    return closeResult(checkout, [CheckoutSessionStatus.OPEN], 'REPLACED');
+    return closeResult(
+      checkout,
+      [CheckoutSessionStatus.OPEN],
+      'REPLACED',
+      await this.canRelease(checkout),
+    );
+  }
+
+  /**
+   * Whether a checkout being closed may give its discount reservation back:
+   * only when Stripe confirms nothing can be paid for it any more. If
+   * Stripe cannot be asked, the reservation is held (the expiry webhook
+   * releases it later); the new checkout is still created.
+   */
+  private async canRelease(checkout: CheckoutSession): Promise<boolean> {
+    try {
+      return (
+        (await this.discounts.hasReservation(checkout.id)) &&
+        (await this.discounts.isUnpayable(checkout))
+      );
+    } catch (error) {
+      if (error instanceof HttpException) throw error;
+      this.logStripeError('checkout.sessions.retrieve', checkout.id, error);
+      return false;
+    }
   }
 
   /**
@@ -567,15 +687,30 @@ export class StripeCheckoutService {
     throw CHECKOUT_ERRORS.providerUnavailable();
   }
 
-  /** A definitively rejected checkout: no Stripe session exists for it. */
+  /**
+   * A definitively rejected checkout: no Stripe session exists for it, so
+   * its discount reservation is given back with it.
+   */
   private async markFailed(checkoutId: string, reason: string) {
-    await this.prisma.checkoutSession.updateMany({
-      where: { id: checkoutId, status: CheckoutSessionStatus.CREATING },
-      data: {
-        status: CheckoutSessionStatus.FAILED,
-        closedAt: new Date(),
-        closedReason: reason,
-      },
+    await this.prisma.$transaction(async (tx) => {
+      const checkout = await tx.checkoutSession.findUniqueOrThrow({
+        where: { id: checkoutId },
+        select: { subscriptionId: true },
+      });
+      await tx.$queryRaw`
+        SELECT "id" FROM "UserSubscription" WHERE "id" = ${checkout.subscriptionId} FOR UPDATE
+      `;
+      const failed = await tx.checkoutSession.updateMany({
+        where: { id: checkoutId, status: CheckoutSessionStatus.CREATING },
+        data: {
+          status: CheckoutSessionStatus.FAILED,
+          closedAt: new Date(),
+          closedReason: reason,
+        },
+      });
+      if (failed.count === 1) {
+        await this.discounts.release(tx, checkoutId, reason, new Date());
+      }
     });
   }
 
@@ -592,6 +727,21 @@ export class StripeCheckoutService {
       status: CheckoutSessionStatus.OPEN,
       billingInterval: checkout.billingInterval,
       amountCents: checkout.amountCents,
+      discount: checkout.discountSource
+        ? {
+            source: checkout.discountSource,
+            percent: checkout.discountPercent,
+            amountOffCents: checkout.discountCents,
+            ...(checkout.requestedDiscountCode &&
+            checkout.discountSource === 'CODE'
+              ? { code: checkout.requestedDiscountCode }
+              : {}),
+            ...(checkout.discountOfferId
+              ? { offerId: checkout.discountOfferId }
+              : {}),
+          }
+        : null,
+      amountDueCents: checkout.amountCents - checkout.discountCents,
       currency: SUBSCRIPTION_PLAN_CURRENCY,
       url: checkout.url,
       expiresAt: checkout.expiresAt.toISOString(),
@@ -658,6 +808,10 @@ function closeResult(
   checkout: CheckoutSession,
   from: CheckoutSessionStatus[],
   reason: PendingClose['reason'],
+  release: boolean,
 ): SettleResult {
-  return { kind: 'close', close: { checkoutId: checkout.id, from, reason } };
+  return {
+    kind: 'close',
+    close: { checkoutId: checkout.id, from, reason, release },
+  };
 }

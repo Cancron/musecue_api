@@ -9,7 +9,10 @@ export interface ExpectedCheckout {
   providerSessionId: string | null;
   providerCustomerId: string;
   billingInterval: BillingInterval;
+  /** The plan price: the subscription's price for every period. */
   amountCents: number;
+  /** Off the first payment (a one-time coupon); 0 without a discount. */
+  discountCents: number;
   currency: string;
 }
 
@@ -78,7 +81,10 @@ const UNPAID_SUBSCRIPTION_STATUSES = new Set([
  * - the session belongs to this checkout and customer and is a completed
  *   subscription checkout with `payment_status = paid`;
  * - the subscription has exactly one item at the stored price and interval;
- * - its first invoice (`subscription_create`) is paid in full in USD.
+ * - its first invoice (`subscription_create`) is paid in full in USD: the
+ *   stored price less the checkout's discount (a one-time coupon), so the
+ *   charge reflects the discount while the subscription keeps the plan
+ *   price.
  *
  * Anything else is rejected; a delayed payment method that has not settled
  * yet is reported as AWAITING_PAYMENT.
@@ -105,8 +111,9 @@ export function verifyStripeCheckout(
   if (session.payment_status !== 'paid') return reject('NO_PAYMENT_COLLECTED');
 
   const currency = expected.currency.toLowerCase();
+  const charged = expected.amountCents - expected.discountCents;
   if (session.currency !== currency) return reject('CURRENCY_MISMATCH');
-  if (session.amount_total !== expected.amountCents) {
+  if (session.amount_total !== charged) {
     return reject('AMOUNT_MISMATCH');
   }
 
@@ -146,7 +153,7 @@ export function verifyStripeCheckout(
   if (
     invoice.status !== 'paid' ||
     invoice.currency !== currency ||
-    invoice.amount_paid !== expected.amountCents ||
+    invoice.amount_paid !== charged ||
     idOf(invoice.customer) !== expected.providerCustomerId
   ) {
     return reject('INVOICE_NOT_PAID');
@@ -161,7 +168,7 @@ export function verifyStripeCheckout(
       providerSessionId: session.id,
       providerPaymentId: invoice.id,
       providerSubscriptionId: subscription.id,
-      amountCents: expected.amountCents,
+      amountCents: charged,
       currency: 'USD',
       billingInterval: expected.billingInterval,
       ...period,
@@ -199,6 +206,11 @@ export interface ExpectedInvoice {
   billingInterval: BillingInterval;
   /** The price fixed when the subscription was bought. */
   amountCents: number;
+  /**
+   * Off the first (`subscription_create`) invoice only: the checkout's
+   * one-time discount. Renewals are charged `amountCents`.
+   */
+  initialDiscountCents?: number;
   currency: string;
   /**
    * The MuseCue checkout that created the subscription. When given, the
@@ -300,10 +312,12 @@ export function verifyStripeInvoice(
     return rejectInvoice('INVOICE_NOT_PAYABLE');
   }
   const currency = expected.currency.toLowerCase();
+  const expectedAmount =
+    kind === 'INITIAL'
+      ? expected.amountCents - (expected.initialDiscountCents ?? 0)
+      : expected.amountCents;
   if (invoice.currency !== currency) return rejectInvoice('CURRENCY_MISMATCH');
-  if (
-    (paid ? invoice.amount_paid : invoice.amount_due) !== expected.amountCents
-  ) {
+  if ((paid ? invoice.amount_paid : invoice.amount_due) !== expectedAmount) {
     return rejectInvoice('AMOUNT_MISMATCH');
   }
 
@@ -330,7 +344,7 @@ export function verifyStripeInvoice(
       providerInvoiceId: invoice.id,
       providerSubscriptionId: expected.providerSubscriptionId,
       kind,
-      amountCents: expected.amountCents,
+      amountCents: expectedAmount,
       currency: 'USD',
       billingInterval: expected.billingInterval,
       ...period,

@@ -358,6 +358,8 @@ describeWithDatabase('Discount campaigns (PostgreSQL, full stack)', () => {
         startsAt: open.startsAt,
         endsAt: open.endsAt,
         remainingRedemptionsForYou: 1,
+        eligibleProducts: [],
+        minSpendCents: 0,
       });
 
       const theirs = await availableIds(someoneElse);

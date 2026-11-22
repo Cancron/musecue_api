@@ -172,7 +172,16 @@ describeWithDatabase('Discount codes (PostgreSQL, full stack)', () => {
         maxRedemptionsPerUser: 1,
         maxTotalRedemptions: null,
         redemptionCount: 0,
+        reservedRedemptions: 0,
+        redeemedRedemptions: 0,
         remainingRedemptions: null,
+        customerEligibility: 'ALL_CUSTOMERS',
+        eligibleProducts: [],
+        minSpendCents: 0,
+        budgetCents: null,
+        budgetSpentCents: 0,
+        budgetReservedCents: 0,
+        budgetRemainingCents: null,
         createdAt: expect.any(String) as unknown,
         updatedAt: expect.any(String) as unknown,
       });
@@ -977,6 +986,8 @@ describeWithDatabase('Discount codes (PostgreSQL, full stack)', () => {
       const other = await createAccount(ctx);
       const row = {
         offerId: created.id,
+        source: 'CODE' as const,
+        product: 'CREDITS_SMALL' as const,
         packageCode: 'SMALL' as const,
         credits: 250,
         discountPercent: 20,

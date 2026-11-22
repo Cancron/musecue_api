@@ -28,14 +28,29 @@ model DiscountOffer {
   audience              DiscountAudience  @default(ALL_USERS)
   maxRedemptionsPerUser Int               @default(1)
   maxTotalRedemptions   Int?
-  // Redemptions ever made (kept when a redeeming account is deleted, so a
-  // depleted offer stays depleted). Maintained by the redemption trigger.
+  // Redemptions counted towards maxTotalRedemptions: RESERVED (held by an
+  // unpaid checkout) and REDEEMED ones, including redemptions of deleted
+  // accounts (a depleted offer stays depleted); `reservedCount` of them are
+  // RESERVED. Maintained by the redemption trigger only.
   redemptionCount       Int               @default(0)
+  reservedCount         Int               @default(0)
+  // Campaign controls. The list price of the product must be at least
+  // `minSpendCents`; `eligibleProducts` empty = every product.
+  minSpendCents         Int                         @default(0)
+  customerEligibility   DiscountCustomerEligibility @default(ALL_CUSTOMERS)
+  eligibleProducts      DiscountProduct[]           @default([])
+  // USD budget for the discounts granted, in cents (NULL = unlimited):
+  // spent (REDEEMED) + reserved (RESERVED) never exceeds it. Maintained by
+  // the redemption trigger only.
+  budgetCents           Int?
+  budgetSpentCents      Int                         @default(0)
+  budgetReservedCents   Int                         @default(0)
   createdAt             DateTime          @default(now())
   updatedAt             DateTime          @updatedAt
 
   targets     DiscountOfferTarget[]
   redemptions DiscountRedemption[]
+  checkouts   CheckoutSession[]
 
   @@index([kind, createdAt])
 }
@@ -53,26 +68,75 @@ model DiscountOfferTarget {
   @@index([authId])
 }
 
-// One redemption of an offer by a user, for one credit package, with the
-// price terms fixed at redemption time. Unique per user and idempotency key,
-// so a retried or duplicated request is counted once. Rows never change.
+// One use of a discount by a user, with the price terms fixed when it was
+// made: a checkout's discount (RESERVED with the checkout, REDEEMED when its
+// payment is recorded, RELEASED when the checkout can no longer be paid), or
+// a discount code or campaign redeemed for a credit package (REDEEMED at
+// once). Unique per user and idempotency key, so a retried or duplicated
+// request is stored once; a user uses the first-purchase and the referral
+// discount at most once (partial unique index). Only the status moves (and
+// only forward, or RELEASED -> REDEEMED for a late payment); nothing else
+// changes (database trigger).
 model DiscountRedemption {
-  id                    String            @id @default(uuid())
-  offerId               String
+  id                    String                   @id @default(uuid())
+  // CODE and CAMPAIGN only.
+  offerId               String?
   authId                String
-  idempotencyKey        String            @db.VarChar(200)
-  packageCode           CreditPackageCode
-  credits               Int
+  source                DiscountSource
+  status                DiscountRedemptionStatus @default(REDEEMED)
+  idempotencyKey        String                   @db.VarChar(200)
+  product               DiscountProduct
+  // Credit packages only.
+  packageCode           CreditPackageCode?
+  credits               Int?
   discountPercent       Int
   originalPriceUsdCents Int
   discountUsdCents      Int
   finalPriceUsdCents    Int
-  redeemedAt            DateTime
-  createdAt             DateTime          @default(now())
+  // The checkout the discount was reserved for, and the payment that
+  // redeemed it.
+  checkoutSessionId     String?                  @unique
+  paymentId             String?
+  reservedAt            DateTime?
+  redeemedAt            DateTime?
+  releasedAt            DateTime?
+  releaseReason         String?                  @db.VarChar(50)
+  createdAt             DateTime                 @default(now())
 
-  offer    DiscountOffer @relation(fields: [offerId], references: [id], onDelete: Restrict)
-  authUser authUser      @relation(fields: [authId], references: [id], onDelete: Cascade)
+  offer    DiscountOffer?      @relation(fields: [offerId], references: [id], onDelete: Restrict)
+  authUser authUser            @relation(fields: [authId], references: [id], onDelete: Cascade)
+  checkout CheckoutSession?    @relation(fields: [checkoutSessionId], references: [id], onDelete: SetNull)
+  payment  PaymentTransaction? @relation(fields: [paymentId], references: [id], onDelete: Restrict)
 
   @@unique([authId, idempotencyKey])
   @@index([offerId, authId])
+  @@index([authId, source])
+}
+
+// ================================
+// Referrals
+// ================================
+
+// A user's own referral code, created on first use.
+model ReferralCode {
+  authId    String   @id
+  // Upper case letters and digits; unique.
+  code      String   @unique @db.VarChar(16)
+  createdAt DateTime @default(now())
+
+  authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
+}
+
+// The user (`authId`) signed up through another user's referral code. Set
+// once, before the user's first successful paid purchase. The referred user
+// keeps the referral if the referrer's account is deleted.
+model Referral {
+  authId         String   @id
+  referrerAuthId String?
+  createdAt      DateTime @default(now())
+
+  authUser authUser  @relation("ReferralReferred", fields: [authId], references: [id], onDelete: Cascade)
+  referrer authUser? @relation("ReferralReferrer", fields: [referrerAuthId], references: [id], onDelete: SetNull)
+
+  @@index([referrerAuthId])
 }

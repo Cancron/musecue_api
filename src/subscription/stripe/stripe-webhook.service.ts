@@ -19,6 +19,7 @@ import {
 import { CustomLoggerService } from '../../common/services/custom-logger.service';
 import { PrismaService } from '../../common/services/prisma.service';
 import { CreditAllowanceService } from '../credit-allowance.service';
+import { CheckoutDiscountService } from '../discounts/checkout-discount.service';
 import { isProActive } from '../subscription-access.policy';
 import { StripeCancellationService } from './stripe-cancellation.service';
 import { StripeRefundService } from './stripe-refund.service';
@@ -156,6 +157,7 @@ export class StripeWebhookService {
     private readonly cancellation: StripeCancellationService,
     private readonly refunds: StripeRefundService,
     private readonly credits: CreditAllowanceService,
+    private readonly checkoutDiscounts: CheckoutDiscountService,
   ) {}
 
   /**
@@ -312,7 +314,7 @@ export class StripeWebhookService {
       case 'checkout.session.async_payment_succeeded':
         return this.confirmPayment(event.data.object, metadata, now);
       case 'checkout.session.async_payment_failed':
-        return this.close(
+        return this.closeAndRelease(
           event.data.object,
           CheckoutSessionStatus.FAILED,
           'ASYNC_PAYMENT_FAILED',
@@ -320,7 +322,7 @@ export class StripeWebhookService {
           now,
         );
       case 'checkout.session.expired':
-        return this.close(
+        return this.closeAndRelease(
           event.data.object,
           CheckoutSessionStatus.EXPIRED,
           'PROVIDER_EXPIRED',
@@ -457,6 +459,9 @@ export class StripeWebhookService {
         payment,
         now,
       );
+      // The checkout's discount was charged with this payment: redeemed
+      // once, in the same transaction (replays never reach this point).
+      await this.checkoutDiscounts.redeem(tx, checkout.id, saved.id, now);
       if (!linked) {
         // Keep the link to the Stripe subscription so its renewals can be
         // traced back to this user.
@@ -604,6 +609,7 @@ export class StripeWebhookService {
       providerCustomerId: origin.providerCustomerId,
       billingInterval: origin.billingInterval,
       amountCents: origin.amountCents,
+      initialDiscountCents: origin.discountCents,
       currency: origin.currency,
       checkoutId: origin.id,
     });
@@ -1001,6 +1007,9 @@ export class StripeWebhookService {
       // Ended before its first payment was recorded (a delayed checkout
       // event): retry rather than lose the cancellation.
       await this.retryIfFirstPaymentPending(ref);
+      // Never paid (e.g. a failed first attempt that expired): the discount
+      // held for its checkout is given back once Stripe confirms it.
+      await this.checkoutDiscounts.releaseForEndedSubscription(ref, now);
       return 'IGNORED';
     }
     // The subscription state comes from the Stripe API, not the payload.
@@ -1067,7 +1076,7 @@ export class StripeWebhookService {
       },
       select: { id: true, proCanceledAt: true },
     });
-    if (!linked) return this.cancellationBeforeFirstPayment(ref);
+    if (!linked) return this.cancellationBeforeFirstPayment(ref, now);
     if (linked.proCanceledAt) return 'ALREADY_PROCESSED';
     if (!ref.cancel_at_period_end) return 'IGNORED';
 
@@ -1097,7 +1106,13 @@ export class StripeWebhookService {
    */
   private async cancellationBeforeFirstPayment(
     ref: Stripe.Subscription,
+    now: Date,
   ): Promise<WebhookOutcome> {
+    if (ref.status === 'incomplete_expired' || ref.status === 'canceled') {
+      await this.retryIfFirstPaymentPending(ref);
+      await this.checkoutDiscounts.releaseForEndedSubscription(ref, now);
+      return 'IGNORED';
+    }
     if (!ref.cancel_at_period_end) return 'IGNORED';
     await this.retryIfFirstPaymentPending(ref);
     return 'IGNORED';
@@ -1197,6 +1212,7 @@ export class StripeWebhookService {
       providerCustomerId: origin.providerCustomerId,
       billingInterval: origin.billingInterval,
       amountCents: origin.amountCents,
+      initialDiscountCents: origin.discountCents,
       currency: origin.currency,
       checkoutId: origin.id,
     });
@@ -1325,6 +1341,29 @@ export class StripeWebhookService {
       },
       tx,
     );
+  }
+
+  /**
+   * Closes a checkout whose session expired or whose delayed payment
+   * failed. Its discount reservation is given back only once Stripe
+   * confirms nothing can be paid for it any more (a failed delayed payment
+   * leaves a subscription whose first invoice may still be paid: the
+   * reservation is held until that subscription ends).
+   */
+  private async closeAndRelease(
+    ref: SessionRef,
+    status: 'EXPIRED' | 'FAILED',
+    reason: string,
+    from: CheckoutSessionStatus[],
+    now: Date,
+  ): Promise<WebhookOutcome> {
+    const outcome = await this.close(ref, status, reason, from, now);
+    if (outcome !== 'CLOSED') return outcome;
+    const checkout = await this.findCheckout(ref);
+    if (checkout) {
+      await this.checkoutDiscounts.releaseIfUnpayable(checkout.id, reason, now);
+    }
+    return outcome;
   }
 
   private async close(

@@ -2,6 +2,8 @@ import { Injectable } from '@nestjs/common';
 import {
   DiscountAudience,
   DiscountOfferKind,
+  DiscountRedemptionStatus,
+  DiscountSource,
   Prisma,
   type CreditPackageCode,
   type DiscountOffer,
@@ -18,23 +20,15 @@ import {
 import {
   applyDiscount,
   normalizeDiscountCode,
+  packageProduct,
   redemptionRejection,
-  type RedemptionRejection,
 } from './discount-offer.policy';
+import { rejectionError } from './discount-rejections';
+import { hasPaidPurchase } from './paid-purchase';
 import type {
   AvailableCampaignView,
   DiscountRedemptionView,
 } from './interfaces/discount-offer.interface';
-
-const REJECTIONS: Record<RedemptionRejection, () => AppError> = {
-  INACTIVE: () => AppError.conflict(DISCOUNT_MESSAGES.INACTIVE),
-  NOT_STARTED: () => AppError.conflict(DISCOUNT_MESSAGES.NOT_STARTED),
-  EXPIRED: () => AppError.conflict(DISCOUNT_MESSAGES.EXPIRED),
-  NOT_ELIGIBLE: () => AppError.forbidden(DISCOUNT_MESSAGES.NOT_ELIGIBLE),
-  USER_LIMIT_REACHED: () =>
-    AppError.conflict(DISCOUNT_MESSAGES.USER_LIMIT_REACHED),
-  DEPLETED: () => AppError.conflict(DISCOUNT_MESSAGES.DEPLETED),
-};
 
 /**
  * Redemption of discount codes and campaigns by signed-in users, for one of
@@ -98,13 +92,16 @@ export class DiscountRedemptionService {
 
   /**
    * The campaigns the user can redeem now: active with a discount above 0%,
-   * running, open to the user, with redemptions left for the user and in
-   * total. Ending soonest first.
+   * running, open to the user (targeting and new/returning customers), with
+   * redemptions left for the user and in total, and budget left. Ending
+   * soonest first. Product and minimum-spend rules depend on the purchase
+   * and are shown (`eligibleProducts`, `minSpendCents`) rather than applied.
    */
   async listAvailableCampaigns(
     authId: string,
   ): Promise<AvailableCampaignView[]> {
     const now = new Date();
+    const paid = await hasPaidPurchase(this.prisma, authId);
     const campaigns = await this.prisma.discountOffer.findMany({
       where: {
         kind: DiscountOfferKind.CAMPAIGN,
@@ -119,17 +116,38 @@ export class DiscountRedemptionService {
       },
       orderBy: [{ endsAt: 'asc' }, { id: 'asc' }],
       include: {
-        _count: { select: { redemptions: { where: { authId } } } },
+        _count: {
+          select: {
+            redemptions: {
+              where: {
+                authId,
+                status: {
+                  in: [
+                    DiscountRedemptionStatus.RESERVED,
+                    DiscountRedemptionStatus.REDEEMED,
+                  ],
+                },
+              },
+            },
+          },
+        },
       },
     });
     return campaigns
       .filter(
         (campaign) =>
-          redemptionRejection(campaign, {
-            now,
-            isTargeted: true,
-            userRedemptions: campaign._count.redemptions,
-          }) === null,
+          redemptionRejection(
+            { ...campaign, eligibleProducts: [], minSpendCents: 0 },
+            {
+              now,
+              isTargeted: true,
+              userRedemptions: campaign._count.redemptions,
+              hasPaidPurchase: paid,
+              product: 'PRO_MONTHLY',
+              listPriceCents: 0,
+              discountCents: 0,
+            },
+          ) === null,
       )
       .map((campaign) => ({
         id: campaign.id,
@@ -139,6 +157,8 @@ export class DiscountRedemptionService {
         endsAt: campaign.endsAt.toISOString(),
         remainingRedemptionsForYou:
           campaign.maxRedemptionsPerUser - campaign._count.redemptions,
+        eligibleProducts: [...campaign.eligibleProducts].sort(),
+        minSpendCents: campaign.minSpendCents,
       }));
   }
 
@@ -182,25 +202,45 @@ export class DiscountRedemptionService {
             where: { offerId: offer.id, authId },
           })) > 0;
         const userRedemptions = await tx.discountRedemption.count({
-          where: { offerId: offer.id, authId },
+          where: {
+            offerId: offer.id,
+            authId,
+            status: {
+              in: [
+                DiscountRedemptionStatus.RESERVED,
+                DiscountRedemptionStatus.REDEEMED,
+              ],
+            },
+          },
         });
+        const pkg = await this.packages.getPackage(packageCode, tx);
+        const price = applyDiscount(pkg.priceUsdCents, offer.discountPercent);
         const rejection = redemptionRejection(offer, {
           now,
           isTargeted,
           userRedemptions,
+          hasPaidPurchase: await hasPaidPurchase(tx, authId),
+          product: packageProduct(packageCode),
+          listPriceCents: pkg.priceUsdCents,
+          discountCents: price.discountUsdCents,
         });
-        if (rejection) throw REJECTIONS[rejection]();
-
-        const pkg = await this.packages.getPackage(packageCode, tx);
+        if (rejection) {
+          throw rejectionError(rejection, offer.customerEligibility);
+        }
         if (!pkg.available) {
           throw AppError.conflict(DISCOUNT_MESSAGES.PACKAGE_UNAVAILABLE);
         }
-        const price = applyDiscount(pkg.priceUsdCents, offer.discountPercent);
         const redemption = await tx.discountRedemption.create({
           data: {
             offerId: offer.id,
             authId,
+            source:
+              offer.kind === DiscountOfferKind.CODE
+                ? DiscountSource.CODE
+                : DiscountSource.CAMPAIGN,
+            status: DiscountRedemptionStatus.REDEEMED,
             idempotencyKey,
+            product: packageProduct(packageCode),
             packageCode,
             credits: pkg.credits,
             discountPercent: offer.discountPercent,
@@ -242,15 +282,15 @@ export class DiscountRedemptionService {
       kind: offer.kind,
       ...(offer.code !== null ? { code: offer.code } : {}),
       name: offer.name,
-      packageCode: redemption.packageCode,
-      credits: redemption.credits,
+      packageCode: redemption.packageCode as CreditPackageCode,
+      credits: redemption.credits as number,
       currency: 'USD',
       discountPercent: redemption.discountPercent,
       originalPriceUsdCents: redemption.originalPriceUsdCents,
       discountUsdCents: redemption.discountUsdCents,
       finalPriceUsdCents: redemption.finalPriceUsdCents,
       finalPriceUsd: formatUsdCents(redemption.finalPriceUsdCents),
-      redeemedAt: redemption.redeemedAt.toISOString(),
+      redeemedAt: (redemption.redeemedAt ?? redemption.createdAt).toISOString(),
       replayed,
     };
   }

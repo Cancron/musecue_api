@@ -193,6 +193,10 @@ export class CreditWalletService {
           throw new InvalidCreditOperationError(expiryRejection);
         }
 
+        if (input.source === CreditSource.DAILY_REWARD) {
+          await this.assertDailyRewardClaim(tx, wallet.authId, input, amount);
+        }
+
         if (input.source === CreditSource.TRIAL) {
           const trial = await tx.creditAllocation.findFirst({
             where: { walletId: wallet.id, source: CreditSource.TRIAL },
@@ -243,6 +247,39 @@ export class CreditWalletService {
       },
       options,
     );
+  }
+
+  /**
+   * DAILY_REWARD credits exist only for a recorded daily reward claim
+   * (DailyRewardClaim, capped at 600 credits per user and UTC month): the
+   * reference must name the claimed day (`daily-reward:<YYYY-MM-DD>`) and the
+   * amount must equal the credits the claim granted. With one allocation per
+   * reference, the credits can never exceed the claims, and so the cap. The
+   * database enforces the same rule (migration
+   * 20261203120000_daily_reward_allocation_guard).
+   */
+  private async assertDailyRewardClaim(
+    tx: Prisma.TransactionClient,
+    authId: string,
+    input: GrantCreditsInput,
+    amount: Prisma.Decimal,
+  ): Promise<void> {
+    const day = /^daily-reward:(\d{4}-\d{2}-\d{2})$/.exec(
+      input.sourceReference,
+    )?.[1];
+    const claimDate = day ? new Date(`${day}T00:00:00.000Z`) : null;
+    const claim =
+      claimDate && !Number.isNaN(claimDate.getTime())
+        ? await tx.dailyRewardClaim.findUnique({
+            where: { authId_claimDate: { authId, claimDate } },
+            select: { grantedCredits: true },
+          })
+        : null;
+    if (!claim || !amount.eq(claim.grantedCredits)) {
+      throw new InvalidCreditOperationError(
+        'Daily reward credits can only be granted for a recorded daily reward claim of the same amount',
+      );
+    }
   }
 
   /**

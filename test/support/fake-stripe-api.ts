@@ -84,6 +84,7 @@ export class FakeStripeApi {
   readonly paymentIntents = new Map<string, Json>();
   readonly charges = new Map<string, Json>();
   readonly refunds = new Map<string, Json>();
+  readonly coupons = new Map<string, Json>();
   private readonly idempotency = new Map<string, StoredResponse>();
   private readonly failures = new Map<string, FailureKind[]>();
   private counter = 0;
@@ -260,6 +261,28 @@ export class FakeStripeApi {
     this.collect(this.requireInvoice(invoiceId));
   }
 
+  /**
+   * Stripe gives up on an `incomplete` subscription whose first invoice was
+   * never paid (about 23 hours after it was created): the subscription
+   * becomes `incomplete_expired` and its first invoice is voided.
+   */
+  expireIncompleteSubscription(subscriptionId: string) {
+    const subscription = this.requireSubscription(subscriptionId);
+    if (subscription.status !== 'incomplete') {
+      throw new Error(
+        `Subscription ${subscriptionId} is ${str(subscription.status)}`,
+      );
+    }
+    Object.assign(subscription, {
+      status: 'incomplete_expired',
+      ended_at: Math.floor(Date.now() / 1000),
+    });
+    Object.assign(this.requireInvoice(str(subscription.latest_invoice)), {
+      status: 'void',
+      next_payment_attempt: null,
+    });
+  }
+
   /** Stripe ends the subscription (e.g. after its last failed retry). */
   cancelSubscription(subscriptionId: string) {
     const now = Math.floor(Date.now() / 1000);
@@ -414,6 +437,9 @@ export class FakeStripeApi {
     const lineItem = (session.line_items as Json[])[0];
     const priceData = lineItem.price_data as Json;
     const amount = Number(priceData.unit_amount);
+    // A `duration: once` coupon discounts the first invoice only.
+    const coupon = this.sessionCoupon(session);
+    const discount = coupon ? Math.min(Number(coupon.amount_off), amount) : 0;
     const interval = str((priceData.recurring as Json).interval);
     const start = Math.floor((periodStart ?? new Date()).getTime() / 1000);
     const end = anchoredPeriodEnd(start, start, interval);
@@ -426,9 +452,13 @@ export class FakeStripeApi {
       subscriptionId,
       metadata: metadata as Json,
       amount,
+      discount,
       start,
       end,
     });
+    if (coupon) {
+      coupon.times_redeemed = Number(coupon.times_redeemed) + 1;
+    }
     this.subscriptions.set(subscriptionId, {
       id: subscriptionId,
       object: 'subscription',
@@ -473,10 +503,14 @@ export class FakeStripeApi {
     subscriptionId: string;
     /** Snapshot of the subscription metadata, as Stripe copies it. */
     metadata: Json;
+    /** The price (line amount) before any discount. */
     amount: number;
+    /** Discount off the invoice total (a coupon). */
+    discount?: number;
     start: number;
     end: number;
   }): Json {
+    const discount = input.discount ?? 0;
     const invoiceId = this.id('in');
     const paymentIntentId = this.id('pi');
     this.paymentIntents.set(paymentIntentId, {
@@ -491,7 +525,10 @@ export class FakeStripeApi {
       billing_reason: input.billingReason,
       customer: input.customer,
       currency: 'usd',
-      amount_due: input.amount,
+      subtotal: input.amount,
+      total: input.amount - discount,
+      total_discount_amounts: discount > 0 ? [{ amount: discount }] : [],
+      amount_due: input.amount - discount,
       amount_paid: 0,
       status: 'open',
       attempted: false,
@@ -523,23 +560,26 @@ export class FakeStripeApi {
     return invoice;
   }
 
-  /** Marks an invoice paid (in full, or `amount`) and its subscription active. */
+  /**
+   * Marks an invoice paid (its amount due after discounts, or `amount`) and
+   * its subscription active.
+   */
   private collect(invoice: Json, amount?: number) {
-    const line = (invoice.lines as { data: Json[] }).data[0];
+    const collected = amount ?? Number(invoice.amount_due);
     Object.assign(invoice, {
       status: 'paid',
       attempted: true,
       attempt_count: Number(invoice.attempt_count) + 1,
       next_payment_attempt: null,
-      amount_paid: amount ?? line.amount,
+      amount_paid: collected,
       status_transitions: { paid_at: Math.floor(Date.now() / 1000) },
     });
     const chargeId = this.id('ch');
     this.charges.set(chargeId, {
       id: chargeId,
       object: 'charge',
-      amount: amount ?? line.amount,
-      amount_captured: amount ?? line.amount,
+      amount: collected,
+      amount_captured: collected,
       amount_refunded: 0,
       refunded: false,
       currency: invoice.currency,
@@ -711,6 +751,9 @@ export class FakeStripeApi {
     if (method === 'POST' && path === '/v1/checkout/sessions') {
       return this.createSession(params);
     }
+    if (method === 'POST' && path === '/v1/coupons') {
+      return this.createCoupon(params);
+    }
     if (method === 'GET' && path === '/v1/refunds') {
       const data = [...this.refunds.values()]
         .filter((refund) => refund.charge === params.charge)
@@ -820,6 +863,20 @@ export class FakeStripeApi {
     if (params.mode !== 'subscription' || !priceData) {
       return invalid(400, 'parameter_missing', 'Missing subscription price');
     }
+    const discounts = params.discounts as Json[] | undefined;
+    if (discounts && params.allow_promotion_codes !== undefined) {
+      return invalid(
+        400,
+        undefined,
+        'You may only specify one of these parameters: allow_promotion_codes, discounts.',
+      );
+    }
+    const couponId = discounts ? str(discounts[0]?.coupon) : '';
+    const coupon = couponId ? this.coupons.get(couponId) : undefined;
+    if (couponId && !coupon) {
+      return invalid(400, 'resource_missing', `No such coupon: '${couponId}'`);
+    }
+    const unitAmount = Number(priceData.unit_amount);
     const id = this.id('cs_test');
     const session: Json = {
       id,
@@ -833,7 +890,11 @@ export class FakeStripeApi {
       metadata: params.metadata ?? {},
       subscription_data: params.subscription_data,
       currency: priceData.currency,
-      amount_total: Number(priceData.unit_amount),
+      amount_subtotal: unitAmount,
+      amount_total: coupon
+        ? Math.max(0, unitAmount - Number(coupon.amount_off))
+        : unitAmount,
+      discounts: coupon ? [{ coupon: coupon.id }] : [],
       expires_at: expiresAt,
       success_url: params.success_url,
       cancel_url: params.cancel_url,
@@ -843,6 +904,43 @@ export class FakeStripeApi {
     };
     this.sessions.set(id, session);
     return { status: 200, body: { ...session } };
+  }
+
+  /** POST /v1/coupons: a fixed amount off, like Stripe (ids are unique). */
+  private createCoupon(params: Json): { status: number; body: Json } {
+    const id = params.id ? str(params.id) : this.id('coupon');
+    if (this.coupons.has(id)) {
+      return invalid(400, 'resource_already_exists', 'Coupon already exists.');
+    }
+    const amountOff = Number(params.amount_off);
+    if (!Number.isInteger(amountOff) || amountOff <= 0) {
+      return invalid(400, 'parameter_invalid_integer', 'Invalid amount_off');
+    }
+    const coupon: Json = {
+      id,
+      object: 'coupon',
+      amount_off: amountOff,
+      percent_off: null,
+      currency: params.currency ?? null,
+      duration: params.duration,
+      max_redemptions:
+        params.max_redemptions === undefined
+          ? null
+          : Number(params.max_redemptions),
+      times_redeemed: 0,
+      name: params.name ?? null,
+      metadata: params.metadata ?? {},
+      valid: true,
+    };
+    this.coupons.set(id, coupon);
+    return { status: 200, body: { ...coupon } };
+  }
+
+  /** The coupon a session was created with, if any. */
+  private sessionCoupon(session: Json): Json | undefined {
+    const discounts = session.discounts as Json[] | undefined;
+    const couponId = discounts?.[0] ? str(discounts[0].coupon) : '';
+    return couponId ? this.coupons.get(couponId) : undefined;
   }
 
   private expand(session: Json, expand: unknown): Json {
