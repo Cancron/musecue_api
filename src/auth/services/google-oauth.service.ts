@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { ReferralRegistrationService } from '../../referrals/referral-registration.service';
 import crypto from 'crypto';
 import * as jwt from 'jsonwebtoken';
 import { JwksClient } from 'jwks-rsa';
@@ -42,6 +43,7 @@ export class GoogleOAuthService {
     private readonly prismaService: PrismaService,
     private readonly activityLogService: ActivityLogService,
     private readonly authUtilsService: AuthUtilsService,
+    private readonly referrals: ReferralRegistrationService,
   ) {
     // Initialize JWKS client for Google public key retrieval
     // Keys are cached and automatically rotated
@@ -182,8 +184,15 @@ export class GoogleOAuthService {
   async getAuthorizationUrl(
     meta: { ip: string; userAgent: string },
     redirectUrl?: string,
+    referralCode?: string,
   ): Promise<{ url: string; state: string }> {
     const { clientId, redirectUri } = getGoogleOAuthCredentials();
+    // An invalid code is refused before the sign-in starts (the email
+    // checks run when the account is created).
+    const referral =
+      referralCode !== undefined
+        ? await this.referrals.findReferrer(referralCode)
+        : null;
 
     // Generate state and PKCE parameters
     const state = this.generateStateToken();
@@ -195,6 +204,7 @@ export class GoogleOAuthService {
       state,
       codeVerifier,
       redirectUrl,
+      ...(referral ? { referralCode: referral.code } : {}),
       ip: meta.ip,
       userAgent: meta.userAgent,
       createdAt: new Date().toISOString(),
@@ -377,11 +387,11 @@ export class GoogleOAuthService {
     }
 
     // Find or create user
-    const result = await this.findOrCreateUser(googleUser, {
-      ip,
-      userAgent,
-      device,
-    });
+    const result = await this.findOrCreateUser(
+      googleUser,
+      { ip, userAgent, device },
+      stateData.referralCode,
+    );
 
     this.customLogger.log(
       `Google OAuth ${result.isNewUser ? 'sign-up' : 'sign-in'} successful for: ${googleUser.email}`,
@@ -401,6 +411,7 @@ export class GoogleOAuthService {
   private async findOrCreateUser(
     googleUser: IGoogleUserInfo,
     meta: { ip: string; userAgent: string; device?: string },
+    referralCode?: string,
   ): Promise<IGoogleOAuthLoginResponse> {
     const { ip, userAgent, device } = meta;
 
@@ -449,7 +460,13 @@ export class GoogleOAuthService {
         }
       }
 
-      // Create new user
+      // Create new user (with its referral: refused referrals create nothing)
+      if (referralCode !== undefined) {
+        await this.referrals.assertUsableAtSignup(
+          referralCode,
+          googleUser.email,
+        );
+      }
       const username = this.generateUsername(googleUser);
 
       user = await this.prismaService.$transaction(async (tx) => {
@@ -486,6 +503,14 @@ export class GoogleOAuthService {
             mfaEnabled: false,
           },
         });
+
+        if (referralCode !== undefined) {
+          await this.referrals.registerAtSignup(tx, {
+            authId: newUser.id,
+            email: googleUser.email,
+            code: referralCode,
+          });
+        }
 
         // Create user profile with Google data
         await tx.userProfile.create({
@@ -539,11 +564,25 @@ export class GoogleOAuthService {
     }
 
     // Generate tokens
-    return this.generateTokensForUser(
+    const response = await this.generateTokensForUser(
       user,
       { ip, userAgent, device },
       isNewUser,
     );
+    if (referralCode === undefined) return response;
+    if (!isNewUser) {
+      // A referral is never added to an existing account (retrospective).
+      this.customLogger.warn(
+        'Referral code ignored: the Google account already exists',
+        this.context,
+      );
+    }
+    return {
+      ...response,
+      referral: isNewUser
+        ? { applied: true }
+        : { applied: false, reason: 'EXISTING_ACCOUNT' },
+    };
   }
 
   /**

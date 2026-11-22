@@ -36,6 +36,8 @@ export interface IGoogleOAuthState {
   state: string;
   codeVerifier: string; // For PKCE
   redirectUrl?: string; // Where to redirect after successful auth
+  // Referral code to register if the sign-in creates a new account
+  referralCode?: string;
   ip: string;
   userAgent: string;
   createdAt: string;
@@ -89,6 +91,12 @@ export interface IGoogleOAuthLoginResponse {
   expiresIn: number;
   isNewUser: boolean;
   redirectUrl?: string;
+  /**
+   * Present when a referral code was given: registered with the new
+   * account, or not applied because the account already existed (a
+   * retrospective referral).
+   */
+  referral?: { applied: boolean; reason?: 'EXISTING_ACCOUNT' };
 }
 
 /**

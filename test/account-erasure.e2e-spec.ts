@@ -66,6 +66,7 @@ import {
   migrationNames,
 } from './support/migrated-schema';
 import { daysFrom, givenProPurchased } from './support/subscription-fixtures';
+import { ReferralRegistrationService } from '../src/referrals/referral-registration.service';
 
 jest.setTimeout(120_000);
 
@@ -171,6 +172,7 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
       new NoopTokenVersionCache(),
       mock<EmailQueueService>(),
       mock<CustomLoggerService>(),
+      mock<ReferralRegistrationService>(),
     );
     emailQueue.sendAccountDeletionCode.mockResolvedValue();
     codes = new AccountDeletionCodeService(challenges, utils, emailQueue);
@@ -336,6 +338,18 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
           },
         },
       },
+    });
+    // Signed up with a referral code (recorded with the account, before
+    // any purchase).
+    const referrer = await client.authUser.create({
+      data: {
+        email: `referrer_${tag}@example.com`,
+        username: `referrer_${tag}`,
+        password: 'not-a-real-hash',
+      },
+    });
+    await client.referral.create({
+      data: { authId: user.id, referrerAuthId: referrer.id },
     });
     const avatarKey = `${user.id}/profile/${randomUUID()}.png`;
     await putFile('images', avatarKey);
@@ -623,16 +637,6 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
     // friend it referred (who keeps the referral when the account is erased).
     await client.referralCode.create({
       data: { authId: user.id, code: `REF${tag.toUpperCase()}` },
-    });
-    const referrer = await client.authUser.create({
-      data: {
-        email: `referrer_${tag}@example.com`,
-        username: `referrer_${tag}`,
-        password: 'not-a-real-hash',
-      },
-    });
-    await client.referral.create({
-      data: { authId: user.id, referrerAuthId: referrer.id },
     });
     const friend = await client.authUser.create({
       data: {

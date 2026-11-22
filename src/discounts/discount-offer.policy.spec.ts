@@ -274,14 +274,19 @@ describe('discount offer policy', () => {
     });
   });
 
-  describe('applyCheckoutDiscount (never below Stripe’s $0.50 minimum charge)', () => {
+  describe('applyCheckoutDiscount (100% is free; never rounded up to Stripe’s $0.50 minimum)', () => {
     it.each([
       [1900, 20, 380, 1520],
       [19000, 15, 2850, 16150],
-      [1900, 100, 1850, 50],
-      [60, 50, 10, 50],
-      [50, 90, 0, 50],
+      [1900, 100, 1900, 0],
+      [19000, 100, 19000, 0],
+      // $0.19 and $0.49 cannot be charged: waived, never raised to $0.50.
+      [1900, 99, 1900, 0],
+      [98, 50, 98, 0],
+      // $0.50 exactly can be charged.
+      [100, 50, 50, 50],
       [1999, 33, 659, 1340],
+      [500, 0, 0, 500],
     ])(
       '%i cents at %i%% off: %i discount, %i charged',
       (price, percent, discount, final) => {

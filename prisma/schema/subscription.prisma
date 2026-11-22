@@ -115,6 +115,9 @@ model PaymentTransaction {
   refunds         PaymentRefund[]
   // The checkout discount this payment redeemed (at most one).
   discountRedemptions DiscountRedemption[]
+  // The referral this payment qualified (the referred user's first paying
+  // purchase), if any.
+  referralQualification Referral?
 
   @@unique([provider, providerPaymentId])
   @@index([subscriptionId, createdAt])

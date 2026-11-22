@@ -130,6 +130,7 @@ export class AuthController {
     const { url, state } = await this.googleOAuthService.getAuthorizationUrl(
       meta,
       query.redirectUrl,
+      query.referralCode,
     );
 
     return {

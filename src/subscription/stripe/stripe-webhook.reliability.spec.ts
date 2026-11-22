@@ -21,7 +21,10 @@ import { StripeRefundService } from './stripe-refund.service';
 import { StripeWebhookService } from './stripe-webhook.service';
 import type { StripeSettings } from './stripe.config';
 import { StripeGateway } from './stripe.gateway';
-import { noCheckoutDiscounts } from '../../../test/support/no-checkout-discounts';
+import {
+  noCheckoutDiscounts,
+  noReferralRewards,
+} from '../../../test/support/no-checkout-discounts';
 
 const { MONTHLY } = BillingInterval;
 const DAY = 24 * 60 * 60 * 1000;
@@ -74,6 +77,7 @@ describe('Stripe webhooks: security and reliability', () => {
       new StripeRefundService(prisma, gateway, activityLog, logger, credits),
       credits,
       noCheckoutDiscounts(),
+      noReferralRewards(),
     );
     access = new SubscriptionAccessService(prisma, plans);
   };

@@ -4,6 +4,7 @@ import { AuthUtilsService } from './services/auth-utils.service';
 import { AUTH_CONFIG } from './config/auth.config';
 import { PrismaService } from '../common/services/prisma.service';
 import { ActivityLogService } from '../common/services/activity-log.service';
+import { ReferralRegistrationService } from '../referrals/referral-registration.service';
 import { EmailQueueService } from '../common/queues/email/email.queue';
 import { CustomLoggerService } from '../common/services/custom-logger.service';
 import AppError from '../common/errors/app.error';
@@ -35,6 +36,7 @@ export class AuthService {
     private readonly tokenVersions: TokenVersionCache,
     private readonly emailQueueService: EmailQueueService,
     private readonly customLogger: CustomLoggerService,
+    private readonly referrals: ReferralRegistrationService,
   ) {}
 
   async create(
@@ -95,6 +97,12 @@ export class AuthService {
       }
     }
 
+    // A referral code is checked before anything is created; an invalid,
+    // own or duplicate referral refuses the registration.
+    if (payload.referralCode !== undefined) {
+      await this.referrals.assertUsableAtSignup(payload.referralCode, email);
+    }
+
     // Generate verification code
     const verificationCode = this.authUtilsService.generateVerificationCode();
     const expiresAt = new Date(
@@ -130,6 +138,16 @@ export class AuthService {
             lastPasswordChange: new Date(),
           },
         });
+
+        // The referral is registered with the account, in this transaction
+        // (checked again under the transaction).
+        if (payload.referralCode !== undefined) {
+          await this.referrals.registerAtSignup(tx, {
+            authId: user.id,
+            email,
+            code: payload.referralCode,
+          });
+        }
 
         // Create email history record for verification email
         await tx.emailHistory.create({

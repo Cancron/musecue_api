@@ -1,4 +1,7 @@
+import { randomBytes } from 'node:crypto';
 import { DiscountsModule } from '../src/discounts/discounts.module';
+import { ReferralRegistrationService } from '../src/referrals/referral-registration.service';
+import { ReferralsModule } from '../src/referrals/referrals.module';
 import {
   dataOf,
   discountCheckout,
@@ -60,6 +63,29 @@ describeWithDatabase(
         .post('/v1/referrals/apply')
         .set('Authorization', harness.bearer(userId))
         .send({ code });
+    /**
+     * A user who signed up with the referrer's code: the account and its
+     * referral are created in one transaction, as registration does.
+     */
+    const signUpReferred = async (referrerId: string) => {
+      const { code } = await referralOf(referrerId);
+      const tag = randomBytes(6).toString('hex');
+      const email = `${tag}@example.com`;
+      return harness.client.$transaction(async (tx) => {
+        const user = await tx.authUser.create({
+          data: {
+            email,
+            username: `user_${tag}`,
+            password: 'not-a-real-hash',
+            verified: true,
+          },
+        });
+        await harness.app
+          .get(ReferralRegistrationService)
+          .registerAtSignup(tx, { authId: user.id, email, code });
+        return user.id;
+      });
+    };
     /** Pays the checkout and moves past the paid term with the Stripe subscription ended. */
     const payAndLetExpire = async (checkoutId: string) => {
       await d.pay(checkoutId);
@@ -76,7 +102,9 @@ describeWithDatabase(
     };
 
     beforeAll(async () => {
-      harness = await createStripeTestApp({ imports: [DiscountsModule] });
+      harness = await createStripeTestApp({
+        imports: [DiscountsModule, ReferralsModule],
+      });
       d = discountCheckout(harness);
       admin = await d.admin();
     });
@@ -324,44 +352,33 @@ describeWithDatabase(
     });
 
     describe('referral discount', () => {
-      it('applies a referral code once, never the own code, and only before the first purchase', async () => {
+      it('applies to users who signed up with a code; existing accounts cannot be referred', async () => {
         await d.setDiscountSettings(admin, { referralDiscountPercent: 15 });
         const referrer = await d.user();
-        const friend = await d.user();
+        const existing = await d.user();
         const { code } = await referralOf(referrer);
         expect(code).toMatch(/^[A-Z0-9]{8}$/);
-        await expect(referralOf(friend)).resolves.toMatchObject({
+
+        // A retrospective referral is refused.
+        expect(messageOf(await applyReferral(existing, code).expect(409))).toBe(
+          'Referral codes can only be used when signing up',
+        );
+        await expect(referralOf(existing)).resolves.toMatchObject({
           referred: false,
           referralDiscountPercent: 0,
         });
+        await expect(d.open(existing)).resolves.toMatchObject({
+          discount: { source: 'FIRST_PURCHASE' },
+        });
 
-        expect(messageOf(await applyReferral(referrer, code).expect(400))).toBe(
-          'You cannot use your own referral code',
-        );
-        expect(
-          messageOf(await applyReferral(friend, 'NOSUCHCODE').expect(404)),
-        ).toBe('Referral code not found');
-        await applyReferral(friend, code.toLowerCase()).expect(201);
+        const friend = await signUpReferred(referrer);
         await expect(referralOf(friend)).resolves.toMatchObject({
           referred: true,
           referralDiscountPercent: 15,
         });
-        expect(messageOf(await applyReferral(friend, code).expect(409))).toBe(
-          'A referral code was already applied to your account',
-        );
         await expect(
           harness.client.referral.findUnique({ where: { authId: friend } }),
-        ).resolves.toMatchObject({
-          referrerAuthId: referrer,
-        });
-
-        // A user who already bought cannot be referred any more.
-        const buyer = await d.user();
-        const view = await d.open(buyer);
-        await d.pay(view.checkoutSessionId);
-        expect(messageOf(await applyReferral(buyer, code).expect(409))).toBe(
-          'Referral codes can only be applied before your first purchase',
-        );
+        ).resolves.toMatchObject({ referrerAuthId: referrer });
       });
 
       it('gives a referred user the highest of the referral and first-purchase discounts, used once', async () => {
@@ -370,10 +387,7 @@ describeWithDatabase(
           referralDiscountPercent: 25,
         });
         const referrer = await d.user();
-        const friend = await d.user();
-        await applyReferral(friend, (await referralOf(referrer)).code).expect(
-          201,
-        );
+        const friend = await signUpReferred(referrer);
 
         const view = await d.open(friend);
         expect(view.discount).toMatchObject({
@@ -400,10 +414,7 @@ describeWithDatabase(
 
       it('prefers the first-purchase discount when it is higher or equal', async () => {
         const referrer = await d.user();
-        const friend = await d.user();
-        await applyReferral(friend, (await referralOf(referrer)).code).expect(
-          201,
-        );
+        const friend = await signUpReferred(referrer);
 
         await d.setDiscountSettings(admin, {
           firstPurchaseDiscountPercent: 30,

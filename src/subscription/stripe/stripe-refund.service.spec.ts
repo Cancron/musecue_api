@@ -22,7 +22,10 @@ import {
   type WebhookOutcome,
 } from './stripe-webhook.service';
 import { StripeGateway } from './stripe.gateway';
-import { noCheckoutDiscounts } from '../../../test/support/no-checkout-discounts';
+import {
+  noCheckoutDiscounts,
+  noReferralRewards,
+} from '../../../test/support/no-checkout-discounts';
 
 const { MONTHLY, YEARLY } = BillingInterval;
 const DAY = 24 * 60 * 60 * 1000;
@@ -84,6 +87,7 @@ describe('StripeRefundService (refund webhooks)', () => {
       new StripeRefundService(prisma, gateway, activityLog, logger, credits),
       credits,
       noCheckoutDiscounts(),
+      noReferralRewards(),
     );
   });
 

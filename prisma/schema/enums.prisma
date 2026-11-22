@@ -420,3 +420,12 @@ enum DiscountCustomerEligibility {
   NEW_CUSTOMERS
   RETURNING_CUSTOMERS
 }
+
+// A referral waits for the referred user's first verified paying purchase:
+// REWARDED when the referrer received credits for it, QUALIFIED when it
+// happened but no reward was due.
+enum ReferralStatus {
+  PENDING
+  REWARDED
+  QUALIFIED
+}

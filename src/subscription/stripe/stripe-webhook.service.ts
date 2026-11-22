@@ -20,6 +20,7 @@ import { CustomLoggerService } from '../../common/services/custom-logger.service
 import { PrismaService } from '../../common/services/prisma.service';
 import { CreditAllowanceService } from '../credit-allowance.service';
 import { CheckoutDiscountService } from '../discounts/checkout-discount.service';
+import { ReferralRewardService } from '../referrals/referral-reward.service';
 import { isProActive } from '../subscription-access.policy';
 import { StripeCancellationService } from './stripe-cancellation.service';
 import { StripeRefundService } from './stripe-refund.service';
@@ -158,6 +159,7 @@ export class StripeWebhookService {
     private readonly refunds: StripeRefundService,
     private readonly credits: CreditAllowanceService,
     private readonly checkoutDiscounts: CheckoutDiscountService,
+    private readonly referralRewards: ReferralRewardService,
   ) {}
 
   /**
@@ -462,6 +464,14 @@ export class StripeWebhookService {
       // The checkout's discount was charged with this payment: redeemed
       // once, in the same transaction (replays never reach this point).
       await this.checkoutDiscounts.redeem(tx, checkout.id, saved.id, now);
+      // A referred user's first paying purchase rewards the referrer, once,
+      // in this transaction.
+      await this.referralRewards.onVerifiedPayment(
+        tx,
+        record.authId,
+        saved,
+        now,
+      );
       if (!linked) {
         // Keep the link to the Stripe subscription so its renewals can be
         // traced back to this user.
@@ -721,6 +731,14 @@ export class StripeWebhookService {
 
       const paidAt = payment.paidAt ?? now;
       const saved = await this.createPayment(tx, record.id, payment, paidAt);
+      // The first paying purchase may be a renewal (after a free first
+      // period): it rewards the referrer, once.
+      await this.referralRewards.onVerifiedPayment(
+        tx,
+        record.authId,
+        saved,
+        now,
+      );
 
       if (
         record.paymentProvider !== STRIPE_PROVIDER ||

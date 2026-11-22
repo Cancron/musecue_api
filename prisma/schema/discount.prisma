@@ -127,16 +127,36 @@ model ReferralCode {
   authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
 }
 
-// The user (`authId`) signed up through another user's referral code. Set
-// once, before the user's first successful paid purchase. The referred user
-// keeps the referral if the referrer's account is deleted.
+// The user (`authId`) signed up with another user's referral code. Recorded
+// only at signup, in the transaction that creates the account (never for an
+// existing account), once per person: `canonicalEmailHash` (SHA-256 of the
+// email, lower case, without "+tags" and, for Gmail, without dots) is
+// unique, and is compared with the referrer's to refuse self-referrals.
+//
+// PENDING until the referred user's first verified paying purchase
+// (a SUCCEEDED Stripe payment above $0): then REWARDED, with the referrer's
+// non-expiring REFERRAL credits granted in the same transaction (once:
+// conditional status change and a unique credit reference), or QUALIFIED
+// when no reward was due (reward switched off, referrer deleted). The
+// referred user keeps the referral if the referrer's account is deleted.
 model Referral {
-  authId         String   @id
-  referrerAuthId String?
-  createdAt      DateTime @default(now())
+  id                  String         @id @default(uuid())
+  authId              String         @unique
+  referrerAuthId      String?
+  // The code used at signup.
+  referralCode        String?        @db.VarChar(16)
+  // NULL only for referrals recorded before signup-time registration.
+  canonicalEmailHash  String?        @unique @db.Char(64)
+  status              ReferralStatus @default(PENDING)
+  qualifyingPaymentId String?        @unique
+  qualifiedAt         DateTime?
+  rewardCredits       Int?
+  rewardedAt          DateTime?
+  createdAt           DateTime       @default(now())
 
-  authUser authUser  @relation("ReferralReferred", fields: [authId], references: [id], onDelete: Cascade)
-  referrer authUser? @relation("ReferralReferrer", fields: [referrerAuthId], references: [id], onDelete: SetNull)
+  authUser          authUser            @relation("ReferralReferred", fields: [authId], references: [id], onDelete: Cascade)
+  referrer          authUser?           @relation("ReferralReferrer", fields: [referrerAuthId], references: [id], onDelete: SetNull)
+  qualifyingPayment PaymentTransaction? @relation(fields: [qualifyingPaymentId], references: [id], onDelete: Restrict)
 
-  @@index([referrerAuthId])
+  @@index([referrerAuthId, createdAt])
 }

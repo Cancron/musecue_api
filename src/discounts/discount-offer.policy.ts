@@ -12,7 +12,10 @@ import {
  * database trigger on DiscountRedemption enforces the same rules.
  */
 
-/** Stripe's minimum USD charge: a discounted payment is never less. */
+/**
+ * Stripe's minimum USD charge: a discounted payment is either at least this
+ * or nothing at all ($0).
+ */
 export const MIN_CHARGE_USD_CENTS = 50;
 
 /** The fields of an offer that decide whether it can be redeemed. */
@@ -194,24 +197,28 @@ export function applyDiscount(
 }
 
 /**
- * A discount charged through Stripe: like applyDiscount, but the payment
- * never goes below Stripe's minimum charge of $0.50 (a 100% discount on
- * $19.00 charges $0.50), so every discounted purchase is a paid purchase.
+ * A discount charged through Stripe: like applyDiscount, and a 100% discount
+ * charges exactly $0. Stripe cannot charge less than its $0.50 minimum, so a
+ * discounted payment that would fall between $0.01 and $0.49 is waived
+ * entirely ($0) rather than rounded up: a customer never pays more than the
+ * advertised discount.
  */
 export function applyCheckoutDiscount(
   priceUsdCents: number,
   discountPercent: number,
 ): DiscountedPrice {
   const exact = applyDiscount(priceUsdCents, discountPercent);
-  const discountUsdCents = Math.max(
-    0,
-    Math.min(exact.discountUsdCents, priceUsdCents - MIN_CHARGE_USD_CENTS),
-  );
-  return {
-    originalPriceUsdCents: priceUsdCents,
-    discountUsdCents,
-    finalPriceUsdCents: priceUsdCents - discountUsdCents,
-  };
+  if (
+    exact.discountUsdCents > 0 &&
+    exact.finalPriceUsdCents < MIN_CHARGE_USD_CENTS
+  ) {
+    return {
+      originalPriceUsdCents: priceUsdCents,
+      discountUsdCents: priceUsdCents,
+      finalPriceUsdCents: 0,
+    };
+  }
+  return exact;
 }
 
 /** The product of a Pro billing option. */

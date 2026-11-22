@@ -22,7 +22,7 @@ The companion mobile application and detailed product specifications live in `..
 - daily reward claims: a signed-in user claims once per UTC day (`POST /v1/daily-rewards/claim`); the reward follows the streak of consecutive days and is granted as never-expiring `DAILY_REWARD` credits. A user never receives more than 600 daily reward credits per UTC calendar month: the claim that reaches the cap grants only the rest and later claims that month are refused, enforced by the service and by PostgreSQL (see "Daily reward claims")
 - discount codes and promotional campaigns: administrators create, view, change and deactivate codes and campaigns (discount percentage, active flag, start and end, optional user targeting, per-user and total redemption limits; 0% switches an offer off). Users redeem them for a credit package at the discounted price; invalid, inactive, not yet started, expired, depleted and ineligible offers are refused, and concurrent or repeated requests never exceed a limit or count twice (see "Discount codes and campaigns")
 - discounts in the Stripe checkout: each Pro checkout gets the best available discount (the highest percentage of the first-purchase discount, the referral discount, an entered discount code and running campaigns), charged through a one-time Stripe coupon so the first payment reflects it while the plan price and renewals stay unchanged. The first-purchase and referral discounts stay available until the first successful paid purchase (trials and failed, canceled or abandoned checkouts do not use them up); every discount is used at most once despite repeated, out-of-order or concurrent payments, subscriptions or checkouts. Campaigns support minimum spend, new/returning customer and product targeting and a USD budget that is reserved with each checkout, spent by its payment and given back only when the checkout can no longer be paid (see "Discounts in the Stripe checkout")
-- referrals: every user has a referral code; a user applies someone else's code once, before their first purchase, to get the referral discount (see "Discounts in the Stripe checkout")
+- referrals: every user has an individual referral code, used when signing up (`POST /auth` or Google sign-up); invalid codes, self-referrals, duplicate and retrospective referrals are refused and create nothing. Referred users get the referral discount; referrers get non-expiring `REFERRAL` credits once, with the invited user's first verified paying Stripe purchase (never for signup, verification, trials or unsuccessful purchases, never twice for repeated or concurrent webhooks), usable for makeup sessions without Pro. Users see their own code, pending and rewarded referrals, earnings and reward history, and nobody else's (see "Referrals")
 - AI credit wallet and ledger: per-user wallets, allocations by source (trial, subscription, purchase, referral) with expiry, exact fractional balances, an append-only transaction ledger with grants, debits and expirations (recorded for every wallet by a scheduled sweep), and per-session overage, all in PostgreSQL and safe under concurrency (see "AI credit wallet and ledger")
 - AI usage metering and credit deductions: every OpenRouter request of a makeup AI run is stored with its user, session, run, tokens and USD cost. Each run is charged once, in exact (fractional) credits converted from its actual cost at the administrator's rate ($0.025 at $0.005 per credit = 5 credits), and the cost and rate are kept in the ledger history (see "AI usage and credit deductions")
 - credit balance and transaction history APIs: a signed-in user sees their own balance by source (granted, available, used, expired, expiry dates), their ledger (allocations, deductions with session overage, expirations, with sources, sessions and AI usage), and the AI usage of their sessions; nobody else's (see "Credit balance and transaction history")
@@ -41,7 +41,7 @@ Intentionally deferred:
 - additional S3-compatible storage providers (the provider interface is in place; see "Private image storage")
 - generated preview images (recommendation reasoning is live, while the existing curated preview-image contract remains in place)
 - production retention/deletion automation and further credit features: issuing purchased and referral credits through the API (see "Credit-based access to makeup sessions")
-- buying credit packages through Stripe (a package redemption is priced but not charged), granting the referrer's reward credits after the referred user's first purchase, and a scheduled release of reservations held by checkouts whose Stripe session never reported back (they are released when the user checks out again or when Stripe's expiry webhook arrives)
+- buying credit packages through Stripe (a package redemption is priced but not charged), taking back referral credits when the qualifying payment is refunded, and a scheduled release of reservations held by checkouts whose Stripe session never reported back (they are released when the user checks out again or when Stripe's expiry webhook arrives)
 
 ## Requirements and setup
 
@@ -554,7 +554,7 @@ Authentication routes:
 
 | Method | Route                             | Purpose                                      |
 | ------ | --------------------------------- | -------------------------------------------- |
-| `POST` | `/auth`                           | Register and queue a verification email      |
+| `POST` | `/auth`                           | Register (optionally with a `referralCode`) and queue a verification email |
 | `POST` | `/auth/verify-email`              | Verify the six-character code                |
 | `POST` | `/auth/resend-verification-email` | Queue a replacement code                     |
 | `POST` | `/auth/login`                     | Return access token, refresh token, and user |
@@ -1163,13 +1163,13 @@ Redemptions require an `Idempotency-Key` header (1–200 characters; otherwise `
 | Source           | Available when                                                                                       |
 | ---------------- | ---------------------------------------------------------------------------------------------------- |
 | `FIRST_PURCHASE` | `firstPurchaseDiscountPercent` > 0 and the user never made a successful paid purchase                 |
-| `REFERRAL`       | `referralDiscountPercent` > 0, the user applied a referral code, and never made a successful paid purchase |
+| `REFERRAL`       | `referralDiscountPercent` > 0, the user signed up with a referral code, and never made a successful paid purchase |
 | `CODE`           | The user sent `"discountCode"` and the code can be used (otherwise the checkout is refused with the code's reason, see the table above, and nothing is created at Stripe or in PostgreSQL) |
 | `CAMPAIGN`       | Every running campaign the user and the purchase qualify for (targeting, customer group, product, minimum spend, limits, budget); campaigns that do not apply are skipped |
 
 The highest percentage wins. Ties go to the first-purchase, then the referral discount (they are gone after the first purchase anyway), then the entered code, then the campaign ending soonest. Only the chosen discount is used; an entered code that was not chosen is not used up. The response shows it (`discount`: `source`, `percent`, `amountOffCents`, and `code`/`offerId` for offers) with `amountDueCents`, the first charge.
 
-**Stripe charge.** The subscription's line item keeps the plan price (`amountCents`, unchanged in the plan configuration). The discount is a Stripe coupon created for the checkout: a fixed `amount_off` in cents, `duration: once`, `max_redemptions: 1`, and an id and idempotency key derived from the checkout, so retries reuse it. Stripe charges `amountCents - amountOffCents` for the first period and the full plan price for renewals. Payment verification requires exactly that amount (session total and first invoice), and a charge that does not reflect the discount grants nothing. The discount is rounded down to a whole cent and never takes the charge below Stripe's $0.50 minimum (a 100% discount on $19.00 charges $0.50).
+**Stripe charge.** The subscription's line item keeps the plan price (`amountCents`, unchanged in the plan configuration). The discount is a Stripe coupon created for the checkout: a fixed `amount_off` in cents, `duration: once`, `max_redemptions: 1`, and an id and idempotency key derived from the checkout, so retries reuse it. Stripe charges `amountCents - amountOffCents` for the first period and the full plan price for renewals. Payment verification requires exactly that amount (session total and first invoice), and a charge that does not reflect the discount grants nothing. The discount is rounded down to a whole cent. A 100% discount charges exactly **$0**: Stripe reports `no_payment_required`, the first invoice is paid with $0, and a $0 `SUCCEEDED` payment is recorded (Checkout still collects a payment method for the renewals). Stripe cannot charge less than $0.50, so a discounted first charge that would fall between $0.01 and $0.49 is waived to $0. It is never rounded up to the minimum: a customer never pays more than the advertised discount.
 
 **First purchase.** A purchase counts once a payment is `SUCCEEDED` (also if it is refunded later). Starting a free trial, failed payment attempts, and canceled, abandoned or expired checkouts do not count, so the first-purchase and referral discounts stay available for the next checkout.
 
@@ -1185,14 +1185,41 @@ A repeated request with the same billing option and code reuses the pending chec
 
 **Guarantees in PostgreSQL.** A partial unique index allows one `RESERVED` or `REDEEMED` first-purchase and one referral discount per user, and a trigger refuses them after a paid purchase. The redemption trigger locks the offer and re-checks eligibility when a discount is reserved (active, running, targeting, customer group, product, minimum spend), then checks the per-user and total limits and the budget (`spent + reserved <= budgetCents`). Status may only move `RESERVED -> REDEEMED | RELEASED` or `RELEASED -> REDEEMED` (re-checking capacity), and the trigger keeps the offer's counters in step. The counters cannot be changed any other way, and a checkout's discount and a redemption's terms never change. Deleting an account gives its reservations back and keeps its redeemed discounts counted.
 
-**Referrals** (any signed-in user):
+### Referrals
 
-| Method | Route                   | Purpose                                                                   |
-| ------ | ----------------------- | ------------------------------------------------------------------------- |
-| `GET`  | `/v1/referrals`         | The caller's own `code` (created on first use), `referred`, and the `referralDiscountPercent` they would get |
-| `POST` | `/v1/referrals/apply`   | Body `{ "code" }` (case-insensitive): sign up under another user's code  |
+Every user has an individual referral code (8 letters and digits, created on first use, shown by `GET /v1/referrals`).
 
-A code can be applied once per user (`409` afterwards), never the caller's own (`400`), only before the caller's first successful paid purchase (`409`); unknown codes answer `404`. If the referrer's account is deleted, the referred user keeps the referral.
+**Registration (signup only).** A code is used when creating an account: `POST /auth` with `"referralCode"` (case-insensitive), or `GET /auth/google?referralCode=…` for a Google sign-up (checked when the sign-in starts, carried in the encrypted OAuth state, applied only if the callback creates a new account). The referral is recorded in the transaction that creates the account, so a refused referral creates nothing: no account, no email.
+
+| Status | Message                                                     | When |
+| ------ | ----------------------------------------------------------- | ---- |
+| `400`  | `Invalid referral code`                                     | Malformed or unknown code, or its owner's account is deleted, blocked or otherwise not active |
+| `400`  | `You cannot use your own referral code`                     | Self-referral: the new email is the code owner's mailbox (compared lower case, without a `+tag`, and for Gmail without dots, so `a.lice+2@googlemail.com` is `alice@gmail.com`) |
+| `409`  | `A referral was already registered for this email address`  | Duplicate: that mailbox was already referred (also under another address, and when signing up concurrently) |
+| `409`  | `Referral codes can only be used when signing up`           | Retrospective: `POST /v1/referrals/apply` for an existing account. A Google sign-in to an existing account ignores the code and reports `referral: { applied: false, reason: "EXISTING_ACCOUNT" }` |
+
+Only a SHA-256 hash of the canonical email is stored with the referral (`canonicalEmailHash`, unique). If the referrer's account is deleted, the referred user keeps the referral (and its discount).
+
+**Referral discount.** A referred user gets `referralDiscountPercent` on their first purchase (see "Discounts in the Stripe checkout").
+
+**Referral reward.** When the referred user's **first verified paying purchase** is recorded (a `SUCCEEDED` Stripe payment above $0, confirmed by a verified webhook), the referrer receives `referrerRewardCredits` `REFERRAL` credits in the same transaction. The credits never expire and are usable with or without Pro, so they open makeup sessions (`POST /v1/sessions`) after a Pro subscription has ended.
+- Signing up, verifying the email, activating the trial, and abandoned, declined, failed or pending purchases grant nothing.
+- A $0 purchase (100% discount) is not a paying purchase: the first paying payment after it (e.g. the first renewal) qualifies.
+- Later purchases never reward again.
+- With the reward set to 0 (or the referrer deleted), the referral becomes `QUALIFIED` without credits, and is never rewarded later.
+- **Once only.** The payment is recorded once per Stripe invoice, under the referred user's lock, whatever the order, repetition or concurrency of webhook deliveries. The referral moves `PENDING -> REWARDED | QUALIFIED` in a conditional update, and the credits carry a unique reference (`referral-reward:<referral id>`).
+- **PostgreSQL enforces the same** (migration `20261205120000_referral_rewards`): referrals are never recorded after a paid purchase or for oneself, are never changed, and change status once; referral reward credits exist only for a `REWARDED` referral of that referrer, for exactly its reward.
+
+**Referral APIs** (any signed-in user, always the caller's own data; no route accepts a user id, and unknown query parameters are refused with `400`):
+
+| Method | Route                        | Purpose |
+| ------ | ---------------------------- | ------- |
+| `GET`  | `/v1/referrals`              | `code`, `referred`, `referralDiscountPercent` (what the caller gets on their first purchase), `rewardCreditsPerReferral`, referral counts (`total`, `pending`, `rewarded`, `qualified`) and `totalEarnedCredits` |
+| `GET`  | `/v1/referrals/invitees`     | The people the caller invited, newest first (`?status=PENDING|REWARDED|QUALIFIED`): `id`, `displayName` (first two characters of the username only, never the email or user id), `status`, `signedUpAt`, `qualifiedAt`, `rewardCredits`, `rewardedAt` |
+| `GET`  | `/v1/referrals/rewards`      | Reward history: `credits`, `remainingCredits`, `grantedAt`, `referralId`, `displayName` (`null` once the invitee's account is deleted), `expiresAt: null` |
+| `POST` | `/v1/referrals/apply`        | Always `409` (referrals are registered at signup only) |
+
+Earnings are read from the caller's own credit allocations, so they stay listed after an invitee deletes their account (their referral then disappears from the invitee list and counts).
 
 ### AI credit wallet and ledger
 
@@ -1487,7 +1514,7 @@ authUser
 |-- UserSubscription (0..1)
 |-- DailyRewardClaim, DailyRewardMonthlyTotal (per UTC day / month)
 |-- DiscountOfferTarget, DiscountRedemption (-> CheckoutSession, PaymentTransaction)
-|-- ReferralCode (0..1), Referral (0..1; referrerAuthId SET NULL when the referrer is deleted)
+|-- ReferralCode (0..1), Referral (0..1, as the referred user; referrerAuthId SET NULL when the referrer is deleted; qualifyingPaymentId -> PaymentTransaction)
 |-- CreditWallet (0..1)
 |   |-- CreditAllocation -> CreditLedgerEntry
 |   |-- CreditTransaction -> CreditLedgerEntry
@@ -1527,6 +1554,8 @@ npm test -- --runInBand credit   # AI credit unit/HTTP tests
 TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json --runInBand test/credit-settings test/credit-wallet test/credit-access test/credit-trial test/credit-subscription test/credit-scheduler test/credit-usage test/credit-overage test/credit-apis   # AI credits on PostgreSQL
 npx jest discount   # discount settings, codes and campaigns unit/HTTP tests (likewise: daily, credit-package)
 TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json discount   # every discount suite on PostgreSQL; one suite: discount-first-purchase, discount-payments, discount-campaign-budget, discount-codes, discount-campaigns (likewise: daily, credit-package)
+npx jest referral   # referral unit tests
+TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json referral   # referral-registration, referral-purchase, referral-apis on PostgreSQL
 TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json test/private-cloud   # storage workflows + cleanup ledger on PostgreSQL (mocked Supabase)
 npm run test:e2e
 npx prisma generate

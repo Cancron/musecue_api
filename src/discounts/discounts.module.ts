@@ -12,15 +12,13 @@ import { DiscountRedemptionController } from './discount-redemption.controller';
 import { DiscountRedemptionService } from './discount-redemption.service';
 import { DiscountSettingsController } from './discount-settings.controller';
 import { DiscountSettingsService } from './discount-settings.service';
-import { ReferralController } from './referral.controller';
-import { ReferralService } from './referral.service';
 
 /**
  * Discounts: the administrator-managed discount and referral settings
  * (first-purchase discount, referral discount, referrer reward credits),
  * discount codes and promotional campaigns (DiscountOfferAdminService), and
  * their redemption by users for a configured credit package
- * (DiscountRedemptionService), and referral attribution (ReferralService).
+ * (DiscountRedemptionService). Referrals are in ReferralsModule.
  * The Pro checkout applies the best available discount through
  * CheckoutDiscountService (SubscriptionModule).
  */
@@ -31,13 +29,11 @@ import { ReferralService } from './referral.service';
     DiscountCodesAdminController,
     DiscountCampaignsAdminController,
     DiscountRedemptionController,
-    ReferralController,
   ],
   providers: [
     DiscountSettingsService,
     DiscountOfferAdminService,
     DiscountRedemptionService,
-    ReferralService,
     ActivityLogService,
     AuthGuard,
     RolesGuard,

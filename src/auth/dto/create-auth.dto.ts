@@ -3,9 +3,11 @@ import {
   IsEmail,
   IsNotEmpty,
   IsString,
+  Length,
   Matches,
   MaxLength,
   MinLength,
+  ValidateIf,
 } from 'class-validator';
 
 export class CreateAuthDto {
@@ -27,4 +29,14 @@ export class CreateAuthDto {
   @IsEmail()
   @IsNotEmpty()
   email: string;
+
+  /**
+   * Optional: another user's referral code (case-insensitive). Referrals
+   * are registered only at signup; an invalid, own or duplicate referral
+   * refuses the registration (nothing is created).
+   */
+  @ValidateIf((_: object, value: unknown) => value !== undefined)
+  @IsString()
+  @Length(1, 32)
+  referralCode?: string;
 }

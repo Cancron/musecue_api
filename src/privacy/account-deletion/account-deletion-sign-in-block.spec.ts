@@ -15,6 +15,7 @@ import type { EmailQueueService } from '../../common/queues/email/email.queue';
 import type { ActivityLogService } from '../../common/services/activity-log.service';
 import type { CustomLoggerService } from '../../common/services/custom-logger.service';
 import type { OAuthStateRepository } from '../../auth/state/oauth-state.repository';
+import { ReferralRegistrationService } from '../../referrals/referral-registration.service';
 
 const PASSWORD = 'correct horse battery staple';
 const META = { ip: '203.0.113.1', userAgent: 'spec' };
@@ -55,6 +56,7 @@ describe('Accounts pending deletion cannot sign in again (privacy)', () => {
       new FakeTokenVersionCache(),
       mock<EmailQueueService>(),
       mock<CustomLoggerService>(),
+      mock<ReferralRegistrationService>(),
     );
   });
 
@@ -122,6 +124,7 @@ describe('Accounts pending deletion cannot sign in again (privacy)', () => {
       store.prisma,
       mock<ActivityLogService>(),
       utils,
+      mock<ReferralRegistrationService>(),
     );
     const createAccessToken = jest.spyOn(utils, 'createAccessToken');
     const findOrCreateUser = (

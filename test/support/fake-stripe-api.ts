@@ -148,12 +148,18 @@ export class FakeStripeApi {
     const paid = (options.paymentStatus ?? 'paid') === 'paid';
     if (!session.invoice) this.startSubscription(session, options.periodStart);
     const invoice = this.requireInvoice(str(session.invoice));
+    // A 100% discount: nothing is due, Stripe requires no payment.
+    const nothingDue = Number(invoice.amount_due) === 0;
     if (paid) {
       this.collect(invoice, options.invoiceAmount);
     }
     Object.assign(session, {
       status: 'complete',
-      payment_status: paid ? 'paid' : 'unpaid',
+      payment_status: paid
+        ? nothingDue
+          ? 'no_payment_required'
+          : 'paid'
+        : 'unpaid',
       url: null,
     });
     return session;
@@ -574,6 +580,11 @@ export class FakeStripeApi {
       amount_paid: collected,
       status_transitions: { paid_at: Math.floor(Date.now() / 1000) },
     });
+    Object.assign(this.subscriptions.get(this.subscriptionOf(invoice)) ?? {}, {
+      status: 'active',
+    });
+    // A $0 invoice is paid without any charge.
+    if (collected === 0) return;
     const chargeId = this.id('ch');
     this.charges.set(chargeId, {
       id: chargeId,

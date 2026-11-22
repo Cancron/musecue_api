@@ -84,7 +84,8 @@ const UNPAID_SUBSCRIPTION_STATUSES = new Set([
  * - its first invoice (`subscription_create`) is paid in full in USD: the
  *   stored price less the checkout's discount (a one-time coupon), so the
  *   charge reflects the discount while the subscription keeps the plan
- *   price.
+ *   price. With a 100% discount that is exactly $0 (Stripe reports
+ *   `no_payment_required` and a paid $0 invoice).
  *
  * Anything else is rejected; a delayed payment method that has not settled
  * yet is reported as AWAITING_PAYMENT.
@@ -105,13 +106,19 @@ export function verifyStripeCheckout(
   if (idOf(session.customer) !== expected.providerCustomerId) {
     return reject('CUSTOMER_MISMATCH');
   }
+  const charged = expected.amountCents - expected.discountCents;
   if (session.payment_status === 'unpaid') {
     return { outcome: 'AWAITING_PAYMENT' };
   }
-  if (session.payment_status !== 'paid') return reject('NO_PAYMENT_COLLECTED');
+  // A 100% discount: nothing is due for the first period, so Stripe reports
+  // no payment required (the first invoice is paid with $0).
+  const nothingDue =
+    charged === 0 && session.payment_status === 'no_payment_required';
+  if (session.payment_status !== 'paid' && !nothingDue) {
+    return reject('NO_PAYMENT_COLLECTED');
+  }
 
   const currency = expected.currency.toLowerCase();
-  const charged = expected.amountCents - expected.discountCents;
   if (session.currency !== currency) return reject('CURRENCY_MISMATCH');
   if (session.amount_total !== charged) {
     return reject('AMOUNT_MISMATCH');

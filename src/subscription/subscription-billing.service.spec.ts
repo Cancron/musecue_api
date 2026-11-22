@@ -20,7 +20,10 @@ import { StripeWebhookService } from './stripe/stripe-webhook.service';
 import { StripeGateway } from './stripe/stripe.gateway';
 import { SubscriptionBillingService } from './subscription-billing.service';
 import { SubscriptionPlanService } from './subscription-plan.service';
-import { noCheckoutDiscounts } from '../../test/support/no-checkout-discounts';
+import {
+  noCheckoutDiscounts,
+  noReferralRewards,
+} from '../../test/support/no-checkout-discounts';
 
 const { MONTHLY, YEARLY } = BillingInterval;
 const DAY = 24 * 60 * 60 * 1000;
@@ -96,6 +99,7 @@ describe('SubscriptionBillingService', () => {
       new StripeRefundService(prisma, gateway, activityLog, logger, credits),
       credits,
       noCheckoutDiscounts(),
+      noReferralRewards(),
     );
     billing = new SubscriptionBillingService(prisma);
   });

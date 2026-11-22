@@ -6,6 +6,7 @@ import { GoogleOAuthService } from './services/google-oauth.service';
 import { ActivityLogService } from '../common/services/activity-log.service';
 import { EmailService } from '../common/services/email.service';
 import { QueueModule } from '../common/modules';
+import { ReferralsModule } from '../referrals/referrals.module';
 import { AuthGuard } from '../common/guards/auth.guard';
 import { AuthChallengeRepository } from './state/auth-challenge.repository';
 import { AuthStateCleanupService } from './state/auth-state-cleanup.service';
@@ -13,7 +14,8 @@ import { OAuthStateRepository } from './state/oauth-state.repository';
 import { RefreshSessionRepository } from './state/refresh-session.repository';
 
 @Module({
-  imports: [QueueModule],
+  // Referral codes given at signup are registered with the new account.
+  imports: [QueueModule, ReferralsModule],
   controllers: [AuthController],
   providers: [
     AuthService,

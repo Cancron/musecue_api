@@ -349,15 +349,43 @@ describeWithDatabase(
         });
       });
 
-      it('never charges below the $0.50 Stripe minimum', async () => {
+      it('charges exactly $0 for a 100% discount, never Stripe’s $0.50 minimum', async () => {
         const free = await createCode({ discountPercent: 100 });
-        const view = await d.open(await d.user(), 'MONTHLY', free.code);
+        const user = await d.user();
+        const view = await d.open(user, 'MONTHLY', free.code);
         expect(view).toMatchObject({
-          discount: { percent: 100, amountOffCents: 1850 },
-          amountDueCents: 50,
+          discount: { percent: 100, amountOffCents: 1900 },
+          amountDueCents: 0,
         });
         const session = await d.pay(view.checkoutSessionId);
-        expect(session.amount_total).toBe(50);
+        expect(session).toMatchObject({
+          amount_total: 0,
+          payment_status: 'no_payment_required',
+        });
+        await expect(harness.status(user)).resolves.toMatchObject({
+          status: 'PRO',
+        });
+        const row = await d.row(view.checkoutSessionId);
+        await expect(
+          harness.client.paymentTransaction.findUniqueOrThrow({
+            where: { id: row.paymentId! },
+          }),
+        ).resolves.toMatchObject({ status: 'SUCCEEDED', amountCents: 0 });
+        // The renewal is charged the plan price.
+        const renewal = harness.stripe.api.renewSubscription(
+          row.providerSubscriptionId!,
+        );
+        expect(renewal.amount_paid).toBe(1900);
+      });
+
+      it('waives a discounted charge below $0.50 instead of rounding it up', async () => {
+        const almost = await createCode({ discountPercent: 99 });
+        const view = await d.open(await d.user(), 'MONTHLY', almost.code);
+        // 1% of $19.00 is $0.19, which Stripe cannot charge: it is free.
+        expect(view).toMatchObject({
+          discount: { percent: 99, amountOffCents: 1900 },
+          amountDueCents: 0,
+        });
       });
     });
 

@@ -8,6 +8,7 @@ import { ActivityLogService } from '../common/services/activity-log.service';
 import { CustomLoggerService } from '../common/services/custom-logger.service';
 import { EmailQueueService } from '../common/queues/email/email.queue';
 import { TokenVersionCache } from '../infrastructure/token-version/token-version.cache';
+import { ReferralRegistrationService } from '../referrals/referral-registration.service';
 
 describe('refresh-token failure and rotation boundaries', () => {
   const sessions = mock<RefreshSessionRepository>();
@@ -22,6 +23,7 @@ describe('refresh-token failure and rotation boundaries', () => {
     mock<TokenVersionCache>(),
     mock<EmailQueueService>(),
     mock<CustomLoggerService>(),
+    mock<ReferralRegistrationService>(),
   );
   const META = { ip: 'test', userAgent: 'test' };
   const active = {

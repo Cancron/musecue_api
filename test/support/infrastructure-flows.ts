@@ -80,6 +80,8 @@ export interface BootOptions {
    * would. The caller owns it: `close()` does not drop it.
    */
   schema?: string;
+  /** Providers replaced by test doubles (e.g. the Stripe client). */
+  overrides?: Array<{ provide: unknown; useValue: unknown }>;
 }
 
 /** Boots AppModule against a freshly migrated (or the given) schema. */
@@ -105,12 +107,17 @@ export async function bootApplication(
   });
   const emails = new CapturingEmailService();
 
-  const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
+  let builder = Test.createTestingModule({ imports: [AppModule] })
     .overrideProvider(PrismaService)
     .useValue(client)
     .overrideProvider(EmailService)
-    .useValue(emails)
-    .compile();
+    .useValue(emails);
+  for (const override of options.overrides ?? []) {
+    builder = builder
+      .overrideProvider(override.provide)
+      .useValue(override.useValue);
+  }
+  const moduleRef = await builder.compile();
   const app = moduleRef.createNestApplication<INestApplication<App>>({
     rawBody: true,
   });

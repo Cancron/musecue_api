@@ -6,6 +6,7 @@ import { ActivityLogService } from '../../common/services/activity-log.service';
 import { AuthUtilsService } from './auth-utils.service';
 import { OAuthStateRepository } from '../state/oauth-state.repository';
 import { RefreshSessionRepository } from '../state/refresh-session.repository';
+import { ReferralRegistrationService } from '../../referrals/referral-registration.service';
 
 describe('GoogleOAuthService', () => {
   let service: GoogleOAuthService;
@@ -91,6 +92,10 @@ describe('GoogleOAuthService', () => {
         {
           provide: AuthUtilsService,
           useValue: mockAuthUtilsService,
+        },
+        {
+          provide: ReferralRegistrationService,
+          useValue: { findReferrer: jest.fn() },
         },
       ],
     }).compile();
