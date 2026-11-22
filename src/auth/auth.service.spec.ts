@@ -10,6 +10,7 @@ import { EmailQueueService } from '../common/queues/email/email.queue';
 import { CustomLoggerService } from '../common/services/custom-logger.service';
 import AppError from '../common/errors/app.error';
 import { ReferralRegistrationService } from '../referrals/referral-registration.service';
+import { NotificationService } from '../notifications/notification.service';
 
 // Mock the AUTH_CONFIG to use numeric values for VERIFICATION
 jest.mock('./config/auth.config', () => ({
@@ -59,6 +60,7 @@ describe('AuthService', () => {
     emailQueueService,
     mock<CustomLoggerService>(),
     mock<ReferralRegistrationService>(),
+    mock<NotificationService>(),
   );
 
   /** Runs every transaction callback with `tx` as its client. */

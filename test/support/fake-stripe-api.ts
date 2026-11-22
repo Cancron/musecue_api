@@ -85,6 +85,8 @@ export class FakeStripeApi {
   readonly charges = new Map<string, Json>();
   readonly refunds = new Map<string, Json>();
   readonly coupons = new Map<string, Json>();
+  /** The card fingerprint each customer pays with (none by default). */
+  readonly customerCards = new Map<string, string>();
   private readonly idempotency = new Map<string, StoredResponse>();
   private readonly failures = new Map<string, FailureKind[]>();
   private counter = 0;
@@ -139,9 +141,14 @@ export class FakeStripeApi {
       paymentStatus?: 'paid' | 'unpaid';
       periodStart?: Date;
       invoiceAmount?: number;
+      /** The customer pays with this card (Stripe's card fingerprint). */
+      cardFingerprint?: string;
     } = {},
   ): Json {
     const session = this.requireSession(sessionId);
+    if (options.cardFingerprint) {
+      this.customerCards.set(str(session.customer), options.cardFingerprint);
+    }
     if (session.status !== 'open') {
       throw new Error(`Session ${sessionId} is ${str(session.status)}`);
     }
@@ -600,10 +607,19 @@ export class FakeStripeApi {
       created: Math.floor(Date.now() / 1000),
     });
     invoice._charge = chargeId;
+    const fingerprint = this.customerCards.get(str(invoice.customer));
     Object.assign(this.paymentIntentOf(invoice), {
       status: 'succeeded',
       last_payment_error: null,
       latest_charge: chargeId,
+      payment_method: fingerprint
+        ? {
+            id: `pm_${fingerprint}`,
+            object: 'payment_method',
+            type: 'card',
+            card: { brand: 'visa', last4: '4242', fingerprint },
+          }
+        : null,
     });
     Object.assign(this.subscriptions.get(this.subscriptionOf(invoice)) ?? {}, {
       status: 'active',

@@ -162,6 +162,26 @@ export class EmailService {
   }
 
   /**
+   * Send the email of an inbox notification (title and message are written
+   * by the application; HTML-escaped here)
+   */
+  async sendNotificationEmail(
+    email: string,
+    username: string,
+    title: string,
+    message: string,
+  ): Promise<void> {
+    const html = this.getEmailTemplate('notification.html', {
+      username: escapeHtml(username),
+      title: escapeHtml(title),
+      message: escapeHtml(message),
+      year: new Date().getFullYear().toString(),
+    });
+
+    await this.sendEmail({ to: email, subject: title, html });
+  }
+
+  /**
    * Send welcome email after verification
    */
   async sendWelcomeEmail(email: string, username: string): Promise<void> {
@@ -176,4 +196,13 @@ export class EmailService {
       html,
     });
   }
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }

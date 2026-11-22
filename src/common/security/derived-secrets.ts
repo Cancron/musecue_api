@@ -22,6 +22,7 @@ export const SECRET_PURPOSES = {
   OAUTH_STATE: 'musecue/oauth-state/v1',
   JOB_PAYLOAD: 'musecue/infrastructure-job-payload/v1',
   RATE_LIMIT_KEY: 'musecue/rate-limit-key/v1',
+  PAYMENT_FINGERPRINT: 'musecue/payment-fingerprint/v1',
 } as const;
 
 export type SecretPurpose =

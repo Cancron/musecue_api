@@ -19,6 +19,8 @@ import { DiscountsModule } from './discounts/discounts.module';
 import { DailyRewardsModule } from './daily-rewards/daily-rewards.module';
 import { CreditPackagesModule } from './credit-packages/credit-packages.module';
 import { ReferralsModule } from './referrals/referrals.module';
+import { NotificationsModule } from './notifications/notifications.module';
+import { NotificationDeliveryModule } from './notifications/delivery/notification-delivery.module';
 import { PrivacyModule } from './privacy/privacy.module';
 import { AccountDeletionModule } from './privacy/account-deletion/account-deletion.module';
 
@@ -53,6 +55,8 @@ import { AccountDeletionModule } from './privacy/account-deletion/account-deleti
     DailyRewardsModule,
     CreditPackagesModule,
     ReferralsModule,
+    NotificationsModule,
+    NotificationDeliveryModule,
     PrivacyModule,
     AccountDeletionModule,
   ],

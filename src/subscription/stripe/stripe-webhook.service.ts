@@ -20,7 +20,11 @@ import { CustomLoggerService } from '../../common/services/custom-logger.service
 import { PrismaService } from '../../common/services/prisma.service';
 import { CreditAllowanceService } from '../credit-allowance.service';
 import { CheckoutDiscountService } from '../discounts/checkout-discount.service';
-import { ReferralRewardService } from '../referrals/referral-reward.service';
+import { hashPaymentFingerprint } from '../../referrals/payment-fingerprint';
+import {
+  type PaymentMethodCheck,
+  ReferralRewardService,
+} from '../../referrals/referral-reward.service';
 import { isProActive } from '../subscription-access.policy';
 import { StripeCancellationService } from './stripe-cancellation.service';
 import { StripeRefundService } from './stripe-refund.service';
@@ -420,6 +424,10 @@ export class StripeWebhookService {
         verification.payment,
         metadata,
         now,
+        await this.paymentMethodHash(
+          verification.payment.providerPaymentId,
+          verification.payment.amountCents,
+        ),
       ),
       metadata,
       now,
@@ -431,6 +439,7 @@ export class StripeWebhookService {
     payment: VerifiedStripePayment,
     metadata: ActivityLogMetadata,
     now: Date,
+    paymentMethod: PaymentMethodCheck,
   ): Promise<WebhookOutcome> {
     return this.prisma.$transaction(async (tx) => {
       await this.lockSubscription(tx, checkout.subscriptionId);
@@ -470,6 +479,7 @@ export class StripeWebhookService {
         tx,
         record.authId,
         saved,
+        paymentMethod,
         now,
       );
       if (!linked) {
@@ -643,6 +653,10 @@ export class StripeWebhookService {
         verification.payment,
         metadata,
         now,
+        await this.paymentMethodHash(
+          verification.payment.providerPaymentId,
+          verification.payment.amountCents,
+        ),
       ),
       metadata,
       now,
@@ -695,6 +709,7 @@ export class StripeWebhookService {
     payment: VerifiedStripeRenewal,
     metadata: ActivityLogMetadata,
     now: Date,
+    paymentMethod: PaymentMethodCheck,
   ): Promise<WebhookOutcome> {
     return this.prisma.$transaction(async (tx) => {
       await this.lockSubscription(tx, subscriptionRecordId);
@@ -737,6 +752,7 @@ export class StripeWebhookService {
         tx,
         record.authId,
         saved,
+        paymentMethod,
         now,
       );
 
@@ -866,6 +882,10 @@ export class StripeWebhookService {
         },
         metadata,
         now,
+        await this.paymentMethodHash(
+          invoice.providerInvoiceId,
+          invoice.amountCents,
+        ),
       ),
       metadata,
       now,
@@ -1276,6 +1296,44 @@ export class StripeWebhookService {
   // -------------------------------------------------------------------------
   // Shared
   // -------------------------------------------------------------------------
+
+  /**
+   * The keyed hash of the payment method that paid an invoice (read from
+   * Stripe, outside any transaction), for recognizing referral accounts that
+   * share a payment method. The provider's fingerprint is hashed at once and
+   * never stored. No hash for $0 invoices and methods without a
+   * fingerprint. When Stripe cannot be asked, the payment is still recorded
+   * (access is never delayed by it) and `unavailable` makes a referral that
+   * this payment would qualify wait for review instead of being rewarded
+   * unchecked.
+   */
+  private async paymentMethodHash(
+    invoiceId: string,
+    amountCents: number,
+  ): Promise<PaymentMethodCheck> {
+    if (amountCents <= 0) return { hash: null, unavailable: false };
+    try {
+      const fingerprint =
+        await this.stripe.retrievePaymentMethodFingerprint(invoiceId);
+      return {
+        hash: fingerprint
+          ? hashPaymentFingerprint(STRIPE_PROVIDER, fingerprint)
+          : null,
+        unavailable: false,
+      };
+    } catch (error) {
+      this.logger.logWithMetadata(
+        'warn',
+        'Could not read the payment method of a payment; referral rewards it qualifies are held',
+        {
+          context: LOG_CONTEXT,
+          providerInvoiceId: invoiceId,
+          errorCode: errorCodeOf(error),
+        },
+      );
+      return { hash: null, unavailable: true };
+    }
+  }
 
   private async lockSubscription(
     tx: Prisma.TransactionClient,

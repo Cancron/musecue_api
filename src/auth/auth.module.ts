@@ -7,6 +7,7 @@ import { ActivityLogService } from '../common/services/activity-log.service';
 import { EmailService } from '../common/services/email.service';
 import { QueueModule } from '../common/modules';
 import { ReferralsModule } from '../referrals/referrals.module';
+import { NotificationsModule } from '../notifications/notifications.module';
 import { AuthGuard } from '../common/guards/auth.guard';
 import { AuthChallengeRepository } from './state/auth-challenge.repository';
 import { AuthStateCleanupService } from './state/auth-state-cleanup.service';
@@ -15,7 +16,8 @@ import { RefreshSessionRepository } from './state/refresh-session.repository';
 
 @Module({
   // Referral codes given at signup are registered with the new account.
-  imports: [QueueModule, ReferralsModule],
+  // Security events create notifications.
+  imports: [QueueModule, ReferralsModule, NotificationsModule],
   controllers: [AuthController],
   providers: [
     AuthService,

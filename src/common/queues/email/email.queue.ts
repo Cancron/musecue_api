@@ -28,10 +28,20 @@ export interface AccountDeletionCodeEmailJob {
   expiresInMinutes: number;
 }
 
+/**
+ * The email of one inbox notification. Only the id travels with the job;
+ * the handler reads the notification and the recipient when it runs.
+ */
+export interface NotificationEmailJob {
+  type: 'notification';
+  notificationId: string;
+}
+
 export type EmailJob =
   | VerificationEmailJob
   | WelcomeEmailJob
-  | AccountDeletionCodeEmailJob;
+  | AccountDeletionCodeEmailJob
+  | NotificationEmailJob;
 
 /** 3 attempts, exponential backoff from 2 seconds. */
 const RETRIES = {
@@ -90,6 +100,31 @@ export class EmailQueueService {
       ...RETRIES,
       removeOnComplete: true,
       removeOnFail: true,
+    });
+  }
+
+  /**
+   * Queues the email of a notification. The job id is derived from the
+   * notification and its attempt count, so dispatching it again adds nothing;
+   * the handler also claims the notification before sending, so it is
+   * emailed once.
+   */
+  async sendNotificationEmail(
+    notificationId: string,
+    authId: string,
+    attempt = 0,
+  ): Promise<void> {
+    await this.jobs.dispatch<EmailJob>(EMAIL_QUEUE, {
+      name: 'send-notification',
+      // One job per claim round: a notification returned to PENDING after
+      // an interrupted or failed attempt gets a new job, while dispatching
+      // the same round again is deduplicated.
+      jobId: `notification-email-${notificationId}-${attempt}`,
+      ownerId: authId,
+      data: { type: 'notification', notificationId },
+      ...RETRIES,
+      removeOnComplete: 100,
+      removeOnFail: 500,
     });
   }
 

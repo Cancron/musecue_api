@@ -5,6 +5,11 @@ import { AUTH_CONFIG } from './config/auth.config';
 import { PrismaService } from '../common/services/prisma.service';
 import { ActivityLogService } from '../common/services/activity-log.service';
 import { ReferralRegistrationService } from '../referrals/referral-registration.service';
+import { NotificationService } from '../notifications/notification.service';
+import {
+  type NotificationContent,
+  notificationContent,
+} from '../notifications/notification.policy';
 import { EmailQueueService } from '../common/queues/email/email.queue';
 import { CustomLoggerService } from '../common/services/custom-logger.service';
 import AppError from '../common/errors/app.error';
@@ -37,6 +42,7 @@ export class AuthService {
     private readonly emailQueueService: EmailQueueService,
     private readonly customLogger: CustomLoggerService,
     private readonly referrals: ReferralRegistrationService,
+    private readonly notifications: NotificationService,
   ) {}
 
   async create(
@@ -725,6 +731,12 @@ export class AuthService {
     if (storedData.tokenHash !== tokenHash) {
       // Token mismatch - potential attack, revoke all tokens
       await this.revokeAllUserTokens(userId, 'REUSE_DETECTED');
+      // Security notification (always emailed), once per reused session.
+      await this.notifySecurityEvent(
+        userId,
+        `security:session-reuse:${jti}`,
+        notificationContent.sessionReuseDetected(),
+      );
       throw AppError.unauthorized('Invalid refresh token');
     }
 
@@ -826,7 +838,46 @@ export class AuthService {
     await this.revokeAllUserTokens(userId, 'LOGOUT_ALL');
     // Increment tokenVersion to immediately invalidate all access tokens
     await this.incrementTokenVersion(userId);
+    // Security notification (always emailed), one per sign-out (the new
+    // token version identifies it).
+    const user = await this.prismaService.authUser.findUnique({
+      where: { id: userId },
+      select: { tokenVersion: true },
+    });
+    if (user) {
+      await this.notifySecurityEvent(
+        userId,
+        `security:signed-out-everywhere:v${user.tokenVersion}`,
+        notificationContent.signedOutEverywhere(),
+      );
+    }
     return { message: 'Logged out from all devices successfully' };
+  }
+
+  /**
+   * Records a security notification (emailed whatever the preferences).
+   * Best effort: the security action itself already happened and must not
+   * fail because of its notification.
+   */
+  private async notifySecurityEvent(
+    userId: string,
+    eventKey: string,
+    content: NotificationContent,
+  ): Promise<void> {
+    try {
+      await this.notifications.notify(
+        this.prismaService,
+        userId,
+        eventKey,
+        content,
+      );
+    } catch (error) {
+      this.customLogger.error(
+        `Failed to record security notification ${content.type}`,
+        error instanceof Error ? error.stack : undefined,
+        'AuthService',
+      );
+    }
   }
 
   /**

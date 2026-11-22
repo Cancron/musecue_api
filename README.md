@@ -22,7 +22,8 @@ The companion mobile application and detailed product specifications live in `..
 - daily reward claims: a signed-in user claims once per UTC day (`POST /v1/daily-rewards/claim`); the reward follows the streak of consecutive days and is granted as never-expiring `DAILY_REWARD` credits. A user never receives more than 600 daily reward credits per UTC calendar month: the claim that reaches the cap grants only the rest and later claims that month are refused, enforced by the service and by PostgreSQL (see "Daily reward claims")
 - discount codes and promotional campaigns: administrators create, view, change and deactivate codes and campaigns (discount percentage, active flag, start and end, optional user targeting, per-user and total redemption limits; 0% switches an offer off). Users redeem them for a credit package at the discounted price; invalid, inactive, not yet started, expired, depleted and ineligible offers are refused, and concurrent or repeated requests never exceed a limit or count twice (see "Discount codes and campaigns")
 - discounts in the Stripe checkout: each Pro checkout gets the best available discount (the highest percentage of the first-purchase discount, the referral discount, an entered discount code and running campaigns), charged through a one-time Stripe coupon so the first payment reflects it while the plan price and renewals stay unchanged. The first-purchase and referral discounts stay available until the first successful paid purchase (trials and failed, canceled or abandoned checkouts do not use them up); every discount is used at most once despite repeated, out-of-order or concurrent payments, subscriptions or checkouts. Campaigns support minimum spend, new/returning customer and product targeting and a USD budget that is reserved with each checkout, spent by its payment and given back only when the checkout can no longer be paid (see "Discounts in the Stripe checkout")
-- referrals: every user has an individual referral code, used when signing up (`POST /auth` or Google sign-up); invalid codes, self-referrals, duplicate and retrospective referrals are refused and create nothing. Referred users get the referral discount; referrers get non-expiring `REFERRAL` credits once, with the invited user's first verified paying Stripe purchase (never for signup, verification, trials or unsuccessful purchases, never twice for repeated or concurrent webhooks), usable for makeup sessions without Pro. Users see their own code, pending and rewarded referrals, earnings and reward history, and nobody else's (see "Referrals")
+- referrals: every user has an individual referral code, used when signing up (`POST /auth` or Google sign-up); invalid codes, self-referrals, duplicate and retrospective referrals are refused and create nothing. Referred users get the referral discount; referrers get non-expiring `REFERRAL` credits once, with the invited user's first verified paying Stripe purchase (never for signup, verification, trials or unsuccessful purchases, never twice for repeated or concurrent webhooks), usable for makeup sessions without Pro. Administrators configure referral milestones (bonus credits after N paid referrals, each awarded once). Referrals paid with a payment method shared with the referrer or another of their invitees are held for administrator review (only a keyed hash of Stripe's payment method fingerprint is stored). Users see their own code, pending, rewarded and held referrals, milestones, earnings and reward history, and nobody else's (see "Referrals")
+- notifications: an in-app inbox per user (paged, read/unread, mark all read) with email delivery through the existing email queue, for referral rewards, referral milestones and security events (signed out everywhere, refresh token reuse); each event notifies once despite retries, concurrency and restarts; users turn referral emails off, security emails are mandatory (see "Notifications")
 - AI credit wallet and ledger: per-user wallets, allocations by source (trial, subscription, purchase, referral) with expiry, exact fractional balances, an append-only transaction ledger with grants, debits and expirations (recorded for every wallet by a scheduled sweep), and per-session overage, all in PostgreSQL and safe under concurrency (see "AI credit wallet and ledger")
 - AI usage metering and credit deductions: every OpenRouter request of a makeup AI run is stored with its user, session, run, tokens and USD cost. Each run is charged once, in exact (fractional) credits converted from its actual cost at the administrator's rate ($0.025 at $0.005 per credit = 5 credits), and the cost and rate are kept in the ledger history (see "AI usage and credit deductions")
 - credit balance and transaction history APIs: a signed-in user sees their own balance by source (granted, available, used, expired, expiry dates), their ledger (allocations, deductions with session overage, expirations, with sources, sessions and AI usage), and the AI usage of their sessions; nobody else's (see "Credit balance and transaction history")
@@ -1198,6 +1199,8 @@ Every user has an individual referral code (8 letters and digits, created on fir
 | `409`  | `A referral was already registered for this email address`  | Duplicate: that mailbox was already referred (also under another address, and when signing up concurrently) |
 | `409`  | `Referral codes can only be used when signing up`           | Retrospective: `POST /v1/referrals/apply` for an existing account. A Google sign-in to an existing account ignores the code and reports `referral: { applied: false, reason: "EXISTING_ACCOUNT" }` |
 
+PostgreSQL enforces signup-only as well (migration `20261206130000_referral_milestones_notifications`): a referral row can only be inserted in the same transaction that created the referred account (`A referral can only be recorded when the account is created`), so no code path or manual statement can attach a referral to an existing account.
+
 Only a SHA-256 hash of the canonical email is stored with the referral (`canonicalEmailHash`, unique). If the referrer's account is deleted, the referred user keeps the referral (and its discount).
 
 **Referral discount.** A referred user gets `referralDiscountPercent` on their first purchase (see "Discounts in the Stripe checkout").
@@ -1210,16 +1213,86 @@ Only a SHA-256 hash of the canonical email is stored with the referral (`canonic
 - **Once only.** The payment is recorded once per Stripe invoice, under the referred user's lock, whatever the order, repetition or concurrency of webhook deliveries. The referral moves `PENDING -> REWARDED | QUALIFIED` in a conditional update, and the credits carry a unique reference (`referral-reward:<referral id>`).
 - **PostgreSQL enforces the same** (migration `20261205120000_referral_rewards`): referrals are never recorded after a paid purchase or for oneself, are never changed, and change status once; referral reward credits exist only for a `REWARDED` referral of that referrer, for exactly its reward.
 
+**Referral statuses.** `PENDING` (signed up, no paid purchase) -> `REWARDED` (credits granted) or `QUALIFIED` (no reward due) or `HELD` (suspicious, waits for review); `HELD` -> `REWARDED`/`QUALIFIED` (approved) or `REJECTED`. Each change happens once; the database refuses any other.
+
+#### Referral milestones
+
+Administrators configure milestones: after `referralCount` **paid referrals** (invited users whose first paying purchase was verified: `REWARDED` or `QUALIFIED`; pending, held and rejected referrals do not count) the referrer receives `rewardCredits` extra non-expiring `REFERRAL` credits (reference `referral-milestone:<milestone id>`) and a notification. There are none by default.
+
+- Each milestone is awarded **once** per referrer (unique award per referrer and milestone). Milestones are evaluated whenever one of the referrer's referrals becomes paid (a verified purchase or an approved review), under a lock of the referrer's `ReferralProgress` row, so concurrent purchases are counted one by one and no milestone is skipped or awarded twice; repeated webhooks change nothing.
+- Every reached, not yet awarded, active milestone is awarded together (e.g. a milestone created or switched on after the referrer passed it is awarded with their next paid referral).
+- Changing `rewardCredits` applies to awards made from then on; switching a milestone off stops new awards. The threshold never changes (one milestone per threshold).
+- PostgreSQL refuses awards of inactive milestones or below the referrer's paid referral count, changes to awards, and milestone credits without an award of the same amount.
+
+| Method  | Route                                  | Purpose |
+| ------- | -------------------------------------- | ------- |
+| `POST`  | `/v1/admin/referral-milestones`        | Create: `referralCount` (integer 1–100000, unique, `409` if taken), `rewardCredits` (integer 1–1000000), optional `active` (default `true`) |
+| `GET`   | `/v1/admin/referral-milestones`        | List by threshold, with `awards` (referrers who reached it) |
+| `GET`   | `/v1/admin/referral-milestones/:id`    | One milestone |
+| `PATCH` | `/v1/admin/referral-milestones/:id`    | Change `rewardCredits` and/or `active` (`referralCount` is refused with `400`) |
+
+`ADMIN` and `SUPERADMIN` only (`403` for users, `401` without a token); invalid values (non-integers, strings, out of range, unknown fields) are refused with `400` and change nothing. Changes are written to the activity log.
+
+#### Suspicious referrals and review
+
+When an invited user's first paying purchase is verified, the webhook reads the fingerprint of the payment method from Stripe (the same card or bank account always has the same fingerprint) and stores only a **keyed hash** of it (`PaymentFingerprint`: HMAC-SHA-256 with a key derived from `JWT_REFRESH_SECRET`; no card number, fingerprint or holder data). The referral is `HELD` instead of rewarded when:
+
+| `holdReason` | When |
+| ------------ | ---- |
+| `SHARED_PAYMENT_METHOD_WITH_REFERRER` | The invited user paid with a payment method the referrer has paid with |
+| `SHARED_PAYMENT_METHOD_WITH_OTHER_REFERRAL` | Another user invited by the same referrer has paid with it |
+| `PAYMENT_METHOD_UNAVAILABLE` | Stripe could not be asked, so sharing cannot be ruled out (the purchase itself is recorded normally) |
+
+A held referral grants no credits, sends no notification and does not count for milestones. Payments with the same payment method are checked one after the other (a transaction lock on its hash), so two invitees paying concurrently with one card cannot both pass. Detection happens when a referral qualifies; earlier rewarded referrals are not re-checked.
+
+| Method | Route                               | Purpose |
+| ------ | ----------------------------------- | ------- |
+| `GET`  | `/v1/admin/referrals`               | Review queue: `HELD` referrals (or `?status=…`), with `referrer`, `referred`, `holdReason`, `heldAt`, `rewardCredits` (the reward waiting), `reviewedAt`, `reviewedBy` |
+| `POST` | `/v1/admin/referrals/:id/approve`   | Grants the held reward (`REWARDED`, credits and "reward earned" notification; `QUALIFIED` if none was due), then evaluates milestones |
+| `POST` | `/v1/admin/referrals/:id/reject`    | `REJECTED`: nothing is granted, the referral never counts |
+
+`ADMIN` and `SUPERADMIN` only. A decision is a conditional update from `HELD`: repeated or concurrent approvals and rejections decide once, the others answer `409 This referral is not waiting for review` (`404` for unknown ids). Decisions are written to the activity log.
+
 **Referral APIs** (any signed-in user, always the caller's own data; no route accepts a user id, and unknown query parameters are refused with `400`):
 
 | Method | Route                        | Purpose |
 | ------ | ---------------------------- | ------- |
-| `GET`  | `/v1/referrals`              | `code`, `referred`, `referralDiscountPercent` (what the caller gets on their first purchase), `rewardCreditsPerReferral`, referral counts (`total`, `pending`, `rewarded`, `qualified`) and `totalEarnedCredits` |
-| `GET`  | `/v1/referrals/invitees`     | The people the caller invited, newest first (`?status=PENDING|REWARDED|QUALIFIED`): `id`, `displayName` (first two characters of the username only, never the email or user id), `status`, `signedUpAt`, `qualifiedAt`, `rewardCredits`, `rewardedAt` |
-| `GET`  | `/v1/referrals/rewards`      | Reward history: `credits`, `remainingCredits`, `grantedAt`, `referralId`, `displayName` (`null` once the invitee's account is deleted), `expiresAt: null` |
+| `GET`  | `/v1/referrals`              | `code`, `referred`, `referralDiscountPercent` (what the caller gets on their first purchase), `rewardCreditsPerReferral`, referral counts (`total`, `pending`, `rewarded`, `qualified`, `underReview`, `rejected`), `milestones` (`paidReferrals`, `reached`, `next` with `remaining`) and `totalEarnedCredits` (referral and milestone credits) |
+| `GET`  | `/v1/referrals/invitees`     | The people the caller invited, newest first (`?status=PENDING|REWARDED|QUALIFIED|HELD|REJECTED`): `id`, `displayName` (first two characters of the username only, never the email or user id), `status`, `signedUpAt`, `qualifiedAt`, `rewardCredits`, `rewardedAt` |
+| `GET`  | `/v1/referrals/rewards`      | Reward history: `kind` (`REFERRAL` or `MILESTONE`, with `milestoneReferralCount`), `credits`, `remainingCredits`, `grantedAt`, `referralId`, `displayName` (`null` once the invitee's account is deleted), `expiresAt: null` |
 | `POST` | `/v1/referrals/apply`        | Always `409` (referrals are registered at signup only) |
 
 Earnings are read from the caller's own credit allocations, so they stay listed after an invitee deletes their account (their referral then disappears from the invitee list and counts).
+
+### Notifications
+
+Users receive notifications in an in-app inbox and, depending on the type and their preferences, by email:
+
+| Type | Event | Email |
+| ---- | ----- | ----- |
+| `REFERRAL_REWARD_EARNED` | A referral was rewarded (also when a held one is approved) | Preference `referralRewards` (default on) |
+| `REFERRAL_MILESTONE_REACHED` | A referral milestone was awarded | Preference `referralMilestones` (default on) |
+| `SECURITY_SIGNED_OUT_EVERYWHERE` | `POST /auth/logout-all` | Always |
+| `SECURITY_SESSION_REUSE_DETECTED` | A replaced refresh token was reused (all sessions ended) | Always |
+
+Held and rejected referrals notify nothing; approval notifies once.
+
+**Once per event.** A notification is written in the same transaction as its event, with an event key unique per user (`referral-reward:<referral id>`, `referral-milestone:<milestone id>`, `security:…`): retried, concurrent or replayed webhooks, repeated approvals and work redone after a restart create nothing new. Whether it is emailed is decided then (`emailStatus` `PENDING` or `NOT_REQUESTED`). Notifications cannot be rewritten (only `readAt` and the email delivery fields change).
+
+**Email delivery (outbox).** `NotificationOutboxService` hands `PENDING` emails to the existing email queue (BullMQ or the PostgreSQL queue) at startup and every `NOTIFICATION_OUTBOX_INTERVAL_MS` (default 5000, minimum 1000), so emails of notifications created before a restart are still sent. The email job claims the notification (`PENDING -> SENDING`) before sending and marks it `SENT`, so duplicate jobs or workers send once; a failed send is retried by the queue (`FAILED` after the last attempt), and a claim interrupted for more than 10 minutes (process stopped mid-send) goes back to `PENDING`. Delivery is at least once only in that last case. The outbox does not run when `NODE_ENV=test` unless `NOTIFICATION_OUTBOX_ENABLED=true`. Security notifications are best effort: a failure to record one never blocks the sign-out.
+
+**Inbox API** (any signed-in user, own notifications only; another user's id answers `404`):
+
+| Method  | Route                               | Purpose |
+| ------- | ----------------------------------- | ------- |
+| `GET`   | `/v1/notifications`                 | Newest first: `?limit=1–50` (default 20), `?status=all|unread|read`, `?cursor=<nextCursor>`; returns `items` (`id`, `type`, `title`, `body`, `data`, `read`, `readAt`, `createdAt`), `nextCursor` (null on the last page) and `unreadCount` |
+| `GET`   | `/v1/notifications/unread-count`    | `{ unreadCount }` |
+| `PATCH` | `/v1/notifications/:id`             | `{ "read": true | false }` (marking read again keeps the first read time) |
+| `POST`  | `/v1/notifications/read-all`        | Marks every unread notification read: `{ updated }` |
+| `GET`   | `/v1/notifications/preferences`     | `{ email: { referralRewards, referralMilestones, security: true }, updatedAt }` |
+| `PATCH` | `/v1/notifications/preferences`     | Any of `referralRewards`, `referralMilestones` (booleans); `security: false` is refused with `400 Security emails cannot be turned off` and nothing is changed |
+
+Preferences apply to notifications created afterwards; the inbox entry is always created.
 
 ### AI credit wallet and ledger
 
@@ -1515,6 +1588,9 @@ authUser
 |-- DailyRewardClaim, DailyRewardMonthlyTotal (per UTC day / month)
 |-- DiscountOfferTarget, DiscountRedemption (-> CheckoutSession, PaymentTransaction)
 |-- ReferralCode (0..1), Referral (0..1, as the referred user; referrerAuthId SET NULL when the referrer is deleted; qualifyingPaymentId -> PaymentTransaction)
+|-- ReferralProgress (0..1, paid referral count and milestone lock), ReferralMilestoneAward (-> ReferralMilestone)
+|-- PaymentFingerprint (keyed hashes of payment methods used)
+|-- Notification, NotificationPreference (0..1)
 |-- CreditWallet (0..1)
 |   |-- CreditAllocation -> CreditLedgerEntry
 |   |-- CreditTransaction -> CreditLedgerEntry
@@ -1536,6 +1612,7 @@ OAuthState, RateLimitBucket: short-lived, keyed by hashes, no owner
 SubscriptionPlan, CreditSettings, DiscountSettings, DailyRewardSettings: single-row administrator configuration, no owner
 DiscountOffer (codes and campaigns) -> DiscountOfferTarget, DiscountRedemption: administrator configuration; targets and redemptions belong to a user (deleted with the account)
 CreditPackage: administrator configuration, one row per package code (SMALL, MEDIUM, LARGE), no owner
+ReferralMilestone: administrator configuration, one row per threshold, no owner
 ```
 
 Mock and live gateways implement the same application-owned operations. The live gateway delegates transport to an OpenRouter provider adapter, workers validate and normalize model-shaped output, and NestJS alone persists it transactionally and advances workflow state. No frontend or public API contract changes are required to switch modes or add another provider adapter.
@@ -1554,8 +1631,9 @@ npm test -- --runInBand credit   # AI credit unit/HTTP tests
 TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json --runInBand test/credit-settings test/credit-wallet test/credit-access test/credit-trial test/credit-subscription test/credit-scheduler test/credit-usage test/credit-overage test/credit-apis   # AI credits on PostgreSQL
 npx jest discount   # discount settings, codes and campaigns unit/HTTP tests (likewise: daily, credit-package)
 TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json discount   # every discount suite on PostgreSQL; one suite: discount-first-purchase, discount-payments, discount-campaign-budget, discount-codes, discount-campaigns (likewise: daily, credit-package)
-npx jest referral   # referral unit tests
-TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json referral   # referral-registration, referral-purchase, referral-apis on PostgreSQL
+npx jest referral   # referral and referral notification unit tests
+TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json referral   # referral-registration, referral-purchase, referral-apis, referral-milestones, referral-notifications on PostgreSQL
+TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json referral-milestones referral-notifications   # milestones, suspicious referral review, notifications
 TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json test/private-cloud   # storage workflows + cleanup ledger on PostgreSQL (mocked Supabase)
 npm run test:e2e
 npx prisma generate

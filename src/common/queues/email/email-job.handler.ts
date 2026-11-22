@@ -38,6 +38,9 @@ export class EmailJobHandler implements JobHandler<EmailJob> {
         case 'welcome':
           await this.handleWelcomeEmail(job);
           break;
+        case 'notification':
+          await this.handleNotificationEmail(job, job.data.notificationId);
+          break;
         case 'account-deletion-code': {
           const data = job.data;
           await this.emailService.sendAccountDeletionCodeEmail(
@@ -68,6 +71,56 @@ export class EmailJobHandler implements JobHandler<EmailJob> {
       });
       throw error; // Re-throw to trigger retry
     }
+  }
+
+  /**
+   * Emails one notification, once: the notification is claimed
+   * (PENDING -> SENDING) before sending, so a duplicate job or a concurrent
+   * worker sends nothing; it is SENT afterwards. A failed send goes back to
+   * PENDING for the next attempt (FAILED after the last one).
+   */
+  private async handleNotificationEmail(
+    job: JobExecution<EmailJob>,
+    notificationId: string,
+  ): Promise<void> {
+    const claimed = await this.prismaService.notification.updateMany({
+      where: { id: notificationId, emailStatus: 'PENDING' },
+      data: {
+        emailStatus: 'SENDING',
+        emailClaimedAt: new Date(),
+        emailAttempts: { increment: 1 },
+      },
+    });
+    if (claimed.count === 0) return;
+    const notification =
+      await this.prismaService.notification.findUniqueOrThrow({
+        where: { id: notificationId },
+        include: { authUser: { select: { email: true, username: true } } },
+      });
+    try {
+      await this.emailService.sendNotificationEmail(
+        notification.authUser.email,
+        notification.authUser.username,
+        notification.title,
+        notification.body,
+      );
+    } catch (error) {
+      const last = job.attemptsMade + 1 >= job.maxAttempts;
+      await this.prismaService.notification.updateMany({
+        where: { id: notificationId, emailStatus: 'SENDING' },
+        data: { emailStatus: last ? 'FAILED' : 'PENDING' },
+      });
+      throw error;
+    }
+    await this.prismaService.notification.updateMany({
+      where: { id: notificationId, emailStatus: 'SENDING' },
+      data: { emailStatus: 'SENT', emailSentAt: new Date() },
+    });
+    this.logger.info('Notification email sent', {
+      context: 'EmailProcessor',
+      jobId: job.id,
+      notificationId,
+    });
   }
 
   /**

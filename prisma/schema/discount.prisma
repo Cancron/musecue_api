@@ -152,6 +152,12 @@ model Referral {
   qualifiedAt         DateTime?
   rewardCredits       Int?
   rewardedAt          DateTime?
+  // HELD: why the referral looks suspicious (no payment data, only the
+  // reason) and when; REJECTED / approved: who reviewed it and when.
+  holdReason          String?        @db.VarChar(50)
+  heldAt              DateTime?
+  reviewedAt          DateTime?
+  reviewedBy          String?        @db.VarChar(64)
   createdAt           DateTime       @default(now())
 
   authUser          authUser            @relation("ReferralReferred", fields: [authId], references: [id], onDelete: Cascade)
@@ -159,4 +165,65 @@ model Referral {
   qualifyingPayment PaymentTransaction? @relation(fields: [qualifyingPaymentId], references: [id], onDelete: Restrict)
 
   @@index([referrerAuthId, createdAt])
+}
+
+// Administrator-configured referral milestones: a referrer who has
+// `referralCount` invited users with a verified first paying purchase
+// (REWARDED or QUALIFIED referrals; held or rejected ones do not count)
+// receives `rewardCredits` non-expiring REFERRAL credits, once per
+// milestone. Milestones are deactivated, never deleted, and their
+// threshold never changes.
+model ReferralMilestone {
+  id            String   @id @default(uuid())
+  referralCount Int      @unique
+  rewardCredits Int
+  active        Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  awards ReferralMilestoneAward[]
+}
+
+// One milestone reached by one referrer (unique), with the reward granted
+// (credits reference `referral-milestone:<milestone id>`).
+model ReferralMilestoneAward {
+  id            String   @id @default(uuid())
+  milestoneId   String
+  authId        String
+  referralCount Int
+  rewardCredits Int
+  awardedAt     DateTime
+  createdAt     DateTime @default(now())
+
+  milestone ReferralMilestone @relation(fields: [milestoneId], references: [id], onDelete: Restrict)
+  authUser  authUser          @relation(fields: [authId], references: [id], onDelete: Cascade)
+
+  @@unique([authId, milestoneId])
+}
+
+// A referrer's count of paid referrals. Its row is locked while a referral
+// of the referrer qualifies or is approved, so concurrent qualifications
+// are counted one at a time and every milestone is reached exactly once.
+model ReferralProgress {
+  authId        String   @id
+  paidReferrals Int      @default(0)
+  updatedAt     DateTime @default(now())
+
+  authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
+}
+
+// The payment methods a user paid with, as keyed hashes (HMAC-SHA-256 of
+// the provider's payment method fingerprint): referral accounts sharing a
+// payment method are recognized without storing any payment data (no card
+// number, fingerprint, name or bank details).
+model PaymentFingerprint {
+  id              String   @id @default(uuid())
+  authId          String
+  fingerprintHash String   @db.Char(64)
+  firstSeenAt     DateTime @default(now())
+
+  authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
+
+  @@unique([authId, fingerprintHash])
+  @@index([fingerprintHash])
 }

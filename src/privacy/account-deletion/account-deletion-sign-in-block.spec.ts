@@ -16,6 +16,7 @@ import type { ActivityLogService } from '../../common/services/activity-log.serv
 import type { CustomLoggerService } from '../../common/services/custom-logger.service';
 import type { OAuthStateRepository } from '../../auth/state/oauth-state.repository';
 import { ReferralRegistrationService } from '../../referrals/referral-registration.service';
+import { NotificationService } from '../../notifications/notification.service';
 
 const PASSWORD = 'correct horse battery staple';
 const META = { ip: '203.0.113.1', userAgent: 'spec' };
@@ -57,6 +58,7 @@ describe('Accounts pending deletion cannot sign in again (privacy)', () => {
       mock<EmailQueueService>(),
       mock<CustomLoggerService>(),
       mock<ReferralRegistrationService>(),
+      mock<NotificationService>(),
     );
   });
 

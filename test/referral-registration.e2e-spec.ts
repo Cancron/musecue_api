@@ -306,7 +306,7 @@ describeWithDatabase('Referral registration (PostgreSQL, full stack)', () => {
     expect(started.url).toContain('accounts.google.com');
   });
 
-  it('has PostgreSQL refuse referrals after a paid purchase, self-referrals and changed referrals', async () => {
+  it('has PostgreSQL refuse referrals for existing accounts, self-referrals and changed referrals', async () => {
     const referrer = await r.signUp();
     const friend = await r.signUp({ referralCode: await r.codeOf(referrer) });
     const referral = (await r.referralOf(friend.id))!;
@@ -323,19 +323,56 @@ describeWithDatabase('Referral registration (PostgreSQL, full stack)', () => {
         data: { referralCode: 'OTHER123' },
       }),
     ).rejects.toThrow('A referral cannot be changed');
+
+    // Signup only: a referral for an account that already exists (created
+    // by an earlier transaction) is refused by the database itself, for a
+    // new user as much as for one who already paid.
+    const existing = await r.signUp();
     await expect(
       app.ctx.client.referral.create({
-        data: { authId: referrer.id, referrerAuthId: referrer.id },
+        data: { authId: existing.id, referrerAuthId: referrer.id },
       }),
-    ).rejects.toThrow('Referral_not_self');
-
-    // A user who already paid can never be referred.
+    ).rejects.toThrow(
+      'A referral can only be recorded when the account is created',
+    );
     const buyer = await r.signUp();
     await r.buyPro(buyer);
     await expect(
       app.ctx.client.referral.create({
         data: { authId: buyer.id, referrerAuthId: referrer.id },
       }),
-    ).rejects.toThrow('A referral cannot be recorded after a paid purchase');
+    ).rejects.toThrow(
+      'A referral can only be recorded when the account is created',
+    );
+
+    // Created with the account, but referring itself: refused.
+    await expect(
+      app.ctx.client.$transaction(async (tx) => {
+        const user = await tx.authUser.create({
+          data: {
+            email: `self_${Date.now()}@example.com`,
+            username: `self_${Date.now() % 1e8}`,
+            password: 'not-a-real-hash',
+          },
+        });
+        await tx.referral.create({
+          data: { authId: user.id, referrerAuthId: user.id },
+        });
+      }),
+    ).rejects.toThrow('Referral_not_self');
+
+    // The same transaction as the account: accepted (what signup does).
+    await app.ctx.client.$transaction(async (tx) => {
+      const user = await tx.authUser.create({
+        data: {
+          email: `direct_${Date.now()}@example.com`,
+          username: `direct_${Date.now() % 1e8}`,
+          password: 'not-a-real-hash',
+        },
+      });
+      await tx.referral.create({
+        data: { authId: user.id, referrerAuthId: referrer.id },
+      });
+    });
   });
 });

@@ -65,8 +65,14 @@ import {
   dropSchema,
   migrationNames,
 } from './support/migrated-schema';
-import { daysFrom, givenProPurchased } from './support/subscription-fixtures';
+import {
+  daysFrom,
+  givenProPurchased,
+  recordPayment,
+  termEnd,
+} from './support/subscription-fixtures';
 import { ReferralRegistrationService } from '../src/referrals/referral-registration.service';
+import { NotificationService } from '../src/notifications/notification.service';
 
 jest.setTimeout(120_000);
 
@@ -111,6 +117,11 @@ const USER_DATA_TABLES = [
   'DiscountRedemption',
   'Referral',
   'ReferralCode',
+  'ReferralMilestoneAward',
+  'ReferralProgress',
+  'PaymentFingerprint',
+  'Notification',
+  'NotificationPreference',
 ] as const;
 
 describeWithDatabase('Account erasure (PostgreSQL)', () => {
@@ -173,6 +184,7 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
       mock<EmailQueueService>(),
       mock<CustomLoggerService>(),
       mock<ReferralRegistrationService>(),
+      mock<NotificationService>(),
     );
     emailQueue.sendAccountDeletionCode.mockResolvedValue();
     codes = new AccountDeletionCodeService(challenges, utils, emailQueue);
@@ -281,10 +293,19 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
   async function seedAccount(): Promise<SeededAccount> {
     const tag = randomBytes(5).toString('hex');
     const email = `${tag}@example.com`;
+    // The account signs up with this user's referral code.
+    const referrer = await client.authUser.create({
+      data: {
+        email: `referrer_${tag}@example.com`,
+        username: `referrer_${tag}`,
+        password: 'not-a-real-hash',
+      },
+    });
     const user = await client.authUser.create({
       data: {
         email,
         username: `user_${tag}`,
+        referral: { create: { referrerAuthId: referrer.id } },
         password: passwordHash,
         verified: true,
         authSecurity: { create: { failedAttempts: 0 } },
@@ -338,18 +359,6 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
           },
         },
       },
-    });
-    // Signed up with a referral code (recorded with the account, before
-    // any purchase).
-    const referrer = await client.authUser.create({
-      data: {
-        email: `referrer_${tag}@example.com`,
-        username: `referrer_${tag}`,
-        password: 'not-a-real-hash',
-      },
-    });
-    await client.referral.create({
-      data: { authId: user.id, referrerAuthId: referrer.id },
     });
     const avatarKey = `${user.id}/profile/${randomUUID()}.png`;
     await putFile('images', avatarKey);
@@ -638,15 +647,68 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
     await client.referralCode.create({
       data: { authId: user.id, code: `REF${tag.toUpperCase()}` },
     });
+    // Created with its referral, like a signup (a referral is only accepted
+    // in the transaction that creates the account).
     const friend = await client.authUser.create({
       data: {
         email: `friend_${tag}@example.com`,
         username: `friend_${tag}`,
         password: 'not-a-real-hash',
+        referral: { create: { referrerAuthId: user.id } },
       },
     });
-    await client.referral.create({
-      data: { authId: friend.id, referrerAuthId: user.id },
+    // The friend buys: the account reaches a milestone as the referrer.
+    const friendSubscription = await client.userSubscription.create({
+      data: { authId: friend.id },
+    });
+    const friendTermStart = new Date(Date.now() - 86_400_000);
+    const friendPayment = await recordPayment(client, friendSubscription.id, {
+      periodStart: friendTermStart,
+      periodEnd: termEnd({
+        billingInterval: 'MONTHLY',
+        startedAt: friendTermStart,
+      }),
+    });
+    await client.referral.update({
+      where: { authId: friend.id },
+      data: {
+        status: 'QUALIFIED',
+        qualifyingPaymentId: friendPayment.id,
+        qualifiedAt: new Date(),
+      },
+    });
+    const milestone = await client.referralMilestone.upsert({
+      where: { referralCount: 1 },
+      create: { referralCount: 1, rewardCredits: 10 },
+      update: {},
+    });
+    await client.referralMilestoneAward.create({
+      data: {
+        milestoneId: milestone.id,
+        authId: user.id,
+        referralCount: 1,
+        rewardCredits: milestone.rewardCredits,
+        awardedAt: new Date(),
+      },
+    });
+    await client.referralProgress.create({
+      data: { authId: user.id, paidReferrals: 1 },
+    });
+    await client.paymentFingerprint.create({
+      data: { authId: user.id, fingerprintHash: 'a'.repeat(64) },
+    });
+    await client.notification.create({
+      data: {
+        authId: user.id,
+        type: 'REFERRAL_MILESTONE_REACHED',
+        eventKey: `referral-milestone:${milestone.id}`,
+        title: 'Milestone reached',
+        body: 'You earned bonus credits.',
+        emailStatus: 'NOT_REQUESTED',
+      },
+    });
+    await client.notificationPreference.create({
+      data: { authId: user.id, emailReferralRewards: false },
     });
 
     await client.activityLogEvent.create({

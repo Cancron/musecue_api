@@ -1,0 +1,42 @@
+// ================================
+// Notifications
+// ================================
+
+// A user's inbox entry. `eventKey` identifies the event that caused it and
+// is unique per user, so retried, concurrent or replayed events (and work
+// redone after a restart) never create a second entry. Emails are sent from
+// this row (an outbox): a background email job claims PENDING -> SENDING,
+// sends once, and marks it SENT.
+model Notification {
+  id             String                  @id @default(uuid())
+  authId         String
+  type           NotificationType
+  eventKey       String                  @db.VarChar(200)
+  title          String                  @db.VarChar(200)
+  body           String                  @db.VarChar(1000)
+  // Small structured details (e.g. credits); never another user's data.
+  data           Json?
+  readAt         DateTime?
+  emailStatus    NotificationEmailStatus
+  emailAttempts  Int                     @default(0)
+  emailClaimedAt DateTime?
+  emailSentAt    DateTime?
+  createdAt      DateTime                @default(now())
+
+  authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
+
+  @@unique([authId, eventKey])
+  @@index([authId, createdAt, id])
+  @@index([emailStatus, createdAt])
+}
+
+// Email delivery preferences (one row per user, created on first change;
+// defaults: every email on). Security emails cannot be turned off.
+model NotificationPreference {
+  authId                  String   @id
+  emailReferralRewards    Boolean  @default(true)
+  emailReferralMilestones Boolean  @default(true)
+  updatedAt               DateTime @updatedAt
+
+  authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
+}

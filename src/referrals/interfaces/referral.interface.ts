@@ -21,8 +21,27 @@ export interface ReferralOverviewView {
     rewarded: number;
     /** Bought while no reward was due. */
     qualified: number;
+    /** Bought, but the reward waits for a review. */
+    underReview: number;
+    /** The review refused the reward. */
+    rejected: number;
   };
-  /** Referral credits earned so far (exact decimal string). */
+  milestones: {
+    /** Invited users whose paid first purchase counts for milestones. */
+    paidReferrals: number;
+    reached: Array<{
+      referralCount: number;
+      rewardCredits: number;
+      awardedAt: string;
+    }>;
+    /** The next active milestone, or null when none is left. */
+    next: {
+      referralCount: number;
+      rewardCredits: number;
+      remaining: number;
+    } | null;
+  };
+  /** Referral and milestone credits earned so far (exact decimal string). */
   totalEarnedCredits: string;
 }
 
@@ -38,12 +57,15 @@ export interface ReferralInviteeView {
   rewardedAt: string | null;
 }
 
-/** One referral reward the caller received. */
+/** One referral or milestone reward the caller received. */
 export interface ReferralRewardView {
   /** The credit allocation. */
   id: string;
-  /** The referral it rewarded. */
-  referralId: string;
+  kind: 'REFERRAL' | 'MILESTONE';
+  /** REFERRAL: the referral it rewarded. */
+  referralId: string | null;
+  /** MILESTONE: the paid referrals it was awarded for. */
+  milestoneReferralCount: number | null;
   /** The invitee, or null if their account was deleted since. */
   displayName: string | null;
   credits: string;

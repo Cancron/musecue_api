@@ -316,6 +316,40 @@ export class StripeGateway {
     return typeof charge === 'string' ? charge : (charge?.id ?? null);
   }
 
+  /**
+   * The fingerprint of the payment method that paid an invoice (the same
+   * card or bank account always has the same fingerprint), or null when the
+   * invoice has no collected payment or its method has none. Callers hash
+   * it at once and never store it.
+   */
+  async retrievePaymentMethodFingerprint(
+    invoiceId: string,
+  ): Promise<string | null> {
+    const client = this.requireClient();
+    const payments = await client.invoicePayments.list({
+      invoice: invoiceId,
+      limit: 10,
+    });
+    const paid = payments.data.find((payment) => payment.status === 'paid');
+    const intent = paid?.payment.payment_intent;
+    const intentId = typeof intent === 'string' ? intent : intent?.id;
+    if (!intentId) return null;
+    const paymentIntent = await client.paymentIntents.retrieve(intentId, {
+      expand: ['payment_method'],
+    });
+    const method = paymentIntent.payment_method;
+    if (!method || typeof method === 'string') return null;
+    return (
+      method.card?.fingerprint ??
+      method.us_bank_account?.fingerprint ??
+      method.sepa_debit?.fingerprint ??
+      method.bacs_debit?.fingerprint ??
+      method.au_becs_debit?.fingerprint ??
+      method.acss_debit?.fingerprint ??
+      null
+    );
+  }
+
   /** Stripe only expires `open` sessions; others reject the request. */
   async expireCheckoutSession(
     sessionId: string,

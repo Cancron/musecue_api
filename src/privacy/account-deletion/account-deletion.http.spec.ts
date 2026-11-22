@@ -48,6 +48,7 @@ import type { AccountDeletionView } from './account-deletion.interface';
 import { AccountDeletionService } from './account-deletion.service';
 import { AccountErasureService } from './account-erasure.service';
 import { ReferralRegistrationService } from '../../referrals/referral-registration.service';
+import { NotificationService } from '../../notifications/notification.service';
 
 const PASSWORD = 'correct horse battery staple';
 const PASSWORD_HASH = bcrypt.hashSync(PASSWORD, 4);
@@ -185,6 +186,10 @@ describe('Account deletion requests (HTTP)', () => {
         {
           provide: ReferralRegistrationService,
           useValue: mock<ReferralRegistrationService>(),
+        },
+        {
+          provide: NotificationService,
+          useValue: mock<NotificationService>(),
         },
         { provide: ActivityLogService, useValue: mock<ActivityLogService>() },
         { provide: EmailQueueService, useValue: emailQueue },

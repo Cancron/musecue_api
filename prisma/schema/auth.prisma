@@ -41,6 +41,11 @@ model authUser {
   referralCode        ReferralCode?
   referral            Referral?  @relation("ReferralReferred")
   referrals           Referral[] @relation("ReferralReferrer")
+  referralMilestoneAwards ReferralMilestoneAward[]
+  referralProgress    ReferralProgress?
+  paymentFingerprints PaymentFingerprint[]
+  notifications       Notification[]
+  notificationPreference NotificationPreference?
 
   @@index([email, id, providerId])
   @@index([username])

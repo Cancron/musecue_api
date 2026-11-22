@@ -1,5 +1,5 @@
 import type { CheckoutDiscountService } from '../../src/subscription/discounts/checkout-discount.service';
-import type { ReferralRewardService } from '../../src/subscription/referrals/referral-reward.service';
+import type { ReferralRewardService } from '../../src/referrals/referral-reward.service';
 
 /**
  * Checkouts without discounts, for unit tests of the checkout and webhook

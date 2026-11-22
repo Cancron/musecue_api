@@ -37,9 +37,11 @@ import {
  */
 
 export interface SentEmail {
-  kind: 'verification' | 'welcome' | 'account-deletion-code';
+  kind: 'verification' | 'welcome' | 'account-deletion-code' | 'notification';
   to: string;
   code?: string;
+  /** Notifications: the subject (the notification's title). */
+  subject?: string;
 }
 
 /** Stands in for EmailService: records what would have been sent. */
@@ -53,6 +55,16 @@ export class CapturingEmailService {
 
   sendWelcomeEmail(to: string) {
     this.sent.push({ kind: 'welcome', to });
+    return Promise.resolve();
+  }
+
+  sendNotificationEmail(
+    to: string,
+    _username: string,
+    title: string,
+    _message: string,
+  ) {
+    this.sent.push({ kind: 'notification', to, subject: title });
     return Promise.resolve();
   }
 

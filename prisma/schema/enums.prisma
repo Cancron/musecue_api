@@ -423,9 +423,38 @@ enum DiscountCustomerEligibility {
 
 // A referral waits for the referred user's first verified paying purchase:
 // REWARDED when the referrer received credits for it, QUALIFIED when it
-// happened but no reward was due.
+// happened but no reward was due, HELD when it looks suspicious and waits
+// for an administrator, REJECTED when the administrator refused it.
 enum ReferralStatus {
   PENDING
   REWARDED
   QUALIFIED
+  // Suspicious (e.g. a payment method shared with the referrer): the reward
+  // waits for an administrator, who approves (REWARDED / QUALIFIED) or
+  // rejects it.
+  HELD
+  REJECTED
+}
+
+// ================================
+// Notification Related Enums
+// ================================
+
+enum NotificationType {
+  REFERRAL_REWARD_EARNED
+  REFERRAL_MILESTONE_REACHED
+  // Security notifications: always emailed, whatever the preferences.
+  SECURITY_SIGNED_OUT_EVERYWHERE
+  SECURITY_SESSION_REUSE_DETECTED
+}
+
+// Email delivery of one notification: NOT_REQUESTED when the user's
+// preferences turned it off; PENDING until a worker claims it (SENDING),
+// SENT once delivered, FAILED after the last attempt.
+enum NotificationEmailStatus {
+  NOT_REQUESTED
+  PENDING
+  SENDING
+  SENT
+  FAILED
 }

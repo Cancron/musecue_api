@@ -706,6 +706,9 @@ describe('StripeRefundService (refund webhooks)', () => {
         periodStart: daysAgo(3),
       }).invoice as string;
       api.refundInvoice(invoiceId);
+      // Both the payment-method lookup (referral checks) and the refund
+      // check after activation cannot reach Stripe.
+      api.failNext('GET /v1/invoice_payments', 'connection');
       api.failNext('GET /v1/invoice_payments', 'connection');
 
       await expect(

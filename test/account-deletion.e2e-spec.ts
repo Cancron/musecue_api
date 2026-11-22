@@ -27,6 +27,7 @@ import {
   migrationNames,
 } from './support/migrated-schema';
 import { ReferralRegistrationService } from '../src/referrals/referral-registration.service';
+import { NotificationService } from '../src/notifications/notification.service';
 
 jest.setTimeout(60_000);
 
@@ -82,6 +83,7 @@ describeWithDatabase('Account deletion requests (PostgreSQL)', () => {
       mock<EmailQueueService>(),
       mock<CustomLoggerService>(),
       mock<ReferralRegistrationService>(),
+      mock<NotificationService>(),
     );
     emailQueue.sendAccountDeletionCode.mockResolvedValue();
     deletions = new AccountDeletionService(

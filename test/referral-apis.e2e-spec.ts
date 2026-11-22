@@ -108,7 +108,15 @@ describeWithDatabase('Referral APIs (PostgreSQL, full stack)', () => {
       referred: false,
       referralDiscountPercent: 0,
       rewardCreditsPerReferral: 120,
-      referrals: { total: 3, pending: 1, rewarded: 1, qualified: 1 },
+      referrals: {
+        total: 3,
+        pending: 1,
+        rewarded: 1,
+        qualified: 1,
+        underReview: 0,
+        rejected: 0,
+      },
+      milestones: { paidReferrals: 2, reached: [], next: null },
       totalEarnedCredits: '120',
     });
     // The invited user sees that they were referred and the discount they
@@ -163,7 +171,9 @@ describeWithDatabase('Referral APIs (PostgreSQL, full stack)', () => {
     expect(history).toEqual([
       {
         id: expect.any(String) as unknown,
+        kind: 'REFERRAL',
         referralId: rewardedReferral!.id,
+        milestoneReferralCount: null,
         displayName: 'ri***',
         credits: '120',
         remainingCredits: '120',

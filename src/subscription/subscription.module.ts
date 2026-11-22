@@ -5,7 +5,7 @@ import { RolesGuard } from '../common/guards/roles.guard';
 import { ActivityLogService } from '../common/services/activity-log.service';
 import { CreditsModule } from '../credits/credits.module';
 import { CheckoutDiscountService } from './discounts/checkout-discount.service';
-import { ReferralRewardService } from './referrals/referral-reward.service';
+import { ReferralsModule } from '../referrals/referrals.module';
 import { CreditAllocationScheduler } from './credit-allocation.scheduler';
 import { CreditAllowanceService } from './credit-allowance.service';
 import { CreditEligibilityService } from './credit-eligibility.service';
@@ -30,7 +30,8 @@ import { STRIPE_CLIENT, StripeGateway } from './stripe/stripe.gateway';
 
 @Module({
   // Credit wallet and settings: allowances and POST /v1/sessions eligibility.
-  imports: [CreditsModule],
+  // Referrals: rewards with the verified payments recorded by the webhook.
+  imports: [CreditsModule, ReferralsModule],
   controllers: [
     SubscriptionPlanController,
     SubscriptionController,
@@ -67,7 +68,6 @@ import { STRIPE_CLIENT, StripeGateway } from './stripe/stripe.gateway';
     },
     StripeGateway,
     CheckoutDiscountService,
-    ReferralRewardService,
     StripeCheckoutService,
     StripeCancellationService,
     StripeRefundService,

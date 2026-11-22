@@ -60,3 +60,16 @@ export const referralRewardReference = (referralId: string) =>
   `referral-reward:${referralId}`;
 
 export const REFERRAL_REWARD_PREFIX = 'referral-reward:';
+
+/** The credit reference of a milestone reward: one per referrer and milestone. */
+export const referralMilestoneReference = (milestoneId: string) =>
+  `referral-milestone:${milestoneId}`;
+
+export const REFERRAL_MILESTONE_PREFIX = 'referral-milestone:';
+
+/** Why a referral was held for review (never any payment data). */
+export type ReferralHoldReason =
+  | 'SHARED_PAYMENT_METHOD_WITH_REFERRER'
+  | 'SHARED_PAYMENT_METHOD_WITH_OTHER_REFERRAL'
+  /** The payment method could not be read from Stripe: not ruled out. */
+  | 'PAYMENT_METHOD_UNAVAILABLE';

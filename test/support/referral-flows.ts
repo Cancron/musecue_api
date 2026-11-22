@@ -66,6 +66,15 @@ export interface SignedUp extends TestAccount {
   password: string;
 }
 
+export interface MilestoneView {
+  id: string;
+  referralCount: number;
+  rewardCredits: number;
+  active: boolean;
+  /** Referrers who reached it. */
+  awards: number;
+}
+
 export const dataOf = <T>(response: { body: unknown }) =>
   (response.body as { data: T }).data;
 export const messageOf = (response: { body: unknown }) =>
@@ -200,10 +209,12 @@ export function referralFlows(app: ReferralApp) {
     buyPro: async (
       account: TestAccount,
       body: Record<string, unknown> = { billingInterval: 'MONTHLY' },
+      /** The card the customer pays with (Stripe card fingerprint). */
+      options: { cardFingerprint?: string } = {},
     ) => {
       const checkout = await helpers.checkout(account, body);
       const sessionId = await helpers.sessionId(checkout.checkoutSessionId);
-      app.stripe.api.completeSession(sessionId);
+      app.stripe.api.completeSession(sessionId, options);
       await helpers
         .sessionEvent('checkout.session.completed', sessionId)
         .expect(200);
@@ -219,6 +230,68 @@ export function referralFlows(app: ReferralApp) {
       };
     },
 
+    /** Pays an opened checkout on the hosted page (no webhook yet). */
+    payCheckout: async (
+      checkoutId: string,
+      options: { cardFingerprint?: string } = {},
+    ) => {
+      const sessionId = await helpers.sessionId(checkoutId);
+      app.stripe.api.completeSession(sessionId, options);
+      return sessionId;
+    },
+    patch: (account: TestAccount, path: string, body: object = {}) =>
+      http()
+        .patch(path)
+        .set('X-Forwarded-For', nextTestIp())
+        .set('Authorization', as(account))
+        .send(body),
+    notificationsOf: (authId: string) =>
+      app.ctx.client.notification.findMany({
+        where: { authId },
+        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      }),
+    notificationEmailsTo: (email: string) =>
+      app.ctx.emails.sent.filter(
+        (item) => item.kind === 'notification' && item.to === email,
+      ),
+    /**
+     * Referral milestones through the admin API. Milestones apply to every
+     * referrer of the application: `reset` switches them all off, `ensure`
+     * creates one or switches it on with the given reward.
+     */
+    milestones: (admin: TestAccount) => {
+      const path = '/v1/admin/referral-milestones';
+      const list = async () =>
+        dataOf<MilestoneView[]>(await helpers.get(admin, path).expect(200));
+      return {
+        list,
+        reset: async () => {
+          for (const m of await list()) {
+            if (m.active) {
+              await helpers
+                .patch(admin, `${path}/${m.id}`, { active: false })
+                .expect(200);
+            }
+          }
+        },
+        ensure: async (referralCount: number, rewardCredits: number) => {
+          const existing = (await list()).find(
+            (m) => m.referralCount === referralCount,
+          );
+          const response = existing
+            ? await helpers
+                .patch(admin, `${path}/${existing.id}`, {
+                  rewardCredits,
+                  active: true,
+                })
+                .expect(200)
+            : await helpers
+                .post(admin, path, { referralCount, rewardCredits })
+                .expect(201);
+          return dataOf<MilestoneView>(response);
+        },
+      };
+    },
     referralOf: (authId: string) =>
       app.ctx.client.referral.findUnique({ where: { authId } }),
     rewardAllocations: (authId: string) =>
