@@ -19,7 +19,8 @@ The companion mobile application and detailed product specifications live in `..
 - a provider-neutral AI gateway with OpenRouter live mode, multimodal private-image input, strict structured output, runtime validation, bounded retries, and deterministic mock mode
 - AI credit configuration: administrators can read and change the trial credit allowance, the monthly Pro allowance, the OpenRouter cost per credit and the per-session overage allowance; the defaults are stored in PostgreSQL by migration and at startup, never overwriting administrator changes (see "AI credit settings" under API)
 - discount, referral, daily reward and credit package configuration: administrators can read and change the first-purchase discount, the referral discount and the referrer's reward credits (all `0` = off by default), the daily reward amounts (10 credits, +10 per day, at most 50; at most 600 daily reward credits per user per UTC calendar month) and the three credit packages (250 credits for $5, 500 for $10, 1,000 for $20: credits, price in cents, availability); stored in PostgreSQL by migration and at startup, never overwriting administrator changes (see "Discount, referral, daily reward and credit package settings" under API). Discounts are priced but not charged, and packages are not sold yet
-- daily reward claims: a signed-in user claims once per UTC day (`POST /v1/daily-rewards/claim`); the reward follows the streak of consecutive days and is granted as never-expiring `DAILY_REWARD` credits. A user never receives more than 600 daily reward credits per UTC calendar month: the claim that reaches the cap grants only the rest and later claims that month are refused, enforced by the service and by PostgreSQL (see "Daily reward claims")
+- daily reward claims and streaks: verified, active users claim once per UTC day (`POST /v1/daily-rewards/claim`; past or future days are refused); the reward follows the streak of consecutive days (10, 20, 30, 40, then 50) and is granted as never-expiring `DAILY_REWARD` credits; a missed day restarts the streak without taking anything back. A user never receives more than 600 daily reward credits per UTC calendar month (spent or not): the claim that reaches the cap grants only the rest and later claims grant 0 but keep the streak; a new month renews the cap, not the streak. Users see their streak, next claim, monthly earnings and remaining cap, balance and claim history. Enforced by the service and by PostgreSQL (see "Daily reward claims")
+- loyalty missions: administrators define missions for verified makeup completions (every guide step completed): one-time or multi-step (N completions), once ever or per UTC week or month, rewarded with never-expiring `MISSION_REWARD` credits once per mission, user and period, outside the daily reward cap; safe under repeated or concurrent completions and restarts (see "Loyalty missions")
 - discount codes and promotional campaigns: administrators create, view, change and deactivate codes and campaigns (discount percentage, active flag, start and end, optional user targeting, per-user and total redemption limits; 0% switches an offer off). Users redeem them for a credit package at the discounted price; invalid, inactive, not yet started, expired, depleted and ineligible offers are refused, and concurrent or repeated requests never exceed a limit or count twice (see "Discount codes and campaigns")
 - discounts in the Stripe checkout: each Pro checkout gets the best available discount (the highest percentage of the first-purchase discount, the referral discount, an entered discount code and running campaigns), charged through a one-time Stripe coupon so the first payment reflects it while the plan price and renewals stay unchanged. The first-purchase and referral discounts stay available until the first successful paid purchase (trials and failed, canceled or abandoned checkouts do not use them up); every discount is used at most once despite repeated, out-of-order or concurrent payments, subscriptions or checkouts. Campaigns support minimum spend, new/returning customer and product targeting and a USD budget that is reserved with each checkout, spent by its payment and given back only when the checkout can no longer be paid (see "Discounts in the Stripe checkout")
 - referrals: every user has an individual referral code, used when signing up (`POST /auth` or Google sign-up); invalid codes, self-referrals, duplicate and retrospective referrals are refused and create nothing. Referred users get the referral discount; referrers get non-expiring `REFERRAL` credits once, with the invited user's first verified paying Stripe purchase (never for signup, verification, trials or unsuccessful purchases, never twice for repeated or concurrent webhooks), usable for makeup sessions without Pro. Administrators configure referral milestones (bonus credits after N paid referrals, each awarded once). Referrals paid with a payment method shared with the referrer or another of their invitees are held for administrator review (only a keyed hash of Stripe's payment method fingerprint is stored). Users see their own code, pending, rewarded and held referrals, milestones, earnings and reward history, and nobody else's (see "Referrals")
@@ -1082,19 +1083,50 @@ For all three, `PATCH` accepts any subset of the editable fields; omitted fields
 
 ### Daily reward claims
 
-A signed-in user (any role) claims a daily reward once per UTC calendar day:
+A verified, active user (any role) claims a daily reward once per UTC calendar day (unverified or inactive accounts get `403 Only verified, active accounts can claim daily rewards`):
 
-| Method | Route                      | Purpose                                                 |
-| ------ | -------------------------- | ------------------------------------------------------- |
-| `GET`  | `/v1/daily-rewards`        | The caller's state: today's claim, streak, next reward, month total |
-| `POST` | `/v1/daily-rewards/claim`  | Claim today's reward (`201`)                            |
+| Method | Route                         | Purpose |
+| ------ | ----------------------------- | ------- |
+| `GET`  | `/v1/daily-rewards`           | The caller's state: `eligible`, `canClaimNow`, `claimedToday`/`todayClaim`, `currentStreakDays`, `longestStreakDays`, `nextClaim` (`date`, `availableAt`, `secondsUntilAvailable`, `streakDay`, `rewardCredits`, `grantedCredits` after the cap), `claimedThisMonthCredits`, `remainingThisMonthCredits`, `monthlyCapCredits` and `creditBalance` (`available`, `usable`, and the daily reward credits `granted`/`available`/`used`) |
+| `POST` | `/v1/daily-rewards/claim`     | Claim today's reward (`201`). Optional body `{ "claimDate": "YYYY-MM-DD" }`: anything but the current UTC day is refused (`409` for a past or future day, `400` for an invalid date) |
+| `GET`  | `/v1/daily-rewards/history`   | Claims, newest first: `?limit=1–100` (default 31), `?cursor=<nextCursor>`, `?month=YYYY-MM`; each with `claimDate`, `streakDay`, `rewardCredits`, `grantedCredits`, `limitedByMonthlyCap`, `claimedAt` |
+| `GET`  | `/v1/daily-rewards/months`    | Credits per UTC month, newest first (the current month and months with claims, `?limit=1–24`): `month`, `claims`, `earnedCredits`, `capCredits`, `remainingCredits` |
 
-- **Amount.** The n-th consecutive claimed day grants `min(startingRewardCredits + (n - 1) × dailyIncrementCredits, maxDailyRewardCredits)` from the settings in force at the claim (defaults: 10, 20, 30, 40, 50, 50, …). A missed day starts the streak again at day 1; a streak continues across a month boundary. Changing the settings affects later claims only.
+- **Amount and streak.** The n-th consecutive claimed UTC day grants `min(startingRewardCredits + (n - 1) × dailyIncrementCredits, maxDailyRewardCredits)` from the settings in force at the claim (defaults: 10, 20, 30, 40, 50, 50, …). A missed day starts the streak again at day 1; credits already received are kept. A streak continues across a month boundary. Changing the settings affects later claims only (each claim stores its `rewardCredits`).
+- **Only today.** A claim is always for the current UTC day; missed days can never be claimed afterwards (no backfilling), and a second claim the same UTC day answers `409 Today's daily reward has already been claimed`.
 - **Credits.** The reward is a `DAILY_REWARD` allocation in the user's wallet (reference `daily-reward:<YYYY-MM-DD>`), granted in the same transaction as the claim. Daily reward credits never expire and are usable with or without Pro, like purchased credits, and appear in `GET /v1/credits/balance` and the transaction history.
-- **Monthly cap: 600 credits per user and UTC calendar month.** The claim that reaches the cap grants only the rest (e.g. a reward of 70 with 580 already granted grants 20, recorded as `rewardCredits: 70, grantedCredits: 20`), and later claims that month are refused with `409` `The monthly limit of 600 daily reward credits has been reached`. The next UTC month starts again at 0.
-- **Rejections** write nothing: a second claim the same UTC day answers `409` `Today's daily reward has already been claimed`; no token answers `401`.
+- **Monthly cap: 600 credits per user and UTC calendar month**, counted when granted (spending the credits does not free the cap). The claim that reaches the cap grants only the rest (e.g. a reward of 70 with 580 already granted grants 20, recorded as `rewardCredits: 70, grantedCredits: 20, limitedByMonthlyCap: true`); later claims that month are recorded with `grantedCredits: 0` and **keep the streak**. The next UTC month renews the cap (not the streak).
 - **Credits only through claims.** `CreditWalletService.grant` accepts `DAILY_REWARD` credits only for a recorded claim: the reference must name the claimed day and the amount must equal the claim's `grantedCredits`. A trigger on `CreditAllocation` enforces the same (migration `20261203120000_daily_reward_allocation_guard`), so credits added outside claims, even by manual SQL, cannot take a user past 600 in a month.
-- **Guarantees** (migrations `20261201120000_add_daily_reward_credit_source`, `20261201130000_add_daily_reward_claims`). A claim runs in one transaction that first locks the user's `DailyRewardMonthlyTotal` row for the month, so concurrent claims of one user apply one at a time (exactly one succeeds per day). Independently of the application, PostgreSQL enforces the cap: every inserted `DailyRewardClaim` recomputes the month's total from the month's claims under the same lock, and a CHECK constraint refuses a total above 600, so no write path (including manual SQL, or deleting the total row) can exceed it. `(authId, claimDate)` is unique and claims cannot be changed. Deleting the account deletes its claims and totals.
+- **Guarantees** (migrations `20261201120000_add_daily_reward_credit_source`, `20261201130000_add_daily_reward_claims`, `20261207130000_daily_reward_streaks_loyalty_missions`). A claim runs in one transaction under a lock of the user's claims (also taken by the database trigger), so concurrent or repeated requests apply one at a time and exactly one succeeds per day. Independently of the application, PostgreSQL enforces: the month's total recomputed from the month's claims and capped at 600 by a CHECK constraint; `grantedCredits` between 0 and `rewardCredits`; a claim is for the UTC day of its `claimedAt` and after the user's last claimed day; its `streakDay` is the previous day's + 1 (or 1); `(authId, claimDate)` is unique and claims cannot be changed. Deleting the account deletes its claims and totals.
+
+### Loyalty missions
+
+Administrators define missions rewarded for **verified makeup completions**: a makeup session finished through its guide with **every step completed** (none skipped). Unfinished sessions and sessions with skipped steps never count. The completion is recorded (`MakeupCompletion`, one per session, kept if the session is later deleted) in the transaction that completes the last step; PostgreSQL checks that the session, its guide and all its steps are `COMPLETED`.
+
+| Field | Meaning |
+| ----- | ------- |
+| `title`, `description` | Shown to users (1–100 / up to 500 characters) |
+| `recurrence` | `ONCE` (once ever), `WEEKLY` (once per UTC week, Monday 00:00 to Monday) or `MONTHLY` (once per UTC calendar month) |
+| `requiredCompletions` | Verified completions needed in the period: `1` for a one-time mission, more for a multi-step mission (1–100) |
+| `rewardCredits` | `MISSION_REWARD` credits awarded (1–100000) |
+| `active` | Inactive missions award nothing and are not shown to users |
+
+A mission starts when it is created (completions before never count). `recurrence` and `requiredCompletions` never change (`400`; create a new mission instead); changing `rewardCredits` or `active` applies from then on.
+
+| Method  | Route                                | Who | Purpose |
+| ------- | ------------------------------------ | --- | ------- |
+| `POST`  | `/v1/admin/loyalty-missions`         | `ADMIN`, `SUPERADMIN` | Create |
+| `GET`   | `/v1/admin/loyalty-missions`         | `ADMIN`, `SUPERADMIN` | List with `awards` granted |
+| `GET`   | `/v1/admin/loyalty-missions/:id`     | `ADMIN`, `SUPERADMIN` | One mission |
+| `PATCH` | `/v1/admin/loyalty-missions/:id`     | `ADMIN`, `SUPERADMIN` | Change `title`, `description`, `rewardCredits`, `active` |
+| `GET`   | `/v1/loyalty-missions`               | signed-in user | The caller's `verifiedCompletions` (`total`, `thisWeek`, `thisMonth`), each active mission with its current `period`, `completions`, `remainingCompletions`, `completed` and `award`, and `totalEarnedCredits` |
+| `GET`   | `/v1/loyalty-missions/awards`        | signed-in user | The caller's mission rewards, newest first (`?limit=1–100`) |
+
+Invalid values (blank titles, unknown recurrences, zero, negative, fractional or string numbers, out of range, unknown fields) answer `400` and change nothing; administration changes are written to the activity log.
+
+- **Rewards.** After a verified completion, every active mission whose `requiredCompletions` are reached in that completion's period is awarded once per user and period (`LoyaltyMissionAward`, unique per mission, user and `periodKey`: `once` or the period's first day), with `MISSION_REWARD` credits (reference `loyalty-mission:<award id>`), which never expire, are usable with or without Pro, and do **not** count towards the daily reward cap.
+- **Once only.** A completion is recorded once per session (repeated or concurrent completion requests record it once) and evaluated once (marked `processedAt` in the evaluation's transaction, under a lock of the user's missions). If the evaluation is interrupted (error, crash, restart), it is resumed at startup and every `LOYALTY_MISSION_SWEEP_INTERVAL_MS` (default 60000, minimum 1000; not when `NODE_ENV=test` unless `LOYALTY_MISSION_SWEEP_ENABLED=true`).
+- **PostgreSQL enforces the same** (migration `20261207130000_daily_reward_streaks_loyalty_missions`): completions only for sessions completed with every step, never changed; awards only for an active mission, a period of its recurrence and with its required completions recorded in that period, never changed; `MISSION_REWARD` credits only for an award of the same user and amount; a mission's recurrence and requirement never change.
 
 ### Discount codes and campaigns
 
@@ -1586,6 +1618,7 @@ authUser
 |-- PaymentCustomer (0..1 per provider)
 |-- UserSubscription (0..1)
 |-- DailyRewardClaim, DailyRewardMonthlyTotal (per UTC day / month)
+|-- MakeupCompletion (verified completions; sessionId without a foreign key), LoyaltyMissionAward (-> LoyaltyMission)
 |-- DiscountOfferTarget, DiscountRedemption (-> CheckoutSession, PaymentTransaction)
 |-- ReferralCode (0..1), Referral (0..1, as the referred user; referrerAuthId SET NULL when the referrer is deleted; qualifyingPaymentId -> PaymentTransaction)
 |-- ReferralProgress (0..1, paid referral count and milestone lock), ReferralMilestoneAward (-> ReferralMilestone)
@@ -1613,6 +1646,7 @@ SubscriptionPlan, CreditSettings, DiscountSettings, DailyRewardSettings: single-
 DiscountOffer (codes and campaigns) -> DiscountOfferTarget, DiscountRedemption: administrator configuration; targets and redemptions belong to a user (deleted with the account)
 CreditPackage: administrator configuration, one row per package code (SMALL, MEDIUM, LARGE), no owner
 ReferralMilestone: administrator configuration, one row per threshold, no owner
+LoyaltyMission: administrator configuration, no owner (switched off, never deleted)
 ```
 
 Mock and live gateways implement the same application-owned operations. The live gateway delegates transport to an OpenRouter provider adapter, workers validate and normalize model-shaped output, and NestJS alone persists it transactionally and advances workflow state. No frontend or public API contract changes are required to switch modes or add another provider adapter.
@@ -1630,6 +1664,8 @@ npx jest private-cloud   # private image storage unit tests
 npm test -- --runInBand credit   # AI credit unit/HTTP tests
 TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json --runInBand test/credit-settings test/credit-wallet test/credit-access test/credit-trial test/credit-subscription test/credit-scheduler test/credit-usage test/credit-overage test/credit-apis   # AI credits on PostgreSQL
 npx jest discount   # discount settings, codes and campaigns unit/HTTP tests (likewise: daily, credit-package)
+npx jest daily      # daily reward and loyalty mission unit tests
+TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json daily   # daily-reward-settings, daily-reward-claims, daily-reward-streak, daily-reward-royalty-missions on PostgreSQL
 TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json discount   # every discount suite on PostgreSQL; one suite: discount-first-purchase, discount-payments, discount-campaign-budget, discount-codes, discount-campaigns (likewise: daily, credit-package)
 npx jest referral   # referral and referral notification unit tests
 TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json referral   # referral-registration, referral-purchase, referral-apis, referral-milestones, referral-notifications on PostgreSQL

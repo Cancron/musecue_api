@@ -1,0 +1,74 @@
+// ================================
+// Loyalty Missions
+// ================================
+//
+// Administrator-defined missions rewarded with MISSION_REWARD credits for
+// verified makeup completions (migration
+// 20261207130000_daily_reward_streaks_loyalty_missions). Mission credits are
+// separate from daily rewards: they never count towards the monthly daily
+// reward cap.
+
+// A mission: complete `requiredCompletions` verified makeup sessions (1 = a
+// single-step mission, more = a multi-step mission) once ever (ONCE) or
+// within each UTC week or month (WEEKLY, MONTHLY), for `rewardCredits`.
+// Completions before `startsAt` never count. The recurrence and the number
+// of completions never change (database trigger); missions are switched off
+// rather than deleted.
+model LoyaltyMission {
+  id                  String                   @id @default(uuid())
+  title               String                   @db.VarChar(100)
+  description         String?                  @db.VarChar(500)
+  recurrence          LoyaltyMissionRecurrence
+  requiredCompletions Int
+  rewardCredits       Int
+  active              Boolean                  @default(true)
+  startsAt            DateTime
+  createdAt           DateTime                 @default(now())
+  updatedAt           DateTime                 @updatedAt
+
+  awards LoyaltyMissionAward[]
+
+  @@index([active])
+}
+
+// A verified makeup completion: a makeup session the user finished through
+// its guide with every step completed (none skipped), recorded with the
+// session's completion (database trigger checks it). One per session; it
+// stays when the session is deleted, so a completion is counted once.
+// `processedAt` is set once the missions were evaluated for it (the
+// application evaluates it right after the completion, and again at
+// startup and periodically if that was interrupted).
+model MakeupCompletion {
+  sessionId   String    @id
+  authId      String
+  completedAt DateTime
+  processedAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
+
+  @@index([authId, completedAt])
+  @@index([processedAt])
+}
+
+// A mission reward: one per mission, user and period (`periodKey`: "once",
+// or the first UTC day of the week or month). Credits are a MISSION_REWARD
+// allocation with reference `loyalty-mission:<award id>`. Awards never
+// change; PostgreSQL refuses awards whose completions are missing.
+model LoyaltyMissionAward {
+  id                  String    @id @default(uuid())
+  missionId           String
+  authId              String
+  periodKey           String    @db.VarChar(20)
+  periodStart         DateTime
+  periodEnd           DateTime?
+  requiredCompletions Int
+  rewardCredits       Int
+  awardedAt           DateTime
+
+  mission  LoyaltyMission @relation(fields: [missionId], references: [id], onDelete: Restrict)
+  authUser authUser       @relation(fields: [authId], references: [id], onDelete: Cascade)
+
+  @@unique([missionId, authId, periodKey])
+  @@index([authId, awardedAt])
+}

@@ -1,4 +1,4 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Optional } from '@nestjs/common';
 import { Prisma, type AiRun } from '@prisma/client';
 import AppError from '../common/errors/app.error';
 import { PrismaService } from '../common/services/prisma.service';
@@ -28,6 +28,10 @@ import type { AiOperation } from './interfaces/makeup.interface';
 import { lockSession, requireSessionStatus } from './workflow-lock';
 import { failRun, toRunJobInput } from './queues/run-lifecycle';
 import { MakeupCreditService } from './makeup-credit.service';
+import {
+  LoyaltyMissionProgressService,
+  recordVerifiedCompletion,
+} from '../daily-rewards/missions/loyalty-mission-progress.service';
 
 /**
  * Transactions that initialize or check a session's credits wait for the
@@ -89,6 +93,8 @@ export class MakeupService {
     private readonly imageLifecycle: PrivateImageLifecycleService,
     @Inject(AI_GATEWAY) private readonly aiGateway: AiGateway,
     private readonly credits: MakeupCreditService,
+    // Absent only where the service is built by hand (unit tests).
+    @Optional() private readonly missions?: LoyaltyMissionProgressService,
   ) {}
 
   /**
@@ -563,16 +569,24 @@ export class MakeupService {
     return run;
   }
 
+  /**
+   * Completes (or skips) the current step. Completing the last step
+   * completes the session; if every step was completed (none skipped), the
+   * session is recorded as a verified completion in the same transaction and
+   * the loyalty missions are evaluated for it afterwards (resumed by the
+   * mission sweep if that is interrupted). Repeated requests change nothing.
+   */
   async completeStep(authId: string, stepId: string, dto: CompleteStepDto) {
     const owned = await this.getOwnedStep(authId, stepId);
     const now = new Date();
-    await this.prisma.$transaction(async (tx) => {
+    const verified = await this.prisma.$transaction(async (tx) => {
       await lockSession(tx, authId, owned.guide.sessionId);
       const step = await tx.guideStep.findUniqueOrThrow({
         where: { id: stepId },
         include: { guide: { include: { steps: true } } },
       });
-      if (step.status === 'COMPLETED' || step.status === 'SKIPPED') return;
+      if (step.status === 'COMPLETED' || step.status === 'SKIPPED')
+        return false;
       if (step.status !== 'CURRENT')
         throw AppError.conflict('Only the current step can be completed');
       const next = step.guide.steps.find(
@@ -631,8 +645,17 @@ export class MakeupService {
           where: { id: step.guide.sessionId },
           data: { status: 'COMPLETED', completedAt: now },
         });
+        return recordVerifiedCompletion(tx, {
+          sessionId: step.guide.sessionId,
+          authId,
+          completedAt: now,
+        });
       }
+      return false;
     });
+    if (verified && this.missions) {
+      await this.missions.afterCompletion(owned.guide.sessionId);
+    }
     return this.getSession(authId, owned.guide.sessionId);
   }
 

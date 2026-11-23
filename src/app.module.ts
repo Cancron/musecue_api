@@ -17,6 +17,7 @@ import { CreditsModule } from './credits/credits.module';
 import { CreditAccountModule } from './credits/account/credit-account.module';
 import { DiscountsModule } from './discounts/discounts.module';
 import { DailyRewardsModule } from './daily-rewards/daily-rewards.module';
+import { LoyaltyMissionsModule } from './daily-rewards/missions/loyalty-missions.module';
 import { CreditPackagesModule } from './credit-packages/credit-packages.module';
 import { ReferralsModule } from './referrals/referrals.module';
 import { NotificationsModule } from './notifications/notifications.module';
@@ -53,6 +54,7 @@ import { AccountDeletionModule } from './privacy/account-deletion/account-deleti
     CreditAccountModule,
     DiscountsModule,
     DailyRewardsModule,
+    LoyaltyMissionsModule,
     CreditPackagesModule,
     ReferralsModule,
     NotificationsModule,

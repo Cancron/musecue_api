@@ -23,6 +23,18 @@ export function addUtcDays(day: string, offset: number): string {
   return utcDay(new Date(dateOfUtcDay(day).getTime() + offset * DAY_MS));
 }
 
+/** Whether `value` is a real calendar day written YYYY-MM-DD. */
+export function isUtcDay(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const date = dateOfUtcDay(value);
+  return !Number.isNaN(date.getTime()) && utcDay(date) === value;
+}
+
+/** Whole seconds from `now` until `at` (0 if `at` has passed). */
+export function secondsUntil(at: Date, now: Date): number {
+  return Math.max(0, Math.ceil((at.getTime() - now.getTime()) / 1000));
+}
+
 /** Midnight UTC of `day`, as stored in DATE columns. */
 export function dateOfUtcDay(day: string): Date {
   return new Date(`${day}T00:00:00.000Z`);
@@ -63,7 +75,7 @@ export function rewardForStreakDay(
 /**
  * The credits a claim may grant: the day's reward, reduced so the month's
  * daily reward credits never exceed the monthly cap. 0 when the cap is
- * reached (the claim is refused).
+ * reached (the claim is still recorded and keeps the streak).
  */
 export function grantableCredits(
   rewardCredits: number,

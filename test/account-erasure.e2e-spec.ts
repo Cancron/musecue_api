@@ -122,6 +122,8 @@ const USER_DATA_TABLES = [
   'PaymentFingerprint',
   'Notification',
   'NotificationPreference',
+  'MakeupCompletion',
+  'LoyaltyMissionAward',
 ] as const;
 
 describeWithDatabase('Account erasure (PostgreSQL)', () => {
@@ -445,6 +447,48 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
       },
       include: { steps: true },
     });
+    // The session was completed step by step: a verified completion, which
+    // earned a loyalty mission (shared configuration, kept on erasure).
+    const sessionCompletedAt = new Date(Date.now() - 60_000);
+    await client.guideStep.update({
+      where: { id: guide.steps[0].id },
+      data: { status: 'COMPLETED', completedAt: sessionCompletedAt },
+    });
+    await client.guide.update({
+      where: { id: guide.id },
+      data: { status: 'COMPLETED', completedAt: sessionCompletedAt },
+    });
+    await client.makeupSession.update({
+      where: { id: session.id },
+      data: { status: 'COMPLETED', completedAt: sessionCompletedAt },
+    });
+    const loyaltyMission = await client.loyaltyMission.create({
+      data: {
+        title: 'First look',
+        recurrence: 'ONCE',
+        requiredCompletions: 1,
+        rewardCredits: 10,
+        startsAt: new Date(sessionCompletedAt.getTime() - 60_000),
+      },
+    });
+    await client.makeupCompletion.create({
+      data: {
+        sessionId: session.id,
+        authId: user.id,
+        completedAt: sessionCompletedAt,
+      },
+    });
+    await client.loyaltyMissionAward.create({
+      data: {
+        missionId: loyaltyMission.id,
+        authId: user.id,
+        periodKey: 'once',
+        periodStart: loyaltyMission.startsAt,
+        requiredCompletions: 1,
+        rewardCredits: 10,
+        awardedAt: new Date(),
+      },
+    });
     await client.aiRun.create({
       data: {
         authId: user.id,
@@ -610,7 +654,7 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
         streakDay: 1,
         rewardCredits: 10,
         grantedCredits: 10,
-        claimedAt: new Date(),
+        claimedAt: new Date('2031-01-05T08:00:00.000Z'),
       },
     });
     const offer = await client.discountOffer.create({

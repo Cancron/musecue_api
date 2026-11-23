@@ -316,6 +316,16 @@ enum CreditSource {
   REFERRAL
   // Daily reward claims (never expire; at most 600 per user and UTC month).
   DAILY_REWARD
+  // Loyalty mission rewards (never expire; not part of the daily reward cap).
+  MISSION_REWARD
+}
+
+// How often a loyalty mission can be completed: once ever, or once per UTC
+// week (Monday to Sunday) or UTC calendar month.
+enum LoyaltyMissionRecurrence {
+  ONCE
+  WEEKLY
+  MONTHLY
 }
 
 // A CreditTransaction changes the available balance: GRANT adds an

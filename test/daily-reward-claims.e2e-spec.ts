@@ -31,9 +31,14 @@ jest.setTimeout(180_000);
 const CLAIM = '/v1/daily-rewards/claim';
 const STATUS = '/v1/daily-rewards';
 const SETTINGS = '/v1/admin/daily-reward-settings';
-const CAP_REACHED =
-  'The monthly limit of 600 daily reward credits has been reached';
+const HISTORY = '/v1/daily-rewards/history';
+const MONTHS = '/v1/daily-rewards/months';
 const ALREADY_CLAIMED = "Today's daily reward has already been claimed";
+const PAST_DAY =
+  'The daily reward of a past day can no longer be claimed; only the current UTC day can be claimed';
+const FUTURE_DAY =
+  'The daily reward of a future day cannot be claimed yet; only the current UTC day can be claimed';
+const NOT_ELIGIBLE = 'Only verified, active accounts can claim daily rewards';
 
 interface ClaimView {
   id: string;
@@ -41,18 +46,35 @@ interface ClaimView {
   streakDay: number;
   rewardCredits: number;
   grantedCredits: number;
+  limitedByMonthlyCap: boolean;
   claimedAt: string;
 }
 interface StatusView {
   today: string;
   month: string;
+  eligible: boolean;
+  canClaimNow: boolean;
   claimedToday: boolean;
   todayClaim: ClaimView | null;
   currentStreakDays: number;
+  longestStreakDays: number;
+  nextClaim: {
+    date: string;
+    availableAt: string;
+    secondsUntilAvailable: number;
+    streakDay: number;
+    rewardCredits: number;
+    grantedCredits: number;
+  };
   nextRewardCredits: number;
   monthlyCapCredits: number;
   claimedThisMonthCredits: number;
   remainingThisMonthCredits: number;
+  creditBalance: {
+    available: string;
+    usable: string;
+    dailyReward: { granted: string; available: string; used: string };
+  };
 }
 
 /** Noon UTC of `day` (YYYY-MM-DD). */
@@ -70,13 +92,10 @@ describeWithDatabase('Daily reward claims (PostgreSQL, full stack)', () => {
   const claim = (account: TestAccount) => as(ctx, account).post(CLAIM);
   const status = async (account: TestAccount) =>
     dataOf<StatusView>(await as(ctx, account).get(STATUS).expect(200));
-  /** Claims on `day` and returns the granted credits (0 if refused by the cap). */
+  /** Claims on `day` and returns the granted credits (0 once capped). */
   const claimOn = async (account: TestAccount, day: string) => {
     freezeTime(noon(day));
     const response = await claim(account);
-    if (response.status === 409 && messageOf(response) === CAP_REACHED) {
-      return 0;
-    }
     expect(response.status).toBe(201);
     return dataOf<ClaimView>(response).grantedCredits;
   };
@@ -136,6 +155,7 @@ describeWithDatabase('Daily reward claims (PostgreSQL, full stack)', () => {
         streakDay: 1,
         rewardCredits: 10,
         grantedCredits: 10,
+        limitedByMonthlyCap: false,
         claimedAt: '2031-01-05T00:00:00.000Z',
       });
       const [allocation, ...others] =
@@ -230,30 +250,241 @@ describeWithDatabase('Daily reward claims (PostgreSQL, full stack)', () => {
       await expect(status(user)).resolves.toEqual({
         today: '2031-05-10',
         month: '2031-05',
+        eligible: true,
+        canClaimNow: true,
         claimedToday: false,
         todayClaim: null,
         currentStreakDays: 0,
+        longestStreakDays: 0,
+        nextClaim: {
+          date: '2031-05-10',
+          availableAt: '2031-05-10T00:00:00.000Z',
+          secondsUntilAvailable: 0,
+          streakDay: 1,
+          rewardCredits: 10,
+          grantedCredits: 10,
+        },
         nextRewardCredits: 10,
         monthlyCapCredits: 600,
         claimedThisMonthCredits: 0,
         remainingThisMonthCredits: 600,
+        creditBalance: {
+          available: '0',
+          usable: '0',
+          dailyReward: { granted: '0', available: '0', used: '0' },
+        },
       });
       const made = dataOf<ClaimView>(await claim(user).expect(201));
       await expect(status(user)).resolves.toMatchObject({
+        canClaimNow: false,
         claimedToday: true,
         todayClaim: made,
         currentStreakDays: 1,
+        longestStreakDays: 1,
+        nextClaim: {
+          date: '2031-05-11',
+          availableAt: '2031-05-11T00:00:00.000Z',
+          secondsUntilAvailable: 12 * 60 * 60,
+          streakDay: 2,
+          rewardCredits: 20,
+          grantedCredits: 20,
+        },
         nextRewardCredits: 20,
         claimedThisMonthCredits: 10,
         remainingThisMonthCredits: 590,
+        creditBalance: {
+          available: '10',
+          usable: '10',
+          dailyReward: { granted: '10', available: '10', used: '0' },
+        },
       });
       await as(ctx).get(STATUS).expect(401);
       await as(ctx).post(CLAIM).expect(401);
+      await as(ctx).get(HISTORY).expect(401);
+      await as(ctx).get(MONTHS).expect(401);
+    });
+
+    it('refuses claims for a past (missed) or future day, and accepts today named explicitly', async () => {
+      const user = await createAccount(ctx);
+      expect(await claimOn(user, '2031-06-01')).toBe(10);
+      // 2031-06-02 is missed; on the 3rd it can no longer be claimed.
+      freezeTime(noon('2031-06-03'));
+      for (const claimDate of ['2031-06-02', '2031-06-01', '2030-12-31']) {
+        expect(
+          messageOf(
+            await as(ctx, user).post(CLAIM).send({ claimDate }).expect(409),
+          ),
+        ).toBe(PAST_DAY);
+      }
+      expect(
+        messageOf(
+          await as(ctx, user)
+            .post(CLAIM)
+            .send({ claimDate: '2031-06-04' })
+            .expect(409),
+        ),
+      ).toBe(FUTURE_DAY);
+      for (const claimDate of [
+        'yesterday',
+        '2031-6-3',
+        '2031-02-30',
+        20310603,
+      ]) {
+        await as(ctx, user).post(CLAIM).send({ claimDate }).expect(400);
+      }
+      await as(ctx, user).post(CLAIM).send({ day: '2031-06-03' }).expect(400);
+      await expect(
+        ctx.client.dailyRewardClaim.count({ where: { authId: user.id } }),
+      ).resolves.toBe(1);
+
+      await expect(
+        as(ctx, user)
+          .post(CLAIM)
+          .send({ claimDate: '2031-06-03' })
+          .expect(201)
+          .then(dataOf),
+      ).resolves.toMatchObject({ claimDate: '2031-06-03', streakDay: 1 });
+      // The missed day stays missed: it was never recorded or granted.
+      await expect(
+        ctx.client.dailyRewardClaim.findMany({
+          where: { authId: user.id },
+          orderBy: { claimDate: 'asc' },
+          select: { claimDate: true },
+        }),
+      ).resolves.toEqual([
+        { claimDate: new Date('2031-06-01') },
+        { claimDate: new Date('2031-06-03') },
+      ]);
+    });
+
+    it('lets only verified, active accounts claim', async () => {
+      const unverified = await createAccount(ctx);
+      await ctx.client.authUser.update({
+        where: { id: unverified.id },
+        data: { verified: false },
+      });
+      freezeTime(noon('2031-06-10'));
+      expect(messageOf(await claim(unverified).expect(403))).toBe(NOT_ELIGIBLE);
+      await expect(status(unverified)).resolves.toMatchObject({
+        eligible: false,
+        canClaimNow: false,
+      });
+
+      for (const state of ['SUSPENDED', 'BLOCKED', 'INACTIVE'] as const) {
+        const account = await createAccount(ctx);
+        await ctx.client.authUser.update({
+          where: { id: account.id },
+          data: { status: state },
+        });
+        const response = await claim(account);
+        expect([401, 403]).toContain(response.status);
+      }
+      await expect(
+        ctx.client.dailyRewardClaim.count({
+          where: { claimDate: new Date('2031-06-10') },
+        }),
+      ).resolves.toBe(0);
+      await expect(
+        ctx.client.creditAllocation.count({
+          where: { authId: unverified.id },
+        }),
+      ).resolves.toBe(0);
+    });
+
+    it('shows the claim history newest first, by page and by month, and the credits per month', async () => {
+      const user = await createAccount(ctx);
+      for (const day of [
+        '2033-01-30',
+        '2033-01-31',
+        '2033-02-01',
+        '2033-02-02',
+        '2033-02-04',
+      ]) {
+        await claimOn(user, day);
+      }
+      freezeTime(noon('2033-02-05'));
+      const first = dataOf<{ items: ClaimView[]; nextCursor: string | null }>(
+        await as(ctx, user).get(`${HISTORY}?limit=2`).expect(200),
+      );
+      expect(first.items.map((c) => [c.claimDate, c.streakDay])).toEqual([
+        ['2033-02-04', 1],
+        ['2033-02-02', 4],
+      ]);
+      expect(first.nextCursor).toBe('2033-02-02');
+      const rest = dataOf<{ items: ClaimView[]; nextCursor: string | null }>(
+        await as(ctx, user)
+          .get(`${HISTORY}?limit=10&cursor=${first.nextCursor}`)
+          .expect(200),
+      );
+      expect(rest.items.map((c) => c.claimDate)).toEqual([
+        '2033-02-01',
+        '2033-01-31',
+        '2033-01-30',
+      ]);
+      expect(rest.nextCursor).toBeNull();
+      const january = dataOf<{ items: ClaimView[] }>(
+        await as(ctx, user).get(`${HISTORY}?month=2033-01`).expect(200),
+      );
+      expect(january.items.map((c) => c.grantedCredits)).toEqual([20, 10]);
+      for (const query of [
+        '?limit=0',
+        '?limit=101',
+        '?cursor=abc',
+        '?month=2033-13',
+        '?userId=x',
+      ]) {
+        await as(ctx, user).get(`${HISTORY}${query}`).expect(400);
+      }
+
+      const months = dataOf<
+        Array<{
+          month: string;
+          claims: number;
+          earnedCredits: number;
+          remainingCredits: number;
+        }>
+      >(await as(ctx, user).get(MONTHS).expect(200));
+      expect(months).toEqual([
+        {
+          month: '2033-02',
+          claims: 3,
+          earnedCredits: 30 + 40 + 10,
+          capCredits: 600,
+          remainingCredits: 520,
+        },
+        {
+          month: '2033-01',
+          claims: 2,
+          earnedCredits: 30,
+          capCredits: 600,
+          remainingCredits: 570,
+        },
+      ]);
+      // Another user sees only their own.
+      const other = await createAccount(ctx);
+      expect(
+        dataOf<{ items: ClaimView[] }>(
+          await as(ctx, other).get(HISTORY).expect(200),
+        ).items,
+      ).toEqual([]);
+      expect(
+        dataOf<Array<{ month: string; claims: number }>>(
+          await as(ctx, other).get(MONTHS).expect(200),
+        ),
+      ).toEqual([
+        {
+          month: '2033-02',
+          claims: 0,
+          earnedCredits: 0,
+          capCredits: 600,
+          remainingCredits: 600,
+        },
+      ]);
     });
   });
 
   describe('the monthly cap of 600 credits', () => {
-    it('grants exactly 600 with the defaults (on the 14th day) and refuses further claims that month', async () => {
+    it('grants exactly 600 with the defaults (on the 14th day); later claims that month grant 0 credits', async () => {
       const user = await createAccount(ctx);
       const granted: number[] = [];
       for (let day = 1; day <= 20; day += 1) {
@@ -285,14 +516,25 @@ describeWithDatabase('Daily reward claims (PostgreSQL, full stack)', () => {
         }),
       ).resolves.toMatchObject({ totalCredits: 600 });
       await expect(status(user)).resolves.toMatchObject({
-        claimedToday: false,
+        claimedToday: true,
         nextRewardCredits: 0,
         claimedThisMonthCredits: 600,
         remainingThisMonthCredits: 0,
       });
-      // Refused claims write nothing.
+      // Zero-credit claims are recorded (they keep the streak), without
+      // credits.
+      const claims = await ctx.client.dailyRewardClaim.findMany({
+        where: { authId: user.id },
+        orderBy: { claimDate: 'asc' },
+      });
+      expect(claims).toHaveLength(20);
+      expect(
+        claims.slice(14).map((c) => [c.streakDay, c.grantedCredits]),
+      ).toEqual([15, 16, 17, 18, 19, 20].map((day) => [day, 0]));
       await expect(
-        ctx.client.dailyRewardClaim.count({ where: { authId: user.id } }),
+        ctx.client.creditAllocation.count({
+          where: { authId: user.id, source: 'DAILY_REWARD' },
+        }),
       ).resolves.toBe(14);
       await expectConsistentLedger(ctx.client, user.id);
     });
@@ -318,7 +560,7 @@ describeWithDatabase('Daily reward claims (PostgreSQL, full stack)', () => {
       });
       expect([capped.rewardCredits, capped.grantedCredits]).toEqual([70, 20]);
 
-      // A new UTC month: the cap starts again (the streak was broken on the 12th).
+      // A new UTC month: the cap starts again (a new streak: days were missed).
       expect(await claimOn(user, '2031-09-01')).toBe(10);
       await expect(walletGrantsByMonth(user.id)).resolves.toEqual({
         '2031-08': 600,
@@ -417,21 +659,21 @@ describeWithDatabase('Daily reward claims (PostgreSQL, full stack)', () => {
 
     it('has PostgreSQL refuse daily reward credits beyond 600 in a month from any write path', async () => {
       const user = await createAccount(ctx);
-      const insert = (day: string, granted: number) =>
+      const insert = (day: string, granted: number, streakDay = 1) =>
         ctx.client.dailyRewardClaim.create({
           data: {
             authId: user.id,
             claimDate: new Date(`${day}T00:00:00.000Z`),
             monthStart: new Date(`${day.slice(0, 7)}-01T00:00:00.000Z`),
-            streakDay: 1,
+            streakDay,
             rewardCredits: 600,
             grantedCredits: granted,
-            claimedAt: new Date(),
+            claimedAt: new Date(`${day}T08:00:00.000Z`),
           },
         });
 
       await insert('2032-05-01', 590);
-      await expect(insert('2032-05-02', 11)).rejects.toThrow(
+      await expect(insert('2032-05-02', 11, 2)).rejects.toThrow(
         'DailyRewardMonthlyTotal_totalCredits_cap',
       );
       // Deleting or lowering the month's total by hand does not reopen it:
@@ -439,10 +681,10 @@ describeWithDatabase('Daily reward claims (PostgreSQL, full stack)', () => {
       await ctx.client.dailyRewardMonthlyTotal.deleteMany({
         where: { authId: user.id },
       });
-      await expect(insert('2032-05-02', 11)).rejects.toThrow(
+      await expect(insert('2032-05-02', 11, 2)).rejects.toThrow(
         'DailyRewardMonthlyTotal_totalCredits_cap',
       );
-      await insert('2032-05-02', 10);
+      await insert('2032-05-02', 10, 2);
       await expect(
         ctx.client.dailyRewardClaim.updateMany({
           where: { authId: user.id },
@@ -461,9 +703,12 @@ describeWithDatabase('Daily reward claims (PostgreSQL, full stack)', () => {
         }),
       ).rejects.toThrow('DailyRewardMonthlyTotal_totalCredits_cap');
 
-      // The API agrees: nothing is left this month.
+      // The API agrees: nothing is left this month (the claim keeps the
+      // streak with 0 credits).
       freezeTime(noon('2032-05-03'));
-      expect(messageOf(await claim(user).expect(409))).toBe(CAP_REACHED);
+      await expect(claim(user).expect(201).then(dataOf)).resolves.toMatchObject(
+        { streakDay: 3, grantedCredits: 0, limitedByMonthlyCap: true },
+      );
     });
   });
 

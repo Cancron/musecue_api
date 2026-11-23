@@ -1,7 +1,9 @@
 import {
   addUtcDays,
   grantableCredits,
+  isUtcDay,
   rewardForStreakDay,
+  secondsUntil,
   utcDay,
   utcMonthStart,
 } from './daily-reward-claim.policy';
@@ -89,5 +91,40 @@ describe('daily reward claim policy', () => {
     it('never grants more than the cap even from an inconsistent total', () => {
       expect(grantableCredits(50, 700)).toBe(0);
     });
+  });
+
+  describe('claim days', () => {
+    it.each(['2031-06-03', '2032-02-29', '2031-12-31'])(
+      'accepts %s as a day',
+      (day) => {
+        expect(isUtcDay(day)).toBe(true);
+      },
+    );
+
+    it.each([
+      '2031-02-29',
+      '2031-02-30',
+      '2031-13-01',
+      '2031-6-3',
+      'today',
+      '',
+    ])('refuses %p as a day', (day) => {
+      expect(isUtcDay(day)).toBe(false);
+    });
+
+    it('counts whole seconds until the next claim (0 once available)', () => {
+      const now = new Date('2031-06-03T12:00:00.000Z');
+      expect(secondsUntil(new Date('2031-06-04T00:00:00.000Z'), now)).toBe(
+        12 * 60 * 60,
+      );
+      expect(secondsUntil(new Date('2031-06-03T00:00:00.000Z'), now)).toBe(0);
+      expect(secondsUntil(new Date('2031-06-03T12:00:00.500Z'), now)).toBe(1);
+    });
+  });
+
+  it('grants 0 once the cap is reached and the rest for the claim reaching it', () => {
+    expect(grantableCredits(50, 600)).toBe(0);
+    expect(grantableCredits(50, 580)).toBe(20);
+    expect(grantableCredits(50, 0)).toBe(50);
   });
 });

@@ -196,6 +196,9 @@ export class CreditWalletService {
         if (input.source === CreditSource.DAILY_REWARD) {
           await this.assertDailyRewardClaim(tx, wallet.authId, input, amount);
         }
+        if (input.source === CreditSource.MISSION_REWARD) {
+          await this.assertMissionAward(tx, wallet.authId, input, amount);
+        }
 
         if (input.source === CreditSource.TRIAL) {
           const trial = await tx.creditAllocation.findFirst({
@@ -278,6 +281,34 @@ export class CreditWalletService {
     if (!claim || !amount.eq(claim.grantedCredits)) {
       throw new InvalidCreditOperationError(
         'Daily reward credits can only be granted for a recorded daily reward claim of the same amount',
+      );
+    }
+  }
+
+  /**
+   * MISSION_REWARD credits exist only for a loyalty mission award of the
+   * same user and amount (`loyalty-mission:<award id>`). The database
+   * enforces the same rule (migration
+   * 20261207130000_daily_reward_streaks_loyalty_missions).
+   */
+  private async assertMissionAward(
+    tx: Prisma.TransactionClient,
+    authId: string,
+    input: GrantCreditsInput,
+    amount: Prisma.Decimal,
+  ): Promise<void> {
+    const awardId = /^loyalty-mission:([0-9a-f-]{36})$/.exec(
+      input.sourceReference,
+    )?.[1];
+    const award = awardId
+      ? await tx.loyaltyMissionAward.findUnique({
+          where: { id: awardId },
+          select: { authId: true, rewardCredits: true },
+        })
+      : null;
+    if (!award || award.authId !== authId || !amount.eq(award.rewardCredits)) {
+      throw new InvalidCreditOperationError(
+        'Mission credits can only be granted for a loyalty mission award of the same amount',
       );
     }
   }

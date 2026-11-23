@@ -15,5 +15,7 @@ import { CreditAccountService } from './credit-account.service';
   imports: [SubscriptionModule],
   controllers: [CreditAccountController],
   providers: [CreditAccountService, AuthGuard],
+  // The daily rewards show the caller's balance.
+  exports: [CreditAccountService],
 })
 export class CreditAccountModule {}

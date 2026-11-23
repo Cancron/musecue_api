@@ -7,6 +7,7 @@ import { registerJobHandler } from '../infrastructure/jobs/job-handler.registry'
 import { StorageModule } from '../storage/storage.module';
 import { SubscriptionModule } from '../subscription/subscription.module';
 import { CreditsModule } from '../credits/credits.module';
+import { LoyaltyMissionsModule } from '../daily-rewards/missions/loyalty-missions.module';
 import { MakeupCreditService } from './makeup-credit.service';
 import { MakeupUsageController } from './makeup-usage.controller';
 import { MockAiGateway } from './ai/mock-ai.gateway';
@@ -24,7 +25,14 @@ import { MakeupRecoveryService } from './queues/makeup-recovery.service';
 @Module({
   // SubscriptionModule: ProAccessGuard (credit eligibility for POST /v1/sessions).
   // CreditsModule: AI usage metering and credit deductions.
-  imports: [QueueModule, StorageModule, SubscriptionModule, CreditsModule],
+  // LoyaltyMissionsModule: mission rewards for verified completions.
+  imports: [
+    QueueModule,
+    StorageModule,
+    SubscriptionModule,
+    CreditsModule,
+    LoyaltyMissionsModule,
+  ],
   controllers: [MakeupController, MakeupUsageController],
   providers: [
     MakeupService,

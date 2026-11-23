@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { AuthGuard } from '../common/guards/auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { ActivityLogService } from '../common/services/activity-log.service';
+import { CreditAccountModule } from '../credits/account/credit-account.module';
 import { CreditsModule } from '../credits/credits.module';
 import { DailyRewardClaimService } from './daily-reward-claim.service';
 import { DailyRewardController } from './daily-reward.controller';
@@ -15,7 +16,7 @@ import { DailyRewardSettingsService } from './daily-reward-settings.service';
  * fixed cap of 600 daily reward credits per user and UTC calendar month.
  */
 @Module({
-  imports: [CreditsModule],
+  imports: [CreditsModule, CreditAccountModule],
   controllers: [DailyRewardSettingsController, DailyRewardController],
   providers: [
     DailyRewardSettingsService,

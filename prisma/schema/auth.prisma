@@ -46,6 +46,8 @@ model authUser {
   paymentFingerprints PaymentFingerprint[]
   notifications       Notification[]
   notificationPreference NotificationPreference?
+  makeupCompletions   MakeupCompletion[]
+  loyaltyMissionAwards LoyaltyMissionAward[]
 
   @@index([email, id, providerId])
   @@index([username])
