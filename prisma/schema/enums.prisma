@@ -318,6 +318,9 @@ enum CreditSource {
   DAILY_REWARD
   // Loyalty mission rewards (never expire; not part of the daily reward cap).
   MISSION_REWARD
+  // Credit packages received as a gift (never expire; spent like purchased
+  // credits).
+  GIFT
 }
 
 // How often a loyalty mission can be completed: once ever, or once per UTC
@@ -382,6 +385,42 @@ enum CreditPackageCode {
 // method that has not settled. PAID is final (credits granted); EXPIRED
 // (abandoned), FAILED and CANCELED are closed (a verified late payment of
 // a closed order still makes it PAID).
+// Whether an order buys credits for the payer or a gift for someone else.
+enum CreditPackageOrderKind {
+  SELF
+  GIFT
+}
+
+// A gift invitation: PENDING until the recipient accepts (ACCEPTED) or
+// declines (DECLINED); EXPIRED if not accepted and paid in time; CANCELED by
+// the sender before payment. Only an ACCEPTED gift can be paid (PAID); it is
+// then DELIVERED at its delivery time, or held for REVIEW when the recipient
+// cannot receive credits (an administrator delivers or REJECTS it).
+enum CreditGiftStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+  EXPIRED
+  CANCELED
+  PAID
+  DELIVERED
+  REVIEW
+  REJECTED
+}
+
+// Granting the credits of a paid order. PENDING / RETRYING: due (at
+// nextAttemptAt); SUCCEEDED: granted once; FAILED: attempts exhausted (an
+// administrator retries); HELD: waiting for an administrator; REJECTED:
+// never granted.
+enum CreditFulfillmentStatus {
+  PENDING
+  RETRYING
+  SUCCEEDED
+  FAILED
+  HELD
+  REJECTED
+}
+
 enum CreditPackageOrderStatus {
   CREATING
   OPEN
@@ -471,6 +510,11 @@ enum NotificationType {
   // Security notifications: always emailed, whatever the preferences.
   SECURITY_SIGNED_OUT_EVERYWHERE
   SECURITY_SESSION_REUSE_DETECTED
+  // Credit package gifts.
+  GIFT_RECEIVED
+  GIFT_ACCEPTED
+  GIFT_DECLINED
+  GIFT_DELIVERED
 }
 
 // Email delivery of one notification: NOT_REQUESTED when the user's

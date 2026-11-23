@@ -1,5 +1,6 @@
 import type {
   CreditPackageCode,
+  CreditPackageOrderKind,
   CreditPackageOrderStatus,
   DiscountSource,
 } from '@prisma/client';
@@ -16,6 +17,9 @@ export interface PurchasableCreditPackageView {
 /** One of the caller's credit package orders. */
 export interface CreditPackageOrderView {
   id: string;
+  /** SELF: credits for the payer; GIFT: the payment of a gift. */
+  kind: CreditPackageOrderKind;
+  giftId: string | null;
   status: CreditPackageOrderStatus;
   packageCode: CreditPackageCode;
   /** Locked when the order was created. */

@@ -7,6 +7,12 @@ import { CreditsModule } from '../credits/credits.module';
 import { CreditPackageCheckoutService } from '../credit-packages/purchases/credit-package-checkout.service';
 import { CreditPackagePaymentService } from '../credit-packages/purchases/credit-package-payment.service';
 import { CreditPackagePurchaseController } from '../credit-packages/purchases/credit-package-purchase.controller';
+import { CreditFulfillmentAdminController } from '../credit-packages/fulfillment/credit-fulfillment-admin.controller';
+import { CreditFulfillmentService } from '../credit-packages/fulfillment/credit-fulfillment.service';
+import { CreditFulfillmentWorker } from '../credit-packages/fulfillment/credit-fulfillment.worker';
+import { CreditGiftController } from '../credit-packages/gifts/credit-gift.controller';
+import { CreditGiftService } from '../credit-packages/gifts/credit-gift.service';
+import { NotificationsModule } from '../notifications/notifications.module';
 import { CheckoutDiscountService } from './discounts/checkout-discount.service';
 import { ReferralsModule } from '../referrals/referrals.module';
 import { CreditAllocationScheduler } from './credit-allocation.scheduler';
@@ -37,12 +43,14 @@ import { STRIPE_CLIENT, StripeGateway } from './stripe/stripe.gateway';
   // Credit package purchases share the Stripe checkout, discounts and
   // webhook (src/credit-packages/purchases; the packages themselves are
   // configured through CreditPackagesModule).
-  imports: [CreditsModule, ReferralsModule],
+  imports: [CreditsModule, ReferralsModule, NotificationsModule],
   controllers: [
     SubscriptionPlanController,
     SubscriptionController,
     StripeWebhookController,
     CreditPackagePurchaseController,
+    CreditGiftController,
+    CreditFulfillmentAdminController,
   ],
   providers: [
     SubscriptionPlanService,
@@ -81,6 +89,9 @@ import { STRIPE_CLIENT, StripeGateway } from './stripe/stripe.gateway';
     StripeWebhookService,
     CreditPackageCheckoutService,
     CreditPackagePaymentService,
+    CreditFulfillmentService,
+    CreditFulfillmentWorker,
+    CreditGiftService,
   ],
   // Modules with Pro feature endpoints import SubscriptionModule and use
   // @UseGuards(AuthGuard, ProAccessGuard), adding @RequireCredits() where

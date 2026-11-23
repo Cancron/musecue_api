@@ -20,6 +20,9 @@ import { CreditAllowanceService } from '../credit-allowance.service';
 import { resolveSubscriptionAccess } from '../subscription-access.policy';
 import { STRIPE_PROVIDER, StripeGateway } from './stripe.gateway';
 
+/** Payment work can wait for row locks under load. */
+const PAYMENT_TRANSACTION_OPTIONS = { maxWait: 10_000, timeout: 20_000 };
+
 const LOG_CONTEXT = 'StripeRefundService';
 
 /** Payments whose money was collected and can therefore be refunded. */
@@ -280,7 +283,7 @@ export class StripeRefundService {
         amountCents: payment.amountCents,
       });
       return 'REFUNDED';
-    });
+    }, PAYMENT_TRANSACTION_OPTIONS);
   }
 
   /**

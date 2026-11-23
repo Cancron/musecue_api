@@ -11,7 +11,11 @@ import {
 } from './notification.policy';
 
 describe('referral notification policy', () => {
-  const none = { emailReferralRewards: false, emailReferralMilestones: false };
+  const none = {
+    emailReferralRewards: false,
+    emailReferralMilestones: false,
+    emailGifts: false,
+  };
 
   it('emails referral notifications by default and follows the preferences', () => {
     expect(

@@ -1,7 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import {
   CreditPackageOrderStatus,
-  CreditSource,
   PaymentStatus,
   type CreditPackageOrder,
   type Prisma,
@@ -9,7 +8,6 @@ import {
 import type Stripe from 'stripe';
 import { CustomLoggerService } from '../../common/services/custom-logger.service';
 import { PrismaService } from '../../common/services/prisma.service';
-import { CreditWalletService } from '../../credits/credit-wallet.service';
 import { hashPaymentFingerprint } from '../../referrals/payment-fingerprint';
 import {
   type PaymentMethodCheck,
@@ -21,16 +19,20 @@ import {
   STRIPE_PROVIDER,
   StripeGateway,
 } from '../../subscription/stripe/stripe.gateway';
-import {
-  packageOrderCreditReference,
-  verifyPackageCheckout,
-} from './credit-package-order.policy';
+import { CreditFulfillmentService } from '../fulfillment/credit-fulfillment.service';
+import { verifyPackageCheckout } from './credit-package-order.policy';
+
+/** Payment and credit work can wait for row locks under load. */
+const ORDER_TRANSACTION_OPTIONS = { maxWait: 10_000, timeout: 20_000 };
 
 const LOG_CONTEXT = 'CreditPackagePaymentService';
 
 /** What a credit package webhook did (part of the webhook outcomes). */
 export type PackageWebhookOutcome =
   | 'CREDITS_GRANTED'
+  /** The payment was recorded; its credits are granted later (scheduled
+   * gift, held for review, or a failed attempt being retried). */
+  | 'PAYMENT_RECORDED'
   | 'ALREADY_PROCESSED'
   | 'AWAITING_PAYMENT'
   | 'REJECTED'
@@ -79,9 +81,9 @@ export class CreditPackagePaymentService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly stripe: StripeGateway,
-    private readonly wallet: CreditWalletService,
     private readonly discounts: CheckoutDiscountService,
     private readonly referralRewards: ReferralRewardService,
+    private readonly fulfillments: CreditFulfillmentService,
     private readonly logger: CustomLoggerService,
   ) {}
 
@@ -90,10 +92,15 @@ export class CreditPackagePaymentService {
     return Boolean(ref.metadata?.[PACKAGE_CHECKOUT_METADATA.ORDER_ID]);
   }
 
-  async confirm(ref: SessionRef, now: Date): Promise<PackageWebhookOutcome> {
+  async confirm(
+    ref: SessionRef,
+    now: Date,
+    options: { closeIfExpired?: boolean } = {},
+  ): Promise<PackageWebhookOutcome> {
     const order = await this.findOrder(ref);
     if (!order) return this.unknown(ref);
     if (order.status === CreditPackageOrderStatus.PAID) {
+      await this.resumeFulfillment(order.id, now);
       return 'ALREADY_PROCESSED';
     }
 
@@ -102,6 +109,17 @@ export class CreditPackagePaymentService {
     const verification = verifyPackageCheckout(session, order);
     switch (verification.outcome) {
       case 'NOT_PAID':
+        if (options.closeIfExpired && session.status === 'expired') {
+          await this.close(
+            order.id,
+            CreditPackageOrderStatus.EXPIRED,
+            'PROVIDER_EXPIRED',
+            [CreditPackageOrderStatus.CREATING, CreditPackageOrderStatus.OPEN],
+            now,
+            session.id,
+          );
+          return 'CLOSED';
+        }
         return 'IGNORED';
       case 'REJECTED':
         this.logger.logWithMetadata(
@@ -146,10 +164,10 @@ export class CreditPackagePaymentService {
       unavailable: false,
     };
 
-    return this.prisma.$transaction(async (tx) => {
+    const recorded = await this.prisma.$transaction(async (tx) => {
       const current = await this.lockOrder(tx, order.id);
       if (current.status === CreditPackageOrderStatus.PAID) {
-        return 'ALREADY_PROCESSED';
+        return null;
       }
       if (!current.authId) {
         this.logger.logWithMetadata(
@@ -169,7 +187,7 @@ export class CreditPackagePaymentService {
           { context: LOG_CONTEXT, orderId: current.id, status: current.status },
         );
       }
-      await this.fulfill(
+      return this.recordPayment(
         tx,
         { ...current, authId: current.authId },
         {
@@ -179,8 +197,58 @@ export class CreditPackagePaymentService {
         paymentMethod,
         now,
       );
-      return 'CREDITS_GRANTED';
+    }, ORDER_TRANSACTION_OPTIONS);
+    if (recorded === null) {
+      await this.resumeFulfillment(order.id, now);
+      return 'ALREADY_PROCESSED';
+    }
+    if (typeof recorded === 'string') return recorded;
+    // The credits are granted from the fulfillment recorded with the
+    // payment; if this fails or the process stops here, the fulfillment
+    // worker grants them.
+    const outcome = await this.fulfillments.processOne(recorded.id, now);
+    return outcome === 'SUCCEEDED' ? 'CREDITS_GRANTED' : 'PAYMENT_RECORDED';
+  }
+
+  /**
+   * A repeated payment event of a paid order: if its credits were not
+   * granted yet (the process stopped after recording the payment), one
+   * attempt now (the fulfillment worker would do it too).
+   */
+  private async resumeFulfillment(orderId: string, now: Date) {
+    const fulfillment = await this.prisma.creditFulfillment.findUnique({
+      where: { orderId },
+      select: { id: true, status: true },
     });
+    if (fulfillment?.status === 'PENDING') {
+      await this.fulfillments.processOne(fulfillment.id, now);
+    }
+  }
+
+  /**
+   * Recovery of an order whose payment events were lost or failed: its
+   * checkout is read from Stripe; a verified payment is recorded like the
+   * webhook would, an expired session closes the order.
+   */
+  async reconcile(orderId: string, now: Date): Promise<PackageWebhookOutcome> {
+    const order = await this.prisma.creditPackageOrder.findUnique({
+      where: { id: orderId },
+    });
+    if (
+      !order?.providerSessionId ||
+      (order.status !== CreditPackageOrderStatus.OPEN &&
+        order.status !== CreditPackageOrderStatus.PROCESSING)
+    ) {
+      return 'IGNORED';
+    }
+    return this.confirm(
+      {
+        id: order.providerSessionId,
+        metadata: { [PACKAGE_CHECKOUT_METADATA.ORDER_ID]: order.id },
+      },
+      now,
+      { closeIfExpired: true },
+    );
   }
 
   /**
@@ -232,22 +300,24 @@ export class CreditPackagePaymentService {
       });
       await this.discounts.releaseForPackageOrder(tx, orderId, reason, now);
       return true;
-    });
+    }, ORDER_TRANSACTION_OPTIONS);
   }
 
   /**
-   * Makes the order PAID with its credits, discount and referral effects,
-   * in the caller's transaction (which holds the order's row lock). Used
-   * for verified Stripe payments and for fully discounted orders (nothing
-   * to charge; not a paying purchase for referral rewards).
+   * Makes the order PAID with its discount and referral effects and writes
+   * the fulfillment that grants its credits, in the caller's transaction
+   * (which holds the order's row lock). Used for verified Stripe payments
+   * and for fully discounted orders (nothing to charge; not a paying
+   * purchase for referral rewards). The credits are granted by
+   * CreditFulfillmentService.processOne after the commit.
    */
-  async fulfill(
+  async recordPayment(
     tx: Prisma.TransactionClient,
     order: CreditPackageOrder & { authId: string },
     payment: { paymentIntentId: string | null; providerSessionId?: string },
     paymentMethod: PaymentMethodCheck,
     now: Date,
-  ): Promise<CreditPackageOrder> {
+  ) {
     const paid = await tx.creditPackageOrder.update({
       where: { id: order.id },
       data: {
@@ -260,19 +330,10 @@ export class CreditPackagePaymentService {
           : {}),
       },
     });
-    await this.wallet.grant(
-      {
-        authId: order.authId,
-        source: CreditSource.PURCHASE,
-        sourceReference: packageOrderCreditReference(order.id),
-        amount: String(order.credits),
-        description: `Credit package ${order.packageCode}: ${order.credits} credits`,
-      },
-      { tx, at: now },
-    );
     await this.discounts.redeemForPackageOrder(tx, order.id, now);
-    // A paid package purchase is a paid purchase for referrals: the
-    // referred user's first paying one rewards the referrer, once.
+    // A paid package purchase (also a gift, for its sender) is a paid
+    // purchase for referrals: the referred user's first paying one rewards
+    // the referrer, once.
     await this.referralRewards.onVerifiedPayment(
       tx,
       order.authId,
@@ -285,7 +346,7 @@ export class CreditPackagePaymentService {
       paymentMethod,
       now,
     );
-    return paid;
+    return this.fulfillments.create(tx, paid, now);
   }
 
   private async lockOrder(

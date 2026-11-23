@@ -21,7 +21,7 @@ export const CREDIT_REFERENCE_MAX_LENGTH = 200;
 /**
  * Returns why a grant's expiry is invalid for its source, or null if valid.
  * TRIAL and SUBSCRIPTION credits must expire after `now`; PURCHASE,
- * REFERRAL, DAILY_REWARD and MISSION_REWARD credits must not expire.
+ * REFERRAL, DAILY_REWARD, MISSION_REWARD and GIFT credits must not expire.
  */
 export function getGrantExpiryRejection(
   source: CreditSource,
@@ -150,6 +150,8 @@ export const SPENDING_TIER: Record<CreditSource, number> = {
   [CreditSource.MISSION_REWARD]: 0,
   [CreditSource.REFERRAL]: 1,
   [CreditSource.PURCHASE]: 2,
+  // Received gifts are purchased credits (bought by the sender).
+  [CreditSource.GIFT]: 2,
 };
 
 /**

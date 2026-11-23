@@ -519,6 +519,17 @@ describeWithDatabase(
             usableNow: true,
             nextExpiresAt: null,
           },
+          {
+            source: 'GIFT',
+            granted: '0',
+            available: '0',
+            upcoming: '0',
+            used: '0',
+            expired: '0',
+            expires: false,
+            usableNow: true,
+            nextExpiresAt: null,
+          },
         ]);
 
         // Each allocation with its dates; granted = available + used + expired.
@@ -660,6 +671,7 @@ describeWithDatabase(
           ['REFERRAL', '0'],
           ['DAILY_REWARD', '0'],
           ['MISSION_REWARD', '0'],
+          ['GIFT', '0'],
         ]);
         await expect(getHistory(newcomer)).resolves.toEqual({
           items: [],

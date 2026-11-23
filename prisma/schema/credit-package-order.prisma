@@ -16,7 +16,11 @@
 // (authId SET NULL).
 model CreditPackageOrder {
   id                      String                   @id @default(uuid())
+  // The payer (the sender of a gift).
   authId                  String?
+  kind                    CreditPackageOrderKind   @default(SELF)
+  // GIFT orders: the gift they pay (at most one order in progress per gift).
+  giftId                  String?
   // Unique per user (Idempotency-Key header): a repeated request returns
   // the same order.
   idempotencyKey          String                   @db.VarChar(200)
@@ -50,10 +54,13 @@ model CreditPackageOrder {
   discountOffer        DiscountOffer?      @relation(fields: [discountOfferId], references: [id], onDelete: Restrict)
   discountRedemption   DiscountRedemption?
   referralQualification Referral?
+  gift                 CreditGift?         @relation(fields: [giftId], references: [id], onDelete: Restrict)
+  fulfillment          CreditFulfillment?
 
   @@unique([authId, idempotencyKey])
   @@unique([provider, providerSessionId])
   @@unique([provider, providerPaymentIntentId])
   @@index([authId, createdAt])
   @@index([status, createdAt])
+  @@index([giftId])
 }

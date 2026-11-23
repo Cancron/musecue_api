@@ -17,11 +17,13 @@ export const isSecurityNotification = (type: NotificationType): boolean =>
 export interface EmailPreferences {
   emailReferralRewards: boolean;
   emailReferralMilestones: boolean;
+  emailGifts: boolean;
 }
 
 export const DEFAULT_EMAIL_PREFERENCES: EmailPreferences = {
   emailReferralRewards: true,
   emailReferralMilestones: true,
+  emailGifts: true,
 };
 
 /** Whether a notification of `type` is emailed with these preferences. */
@@ -34,6 +36,11 @@ export function wantsEmail(
       return preferences.emailReferralRewards;
     case NotificationType.REFERRAL_MILESTONE_REACHED:
       return preferences.emailReferralMilestones;
+    case NotificationType.GIFT_RECEIVED:
+    case NotificationType.GIFT_ACCEPTED:
+    case NotificationType.GIFT_DECLINED:
+    case NotificationType.GIFT_DELIVERED:
+      return preferences.emailGifts;
     case NotificationType.SECURITY_SIGNED_OUT_EVERYWHERE:
     case NotificationType.SECURITY_SESSION_REUSE_DETECTED:
       return true;
@@ -67,6 +74,52 @@ export const notificationContent = {
     title: `Milestone reached: ${referralCount} paid referral${referralCount === 1 ? '' : 's'}`,
     body: `You earned ${credits} bonus credits for inviting ${referralCount} ${referralCount === 1 ? 'person who has' : 'people who have'} made a purchase.`,
     data: { milestoneId, referralCount, credits },
+  }),
+  giftReceived: (
+    giftId: string,
+    senderName: string,
+    credits: number,
+  ): NotificationContent => ({
+    type: NotificationType.GIFT_RECEIVED,
+    title: `${senderName} wants to give you ${credits} credits`,
+    body: `${senderName} sent you a gift of ${credits} MuseCue credits. Accept it to let them complete the gift, or decline it.`,
+    data: { giftId, credits },
+  }),
+  giftAccepted: (
+    giftId: string,
+    recipientName: string,
+    credits: number,
+  ): NotificationContent => ({
+    type: NotificationType.GIFT_ACCEPTED,
+    title: `${recipientName} accepted your gift`,
+    body: `${recipientName} accepted your gift of ${credits} credits. Complete the payment to send it.`,
+    data: { giftId, credits },
+  }),
+  giftDeclined: (
+    giftId: string,
+    recipientName: string,
+    credits: number,
+  ): NotificationContent => ({
+    type: NotificationType.GIFT_DECLINED,
+    title: `${recipientName} declined your gift`,
+    body: `${recipientName} declined your gift of ${credits} credits. Nothing was charged.`,
+    data: { giftId, credits },
+  }),
+  giftDelivered: (giftId: string, credits: number): NotificationContent => ({
+    type: NotificationType.GIFT_DELIVERED,
+    title: `You received ${credits} gift credits`,
+    body: `A gift of ${credits} credits was added to your balance. Gift credits never expire.`,
+    data: { giftId, credits },
+  }),
+  giftDeliveredToRecipient: (
+    giftId: string,
+    recipientName: string,
+    credits: number,
+  ): NotificationContent => ({
+    type: NotificationType.GIFT_DELIVERED,
+    title: `Your gift to ${recipientName} was delivered`,
+    body: `${recipientName} received the ${credits} credits you gave.`,
+    data: { giftId, credits },
   }),
   signedOutEverywhere: (): NotificationContent => ({
     type: NotificationType.SECURITY_SIGNED_OUT_EVERYWHERE,

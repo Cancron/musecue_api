@@ -30,6 +30,9 @@ import type {
   DiscountRedemptionView,
 } from './interfaces/discount-offer.interface';
 
+/** Payment work can wait for row locks under load. */
+const REDEMPTION_TRANSACTION_OPTIONS = { maxWait: 10_000, timeout: 20_000 };
+
 /**
  * Redemption of discount codes and campaigns by signed-in users, for one of
  * the configured credit packages (CreditPackageSettingsService): the
@@ -249,7 +252,7 @@ export class DiscountRedemptionService {
           },
         });
         return this.toView(redemption, offer, false);
-      });
+      }, REDEMPTION_TRANSACTION_OPTIONS);
     } catch (error) {
       // The same key was used concurrently for another offer, whose
       // redemption committed first.

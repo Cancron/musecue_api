@@ -19,6 +19,9 @@ import {
   StripeGateway,
 } from './stripe.gateway';
 
+/** Payment work can wait for row locks under load. */
+const PAYMENT_TRANSACTION_OPTIONS = { maxWait: 10_000, timeout: 20_000 };
+
 const LOG_CONTEXT = 'StripeCancellationService';
 
 export const CANCELLATION_ERRORS = {
@@ -204,7 +207,7 @@ export class StripeCancellationService {
         outcome: 'CANCELED',
         record: { ...record, proCanceledAt: canceledAt },
       };
-    });
+    }, PAYMENT_TRANSACTION_OPTIONS);
   }
 
   private toView(

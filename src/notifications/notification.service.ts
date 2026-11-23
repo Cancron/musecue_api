@@ -159,7 +159,11 @@ export class NotificationService {
 
   async updatePreferences(
     authId: string,
-    input: { referralRewards?: boolean; referralMilestones?: boolean },
+    input: {
+      referralRewards?: boolean;
+      referralMilestones?: boolean;
+      gifts?: boolean;
+    },
   ): Promise<NotificationPreferencesView> {
     const data = {
       ...(input.referralRewards !== undefined
@@ -168,6 +172,7 @@ export class NotificationService {
       ...(input.referralMilestones !== undefined
         ? { emailReferralMilestones: input.referralMilestones }
         : {}),
+      ...(input.gifts !== undefined ? { emailGifts: input.gifts } : {}),
     };
     const stored = await this.prisma.notificationPreference.upsert({
       where: { authId },
@@ -181,6 +186,7 @@ export class NotificationService {
     stored: {
       emailReferralRewards: boolean;
       emailReferralMilestones: boolean;
+      emailGifts: boolean;
       updatedAt: Date;
     } | null,
   ): NotificationPreferencesView {
@@ -189,6 +195,7 @@ export class NotificationService {
       email: {
         referralRewards: preferences.emailReferralRewards,
         referralMilestones: preferences.emailReferralMilestones,
+        gifts: preferences.emailGifts,
         security: true,
       },
       updatedAt: stored?.updatedAt.toISOString() ?? null,

@@ -25,6 +25,8 @@ export const CREDIT_PACKAGE_ORDER_MESSAGES = {
   PAYMENT_IN_PROGRESS:
     'This order was already paid or its payment is being processed',
   BUSY: 'Your purchase is being updated by another request; please try again',
+  GIFT_NOT_PAYABLE:
+    'This gift cannot be paid: it must be yours, accepted and not expired',
   PROVIDER_REJECTED:
     'The payment provider refused to open the checkout; please try again later',
 } as const;

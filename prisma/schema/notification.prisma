@@ -36,6 +36,7 @@ model NotificationPreference {
   authId                  String   @id
   emailReferralRewards    Boolean  @default(true)
   emailReferralMilestones Boolean  @default(true)
+  emailGifts              Boolean  @default(true)
   updatedAt               DateTime @updatedAt
 
   authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)

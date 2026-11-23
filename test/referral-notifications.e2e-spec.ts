@@ -46,6 +46,7 @@ interface PreferencesView {
   email: {
     referralRewards: boolean;
     referralMilestones: boolean;
+    gifts: boolean;
     security: boolean;
   };
   updatedAt: string | null;
@@ -409,6 +410,7 @@ describeWithDatabase(
           email: {
             referralRewards: true,
             referralMilestones: true,
+            gifts: true,
             security: true,
           },
           updatedAt: null,
@@ -423,6 +425,7 @@ describeWithDatabase(
         expect(updated.email).toEqual({
           referralRewards: false,
           referralMilestones: true,
+          gifts: true,
           security: true,
         });
         await r.milestones(admin).ensure(1, 10);

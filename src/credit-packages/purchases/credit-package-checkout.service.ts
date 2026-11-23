@@ -1,6 +1,8 @@
 import { HttpException, Injectable } from '@nestjs/common';
 import {
+  CreditGiftStatus,
   CreditPackageCode,
+  CreditPackageOrderKind,
   CreditPackageOrderStatus,
   Prisma,
   type CreditPackageOrder,
@@ -32,10 +34,14 @@ import type {
   PurchasableCreditPackageView,
 } from './credit-package-order.interface';
 import { CREDIT_PACKAGE_ORDER_MESSAGES as MESSAGES } from './credit-package-order.policy';
+import { CreditFulfillmentService } from '../fulfillment/credit-fulfillment.service';
 import {
   CreditPackagePaymentService,
   NO_PAYMENT_METHOD,
 } from './credit-package-payment.service';
+
+/** Payment and credit work can wait for row locks under load. */
+const ORDER_TRANSACTION_OPTIONS = { maxWait: 10_000, timeout: 20_000 };
 
 const LOG_CONTEXT = 'CreditPackageCheckoutService';
 const ORDER_LOCK = 'credit-package-orders:';
@@ -71,6 +77,7 @@ export class CreditPackageCheckoutService {
     private readonly checkout: StripeCheckoutService,
     private readonly discounts: CheckoutDiscountService,
     private readonly payments: CreditPackagePaymentService,
+    private readonly fulfillments: CreditFulfillmentService,
     private readonly logger: CustomLoggerService,
   ) {}
 
@@ -98,15 +105,52 @@ export class CreditPackageCheckoutService {
     rawKey: string | undefined,
     now: Date = new Date(),
   ): Promise<CreditPackageOrderView> {
+    return this.placeOrder(
+      authId,
+      { packageCode: this.requireCode(rawCode), giftId: null },
+      options,
+      rawKey,
+      now,
+    );
+  }
+
+  /**
+   * The sender pays an accepted gift (CreditGiftService checks the gift is
+   * theirs first). While a checkout of the gift is in progress, it is
+   * returned instead of a second one.
+   */
+  async createGiftOrder(
+    authId: string,
+    gift: { id: string; packageCode: CreditPackageCode },
+    options: { discountCode?: string | null },
+    rawKey: string | undefined,
+    now: Date = new Date(),
+  ): Promise<CreditPackageOrderView> {
+    return this.placeOrder(
+      authId,
+      { packageCode: gift.packageCode, giftId: gift.id },
+      options,
+      rawKey,
+      now,
+    );
+  }
+
+  private async placeOrder(
+    authId: string,
+    target: { packageCode: CreditPackageCode; giftId: string | null },
+    options: { discountCode?: string | null },
+    rawKey: string | undefined,
+    now: Date,
+  ): Promise<CreditPackageOrderView> {
     const idempotencyKey = this.requireKey(rawKey);
-    const packageCode = this.requireCode(rawCode);
+    const { packageCode, giftId } = target;
     const discountCode = options.discountCode
       ? normalizeDiscountCode(options.discountCode)
       : null;
 
     const previous = await this.findByKey(authId, idempotencyKey);
     if (previous) {
-      return this.replay(previous, packageCode, discountCode, now);
+      return this.replay(previous, target, discountCode, now);
     }
 
     const account = await this.prisma.authUser.findUnique({
@@ -124,7 +168,11 @@ export class CreditPackageCheckoutService {
       account.email,
     );
 
-    let result: { order: CreditPackageOrder; created: boolean };
+    let result: {
+      order: CreditPackageOrder;
+      created: boolean;
+      fulfillmentId: string | null;
+    };
     try {
       result = await this.prisma.$transaction(async (tx) => {
         await tx.$queryRaw`
@@ -136,35 +184,74 @@ export class CreditPackageCheckoutService {
         const again = await tx.creditPackageOrder.findUnique({
           where: { authId_idempotencyKey: { authId, idempotencyKey } },
         });
-        if (again) return { order: again, created: false };
+        if (again) return { order: again, created: false, fulfillmentId: null };
 
-        // The package terms stay as read until the order is stored.
-        await tx.$queryRaw`
-          SELECT "code" FROM "CreditPackage"
-          WHERE "code" = ${packageCode}::"CreditPackageCode" FOR SHARE
-        `;
-        const pkg = await tx.creditPackage.findUnique({
-          where: { code: packageCode },
-        });
-        if (!pkg?.available) {
-          throw AppError.conflict(MESSAGES.PACKAGE_UNAVAILABLE);
+        let terms: { credits: number; priceUsdCents: number };
+        if (giftId) {
+          await tx.$queryRaw`SELECT "id" FROM "CreditGift" WHERE "id" = ${giftId} FOR UPDATE`;
+          const gift = await tx.creditGift.findUniqueOrThrow({
+            where: { id: giftId },
+          });
+          if (
+            gift.senderAuthId !== authId ||
+            gift.status !== CreditGiftStatus.ACCEPTED ||
+            gift.expiresAt.getTime() <= now.getTime()
+          ) {
+            throw AppError.conflict(MESSAGES.GIFT_NOT_PAYABLE);
+          }
+          const inProgress = await tx.creditPackageOrder.findFirst({
+            where: {
+              giftId,
+              status: {
+                in: [
+                  CreditPackageOrderStatus.CREATING,
+                  CreditPackageOrderStatus.OPEN,
+                  CreditPackageOrderStatus.PROCESSING,
+                ],
+              },
+            },
+          });
+          if (inProgress) {
+            return { order: inProgress, created: false, fulfillmentId: null };
+          }
+          terms = {
+            credits: gift.credits,
+            priceUsdCents: gift.listPriceUsdCents,
+          };
+        } else {
+          // The package terms stay as read until the order is stored.
+          await tx.$queryRaw`
+            SELECT "code" FROM "CreditPackage"
+            WHERE "code" = ${packageCode}::"CreditPackageCode" FOR SHARE
+          `;
+          const pkg = await tx.creditPackage.findUnique({
+            where: { code: packageCode },
+          });
+          if (!pkg?.available) {
+            throw AppError.conflict(MESSAGES.PACKAGE_UNAVAILABLE);
+          }
+          terms = pkg;
         }
         const selected = await this.discounts.select(tx, {
           authId,
           product: packageProduct(packageCode),
-          listPriceCents: pkg.priceUsdCents,
+          listPriceCents: terms.priceUsdCents,
           code: discountCode,
           now,
         });
         const discountCents = selected?.discountCents ?? 0;
-        const amount = pkg.priceUsdCents - discountCents;
+        const amount = terms.priceUsdCents - discountCents;
         const order = await tx.creditPackageOrder.create({
           data: {
             authId,
+            kind: giftId
+              ? CreditPackageOrderKind.GIFT
+              : CreditPackageOrderKind.SELF,
+            giftId,
             idempotencyKey,
             packageCode,
-            credits: pkg.credits,
-            listPriceUsdCents: pkg.priceUsdCents,
+            credits: terms.credits,
+            listPriceUsdCents: terms.priceUsdCents,
             discountSource: selected?.source ?? null,
             discountOfferId: selected?.offerId ?? null,
             discountPercent: selected?.percent ?? 0,
@@ -183,20 +270,18 @@ export class CreditPackageCheckoutService {
           await this.discounts.reserveForPackageOrder(tx, owned, selected, now);
         }
         if (amount === 0) {
-          // Fully discounted: nothing to charge, fulfilled at once.
-          return {
-            order: await this.payments.fulfill(
-              tx,
-              owned,
-              { paymentIntentId: null },
-              NO_PAYMENT_METHOD,
-              now,
-            ),
-            created: true,
-          };
+          // Fully discounted: nothing to charge, paid at once.
+          const fulfillment = await this.payments.recordPayment(
+            tx,
+            owned,
+            { paymentIntentId: null },
+            NO_PAYMENT_METHOD,
+            now,
+          );
+          return { order, created: true, fulfillmentId: fulfillment.id };
         }
-        return { order, created: true };
-      });
+        return { order, created: true, fulfillmentId: null };
+      }, ORDER_TRANSACTION_OPTIONS);
     } catch (error) {
       if (
         error instanceof Prisma.PrismaClientKnownRequestError &&
@@ -205,10 +290,14 @@ export class CreditPackageCheckoutService {
         // The same key was used concurrently (its order committed first),
         // or a concurrent purchase took the same one-time discount.
         const winner = await this.findByKey(authId, idempotencyKey);
-        if (winner) return this.replay(winner, packageCode, discountCode, now);
+        if (winner) return this.replay(winner, target, discountCode, now);
         throw AppError.conflict(MESSAGES.BUSY);
       }
       throw error;
+    }
+    if (result.fulfillmentId) {
+      // Granted now, or by the fulfillment worker if this fails.
+      await this.fulfillments.processOne(result.fulfillmentId, now);
     }
     return this.open(result.order, !result.created, now);
   }
@@ -295,12 +384,13 @@ export class CreditPackageCheckoutService {
   /** A repeated request: the same order, if the request is the same. */
   private replay(
     order: CreditPackageOrder,
-    packageCode: CreditPackageCode,
+    target: { packageCode: CreditPackageCode; giftId: string | null },
     discountCode: string | null,
     now: Date,
   ): Promise<CreditPackageOrderView> {
     if (
-      order.packageCode !== packageCode ||
+      order.packageCode !== target.packageCode ||
+      order.giftId !== target.giftId ||
       order.requestedDiscountCode !== discountCode
     ) {
       throw AppError.conflict(MESSAGES.IDEMPOTENCY_KEY_REUSED);
@@ -435,6 +525,8 @@ export class CreditPackageCheckoutService {
   ): CreditPackageOrderView {
     return {
       id: order.id,
+      kind: order.kind,
+      giftId: order.giftId,
       status: order.status,
       packageCode: order.packageCode,
       credits: order.credits,

@@ -282,6 +282,7 @@ describe('ProAccessGuard', () => {
         REFERRAL: '0',
         DAILY_REWARD: '0',
         MISSION_REWARD: '0',
+        GIFT: '0',
       },
       proAccess: {
         status: hasProAccess ? 'PRO' : 'EXPIRED',

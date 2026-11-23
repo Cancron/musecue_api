@@ -483,7 +483,9 @@ describeWithDatabase(
               providerPaymentIntentId: 'pi_forged',
             },
           }),
-        ).rejects.toThrow('A paid credit package order must grant its credits');
+        ).rejects.toThrow(
+          'A paid credit package order must have its fulfillment',
+        );
         // A paid order never changes status again, and orders are kept.
         await expect(
           app.ctx.client.creditPackageOrder.update({

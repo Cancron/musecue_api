@@ -47,6 +47,9 @@ import {
   toProviderCancellation,
 } from './stripe.gateway';
 
+/** Payment and credit work can wait for row locks under load. */
+const PAYMENT_TRANSACTION_OPTIONS = { maxWait: 10_000, timeout: 20_000 };
+
 const LOG_CONTEXT = 'StripeWebhookService';
 
 /** What processing an event did; used for logs and tests. */
@@ -58,6 +61,8 @@ export type WebhookOutcome =
   | 'RENEWED'
   /** A credit package payment was verified: its credits were granted. */
   | 'CREDITS_GRANTED'
+  /** Verified and recorded; its credits are granted later (fulfillment). */
+  | 'PAYMENT_RECORDED'
   /** A delayed renewal for a period the paid term already covers. */
   | 'ALREADY_COVERED'
   | 'ALREADY_PROCESSED'
@@ -591,7 +596,7 @@ export class StripeWebhookService {
         now,
       );
       return 'ACTIVATED';
-    });
+    }, PAYMENT_TRANSACTION_OPTIONS);
   }
 
   /** Links the payment to a pending checkout. False if it was already closed. */
@@ -867,7 +872,7 @@ export class StripeWebhookService {
         now,
       );
       return 'RENEWED';
-    });
+    }, PAYMENT_TRANSACTION_OPTIONS);
   }
 
   // -------------------------------------------------------------------------
@@ -1058,7 +1063,7 @@ export class StripeWebhookService {
         failureCode: saved.failureCode,
       });
       return 'PAYMENT_FAILED';
-    });
+    }, PAYMENT_TRANSACTION_OPTIONS);
   }
 
   /**
@@ -1131,7 +1136,7 @@ export class StripeWebhookService {
       }
       await this.audit(tx, record, next, metadata);
       return 'SUBSCRIPTION_ENDED';
-    });
+    }, PAYMENT_TRANSACTION_OPTIONS);
   }
 
   /**

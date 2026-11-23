@@ -9,6 +9,9 @@ import { PrismaService } from '../common/services/prisma.service';
 import { ReferralMilestoneService } from './referral-milestone.service';
 import { ReferralRewardService } from './referral-reward.service';
 
+/** Payment and credit work can wait for row locks under load. */
+const REVIEW_TRANSACTION_OPTIONS = { maxWait: 10_000, timeout: 20_000 };
+
 export interface ReferralReviewView {
   id: string;
   status: ReferralStatus;
@@ -131,7 +134,7 @@ export class ReferralReviewService {
           referrer: { select: { id: true, username: true } },
         },
       });
-    });
+    }, REVIEW_TRANSACTION_OPTIONS);
     return this.toView(referral, referral.authUser, referral.referrer);
   }
 

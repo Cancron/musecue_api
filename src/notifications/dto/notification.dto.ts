@@ -51,6 +51,10 @@ export class UpdateNotificationPreferencesDto {
   @IsBoolean()
   referralMilestones?: boolean;
 
+  @ValidateIf(isPresent)
+  @IsBoolean()
+  gifts?: boolean;
+
   /** Security emails are mandatory: only `true` is accepted. */
   @ValidateIf(isPresent)
   @Equals(true, { message: 'Security emails cannot be turned off' })

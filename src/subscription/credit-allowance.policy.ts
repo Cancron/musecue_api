@@ -157,6 +157,7 @@ export function isCreditSourceUsable(
     case CreditSource.REFERRAL:
     case CreditSource.DAILY_REWARD:
     case CreditSource.MISSION_REWARD:
+    case CreditSource.GIFT:
       return true;
     case CreditSource.TRIAL:
       return trialCreditsApply(record, now);

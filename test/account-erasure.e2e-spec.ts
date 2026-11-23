@@ -1117,6 +1117,9 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
         .sort();
       expect(detached).toEqual([
         'ActivityLogEvent.actionedBy',
+        'CreditFulfillment.recipientAuthId',
+        'CreditGift.recipientAuthId',
+        'CreditGift.senderAuthId',
         'CreditPackageOrder.authId',
         'PaymentTransaction.subscriptionId',
       ]);
@@ -1127,6 +1130,8 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
         'AccountDeletionFile',
         'PaymentTransaction',
         'CreditPackageOrder',
+        'CreditGift',
+        'CreditFulfillment',
         'ActivityLogEvent',
       ]) {
         expect(deleted.has(shared)).toBe(false);

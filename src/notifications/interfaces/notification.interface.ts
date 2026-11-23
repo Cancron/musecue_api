@@ -22,6 +22,7 @@ export interface NotificationPreferencesView {
   email: {
     referralRewards: boolean;
     referralMilestones: boolean;
+    gifts: boolean;
     /** Always true: security emails cannot be turned off. */
     security: true;
   };

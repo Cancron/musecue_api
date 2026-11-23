@@ -1,0 +1,103 @@
+// ================================
+// Credit Package Gifts and Fulfillment
+// ================================
+//
+// Migration 20261209120000_credit_gifts_fulfillment.
+
+// A credit package gift from one user to another. The package terms
+// (credits, list price) are locked when the invitation is sent; the
+// recipient accepts (or declines) before the sender pays; a paid gift is
+// delivered once, at `deliverAt` or later, as GIFT credits of the recipient
+// (reference `credit-gift:<gift id>`). Both users keep their own first-
+// purchase and referral eligibility: the sender's payment is the sender's
+// purchase. Kept (users detached) when either account is deleted.
+model CreditGift {
+  id              String           @id @default(uuid())
+  senderAuthId    String?
+  recipientAuthId String?
+  // Unique per sender (Idempotency-Key header).
+  idempotencyKey  String           @db.VarChar(200)
+  packageCode     CreditPackageCode
+  credits         Int
+  listPriceUsdCents Int
+  message         String?          @db.VarChar(280)
+  // When the credits are delivered (not before payment).
+  deliverAt       DateTime
+  // The invitation must be accepted and paid before this.
+  expiresAt       DateTime
+  status          CreditGiftStatus @default(PENDING)
+  acceptedAt      DateTime?
+  declinedAt      DateTime?
+  canceledAt      DateTime?
+  expiredAt       DateTime?
+  paidAt          DateTime?
+  deliveredAt     DateTime?
+  reviewReason    String?          @db.VarChar(50)
+  reviewedAt      DateTime?
+  reviewedBy      String?          @db.VarChar(64)
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  sender    authUser?            @relation("CreditGiftSender", fields: [senderAuthId], references: [id], onDelete: SetNull)
+  recipient authUser?            @relation("CreditGiftRecipient", fields: [recipientAuthId], references: [id], onDelete: SetNull)
+  orders    CreditPackageOrder[]
+
+  @@unique([senderAuthId, idempotencyKey])
+  @@index([senderAuthId, createdAt])
+  @@index([recipientAuthId, createdAt])
+  @@index([status, expiresAt])
+}
+
+// Granting the credits of one paid order (a package bought for oneself, or a
+// gift), written in the transaction that records the verified payment: an
+// outbox. A worker grants the credits when due, in one transaction that
+// claims the row (FOR UPDATE SKIP LOCKED) and marks it SUCCEEDED, so a crash,
+// restart, duplicate worker or repeated attempt never grants twice and never
+// loses a paid order. Failed attempts are retried with backoff; every step
+// is recorded in CreditFulfillmentEvent.
+model CreditFulfillment {
+  id              String                  @id @default(uuid())
+  orderId         String                  @unique
+  kind            CreditPackageOrderKind
+  // Who receives the credits (the payer, or the gift's recipient).
+  recipientAuthId String?
+  source          CreditSource
+  // The credit allocation reference (unique per wallet and source).
+  creditReference String                  @db.VarChar(255)
+  credits         Int
+  // Not before this (a gift's delivery time).
+  dueAt           DateTime
+  status          CreditFulfillmentStatus @default(PENDING)
+  attempts        Int                     @default(0)
+  nextAttemptAt   DateTime
+  lastAttemptAt   DateTime?
+  lastErrorCode   String?                 @db.VarChar(100)
+  holdReason      String?                 @db.VarChar(50)
+  completedAt     DateTime?
+  createdAt       DateTime                @default(now())
+  updatedAt       DateTime                @updatedAt
+
+  order     CreditPackageOrder        @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  recipient authUser?                 @relation(fields: [recipientAuthId], references: [id], onDelete: SetNull)
+  events    CreditFulfillmentEvent[]
+
+  @@index([status, nextAttemptAt])
+}
+
+// Audit record of a fulfillment: created, each attempt, holds and
+// administrator decisions. Never changed.
+model CreditFulfillmentEvent {
+  id            String                  @id @default(uuid())
+  fulfillmentId String
+  type          String                  @db.VarChar(40)
+  // The fulfillment's status after the event.
+  status        CreditFulfillmentStatus
+  detail        String?                 @db.VarChar(200)
+  // An administrator's id, or NULL for the system.
+  actor         String?                 @db.VarChar(64)
+  createdAt     DateTime                @default(now())
+
+  fulfillment CreditFulfillment @relation(fields: [fulfillmentId], references: [id], onDelete: Restrict)
+
+  @@index([fulfillmentId, createdAt])
+}

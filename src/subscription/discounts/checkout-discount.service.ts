@@ -34,6 +34,9 @@ import { DISCOUNT_SETTINGS_ID } from '../../discounts/discount-settings.constant
 import { hasPaidPurchase } from '../../discounts/paid-purchase';
 import { CHECKOUT_METADATA, StripeGateway } from '../stripe/stripe.gateway';
 
+/** Payment work can wait for row locks under load. */
+const DISCOUNT_TRANSACTION_OPTIONS = { maxWait: 10_000, timeout: 20_000 };
+
 const LOG_CONTEXT = 'CheckoutDiscountService';
 
 /** RESERVED and REDEEMED redemptions count towards limits and budgets. */
@@ -572,7 +575,7 @@ export class CheckoutDiscountService {
       return (await this.release(tx, checkoutId, reason, now))
         ? 'RELEASED'
         : 'NONE';
-    });
+    }, DISCOUNT_TRANSACTION_OPTIONS);
   }
 
   /**
