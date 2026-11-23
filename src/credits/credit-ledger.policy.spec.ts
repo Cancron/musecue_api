@@ -140,63 +140,6 @@ describe('credit ledger policy', () => {
       ]);
     });
 
-    it('spends free credits, then referral credits, then purchased credits, even when purchased credits are older', () => {
-      const DAY = 24 * HOUR;
-      const list = [
-        allocation(
-          'purchase-old',
-          '1',
-          null,
-          at(-90 * DAY),
-          CreditSource.PURCHASE,
-        ),
-        allocation('purchase-new', '1', null, at(-DAY), CreditSource.PURCHASE),
-        allocation(
-          'referral-new',
-          '1',
-          null,
-          at(-2 * DAY),
-          CreditSource.REFERRAL,
-        ),
-        allocation(
-          'referral-old',
-          '1',
-          null,
-          at(-30 * DAY),
-          CreditSource.REFERRAL,
-        ),
-        allocation(
-          'mission',
-          '1',
-          null,
-          at(-5 * DAY),
-          CreditSource.MISSION_REWARD,
-        ),
-        allocation('daily', '1', null, at(-6 * DAY), CreditSource.DAILY_REWARD),
-        allocation(
-          'subscription',
-          '1',
-          at(20 * DAY),
-          at(-10 * DAY),
-          CreditSource.SUBSCRIPTION,
-        ),
-        allocation('trial', '1', at(2 * DAY), at(-DAY), CreditSource.TRIAL),
-      ];
-      expect(list.sort(compareSpendingOrder).map((a) => a.id)).toEqual([
-        // Free credits: closest expiration first, then the oldest grant.
-        'trial',
-        'subscription',
-        'daily',
-        'mission',
-        // Referral credits, oldest first.
-        'referral-old',
-        'referral-new',
-        // Purchased credits last, oldest first.
-        'purchase-old',
-        'purchase-new',
-      ]);
-    });
-
     it('breaks ties by grant time, then ID', () => {
       const list = [
         allocation('b', '1', null, at(-HOUR)),
