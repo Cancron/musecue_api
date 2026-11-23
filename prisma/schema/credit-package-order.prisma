@@ -1,0 +1,59 @@
+// ================================
+// Credit Package Purchases
+// ================================
+//
+// Migration 20261208120000_credit_package_purchases.
+
+// One purchase of a credit package through a Stripe Checkout Session in
+// payment mode. The package terms (credits, list price) and the discount are
+// locked when the order is created (database trigger: they match the
+// package configuration at that moment and never change); the charge is
+// listPriceUsdCents - discountUsdCents (0, or at least Stripe's $0.50).
+// Only a verified webhook (or a fully discounted order) makes it PAID,
+// once, in the transaction that grants its PURCHASE credits (reference
+// `credit-package:<order id>`). Orders are financial records: never
+// deleted; when the account is deleted they are kept, detached
+// (authId SET NULL).
+model CreditPackageOrder {
+  id                      String                   @id @default(uuid())
+  authId                  String?
+  // Unique per user (Idempotency-Key header): a repeated request returns
+  // the same order.
+  idempotencyKey          String                   @db.VarChar(200)
+  packageCode             CreditPackageCode
+  credits                 Int
+  listPriceUsdCents       Int
+  discountSource          DiscountSource?
+  discountOfferId         String?
+  discountPercent         Int                      @default(0)
+  discountUsdCents        Int                      @default(0)
+  // What the customer is charged.
+  amountUsdCents          Int
+  currency                String                   @default("USD") @db.Char(3)
+  requestedDiscountCode   String?                  @db.VarChar(32)
+  status                  CreditPackageOrderStatus @default(CREATING)
+  // NULL for an order with nothing to charge (fully discounted).
+  provider                String?                  @db.VarChar(50)
+  providerCustomerId      String?                  @db.VarChar(255)
+  providerSessionId       String?                  @db.VarChar(255)
+  providerPaymentIntentId String?                  @db.VarChar(255)
+  // Hosted payment page; only returned while the order is OPEN.
+  url                     String?
+  expiresAt               DateTime?
+  paidAt                  DateTime?
+  closedAt                DateTime?
+  closedReason            String?                  @db.VarChar(100)
+  createdAt               DateTime                 @default(now())
+  updatedAt               DateTime                 @updatedAt
+
+  authUser             authUser?           @relation(fields: [authId], references: [id], onDelete: SetNull)
+  discountOffer        DiscountOffer?      @relation(fields: [discountOfferId], references: [id], onDelete: Restrict)
+  discountRedemption   DiscountRedemption?
+  referralQualification Referral?
+
+  @@unique([authId, idempotencyKey])
+  @@unique([provider, providerSessionId])
+  @@unique([provider, providerPaymentIntentId])
+  @@index([authId, createdAt])
+  @@index([status, createdAt])
+}

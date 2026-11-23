@@ -1,4 +1,4 @@
-import { HttpException, Injectable } from '@nestjs/common';
+import { HttpException, Injectable, Optional } from '@nestjs/common';
 import {
   type CheckoutSession,
   CheckoutSessionStatus,
@@ -18,6 +18,7 @@ import {
 } from '../../common/services/activity-log.service';
 import { CustomLoggerService } from '../../common/services/custom-logger.service';
 import { PrismaService } from '../../common/services/prisma.service';
+import { CreditPackagePaymentService } from '../../credit-packages/purchases/credit-package-payment.service';
 import { CreditAllowanceService } from '../credit-allowance.service';
 import { CheckoutDiscountService } from '../discounts/checkout-discount.service';
 import { hashPaymentFingerprint } from '../../referrals/payment-fingerprint';
@@ -55,6 +56,8 @@ export type WebhookOutcome =
   | 'UNKNOWN_SUBSCRIPTION'
   | 'ACTIVATED'
   | 'RENEWED'
+  /** A credit package payment was verified: its credits were granted. */
+  | 'CREDITS_GRANTED'
   /** A delayed renewal for a period the paid term already covers. */
   | 'ALREADY_COVERED'
   | 'ALREADY_PROCESSED'
@@ -164,6 +167,9 @@ export class StripeWebhookService {
     private readonly credits: CreditAllowanceService,
     private readonly checkoutDiscounts: CheckoutDiscountService,
     private readonly referralRewards: ReferralRewardService,
+    // Absent only where the service is built by hand (unit tests).
+    @Optional()
+    private readonly packagePayments?: CreditPackagePaymentService,
   ) {}
 
   /**
@@ -315,6 +321,38 @@ export class StripeWebhookService {
     metadata: ActivityLogMetadata,
     now: Date,
   ): Promise<WebhookOutcome> | WebhookOutcome {
+    // Checkout sessions of credit package orders (one-time payments).
+    const packages = this.packagePayments;
+    if (
+      packages &&
+      event.type.startsWith('checkout.session.') &&
+      packages.isPackageSession(
+        event.data.object as { metadata?: Stripe.Metadata | null },
+      )
+    ) {
+      const session = event.data.object as Stripe.Checkout.Session;
+      switch (event.type) {
+        case 'checkout.session.completed':
+        case 'checkout.session.async_payment_succeeded':
+          return packages.confirm(session, now);
+        case 'checkout.session.async_payment_failed':
+          return packages.closeFromWebhook(
+            session,
+            'FAILED',
+            'ASYNC_PAYMENT_FAILED',
+            now,
+          );
+        case 'checkout.session.expired':
+          return packages.closeFromWebhook(
+            session,
+            'EXPIRED',
+            'PROVIDER_EXPIRED',
+            now,
+          );
+        default:
+          return 'IGNORED';
+      }
+    }
     switch (event.type) {
       case 'checkout.session.completed':
       case 'checkout.session.async_payment_succeeded':

@@ -28,6 +28,17 @@ export interface PaymentMethodCheck {
   unavailable: boolean;
 }
 
+/**
+ * A verified payment: a Pro payment (PaymentTransaction) or a credit package
+ * order's payment (`kind: 'CREDIT_PACKAGE'`, the order's id).
+ */
+export interface VerifiedPurchase {
+  id: string;
+  amountCents: number;
+  status: PaymentStatus;
+  kind?: 'SUBSCRIPTION' | 'CREDIT_PACKAGE';
+}
+
 export type ReferralRewardOutcome =
   /** Not a paying purchase, or the payer was not referred. */
   | 'NONE'
@@ -48,7 +59,8 @@ export type ReferralRewardOutcome =
  *    on that hash, so concurrent payments with the same payment method are
  *    checked one after the other.
  * 2. On the referred user's first verified paying purchase (a SUCCEEDED
- *    payment above $0) the referral qualifies, once (PENDING -> ... in a
+ *    Pro payment or a paid credit package order, above $0) the referral
+ *    qualifies, once (PENDING -> ... in a
  *    conditional update; database triggers refuse any second change):
  *    - HELD when the referred user paid with a payment method the referrer
  *      or another user they referred also paid with: no credits, no
@@ -73,7 +85,7 @@ export class ReferralRewardService {
   async onVerifiedPayment(
     tx: Prisma.TransactionClient,
     authId: string,
-    payment: { id: string; amountCents: number; status: PaymentStatus },
+    payment: VerifiedPurchase,
     paymentMethod: PaymentMethodCheck,
     now: Date,
   ): Promise<ReferralRewardOutcome> {
@@ -105,7 +117,10 @@ export class ReferralRewardService {
     });
     const credits = settings?.referrerRewardCredits ?? 0;
     const referrerAuthId = referral.referrerAuthId;
-    const qualified = { qualifyingPaymentId: payment.id, qualifiedAt: now };
+    const qualified =
+      payment.kind === 'CREDIT_PACKAGE'
+        ? { qualifyingPackageOrderId: payment.id, qualifiedAt: now }
+        : { qualifyingPaymentId: payment.id, qualifiedAt: now };
 
     const holdReason: ReferralHoldReason | null = !referrerAuthId
       ? null

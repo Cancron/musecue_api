@@ -377,6 +377,21 @@ enum CreditPackageCode {
   LARGE
 }
 
+// A credit package purchase. CREATING: stored, Stripe checkout not opened
+// yet; OPEN: payable on the Stripe page; PROCESSING: paid with a delayed
+// method that has not settled. PAID is final (credits granted); EXPIRED
+// (abandoned), FAILED and CANCELED are closed (a verified late payment of
+// a closed order still makes it PAID).
+enum CreditPackageOrderStatus {
+  CREATING
+  OPEN
+  PROCESSING
+  PAID
+  EXPIRED
+  FAILED
+  CANCELED
+}
+
 // ================================
 // Discount Offer Related Enums
 // ================================

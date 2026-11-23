@@ -34,6 +34,28 @@ export interface CheckoutSessionRequest {
   discount?: CheckoutDiscountRequest | null;
 }
 
+/** Metadata keys written on credit package checkouts and their payments. */
+export const PACKAGE_CHECKOUT_METADATA = {
+  ORDER_ID: 'creditPackageOrderId',
+  AUTH_ID: 'authId',
+  PACKAGE_CODE: 'creditPackageCode',
+} as const;
+
+/** A Stripe Checkout Session in payment mode for one credit package order. */
+export interface PackageCheckoutRequest {
+  /** Local CreditPackageOrder id; also the source of the idempotency key. */
+  orderId: string;
+  authId: string;
+  customerId: string;
+  packageCode: string;
+  credits: number;
+  /** The package's list price (the line item). */
+  listPriceCents: number;
+  /** The order's discount, as a one-time coupon. */
+  discount?: CheckoutDiscountRequest | null;
+  expiresAt: Date;
+}
+
 export interface CheckoutDiscountRequest {
   /** Cents off the first invoice. */
   amountOffCents: number;
@@ -62,6 +84,7 @@ export const stripeIdempotencyKeys = {
   customer: (authId: string) => `musecue-customer-${authId}`,
   checkout: (checkoutId: string) => `musecue-checkout-${checkoutId}`,
   coupon: (checkoutId: string) => `musecue-coupon-${checkoutId}`,
+  packageCheckout: (orderId: string) => `musecue-credit-package-${orderId}`,
   /** One cancellation per subscription and paid term. */
   cancel: (subscriptionId: string, termEndsAt: Date) =>
     `musecue-cancel-${subscriptionId}-${termEndsAt.getTime()}`,
@@ -157,6 +180,9 @@ export class StripeGateway {
   private async createCheckoutCoupon(
     checkoutId: string,
     discount: CheckoutDiscountRequest,
+    metadata: Record<string, string> = {
+      [CHECKOUT_METADATA.CHECKOUT_ID]: checkoutId,
+    },
   ): Promise<string> {
     const coupon = await this.requireClient().coupons.create(
       {
@@ -166,11 +192,75 @@ export class StripeGateway {
         duration: 'once',
         max_redemptions: 1,
         name: discount.name.slice(0, 40),
-        metadata: { [CHECKOUT_METADATA.CHECKOUT_ID]: checkoutId },
+        metadata,
       },
       { idempotencyKey: stripeIdempotencyKeys.coupon(checkoutId) },
     );
     return coupon.id;
+  }
+
+  /**
+   * Creates the hosted one-time payment checkout for a credit package
+   * order: the package at its list price, less the order's discount as a
+   * one-time coupon, so Stripe charges exactly the order's amount. The
+   * idempotency key derives from the order, so retried or concurrent calls
+   * return the same Stripe session.
+   */
+  async createPackageCheckoutSession(
+    request: PackageCheckoutRequest,
+  ): Promise<ProviderCheckoutSession> {
+    const metadata = {
+      [PACKAGE_CHECKOUT_METADATA.ORDER_ID]: request.orderId,
+      [PACKAGE_CHECKOUT_METADATA.AUTH_ID]: request.authId,
+      [PACKAGE_CHECKOUT_METADATA.PACKAGE_CODE]: request.packageCode,
+    };
+    const couponId = request.discount
+      ? await this.createCheckoutCoupon(request.orderId, request.discount, {
+          [PACKAGE_CHECKOUT_METADATA.ORDER_ID]: request.orderId,
+        })
+      : null;
+    const session = await this.requireClient().checkout.sessions.create(
+      {
+        mode: 'payment',
+        customer: request.customerId,
+        client_reference_id: request.authId,
+        line_items: [
+          {
+            quantity: 1,
+            price_data: {
+              currency: 'usd',
+              unit_amount: request.listPriceCents,
+              product_data: {
+                name: `${request.credits} MuseCue credits`,
+              },
+            },
+          },
+        ],
+        ...(couponId
+          ? { discounts: [{ coupon: couponId }] }
+          : { allow_promotion_codes: false }),
+        adaptive_pricing: { enabled: false },
+        success_url: this.settings.successUrl ?? undefined,
+        cancel_url: this.settings.cancelUrl ?? undefined,
+        expires_at: Math.floor(request.expiresAt.getTime() / 1000),
+        metadata,
+        payment_intent_data: { metadata },
+      },
+      {
+        idempotencyKey: stripeIdempotencyKeys.packageCheckout(request.orderId),
+      },
+    );
+    return toProviderSession(session);
+  }
+
+  /**
+   * A credit package checkout with its PaymentIntent and payment method,
+   * read from Stripe for payment verification.
+   */
+  retrievePackageCheckout(sessionId: string): Promise<Stripe.Checkout.Session> {
+    return this.requireClient().checkout.sessions.retrieve(sessionId, {
+      expand: ['payment_intent', 'payment_intent.payment_method'],
+    });
   }
 
   async retrieveCheckoutSession(
@@ -337,17 +427,7 @@ export class StripeGateway {
     const paymentIntent = await client.paymentIntents.retrieve(intentId, {
       expand: ['payment_method'],
     });
-    const method = paymentIntent.payment_method;
-    if (!method || typeof method === 'string') return null;
-    return (
-      method.card?.fingerprint ??
-      method.us_bank_account?.fingerprint ??
-      method.sepa_debit?.fingerprint ??
-      method.bacs_debit?.fingerprint ??
-      method.au_becs_debit?.fingerprint ??
-      method.acss_debit?.fingerprint ??
-      null
-    );
+    return paymentMethodFingerprint(paymentIntent.payment_method);
   }
 
   /** Stripe only expires `open` sessions; others reject the request. */
@@ -460,4 +540,23 @@ function toProviderSession(
     status: session.status,
     paymentStatus: session.payment_status,
   };
+}
+
+/**
+ * The fingerprint of an expanded payment method (the same card or bank
+ * account always has the same one), or null. Callers hash it at once.
+ */
+export function paymentMethodFingerprint(
+  method: string | Stripe.PaymentMethod | null,
+): string | null {
+  if (!method || typeof method === 'string') return null;
+  return (
+    method.card?.fingerprint ??
+    method.us_bank_account?.fingerprint ??
+    method.sepa_debit?.fingerprint ??
+    method.bacs_debit?.fingerprint ??
+    method.au_becs_debit?.fingerprint ??
+    method.acss_debit?.fingerprint ??
+    null
+  );
 }

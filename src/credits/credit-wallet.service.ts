@@ -117,6 +117,9 @@ const WALLET_TRANSACTION_OPTIONS = { maxWait: 10_000, timeout: 20_000 };
  * reservations of completed or deleted sessions are released whenever the
  * wallet is locked.
  */
+/** Reference prefix of credit package order credits. */
+const PACKAGE_ORDER_PREFIX = 'credit-package:';
+
 @Injectable()
 export class CreditWalletService {
   constructor(
@@ -198,6 +201,12 @@ export class CreditWalletService {
         }
         if (input.source === CreditSource.MISSION_REWARD) {
           await this.assertMissionAward(tx, wallet.authId, input, amount);
+        }
+        if (
+          input.source === CreditSource.PURCHASE &&
+          input.sourceReference.startsWith(PACKAGE_ORDER_PREFIX)
+        ) {
+          await this.assertPaidPackageOrder(tx, wallet.authId, input, amount);
         }
 
         if (input.source === CreditSource.TRIAL) {
@@ -281,6 +290,33 @@ export class CreditWalletService {
     if (!claim || !amount.eq(claim.grantedCredits)) {
       throw new InvalidCreditOperationError(
         'Daily reward credits can only be granted for a recorded daily reward claim of the same amount',
+      );
+    }
+  }
+
+  /**
+   * Credit package credits (`credit-package:<order id>`) exist only for a
+   * PAID order of the same user, for exactly its credits. The database
+   * enforces the same rule (migration 20261208120000_credit_package_purchases).
+   */
+  private async assertPaidPackageOrder(
+    tx: Prisma.TransactionClient,
+    authId: string,
+    input: GrantCreditsInput,
+    amount: Prisma.Decimal,
+  ): Promise<void> {
+    const order = await tx.creditPackageOrder.findUnique({
+      where: { id: input.sourceReference.slice(PACKAGE_ORDER_PREFIX.length) },
+      select: { authId: true, status: true, credits: true },
+    });
+    if (
+      !order ||
+      order.authId !== authId ||
+      order.status !== 'PAID' ||
+      !amount.eq(order.credits)
+    ) {
+      throw new InvalidCreditOperationError(
+        'Credit package credits can only be granted for a paid order of the same credits',
       );
     }
   }

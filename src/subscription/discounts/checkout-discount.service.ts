@@ -8,6 +8,9 @@ import {
   DiscountRedemptionStatus,
   DiscountSource,
   Prisma,
+  type CreditPackageOrder,
+  type DiscountProduct,
+  type DiscountRedemption,
 } from '@prisma/client';
 import type Stripe from 'stripe';
 import AppError from '../../common/errors/app.error';
@@ -18,6 +21,7 @@ import {
   applyCheckoutDiscount,
   lateRedemptionFits,
   normalizeDiscountCode,
+  packageProduct,
   proProduct,
   redemptionRejection,
 } from '../../discounts/discount-offer.policy';
@@ -99,7 +103,9 @@ export class CheckoutDiscountService {
     tx: Prisma.TransactionClient,
     input: {
       authId: string;
-      billingInterval: BillingInterval;
+      /** A Pro checkout's interval, or the product (credit packages). */
+      billingInterval?: BillingInterval;
+      product?: DiscountProduct;
       listPriceCents: number;
       code: string | null;
       now: Date;
@@ -121,7 +127,10 @@ export class CheckoutDiscountService {
             ],
           }
         : {};
-    const product = proProduct(input.billingInterval);
+    const product =
+      input.product ??
+      (input.billingInterval ? proProduct(input.billingInterval) : null);
+    if (!product) throw new RangeError('A discount needs a product');
     const paid = await hasPaidPurchase(tx, authId);
     const candidates: DiscountCandidate[] = [];
 
@@ -303,6 +312,75 @@ export class CheckoutDiscountService {
   }
 
   /**
+   * Reserves the selected discount for a new credit package order (same
+   * transaction as the order).
+   */
+  async reserveForPackageOrder(
+    tx: Prisma.TransactionClient,
+    order: CreditPackageOrder & { authId: string },
+    selected: SelectedCheckoutDiscount,
+    now: Date,
+  ): Promise<void> {
+    await tx.discountRedemption.create({
+      data: {
+        offerId: selected.offerId,
+        authId: order.authId,
+        source: selected.source,
+        status: DiscountRedemptionStatus.RESERVED,
+        idempotencyKey: `credit-package-order:${order.id}`,
+        product: packageProduct(order.packageCode),
+        packageCode: order.packageCode,
+        credits: order.credits,
+        discountPercent: selected.percent,
+        originalPriceUsdCents: order.listPriceUsdCents,
+        discountUsdCents: selected.discountCents,
+        finalPriceUsdCents: order.listPriceUsdCents - selected.discountCents,
+        packageOrderId: order.id,
+        reservedAt: now,
+      },
+    });
+  }
+
+  /**
+   * Gives back a credit package order's reservation (the order can no
+   * longer be paid: expired, failed or canceled).
+   */
+  async releaseForPackageOrder(
+    tx: Prisma.TransactionClient,
+    orderId: string,
+    reason: string,
+    now: Date,
+  ): Promise<boolean> {
+    const { count } = await tx.discountRedemption.updateMany({
+      where: {
+        packageOrderId: orderId,
+        status: DiscountRedemptionStatus.RESERVED,
+      },
+      data: {
+        status: DiscountRedemptionStatus.RELEASED,
+        releasedAt: now,
+        releaseReason: reason,
+      },
+    });
+    return count > 0;
+  }
+
+  /** A credit package order was paid: its discount is redeemed once. */
+  async redeemForPackageOrder(
+    tx: Prisma.TransactionClient,
+    orderId: string,
+    now: Date,
+  ): Promise<RedeemOutcome> {
+    const redemption = await tx.discountRedemption.findUnique({
+      where: { packageOrderId: orderId },
+    });
+    if (!redemption) return 'NONE';
+    return this.redeemRedemption(tx, redemption, null, now, {
+      packageOrderId: orderId,
+    });
+  }
+
+  /**
    * Gives back the checkout's reservation. The caller has established that
    * the checkout can no longer be paid and holds the user's lock.
    */
@@ -340,13 +418,30 @@ export class CheckoutDiscountService {
       where: { checkoutSessionId: checkoutId },
     });
     if (!redemption) return 'NONE';
+    return this.redeemRedemption(tx, redemption, paymentId, now, {
+      checkoutId,
+    });
+  }
+
+  /**
+   * RESERVED -> REDEEMED with the payment. A late payment of a RELEASED
+   * reservation is counted again only if the limits and budget still allow
+   * it; otherwise it stays uncounted (reported for review).
+   */
+  private async redeemRedemption(
+    tx: Prisma.TransactionClient,
+    redemption: DiscountRedemption,
+    paymentId: string | null,
+    now: Date,
+    logRef: Record<string, string>,
+  ): Promise<RedeemOutcome> {
     if (redemption.status === DiscountRedemptionStatus.REDEEMED) {
       return 'ALREADY_REDEEMED';
     }
     const redeemed = {
       status: DiscountRedemptionStatus.REDEEMED,
       redeemedAt: now,
-      paymentId,
+      ...(paymentId ? { paymentId } : {}),
     };
     if (redemption.status === DiscountRedemptionStatus.RESERVED) {
       await tx.discountRedemption.update({
@@ -395,20 +490,22 @@ export class CheckoutDiscountService {
       this.logger.logWithMetadata(
         'warn',
         'Late payment of a released checkout discount; redeemed within its limits',
-        { context: LOG_CONTEXT, checkoutId, redemptionId: redemption.id },
+        { context: LOG_CONTEXT, ...logRef, redemptionId: redemption.id },
       );
       return 'REDEEMED';
     }
-    await tx.discountRedemption.update({
-      where: { id: redemption.id },
-      data: { paymentId },
-    });
+    if (paymentId) {
+      await tx.discountRedemption.update({
+        where: { id: redemption.id },
+        data: { paymentId },
+      });
+    }
     this.logger.logWithMetadata(
       'error',
       'Late payment of a released checkout discount exceeds its limits or budget; not counted, review required',
       {
         context: LOG_CONTEXT,
-        checkoutId,
+        ...logRef,
         redemptionId: redemption.id,
         source: redemption.source,
       },

@@ -289,6 +289,7 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
     email: string;
     subscriptionId: string;
     paymentId: string;
+    packageOrderId: string;
   }
 
   /** An account with data in every table, private files and a payment. */
@@ -775,11 +776,25 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
         actionedBy: user.id,
       },
     });
+    // A credit package order: a financial record, kept detached.
+    const packageOrder = await client.creditPackageOrder.create({
+      data: {
+        authId: user.id,
+        idempotencyKey: `erasure-${tag}`,
+        packageCode: 'SMALL',
+        credits: 250,
+        listPriceUsdCents: 500,
+        amountUsdCents: 500,
+        provider: 'stripe',
+        providerCustomerId,
+      },
+    });
     return {
       id: user.id,
       email,
       subscriptionId: subscription.id,
       paymentId: payment.id,
+      packageOrderId: packageOrder.id,
     };
   }
 
@@ -918,6 +933,11 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
       subscriptionId: null,
       updatedAt: paymentAfter.updatedAt,
     });
+    await expect(
+      client.creditPackageOrder.findUniqueOrThrow({
+        where: { id: victim.packageOrderId },
+      }),
+    ).resolves.toMatchObject({ authId: null, credits: 250 });
 
     // 3. Shared records: the plan is untouched; the admin's audit entry stays
     //    without anything that identifies the person.
@@ -1097,6 +1117,7 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
         .sort();
       expect(detached).toEqual([
         'ActivityLogEvent.actionedBy',
+        'CreditPackageOrder.authId',
         'PaymentTransaction.subscriptionId',
       ]);
       // Shared records are never reachable from a user.
@@ -1105,6 +1126,7 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
         'AccountDeletionRequest',
         'AccountDeletionFile',
         'PaymentTransaction',
+        'CreditPackageOrder',
         'ActivityLogEvent',
       ]) {
         expect(deleted.has(shared)).toBe(false);

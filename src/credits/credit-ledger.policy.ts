@@ -132,6 +132,7 @@ export function isAllocationDueForExpiration(
 
 export interface SpendableAllocation {
   id: string;
+  source: CreditSource;
   remaining: Prisma.Decimal;
   expiresAt: Date | null;
   grantedAt: Date;
@@ -139,13 +140,32 @@ export interface SpendableAllocation {
 }
 
 /**
- * Order in which allocations are spent: credits that expire soonest first,
- * never-expiring credits last; ties by grant time, then ID (deterministic).
+ * Spending tiers: free credits first (trial, subscription, daily reward and
+ * loyalty mission credits), then referral credits, then purchased credits.
+ */
+export const SPENDING_TIER: Record<CreditSource, number> = {
+  [CreditSource.TRIAL]: 0,
+  [CreditSource.SUBSCRIPTION]: 0,
+  [CreditSource.DAILY_REWARD]: 0,
+  [CreditSource.MISSION_REWARD]: 0,
+  [CreditSource.REFERRAL]: 1,
+  [CreditSource.PURCHASE]: 2,
+};
+
+/**
+ * Order in which allocations are spent: free credits (trial, subscription,
+ * daily reward, loyalty mission) first, those expiring soonest first and
+ * never-expiring ones after them; then referral credits; then purchased
+ * credits last, even when they are older than referral credits. Within a
+ * tier, ties (and non-expiring credits) go by grant time, oldest first,
+ * then ID (deterministic).
  */
 export function compareSpendingOrder(
   a: SpendableAllocation,
   b: SpendableAllocation,
 ): number {
+  const tier = SPENDING_TIER[a.source] - SPENDING_TIER[b.source];
+  if (tier !== 0) return tier;
   const aExpiry = a.expiresAt?.getTime() ?? Number.POSITIVE_INFINITY;
   const bExpiry = b.expiresAt?.getTime() ?? Number.POSITIVE_INFINITY;
   if (aExpiry !== bExpiry) return aExpiry < bExpiry ? -1 : 1;

@@ -153,6 +153,9 @@ export class FakeStripeApi {
       throw new Error(`Session ${sessionId} is ${str(session.status)}`);
     }
     const paid = (options.paymentStatus ?? 'paid') === 'paid';
+    if (session.mode === 'payment') {
+      return this.completePaymentSession(session, paid);
+    }
     if (!session.invoice) this.startSubscription(session, options.periodStart);
     const invoice = this.requireInvoice(str(session.invoice));
     // A 100% discount: nothing is due, Stripe requires no payment.
@@ -335,8 +338,98 @@ export class FakeStripeApi {
   /** The delayed payment of an `unpaid` completed session settles. */
   settleDelayedPayment(sessionId: string) {
     const session = this.requireSession(sessionId);
+    if (session.mode === 'payment') {
+      this.chargePaymentIntent(
+        this.paymentIntents.get(str(session.payment_intent)) ?? {},
+        str(session.customer),
+      );
+      Object.assign(session, { payment_status: 'paid' });
+      return;
+    }
     this.collect(this.requireInvoice(str(session.invoice)));
     Object.assign(session, { payment_status: 'paid' });
+  }
+
+  /** The delayed payment of a payment-mode session fails. */
+  failDelayedPayment(sessionId: string) {
+    const session = this.requireSession(sessionId);
+    Object.assign(this.paymentIntents.get(str(session.payment_intent)) ?? {}, {
+      status: 'requires_payment_method',
+      last_payment_error: {
+        type: 'card_error',
+        code: 'payment_failed',
+        message: 'The payment failed.',
+      },
+    });
+  }
+
+  /**
+   * A payment-mode session is paid on the hosted page: its PaymentIntent is
+   * created and collected (or, with a delayed method, `processing`).
+   */
+  private completePaymentSession(session: Json, paid: boolean): Json {
+    const coupon = this.sessionCoupon(session);
+    if (coupon) {
+      coupon.times_redeemed = Number(coupon.times_redeemed) + 1;
+    }
+    const intentId = this.id('pi');
+    const intent: Json = {
+      id: intentId,
+      object: 'payment_intent',
+      amount: session.amount_total,
+      amount_received: 0,
+      currency: session.currency,
+      customer: session.customer,
+      metadata: session._paymentIntentMetadata ?? {},
+      status: 'processing',
+      last_payment_error: null,
+      latest_charge: null,
+      payment_method: null,
+      created: Math.floor(Date.now() / 1000),
+    };
+    this.paymentIntents.set(intentId, intent);
+    if (paid) this.chargePaymentIntent(intent, str(session.customer));
+    Object.assign(session, {
+      status: 'complete',
+      payment_status: paid ? 'paid' : 'unpaid',
+      payment_intent: intentId,
+      url: null,
+    });
+    return session;
+  }
+
+  /** Collects a PaymentIntent with the customer's card. */
+  private chargePaymentIntent(intent: Json, customer: string) {
+    const amount = Number(intent.amount);
+    const chargeId = this.id('ch');
+    this.charges.set(chargeId, {
+      id: chargeId,
+      object: 'charge',
+      amount,
+      amount_captured: amount,
+      amount_refunded: 0,
+      refunded: false,
+      currency: intent.currency,
+      customer,
+      payment_intent: intent.id,
+      status: 'succeeded',
+      created: Math.floor(Date.now() / 1000),
+    });
+    const fingerprint = this.customerCards.get(customer);
+    Object.assign(intent, {
+      status: 'succeeded',
+      amount_received: amount,
+      last_payment_error: null,
+      latest_charge: chargeId,
+      payment_method: fingerprint
+        ? {
+            id: `pm_${fingerprint}`,
+            object: 'payment_method',
+            type: 'card',
+            card: { brand: 'visa', last4: '4242', fingerprint },
+          }
+        : null,
+    });
   }
 
   /** The charge that collected an invoice. */
@@ -667,7 +760,10 @@ export class FakeStripeApi {
     sessionId: string,
     overrides: Json = {},
   ): { payload: string; signature: string } {
-    return this.sign(type, { ...this.requireSession(sessionId), ...overrides });
+    return this.sign(type, {
+      ...withoutInternals(this.requireSession(sessionId)),
+      ...overrides,
+    });
   }
 
   private sign(type: string, object: Json) {
@@ -862,7 +958,7 @@ export class FakeStripeApi {
         );
       }
       Object.assign(session, { status: 'expired', url: null });
-      return { status: 200, body: { ...session } };
+      return { status: 200, body: withoutInternals(session) };
     }
     return invalid(404, 'resource_missing', `Unknown route ${method} ${path}`);
   }
@@ -887,8 +983,16 @@ export class FakeStripeApi {
     }
     const lineItems = params.line_items as Json[] | undefined;
     const priceData = lineItems?.[0]?.price_data as Json | undefined;
-    if (params.mode !== 'subscription' || !priceData) {
-      return invalid(400, 'parameter_missing', 'Missing subscription price');
+    const mode = str(params.mode);
+    if (!['subscription', 'payment'].includes(mode) || !priceData) {
+      return invalid(400, 'parameter_missing', 'Missing line item price');
+    }
+    if ((mode === 'payment') !== (priceData.recurring === undefined)) {
+      return invalid(
+        400,
+        undefined,
+        'Recurring prices require subscription mode, one-time prices payment mode',
+      );
     }
     const discounts = params.discounts as Json[] | undefined;
     if (discounts && params.allow_promotion_codes !== undefined) {
@@ -908,7 +1012,7 @@ export class FakeStripeApi {
     const session: Json = {
       id,
       object: 'checkout.session',
-      mode: 'subscription',
+      mode,
       status: 'open',
       payment_status: 'unpaid',
       url: `https://checkout.stripe.com/c/pay/${id}`,
@@ -928,9 +1032,13 @@ export class FakeStripeApi {
       line_items: lineItems,
       subscription: null,
       invoice: null,
+      payment_intent: null,
+      // Not part of the Stripe session object: the PaymentIntent metadata.
+      _paymentIntentMetadata:
+        (params.payment_intent_data as Json | undefined)?.metadata ?? {},
     };
     this.sessions.set(id, session);
-    return { status: 200, body: { ...session } };
+    return { status: 200, body: withoutInternals(session) };
   }
 
   /** POST /v1/coupons: a fixed amount off, like Stripe (ids are unique). */
@@ -972,9 +1080,21 @@ export class FakeStripeApi {
 
   private expand(session: Json, expand: unknown): Json {
     const paths = Array.isArray(expand) ? expand.map(str) : [];
-    const copy: Json = { ...session };
+    const copy: Json = withoutInternals(session);
     delete copy.line_items;
     delete copy.subscription_data;
+    if (paths.includes('payment_intent') && session.payment_intent) {
+      const intent: Json = {
+        ...this.paymentIntents.get(str(session.payment_intent)),
+      };
+      if (
+        !paths.includes('payment_intent.payment_method') &&
+        intent.payment_method
+      ) {
+        intent.payment_method = (intent.payment_method as Json).id;
+      }
+      copy.payment_intent = intent;
+    }
     if (paths.includes('invoice') && session.invoice) {
       copy.invoice = withoutInternals(
         this.requireInvoice(str(session.invoice)),

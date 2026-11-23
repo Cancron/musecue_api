@@ -439,7 +439,9 @@ describeWithDatabase(
       it('reports every source with granted, used, expired and available credits and expiry dates; expired credits never count', async () => {
         const balance = await getBalance(alice);
 
-        // 30 purchased - 9 used by today's session + 5 referral.
+        // Today's session used 9: the 5 referral credits first (spent
+        // before purchased credits, though granted later), then 4 of the
+        // 30 purchased.
         expect(balance).toMatchObject({
           available: '26',
           usable: '26',
@@ -476,9 +478,9 @@ describeWithDatabase(
           {
             source: 'PURCHASE',
             granted: '30',
-            available: '21',
+            available: '26',
             upcoming: '0',
-            used: '9',
+            used: '4',
             expired: '0',
             expires: false,
             usableNow: true,
@@ -487,9 +489,9 @@ describeWithDatabase(
           {
             source: 'REFERRAL',
             granted: '5',
-            available: '5',
+            available: '0',
             upcoming: '0',
-            used: '0',
+            used: '5',
             expired: '0',
             expires: false,
             usableNow: true,
@@ -532,8 +534,8 @@ describeWithDatabase(
             a.expiredAt,
           ]),
         ).toEqual([
-          ['REFERRAL', 'AVAILABLE', '5', '5', '0', '0', null, null],
-          ['PURCHASE', 'AVAILABLE', '30', '21', '9', '0', null, null],
+          ['REFERRAL', 'USED_UP', '5', '0', '5', '0', null, null],
+          ['PURCHASE', 'AVAILABLE', '30', '26', '4', '0', null, null],
           [
             'SUBSCRIPTION',
             'EXPIRED',
@@ -699,7 +701,7 @@ describeWithDatabase(
           ['ALLOCATION', 'REFERRAL', '5', '0'],
           ['DEDUCTION', 'SUBSCRIPTION', '-200', '0'],
           ['EXPIRATION', 'SUBSCRIPTION', '-800', '0'],
-          ['DEDUCTION', 'PURCHASE', '-5', '0'],
+          ['DEDUCTION', 'REFERRAL', '-5', '0'],
           ['DEDUCTION', 'PURCHASE', '-2', '0'],
           ['DEDUCTION', 'PURCHASE', '-0.5', '0'],
           ['DEDUCTION', 'PURCHASE', '-1.5', '0'],

@@ -328,7 +328,11 @@ export class StripeCheckoutService {
    * concurrent first checkouts create a single Stripe customer; the unique
    * constraints make sure only one is ever linked to the user.
    */
-  private async ensureCustomer(authId: string, email: string) {
+  /**
+   * The user's Stripe customer (created once; shared by Pro and credit
+   * package checkouts).
+   */
+  async ensureCustomer(authId: string, email: string) {
     const where = {
       authId_provider: { authId, provider: STRIPE_PROVIDER },
     };

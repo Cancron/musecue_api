@@ -1,4 +1,8 @@
-import { PaymentStatus, type Prisma } from '@prisma/client';
+import {
+  CreditPackageOrderStatus,
+  PaymentStatus,
+  type Prisma,
+} from '@prisma/client';
 
 /**
  * Payments that make a purchase "paid": collected, even if refunded later
@@ -12,9 +16,11 @@ export const PAID_PURCHASE_STATUSES: PaymentStatus[] = [
 ];
 
 /**
- * Whether the user ever made a successful paid purchase. Until then the
- * first-purchase and referral discounts stay available, and the user is a
- * new customer for campaign targeting.
+ * Whether the user ever made a successful paid purchase: a collected Pro
+ * payment or a PAID credit package order. Until then the first-purchase and
+ * referral discounts stay available, and the user is a new customer for
+ * campaign targeting. (PostgreSQL applies the same rule:
+ * musecue_has_paid_purchase.)
  */
 export async function hasPaidPurchase(
   client: Prisma.TransactionClient,
@@ -27,5 +33,10 @@ export async function hasPaidPurchase(
     },
     select: { id: true },
   });
-  return paid !== null;
+  if (paid) return true;
+  const order = await client.creditPackageOrder.findFirst({
+    where: { authId, status: CreditPackageOrderStatus.PAID },
+    select: { id: true },
+  });
+  return order !== null;
 }

@@ -11,6 +11,7 @@ import AppError from '../../common/errors/app.error';
 import { PrismaService } from '../../common/services/prisma.service';
 import { CreditEligibilityService } from '../../subscription/credit-eligibility.service';
 import { formatCredits, sumCredits, ZERO_CREDITS } from '../credit-amount';
+import { compareSpendingOrder } from '../credit-ledger.policy';
 import { formatUsdMicros } from '../credit-settings.constants';
 import {
   summarizeAllocation,
@@ -50,7 +51,11 @@ const FILTERS: Record<CreditHistoryFilter, Prisma.CreditTransactionWhereInput> =
 type HistoryRow = CreditTransaction & {
   entries: Array<
     CreditLedgerEntry & {
-      allocation: { source: CreditSource; expiresAt: Date | null };
+      allocation: {
+        source: CreditSource;
+        expiresAt: Date | null;
+        grantedAt: Date;
+      };
     }
   >;
   aiUsage: AiUsage | null;
@@ -197,7 +202,9 @@ export class CreditAccountService {
       include: {
         entries: {
           include: {
-            allocation: { select: { source: true, expiresAt: true } },
+            allocation: {
+              select: { source: true, expiresAt: true, grantedAt: true },
+            },
           },
           orderBy: { id: 'asc' },
         },
@@ -294,7 +301,14 @@ export class CreditAccountService {
     row: HistoryRow,
     session: CreditHistoryItemView['session'],
   ): CreditHistoryItemView {
-    const sources: CreditHistorySourceView[] = row.entries.map((entry) => ({
+    // In spending order (the order the credits were taken in).
+    const entries = [...row.entries].sort((a, b) =>
+      compareSpendingOrder(
+        { ...a.allocation, id: a.allocationId, remaining: ZERO_CREDITS },
+        { ...b.allocation, id: b.allocationId, remaining: ZERO_CREDITS },
+      ),
+    );
+    const sources: CreditHistorySourceView[] = entries.map((entry) => ({
       source: entry.allocation.source,
       amount: formatCredits(entry.amount),
       allocationId: entry.allocationId,

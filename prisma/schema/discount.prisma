@@ -51,6 +51,7 @@ model DiscountOffer {
   targets     DiscountOfferTarget[]
   redemptions DiscountRedemption[]
   checkouts   CheckoutSession[]
+  packageOrders CreditPackageOrder[]
 
   @@index([kind, createdAt])
 }
@@ -97,6 +98,8 @@ model DiscountRedemption {
   // redeemed it.
   checkoutSessionId     String?                  @unique
   paymentId             String?
+  // Or the credit package order it was reserved for (and redeemed with).
+  packageOrderId        String?                  @unique
   reservedAt            DateTime?
   redeemedAt            DateTime?
   releasedAt            DateTime?
@@ -107,6 +110,7 @@ model DiscountRedemption {
   authUser authUser            @relation(fields: [authId], references: [id], onDelete: Cascade)
   checkout CheckoutSession?    @relation(fields: [checkoutSessionId], references: [id], onDelete: SetNull)
   payment  PaymentTransaction? @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  packageOrder CreditPackageOrder? @relation(fields: [packageOrderId], references: [id], onDelete: Restrict)
 
   @@unique([authId, idempotencyKey])
   @@index([offerId, authId])
@@ -149,6 +153,9 @@ model Referral {
   canonicalEmailHash  String?        @unique @db.Char(64)
   status              ReferralStatus @default(PENDING)
   qualifyingPaymentId String?        @unique
+  // Or the credit package order whose payment qualified it (exactly one of
+  // the two once qualified).
+  qualifyingPackageOrderId String?   @unique
   qualifiedAt         DateTime?
   rewardCredits       Int?
   rewardedAt          DateTime?
@@ -163,6 +170,7 @@ model Referral {
   authUser          authUser            @relation("ReferralReferred", fields: [authId], references: [id], onDelete: Cascade)
   referrer          authUser?           @relation("ReferralReferrer", fields: [referrerAuthId], references: [id], onDelete: SetNull)
   qualifyingPayment PaymentTransaction? @relation(fields: [qualifyingPaymentId], references: [id], onDelete: Restrict)
+  qualifyingPackageOrder CreditPackageOrder? @relation(fields: [qualifyingPackageOrderId], references: [id], onDelete: Restrict)
 
   @@index([referrerAuthId, createdAt])
 }

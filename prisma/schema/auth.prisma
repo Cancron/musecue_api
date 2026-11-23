@@ -47,6 +47,7 @@ model authUser {
   notifications       Notification[]
   notificationPreference NotificationPreference?
   makeupCompletions   MakeupCompletion[]
+  creditPackageOrders CreditPackageOrder[]
   loyaltyMissionAwards LoyaltyMissionAward[]
 
   @@index([email, id, providerId])
