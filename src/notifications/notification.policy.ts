@@ -18,12 +18,14 @@ export interface EmailPreferences {
   emailReferralRewards: boolean;
   emailReferralMilestones: boolean;
   emailGifts: boolean;
+  emailPurchases: boolean;
 }
 
 export const DEFAULT_EMAIL_PREFERENCES: EmailPreferences = {
   emailReferralRewards: true,
   emailReferralMilestones: true,
   emailGifts: true,
+  emailPurchases: true,
 };
 
 /** Whether a notification of `type` is emailed with these preferences. */
@@ -40,7 +42,15 @@ export function wantsEmail(
     case NotificationType.GIFT_ACCEPTED:
     case NotificationType.GIFT_DECLINED:
     case NotificationType.GIFT_DELIVERED:
+    case NotificationType.GIFT_PAID:
+    case NotificationType.GIFT_CANCELED:
+    case NotificationType.GIFT_EXPIRED:
+    case NotificationType.GIFT_UNDER_REVIEW:
+    case NotificationType.GIFT_REJECTED:
       return preferences.emailGifts;
+    case NotificationType.CREDIT_PURCHASE_COMPLETED:
+    case NotificationType.CREDIT_PURCHASE_FAILED:
+      return preferences.emailPurchases;
     case NotificationType.SECURITY_SIGNED_OUT_EVERYWHERE:
     case NotificationType.SECURITY_SESSION_REUSE_DETECTED:
       return true;
@@ -120,6 +130,67 @@ export const notificationContent = {
     title: `Your gift to ${recipientName} was delivered`,
     body: `${recipientName} received the ${credits} credits you gave.`,
     data: { giftId, credits },
+  }),
+  giftPaid: (
+    giftId: string,
+    recipientName: string,
+    credits: number,
+    deliverAt: Date,
+    immediate: boolean,
+  ): NotificationContent => ({
+    type: NotificationType.GIFT_PAID,
+    title: `Your gift to ${recipientName} is paid`,
+    body: immediate
+      ? `Your payment for ${credits} credits for ${recipientName} was received. The gift is being delivered.`
+      : `Your payment for ${credits} credits for ${recipientName} was received. The gift will be delivered on ${deliverAt.toISOString().slice(0, 16).replace('T', ' ')} UTC.`,
+    data: { giftId, credits, deliverAt: deliverAt.toISOString() },
+  }),
+  giftCanceled: (
+    giftId: string,
+    senderName: string,
+    credits: number,
+  ): NotificationContent => ({
+    type: NotificationType.GIFT_CANCELED,
+    title: `${senderName} canceled a gift`,
+    body: `${senderName} canceled the gift of ${credits} credits they sent you.`,
+    data: { giftId, credits },
+  }),
+  giftExpired: (giftId: string, credits: number): NotificationContent => ({
+    type: NotificationType.GIFT_EXPIRED,
+    title: 'Your gift invitation expired',
+    body: `Your gift of ${credits} credits was not accepted and paid in time. Nothing was charged.`,
+    data: { giftId, credits },
+  }),
+  giftUnderReview: (giftId: string, credits: number): NotificationContent => ({
+    type: NotificationType.GIFT_UNDER_REVIEW,
+    title: 'Your gift is being reviewed',
+    body: `Your paid gift of ${credits} credits could not be delivered yet and is being reviewed by our team.`,
+    data: { giftId, credits },
+  }),
+  giftRejected: (giftId: string, credits: number): NotificationContent => ({
+    type: NotificationType.GIFT_REJECTED,
+    title: 'Your gift could not be delivered',
+    body: `Your gift of ${credits} credits could not be delivered. Your payment will be refunded.`,
+    data: { giftId, credits },
+  }),
+  creditPurchaseCompleted: (
+    orderId: string,
+    credits: number,
+    amountUsd: string,
+  ): NotificationContent => ({
+    type: NotificationType.CREDIT_PURCHASE_COMPLETED,
+    title: `Your ${credits} credits are ready`,
+    body: `Thank you for your purchase of ${credits} credits ($${amountUsd}). They were added to your balance and never expire.`,
+    data: { orderId, credits },
+  }),
+  creditPurchaseFailed: (
+    orderId: string,
+    credits: number,
+  ): NotificationContent => ({
+    type: NotificationType.CREDIT_PURCHASE_FAILED,
+    title: 'Your payment did not go through',
+    body: `The payment for ${credits} credits failed, so nothing was charged or added. You can try again with another payment method.`,
+    data: { orderId, credits },
   }),
   signedOutEverywhere: (): NotificationContent => ({
     type: NotificationType.SECURITY_SIGNED_OUT_EVERYWHERE,

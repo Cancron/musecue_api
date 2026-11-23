@@ -27,27 +27,49 @@ model loginHistory {
 // Email History Model
 // ================================
 
+// Every email the application sends, and its delivery history: an outbox.
+// A row is written before the email is queued (a notification's email in
+// the transaction that creates the notification), keyed by a unique
+// `messageId` derived from its event, so no event emails twice. The email
+// job claims the row (`claimedAt`), sends it through SMTP and records the
+// outcome on the same row: `sent` with `sentAt` after a successful SMTP
+// delivery, or `failed` with the error, `retry_count` and `nextAttemptAt`
+// (retried by the job queue and the email outbox; a failed row stays failed
+// until a retry delivers it, then becomes sent). `payload` holds the
+// encrypted secrets of the email (e.g. a verification code) until it is
+// sent. Migration 20261210120000_email_delivery_outbox.
 model emailHistory {
-  id            String          @id @default(uuid())
-  authId        String
-  emailTo       String
-  emailType     email_type
-  subject       String
-  emailProvider email_provider?
-  messageId     String
-  emailStatus   email_status
-  retry_count   Int             @default(0)
-  ipAddress     String?
-  userAgent     String?
-  sentAt        DateTime        @default(now())
-  errorMessage  String?
-  createdAt     DateTime        @default(now())
+  id             String          @id @default(uuid())
+  authId         String
+  emailTo        String
+  emailType      email_type
+  subject        String
+  emailProvider  email_provider?
+  messageId      String          @unique
+  emailStatus    email_status
+  // Failed delivery attempts.
+  retry_count    Int             @default(0)
+  ipAddress      String?
+  userAgent      String?
+  // When SMTP accepted the email (NULL until then).
+  sentAt         DateTime?
+  errorMessage   String?
+  notificationId String?         @unique
+  payload        String?
+  lastAttemptAt  DateTime?
+  // When the outbox dispatches it (again); NULL: nothing left to do.
+  nextAttemptAt  DateTime?
+  // Set while a worker is sending it.
+  claimedAt      DateTime?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @default(now()) @updatedAt
 
   // Relations
-  authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
+  authUser     authUser      @relation(fields: [authId], references: [id], onDelete: Cascade)
+  notification Notification? @relation(fields: [notificationId], references: [id], onDelete: Cascade)
 
   @@index([authId])
   @@index([emailTo])
   @@index([sentAt])
-  @@index([messageId])
+  @@index([emailStatus, nextAttemptAt])
 }

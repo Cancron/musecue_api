@@ -1,11 +1,47 @@
-import { Injectable } from '@nestjs/common';
+import { Inject, Injectable, Optional } from '@nestjs/common';
 import * as nodemailer from 'nodemailer';
 import * as fs from 'fs';
 import * as path from 'path';
 import config from '../config/app.config';
 import AppError from '../errors/app.error';
 import httpStatus from 'http-status';
+import { EMAIL_SUBJECTS } from '../queues/email/email-delivery';
 import { CustomLoggerService } from './custom-logger.service';
+
+/** The SMTP transport (nodemailer in production; a mock in tests). */
+export interface EmailTransport {
+  sendMail(options: nodemailer.SendMailOptions): Promise<unknown>;
+}
+
+export const EMAIL_TRANSPORT = Symbol('EMAIL_TRANSPORT');
+
+/** The configured SMTP server. */
+export function createSmtpTransport(): EmailTransport {
+  return nodemailer.createTransport({
+    host: String(config.email_host),
+    port: Number(config.email_port),
+    secure: config.email_port === 465, // true for 465, false for other ports
+    auth: {
+      user: String(config.email_user),
+      pass: String(config.email_pass),
+    },
+  });
+}
+
+/**
+ * An SMTP delivery failed. Carries the SMTP response code or the transport
+ * error code, recorded in the email's delivery history.
+ */
+export class EmailDeliveryError extends Error {
+  constructor(
+    message: string,
+    readonly responseCode?: number,
+    readonly code?: string,
+  ) {
+    super(message);
+    this.name = 'EmailDeliveryError';
+  }
+}
 
 export interface EmailOptions {
   to: string;
@@ -16,18 +52,13 @@ export interface EmailOptions {
 
 @Injectable()
 export class EmailService {
-  private transporter: nodemailer.Transporter;
+  private readonly transporter: EmailTransport;
 
-  constructor(private readonly customLogger: CustomLoggerService) {
-    this.transporter = nodemailer.createTransport({
-      host: String(config.email_host),
-      port: Number(config.email_port),
-      secure: config.email_port === 465, // true for 465, false for other ports
-      auth: {
-        user: String(config.email_user),
-        pass: String(config.email_pass),
-      },
-    });
+  constructor(
+    private readonly customLogger: CustomLoggerService,
+    @Optional() @Inject(EMAIL_TRANSPORT) transport?: EmailTransport,
+  ) {
+    this.transporter = transport ?? createSmtpTransport();
   }
 
   /**
@@ -58,8 +89,15 @@ export class EmailService {
         error instanceof Error ? error.stack : undefined,
         'EmailService',
       );
-      console.error('Error sending email:', error);
-      throw AppError.badRequest('Email sending failed, something went wrong!');
+      const smtp = error as { responseCode?: number; code?: string };
+      throw new EmailDeliveryError(
+        (error instanceof Error ? error.message : 'Email sending failed').slice(
+          0,
+          300,
+        ),
+        typeof smtp?.responseCode === 'number' ? smtp.responseCode : undefined,
+        typeof smtp?.code === 'string' ? smtp.code : undefined,
+      );
     }
   }
 
@@ -112,7 +150,7 @@ export class EmailService {
 
     await this.sendEmail({
       to: email,
-      subject: 'Verify your MuseCue email address',
+      subject: EMAIL_SUBJECTS.verification,
       html,
     });
   }
@@ -135,7 +173,7 @@ export class EmailService {
 
     await this.sendEmail({
       to: email,
-      subject: 'Confirm the deletion of your MuseCue account',
+      subject: EMAIL_SUBJECTS.accountDeletion,
       html,
     });
   }
@@ -192,7 +230,7 @@ export class EmailService {
 
     await this.sendEmail({
       to: email,
-      subject: 'Welcome to MuseCue!',
+      subject: EMAIL_SUBJECTS.welcome,
       html,
     });
   }

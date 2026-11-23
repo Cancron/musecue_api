@@ -174,6 +174,7 @@ describeWithDatabase(
         expect((await inbox(sender)).sort()).toEqual([
           'GIFT_ACCEPTED',
           'GIFT_DELIVERED',
+          'GIFT_PAID',
         ]);
         const balance = dataOf<{
           sources: Array<{ source: string; available: string }>;

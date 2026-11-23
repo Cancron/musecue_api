@@ -27,7 +27,8 @@ The companion mobile application and detailed product specifications live in `..
 - discount codes and promotional campaigns: administrators create, view, change and deactivate codes and campaigns (discount percentage, active flag, start and end, optional user targeting, per-user and total redemption limits; 0% switches an offer off). Users redeem them for a credit package at the discounted price; invalid, inactive, not yet started, expired, depleted and ineligible offers are refused, and concurrent or repeated requests never exceed a limit or count twice (see "Discount codes and campaigns")
 - discounts in the Stripe checkout: each Pro checkout gets the best available discount (the highest percentage of the first-purchase discount, the referral discount, an entered discount code and running campaigns), charged through a one-time Stripe coupon so the first payment reflects it while the plan price and renewals stay unchanged. The first-purchase and referral discounts stay available until the first successful paid purchase (trials and failed, canceled or abandoned checkouts do not use them up); every discount is used at most once despite repeated, out-of-order or concurrent payments, subscriptions or checkouts. Campaigns support minimum spend, new/returning customer and product targeting and a USD budget that is reserved with each checkout, spent by its payment and given back only when the checkout can no longer be paid (see "Discounts in the Stripe checkout")
 - referrals: every user has an individual referral code, used when signing up (`POST /auth` or Google sign-up); invalid codes, self-referrals, duplicate and retrospective referrals are refused and create nothing. Referred users get the referral discount; referrers get non-expiring `REFERRAL` credits once, with the invited user's first verified paying Stripe purchase (never for signup, verification, trials or unsuccessful purchases, never twice for repeated or concurrent webhooks), usable for makeup sessions without Pro. Administrators configure referral milestones (bonus credits after N paid referrals, each awarded once). Referrals paid with a payment method shared with the referrer or another of their invitees are held for administrator review (only a keyed hash of Stripe's payment method fingerprint is stored). Users see their own code, pending, rewarded and held referrals, milestones, earnings and reward history, and nobody else's (see "Referrals")
-- notifications: an in-app inbox per user (paged, read/unread, mark all read) with email delivery through the existing email queue, for referral rewards, referral milestones and security events (signed out everywhere, refresh token reuse); each event notifies once despite retries, concurrency and restarts; users turn referral emails off, security emails are mandatory (see "Notifications")
+- notifications: an in-app inbox per user (paged, read/unread, mark all read) and emails for purchases (credits ready, payment failed), gifts (received, accepted, declined, paid, delivered, canceled, expired, under review, rejected), referral rewards and milestones (only when credits are granted) and security events; each event notifies once despite retries, concurrency and restarts; users turn purchase, gift and referral emails off, security emails are mandatory (see "Notifications")
+- reliable email delivery: verification, welcome, account deletion, purchase, gift, referral and security emails all go through one email outbox with a delivery history per email (`emailHistory`), sent by BullMQ/PostgreSQL jobs; failed SMTP deliveries (welcome emails too) are retried by the job and then by the outbox sweep, the failed record stays `failed` until a retry delivers it and then becomes `sent` with `sentAt` set at the SMTP delivery; no email is sent twice for repeated events, concurrent workers, job retries or restarts (see "Email delivery")
 - AI credit wallet and ledger: per-user wallets, allocations by source (trial, subscription, purchase, referral) with expiry, exact fractional balances, an append-only transaction ledger with grants, debits and expirations (recorded for every wallet by a scheduled sweep), and per-session overage, all in PostgreSQL and safe under concurrency (see "AI credit wallet and ledger")
 - AI usage metering and credit deductions: every OpenRouter request of a makeup AI run is stored with its user, session, run, tokens and USD cost. Each run is charged once, in exact (fractional) credits converted from its actual cost at the administrator's rate ($0.025 at $0.005 per credit = 5 credits), and the cost and rate are kept in the ledger history (see "AI usage and credit deductions")
 - credit balance and transaction history APIs: a signed-in user sees their own balance by source (granted, available, used, expired, expiry dates), their ledger (allocations, deductions with session overage, expirations, with sources, sessions and AI usage), and the AI usage of their sessions; nobody else's (see "Credit balance and transaction history")
@@ -1368,15 +1369,42 @@ Users receive notifications in an in-app inbox and, depending on the type and th
 | ---- | ----- | ----- |
 | `REFERRAL_REWARD_EARNED` | A referral was rewarded (also when a held one is approved) | Preference `referralRewards` (default on) |
 | `REFERRAL_MILESTONE_REACHED` | A referral milestone was awarded | Preference `referralMilestones` (default on) |
-| `GIFT_RECEIVED`, `GIFT_ACCEPTED`, `GIFT_DECLINED`, `GIFT_DELIVERED` | Credit package gifts (see "Credit package gifts") | Preference `gifts` (default on) |
+| `CREDIT_PURCHASE_COMPLETED` | The buyer's package credits were granted | Preference `purchases` (default on) |
+| `CREDIT_PURCHASE_FAILED` | The payer's delayed payment failed (nothing charged) | Preference `purchases` |
+| `GIFT_RECEIVED` | A gift invitation (recipient) | Preference `gifts` (default on) |
+| `GIFT_ACCEPTED`, `GIFT_DECLINED` | The recipient's answer (sender) | Preference `gifts` |
+| `GIFT_PAID` | The sender's payment was verified; when the gift is delivered (sender) | Preference `gifts` |
+| `GIFT_DELIVERED` | The credits were granted (recipient, and a confirmation to the sender) | Preference `gifts` |
+| `GIFT_CANCELED` | The sender canceled (recipient) | Preference `gifts` |
+| `GIFT_EXPIRED` | The invitation lapsed (sender) | Preference `gifts` |
+| `GIFT_UNDER_REVIEW`, `GIFT_REJECTED` | A paid gift is held for review / rejected and refunded (sender) | Preference `gifts` |
 | `SECURITY_SIGNED_OUT_EVERYWHERE` | `POST /auth/logout-all` | Always |
 | `SECURITY_SESSION_REUSE_DETECTED` | A replaced refresh token was reused (all sessions ended) | Always |
 
-Held and rejected referrals notify nothing; approval notifies once.
+Reward notifications (`REFERRAL_REWARD_EARNED`, `REFERRAL_MILESTONE_REACHED`, `GIFT_DELIVERED`, `CREDIT_PURCHASE_COMPLETED`) are created only in the transaction that grants the credits: held, rejected or unrewarded referrals, held gifts and unpaid or unfulfilled orders notify no reward; approval notifies once.
 
 **Once per event.** A notification is written in the same transaction as its event, with an event key unique per user (`referral-reward:<referral id>`, `referral-milestone:<milestone id>`, `security:…`): retried, concurrent or replayed webhooks, repeated approvals and work redone after a restart create nothing new. Whether it is emailed is decided then (`emailStatus` `PENDING` or `NOT_REQUESTED`). Notifications cannot be rewritten (only `readAt` and the email delivery fields change).
 
-**Email delivery (outbox).** `NotificationOutboxService` hands `PENDING` emails to the existing email queue (BullMQ or the PostgreSQL queue) at startup and every `NOTIFICATION_OUTBOX_INTERVAL_MS` (default 5000, minimum 1000), so emails of notifications created before a restart are still sent. The email job claims the notification (`PENDING -> SENDING`) before sending and marks it `SENT`, so duplicate jobs or workers send once; a failed send is retried by the queue (`FAILED` after the last attempt), and a claim interrupted for more than 10 minutes (process stopped mid-send) goes back to `PENDING`. Delivery is at least once only in that last case. The outbox does not run when `NODE_ENV=test` unless `NOTIFICATION_OUTBOX_ENABLED=true`. Security notifications are best effort: a failure to record one never blocks the sign-out.
+**Emails.** An emailed notification's email is recorded in the email outbox in the same transaction (see "Email delivery"); the notification's `emailStatus` follows it (`PENDING`, `FAILED` while it fails, `SENT`). Security notifications are best effort: a failure to record one never blocks the sign-out.
+
+### Email delivery
+
+Every email (verification, welcome, account deletion code, and the purchase, gift, referral and security notification emails) is a row of the email outbox `emailHistory`, which is also its delivery history:
+
+| Field | Meaning |
+| ----- | ------- |
+| `messageId` | Unique, derived from the event (`welcome:<user>`, `verification:<user>:<code digest>`, `account-deletion:<user>:<code digest>`, `notification:<notification id>`), so no event emails twice |
+| `emailType` | `verification`, `welcome`, `account_deletion`, `purchase`, `gift`, `referral`, `security` |
+| `emailStatus` | `pending` (not attempted yet), `failed` (the last attempt failed; it is retried), `sent` (SMTP accepted it) |
+| `retry_count`, `errorMessage`, `lastAttemptAt`, `nextAttemptAt` | Failed attempts, the last SMTP error (code and message), when it was last tried and when it is tried next (`null`: nothing left to do) |
+| `sentAt` | When SMTP accepted it; `null` until then (never set before a successful delivery) |
+| `payload` | Secrets of the email (e.g. the verification code), encrypted (key derived from `JWT_REFRESH_SECRET`) and removed once sent |
+
+- **Queued once, sent once.** The row is written first (a notification's email in the notification's transaction; account emails right after their event), then an email job (BullMQ or the PostgreSQL queue) is dispatched with an id derived from the email and its dispatch round. The job claims the row (only an unsent, unclaimed one, or one whose claim is older than 10 minutes after a crash), sends it through SMTP and records the outcome on the same row, so duplicate jobs, concurrent workers and repeated events send once. (A process stopped between the SMTP delivery and recording it sends that email again: at least once.)
+- **Retries.** A failed SMTP delivery (every type, welcome emails included) is recorded as `failed` with the error and retried by the job (3 attempts, from 2 s), then by the outbox sweep (`EmailOutboxService`: 1 min, 5 min, 15 min, 1 h, 3 h, 6 h, 12 h after the latest failure). The record stays `failed` until a retry delivers it; then the same record becomes `sent` (keeping its `retry_count` and last error) with `sentAt`. After 8 failed attempts it stays `failed` for good.
+- **Restarts.** The sweep runs at startup and every `EMAIL_OUTBOX_INTERVAL_MS` (default 5000, minimum 1000; not when `NODE_ENV=test` unless `EMAIL_OUTBOX_ENABLED=true`) and dispatches every due email (new ones whose job was never queued, failed ones whose next attempt has come, interrupted ones), so nothing recorded before a crash or restart is lost; several instances may run it at once.
+- **PostgreSQL enforces** (migration `20261210120000_email_delivery_outbox`): unique `messageId` and notification; `sentAt` set exactly for delivered rows; secrets removed once sent; an email's identity, a delivered email's status and `sentAt` and its failed attempts can never be rewritten.
+- **Tests** use a mock SMTP transport (`EMAIL_TRANSPORT` replaced by `test/support/mock-smtp.ts`): real templates and history, with injected SMTP failures, and nothing is sent.
 
 **Inbox API** (any signed-in user, own notifications only; another user's id answers `404`):
 
@@ -1386,8 +1414,8 @@ Held and rejected referrals notify nothing; approval notifies once.
 | `GET`   | `/v1/notifications/unread-count`    | `{ unreadCount }` |
 | `PATCH` | `/v1/notifications/:id`             | `{ "read": true | false }` (marking read again keeps the first read time) |
 | `POST`  | `/v1/notifications/read-all`        | Marks every unread notification read: `{ updated }` |
-| `GET`   | `/v1/notifications/preferences`     | `{ email: { referralRewards, referralMilestones, gifts, security: true }, updatedAt }` |
-| `PATCH` | `/v1/notifications/preferences`     | Any of `referralRewards`, `referralMilestones`, `gifts` (booleans); `security: false` is refused with `400 Security emails cannot be turned off` and nothing is changed |
+| `GET`   | `/v1/notifications/preferences`     | `{ email: { referralRewards, referralMilestones, gifts, purchases, security: true }, updatedAt }` |
+| `PATCH` | `/v1/notifications/preferences`     | Any of `referralRewards`, `referralMilestones`, `gifts`, `purchases` (booleans); `security: false` is refused with `400 Security emails cannot be turned off` and nothing is changed |
 
 Preferences apply to notifications created afterwards; the inbox entry is always created.
 
@@ -1733,7 +1761,7 @@ TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json --runInBand test/cr
 npx jest discount   # discount settings, codes and campaigns unit/HTTP tests (likewise: daily, credit-package)
 npx jest daily      # daily reward and loyalty mission unit tests
 npx jest credit-package   # credit package settings and purchase unit tests
-TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json credit-package   # credit-package-settings, -payments, -ledger, -gifts, -recovery on PostgreSQL
+TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json credit-package   # credit-package-settings, -payments, -ledger, -gifts, -recovery, -notifications on PostgreSQL
 TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json daily   # daily-reward-settings, daily-reward-claims, daily-reward-streak, daily-reward-royalty-missions on PostgreSQL
 TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json discount   # every discount suite on PostgreSQL; one suite: discount-first-purchase, discount-payments, discount-campaign-budget, discount-codes, discount-campaigns (likewise: daily, credit-package)
 npx jest referral   # referral and referral notification unit tests

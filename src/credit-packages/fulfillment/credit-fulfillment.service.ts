@@ -19,6 +19,7 @@ import { PrismaService } from '../../common/services/prisma.service';
 import { CreditWalletService } from '../../credits/credit-wallet.service';
 import { notificationContent } from '../../notifications/notification.policy';
 import { NotificationService } from '../../notifications/notification.service';
+import { formatUsdCents } from '../credit-package-settings.constants';
 import { packageOrderCreditReference } from '../purchases/credit-package-order.policy';
 import {
   type FulfillmentHoldReason,
@@ -118,6 +119,20 @@ export class CreditFulfillmentService {
           where: { id: gift.id },
           data: { status: CreditGiftStatus.PAID, paidAt: now },
         });
+        if (gift.senderAuthId) {
+          await this.notifications.notify(
+            tx,
+            gift.senderAuthId,
+            `gift-paid:${gift.id}`,
+            notificationContent.giftPaid(
+              gift.id,
+              await this.usernameOf(tx, gift.recipientAuthId),
+              gift.credits,
+              gift.deliverAt,
+              gift.deliverAt.getTime() <= now.getTime(),
+            ),
+          );
+        }
       } else {
         hold =
           gift.status === CreditGiftStatus.PAID ||
@@ -157,6 +172,7 @@ export class CreditFulfillmentService {
         'Paid credit package order held for review',
         { context: LOG_CONTEXT, orderId: order.id, holdReason: hold },
       );
+      if (order.giftId) await this.notifyUnderReview(tx, order.giftId);
     }
     return fulfillment;
   }
@@ -373,6 +389,14 @@ export class CreditFulfillmentService {
           },
         });
       }
+      if (gift?.senderAuthId) {
+        await this.notifications.notify(
+          tx,
+          gift.senderAuthId,
+          `gift-rejected:${fulfillment.orderId}`,
+          notificationContent.giftRejected(gift.id, gift.credits),
+        );
+      }
       await this.event(tx, id, 'REJECTED', 'REJECTED', {
         actor: actor.actionedBy,
         detail: 'REFUND_REQUIRED',
@@ -419,6 +443,19 @@ export class CreditFulfillmentService {
       },
     });
     await this.event(tx, fulfillment.id, eventType, 'SUCCEEDED', { actor });
+    if (fulfillment.kind === CreditPackageOrderKind.SELF) {
+      // Credits were granted: the purchase confirmation, once.
+      await this.notifications.notify(
+        tx,
+        recipientAuthId,
+        `purchase-completed:${fulfillment.orderId}`,
+        notificationContent.creditPurchaseCompleted(
+          fulfillment.orderId,
+          fulfillment.credits,
+          formatUsdCents(fulfillment.order.amountUsdCents),
+        ),
+      );
+    }
     if (gift) {
       await tx.creditGift.update({
         where: { id: gift.id },
@@ -456,6 +493,7 @@ export class CreditFulfillmentService {
         where: { id: gift.id },
         data: { status: CreditGiftStatus.REVIEW, reviewReason: reason },
       });
+      await this.notifyUnderReview(tx, gift.id);
     }
     this.logger.logWithMetadata('warn', 'Credit fulfillment held for review', {
       context: LOG_CONTEXT,
@@ -549,6 +587,35 @@ export class CreditFulfillmentService {
         ),
       );
     }
+  }
+
+  /** The sender learns that their paid gift waits for a review. */
+  private async notifyUnderReview(
+    tx: Prisma.TransactionClient,
+    giftId: string,
+  ) {
+    const gift = await tx.creditGift.findUniqueOrThrow({
+      where: { id: giftId },
+    });
+    if (!gift.senderAuthId) return;
+    await this.notifications.notify(
+      tx,
+      gift.senderAuthId,
+      `gift-review:${gift.id}`,
+      notificationContent.giftUnderReview(gift.id, gift.credits),
+    );
+  }
+
+  private async usernameOf(
+    tx: Prisma.TransactionClient,
+    authId: string | null,
+  ): Promise<string> {
+    if (!authId) return 'the recipient';
+    const user = await tx.authUser.findUnique({
+      where: { id: authId },
+      select: { username: true },
+    });
+    return user?.username ?? 'the recipient';
   }
 
   private load(

@@ -153,7 +153,13 @@ describe('AuthService', () => {
         ],
       ]);
       expect(emailQueueService.sendVerificationEmail.mock.calls).toContainEqual(
-        [createAuthDto.email, createAuthDto.username, '123456', mockUser.id],
+        [
+          createAuthDto.email,
+          createAuthDto.username,
+          '123456',
+          mockUser.id,
+          { ipAddress: '127.0.0.1', userAgent: 'Jest Test Agent' },
+        ],
       );
     });
 
@@ -424,9 +430,8 @@ describe('AuthService', () => {
       await expect(
         service.resendVerificationEmail(email, meta),
       ).rejects.toThrow('Failed to send verification email');
-      expect(
-        prismaService.emailHistory.updateMany.mock.calls.length,
-      ).toBeGreaterThan(0);
+      // The email outbox records its own history; nothing else is written.
+      expect(prismaService.emailHistory.updateMany.mock.calls).toEqual([]);
     });
   });
 });

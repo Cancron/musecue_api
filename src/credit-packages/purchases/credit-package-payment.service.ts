@@ -19,6 +19,8 @@ import {
   STRIPE_PROVIDER,
   StripeGateway,
 } from '../../subscription/stripe/stripe.gateway';
+import { notificationContent } from '../../notifications/notification.policy';
+import { NotificationService } from '../../notifications/notification.service';
 import { CreditFulfillmentService } from '../fulfillment/credit-fulfillment.service';
 import { verifyPackageCheckout } from './credit-package-order.policy';
 
@@ -84,6 +86,7 @@ export class CreditPackagePaymentService {
     private readonly discounts: CheckoutDiscountService,
     private readonly referralRewards: ReferralRewardService,
     private readonly fulfillments: CreditFulfillmentService,
+    private readonly notifications: NotificationService,
     private readonly logger: CustomLoggerService,
   ) {}
 
@@ -299,6 +302,15 @@ export class CreditPackagePaymentService {
         },
       });
       await this.discounts.releaseForPackageOrder(tx, orderId, reason, now);
+      if (reason === 'ASYNC_PAYMENT_FAILED' && current.authId) {
+        // The payer learns that the payment failed (nothing was charged).
+        await this.notifications.notify(
+          tx,
+          current.authId,
+          `purchase-failed:${orderId}`,
+          notificationContent.creditPurchaseFailed(orderId, current.credits),
+        );
+      }
       return true;
     }, ORDER_TRANSACTION_OPTIONS);
   }

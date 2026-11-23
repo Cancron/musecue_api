@@ -14,7 +14,11 @@ import type { Logger } from 'winston';
 import { AppModule } from '../../src/app.module';
 import { AllExceptionsFilter } from '../../src/common/filters/all-exception.filter';
 import { TransformInterceptor } from '../../src/common/interceptors/transform.interceptor';
-import { EmailService } from '../../src/common/services/email.service';
+import { MockSmtpTransport, SmtpEmailCapture } from './mock-smtp';
+import {
+  EMAIL_TRANSPORT,
+  EmailService,
+} from '../../src/common/services/email.service';
 import { PrismaService } from '../../src/common/services/prisma.service';
 import { AccountDeletionRecoveryService } from '../../src/privacy/account-deletion/account-deletion-recovery.service';
 import { givenCreditsInPostgres } from './credit-fixtures';
@@ -79,7 +83,7 @@ export interface TestApplication {
   client: PrismaClient;
   /** The PostgreSQL schema the application runs against. */
   schema: string;
-  emails: CapturingEmailService;
+  emails: { readonly sent: SentEmail[] };
   /** Resolves the application's provider for `token`. */
   get<T>(token: unknown): T;
   close(): Promise<void>;
@@ -94,6 +98,11 @@ export interface BootOptions {
   schema?: string;
   /** Providers replaced by test doubles (e.g. the Stripe client). */
   overrides?: Array<{ provide: unknown; useValue: unknown }>;
+  /**
+   * Deliver through the real EmailService (templates, history) into this
+   * mock SMTP transport instead of capturing EmailService calls.
+   */
+  smtp?: MockSmtpTransport;
 }
 
 /** Boots AppModule against a freshly migrated (or the given) schema. */
@@ -117,13 +126,16 @@ export async function bootApplication(
       { schema },
     ),
   });
-  const emails = new CapturingEmailService();
+  const emails = options.smtp
+    ? new SmtpEmailCapture(options.smtp)
+    : new CapturingEmailService();
 
   let builder = Test.createTestingModule({ imports: [AppModule] })
     .overrideProvider(PrismaService)
-    .useValue(client)
-    .overrideProvider(EmailService)
-    .useValue(emails);
+    .useValue(client);
+  builder = options.smtp
+    ? builder.overrideProvider(EMAIL_TRANSPORT).useValue(options.smtp)
+    : builder.overrideProvider(EmailService).useValue(emails);
   for (const override of options.overrides ?? []) {
     builder = builder
       .overrideProvider(override.provide)

@@ -1,14 +1,14 @@
 import { Module } from '@nestjs/common';
 import { QueueModule } from '../../common/modules';
-import { NotificationOutboxService } from './notification-outbox.service';
+import { EmailOutboxService } from './email-outbox.service';
 
 /**
- * Email delivery of notifications through the existing email queue
- * (QueueModule): the outbox dispatcher. Loaded by AppModule only.
+ * Email delivery (QueueModule's email queue and the email outbox sweep that
+ * dispatches every due email). Loaded by AppModule only.
  */
 @Module({
   imports: [QueueModule],
-  providers: [NotificationOutboxService],
-  exports: [NotificationOutboxService],
+  providers: [EmailOutboxService],
+  exports: [EmailOutboxService],
 })
 export class NotificationDeliveryModule {}

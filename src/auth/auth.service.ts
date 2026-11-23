@@ -155,20 +155,6 @@ export class AuthService {
           });
         }
 
-        // Create email history record for verification email
-        await tx.emailHistory.create({
-          data: {
-            authId: user.id,
-            emailTo: email,
-            emailType: 'verification',
-            subject: 'Verify your email address',
-            messageId: `verify-${user.id}-${Date.now()}`,
-            emailStatus: 'pending',
-            ipAddress: ip,
-            userAgent: userAgent,
-          },
-        });
-
         // Log user registration activity
         await this.activityLogService.logCreate(
           'authUser',
@@ -201,13 +187,14 @@ export class AuthService {
       },
     );
 
-    // Queue verification email for async processing
+    // Record the verification email (its delivery history) and queue it.
     try {
       await this.emailQueueService.sendVerificationEmail(
         email,
         username,
         verificationCode,
         newUser.id,
+        { ipAddress: ip, userAgent },
       );
       this.customLogger.log(
         `User registered successfully: ${email}, verification email queued`,
@@ -219,21 +206,7 @@ export class AuthService {
         error instanceof Error ? error.stack : undefined,
         'AuthService',
       );
-      console.error('Failed to queue verification email:', error);
-      // Update email history status to 'failed'
-      await this.prismaService.emailHistory.updateMany({
-        where: {
-          authId: newUser.id,
-          emailType: 'verification',
-          emailStatus: 'pending',
-        },
-        data: {
-          emailStatus: 'failed',
-          errorMessage:
-            error instanceof Error ? error.message : 'Failed to queue email',
-        },
-      });
-      // Don't throw error, user is created, just email failed
+      // The user is created; they can request the code again.
     }
   }
 
@@ -401,43 +374,21 @@ export class AuthService {
       },
     );
 
-    // Create new email history record
-    await this.prismaService.emailHistory.create({
-      data: {
-        authId: user.id,
-        emailTo: email,
-        emailType: 'verification',
-        subject: 'Verify your email address',
-        messageId: `verify-resend-${user.id}-${Date.now()}`,
-        emailStatus: 'pending',
-        ipAddress: ip,
-        userAgent: userAgent,
-      },
-    });
-
-    // Queue verification email for async processing
+    // Record the verification email (its delivery history) and queue it.
     try {
       await this.emailQueueService.sendVerificationEmail(
         email,
         user.username,
         verificationCode,
         user.id,
+        { ipAddress: ip, userAgent },
       );
     } catch (error) {
-      console.error('Failed to queue verification email:', error);
-      // Update email history status to 'failed'
-      await this.prismaService.emailHistory.updateMany({
-        where: {
-          authId: user.id,
-          emailType: 'verification',
-          emailStatus: 'pending',
-        },
-        data: {
-          emailStatus: 'failed',
-          errorMessage:
-            error instanceof Error ? error.message : 'Failed to queue email',
-        },
-      });
+      this.customLogger.error(
+        'Failed to record the verification email',
+        error instanceof Error ? error.stack : undefined,
+        'AuthService',
+      );
       throw AppError.badRequest('Failed to send verification email');
     }
 

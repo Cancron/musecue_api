@@ -23,7 +23,8 @@ model Notification {
   emailSentAt    DateTime?
   createdAt      DateTime                @default(now())
 
-  authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
+  authUser authUser      @relation(fields: [authId], references: [id], onDelete: Cascade)
+  email    emailHistory?
 
   @@unique([authId, eventKey])
   @@index([authId, createdAt, id])
@@ -37,6 +38,7 @@ model NotificationPreference {
   emailReferralRewards    Boolean  @default(true)
   emailReferralMilestones Boolean  @default(true)
   emailGifts              Boolean  @default(true)
+  emailPurchases          Boolean  @default(true)
   updatedAt               DateTime @updatedAt
 
   authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)

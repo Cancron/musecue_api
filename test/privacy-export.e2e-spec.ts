@@ -681,6 +681,7 @@ describeWithDatabase('Personal data export (PostgreSQL)', () => {
         subject: 'Verify your email address',
         messageId: secrets.smtpMessageId,
         emailStatus: 'sent',
+        sentAt: new Date(),
         errorMessage: secrets.emailError,
       },
     });

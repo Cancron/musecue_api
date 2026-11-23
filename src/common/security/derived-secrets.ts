@@ -23,6 +23,7 @@ export const SECRET_PURPOSES = {
   JOB_PAYLOAD: 'musecue/infrastructure-job-payload/v1',
   RATE_LIMIT_KEY: 'musecue/rate-limit-key/v1',
   PAYMENT_FINGERPRINT: 'musecue/payment-fingerprint/v1',
+  EMAIL_PAYLOAD: 'musecue/email-payload/v1',
 } as const;
 
 export type SecretPurpose =

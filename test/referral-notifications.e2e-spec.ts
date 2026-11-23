@@ -3,7 +3,7 @@
 import './support/env-postgres-mode';
 import { userRole } from '@prisma/client';
 import { NotificationService } from '../src/notifications/notification.service';
-import { NotificationOutboxService } from '../src/notifications/delivery/notification-outbox.service';
+import { EmailOutboxService } from '../src/notifications/delivery/email-outbox.service';
 import { createAccount, type TestAccount } from './support/discount-fixtures';
 import { FakeStripeApi } from './support/fake-stripe-api';
 import { eventually } from './support/infrastructure-flows';
@@ -47,6 +47,7 @@ interface PreferencesView {
     referralRewards: boolean;
     referralMilestones: boolean;
     gifts: boolean;
+    purchases: boolean;
     security: boolean;
   };
   updatedAt: string | null;
@@ -71,8 +72,7 @@ describeWithDatabase(
     let r: ReturnType<typeof referralFlows>;
     let admin: TestAccount;
 
-    const outbox = () =>
-      app.ctx.get<NotificationOutboxService>(NotificationOutboxService);
+    const outbox = () => app.ctx.get<EmailOutboxService>(EmailOutboxService);
     const inbox = async (account: TestAccount, query = '') =>
       dataOf<PageView>(await r.get(account, `${INBOX}${query}`).expect(200));
     /** Dispatches pending emails and waits until none is left in flight. */
@@ -81,7 +81,7 @@ describeWithDatabase(
       await eventually(
         async () =>
           (await app.ctx.client.notification.count({
-            where: { emailStatus: { in: ['PENDING', 'SENDING'] } },
+            where: { emailStatus: 'PENDING' },
           })) === 0,
         30_000,
         'notification emails to be sent',
@@ -246,6 +246,8 @@ describeWithDatabase(
       /** `count` notifications for the account, oldest first. */
       const seed = async (account: TestAccount, count: number) => {
         const service = app.ctx.get<NotificationService>(NotificationService);
+        // Seeded entries are not emailed by this test.
+        await service.updatePreferences(account.id, { referralRewards: false });
         for (let i = 0; i < count; i += 1) {
           await service.notify(app.ctx.client, account.id, `test:seed:${i}`, {
             type: 'REFERRAL_REWARD_EARNED',
@@ -253,11 +255,6 @@ describeWithDatabase(
             body: 'Seeded notification',
           });
         }
-        // Seeded entries are not emailed by this test.
-        await app.ctx.client.notification.updateMany({
-          where: { authId: account.id, emailStatus: 'PENDING' },
-          data: { emailStatus: 'NOT_REQUESTED' },
-        });
       };
 
       it('pages the owner’s notifications newest first with a cursor', async () => {
@@ -411,6 +408,7 @@ describeWithDatabase(
             referralRewards: true,
             referralMilestones: true,
             gifts: true,
+            purchases: true,
             security: true,
           },
           updatedAt: null,
@@ -426,6 +424,7 @@ describeWithDatabase(
           referralRewards: false,
           referralMilestones: true,
           gifts: true,
+          purchases: true,
           security: true,
         });
         await r.milestones(admin).ensure(1, 10);
@@ -534,13 +533,9 @@ describeWithDatabase(
             await first.ctx.client.notification.findFirstOrThrow({
               where: { authId: other.id },
             });
-          await first.ctx.client.notification.update({
-            where: { id: interrupted.id },
-            data: {
-              emailStatus: 'SENDING',
-              emailAttempts: 1,
-              emailClaimedAt: new Date(Date.now() - 11 * 60_000),
-            },
+          await first.ctx.client.emailHistory.update({
+            where: { notificationId: interrupted.id },
+            data: { claimedAt: new Date(Date.now() - 11 * 60_000) },
           });
           expect(before.notificationEmailsTo(referrer.email)).toEqual([]);
           await first.ctx.close();
@@ -574,7 +569,7 @@ describeWithDatabase(
             .invoiceEvent('invoice.paid', purchase.invoiceId)
             .expect(200);
           await second.ctx
-            .get<NotificationOutboxService>(NotificationOutboxService)
+            .get<EmailOutboxService>(EmailOutboxService)
             .dispatchPending();
           expect(after.notificationEmailsTo(referrer.email)).toHaveLength(1);
           await second.ctx.close();
@@ -583,7 +578,7 @@ describeWithDatabase(
           // Another restart sends nothing again.
           third = await bootReferralApp(schema);
           await third.ctx
-            .get<NotificationOutboxService>(NotificationOutboxService)
+            .get<EmailOutboxService>(EmailOutboxService)
             .dispatchPending();
           await new Promise((resolve) => setTimeout(resolve, 1_500));
           expect(

@@ -55,6 +55,10 @@ export class UpdateNotificationPreferencesDto {
   @IsBoolean()
   gifts?: boolean;
 
+  @ValidateIf(isPresent)
+  @IsBoolean()
+  purchases?: boolean;
+
   /** Security emails are mandatory: only `true` is accepted. */
   @ValidateIf(isPresent)
   @Equals(true, { message: 'Security emails cannot be turned off' })

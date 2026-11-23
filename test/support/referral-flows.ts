@@ -15,6 +15,7 @@ import {
   type TestAccount,
 } from './discount-fixtures';
 import { FAKE_WEBHOOK_SECRET, FakeStripeApi } from './fake-stripe-api';
+import type { MockSmtpTransport } from './mock-smtp';
 import {
   bootApplication,
   eventually,
@@ -32,7 +33,10 @@ export interface ReferralApp {
   stripe: { api: FakeStripeApi };
 }
 
-export async function bootReferralApp(schema?: string): Promise<ReferralApp> {
+export async function bootReferralApp(
+  schema?: string,
+  options: { smtp?: MockSmtpTransport } = {},
+): Promise<ReferralApp> {
   const stripe = { api: new FakeStripeApi(5) };
   const client = new Stripe('sk_test_fake', {
     httpClient: Stripe.createFetchHttpClient(
@@ -52,6 +56,7 @@ export async function bootReferralApp(schema?: string): Promise<ReferralApp> {
   };
   const ctx = await bootApplication({
     schema,
+    smtp: options.smtp,
     overrides: [
       { provide: STRIPE_SETTINGS, useValue: settings },
       { provide: STRIPE_CLIENT, useValue: client },

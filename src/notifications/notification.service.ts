@@ -6,6 +6,10 @@ import {
 } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 import AppError from '../common/errors/app.error';
+import {
+  emailTypeOfNotification,
+  recordEmail,
+} from '../common/queues/email/email-delivery';
 import { PrismaService } from '../common/services/prisma.service';
 import type {
   NotificationPageView,
@@ -30,8 +34,9 @@ const DEFAULT_PAGE_SIZE = 20;
  * retried, concurrent or replayed event, or work redone after a restart,
  * finds the existing entry and creates nothing. Whether it is emailed is
  * decided at creation from the user's preferences (security notifications
- * always); NotificationOutboxService hands PENDING emails to the existing
- * email queue. Every inbox query is scoped to the owner.
+ * always); the email is recorded in the email outbox (emailHistory) in the
+ * same transaction and sent by the email job (EmailOutboxService dispatches
+ * it). Every inbox query is scoped to the owner.
  */
 @Injectable()
 export class NotificationService {
@@ -51,6 +56,7 @@ export class NotificationService {
       where: { authId },
     });
     const preferences = stored ?? DEFAULT_EMAIL_PREFERENCES;
+    const emailed = wantsEmail(content.type, preferences);
     const id = randomUUID();
     const { count } = await client.notification.createMany({
       data: [
@@ -62,14 +68,31 @@ export class NotificationService {
           title: content.title,
           body: content.body,
           data: content.data ?? Prisma.JsonNull,
-          emailStatus: wantsEmail(content.type, preferences)
+          emailStatus: emailed
             ? NotificationEmailStatus.PENDING
             : NotificationEmailStatus.NOT_REQUESTED,
         },
       ],
       skipDuplicates: true,
     });
-    return count === 1 ? id : null;
+    if (count !== 1) return null;
+    if (emailed) {
+      // Its email, in the outbox, in the same transaction: sent by the
+      // email job (dispatched by EmailOutboxService), once.
+      const user = await client.authUser.findUniqueOrThrow({
+        where: { id: authId },
+        select: { email: true },
+      });
+      await recordEmail(client, {
+        authId,
+        emailTo: user.email,
+        type: emailTypeOfNotification(content.type),
+        subject: content.title,
+        messageId: `notification:${id}`,
+        notificationId: id,
+      });
+    }
+    return id;
   }
 
   async list(
@@ -163,6 +186,7 @@ export class NotificationService {
       referralRewards?: boolean;
       referralMilestones?: boolean;
       gifts?: boolean;
+      purchases?: boolean;
     },
   ): Promise<NotificationPreferencesView> {
     const data = {
@@ -173,6 +197,9 @@ export class NotificationService {
         ? { emailReferralMilestones: input.referralMilestones }
         : {}),
       ...(input.gifts !== undefined ? { emailGifts: input.gifts } : {}),
+      ...(input.purchases !== undefined
+        ? { emailPurchases: input.purchases }
+        : {}),
     };
     const stored = await this.prisma.notificationPreference.upsert({
       where: { authId },
@@ -187,6 +214,7 @@ export class NotificationService {
       emailReferralRewards: boolean;
       emailReferralMilestones: boolean;
       emailGifts: boolean;
+      emailPurchases: boolean;
       updatedAt: Date;
     } | null,
   ): NotificationPreferencesView {
@@ -196,6 +224,7 @@ export class NotificationService {
         referralRewards: preferences.emailReferralRewards,
         referralMilestones: preferences.emailReferralMilestones,
         gifts: preferences.emailGifts,
+        purchases: preferences.emailPurchases,
         security: true,
       },
       updatedAt: stored?.updatedAt.toISOString() ?? null,

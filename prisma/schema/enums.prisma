@@ -60,6 +60,12 @@ enum email_type {
   verification
   password_reset
   notification
+  welcome
+  account_deletion
+  purchase
+  gift
+  referral
+  security
 }
 
 enum email_provider {
@@ -515,6 +521,14 @@ enum NotificationType {
   GIFT_ACCEPTED
   GIFT_DECLINED
   GIFT_DELIVERED
+  GIFT_PAID
+  GIFT_CANCELED
+  GIFT_EXPIRED
+  GIFT_UNDER_REVIEW
+  GIFT_REJECTED
+  // Credit package purchases.
+  CREDIT_PURCHASE_COMPLETED
+  CREDIT_PURCHASE_FAILED
 }
 
 // Email delivery of one notification: NOT_REQUESTED when the user's

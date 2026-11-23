@@ -15,6 +15,7 @@ describe('referral notification policy', () => {
     emailReferralRewards: false,
     emailReferralMilestones: false,
     emailGifts: false,
+    emailPurchases: false,
   };
 
   it('emails referral notifications by default and follows the preferences', () => {

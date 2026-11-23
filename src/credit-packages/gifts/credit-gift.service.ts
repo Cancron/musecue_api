@@ -300,11 +300,24 @@ export class CreditGiftService {
         throw AppError.conflict(GIFT_MESSAGES.NOT_CANCELABLE);
       }
       await this.assertNoPaymentInProgress(tx, giftId);
-      return tx.creditGift.update({
+      const canceled = await tx.creditGift.update({
         where: { id: giftId },
         data: { status: CreditGiftStatus.CANCELED, canceledAt: now },
         include: GIFT_INCLUDE,
       });
+      if (canceled.recipientAuthId) {
+        await this.notifications.notify(
+          tx,
+          canceled.recipientAuthId,
+          `gift-canceled:${giftId}`,
+          notificationContent.giftCanceled(
+            giftId,
+            canceled.sender?.username ?? 'The sender',
+            canceled.credits,
+          ),
+        );
+      }
+      return canceled;
     }, GIFT_TRANSACTION_OPTIONS);
     return this.toView(gift, authId, undefined, now);
   }
@@ -337,15 +350,45 @@ export class CreditGiftService {
    * checkout in progress). Returns how many.
    */
   async expireDue(now: Date = new Date()): Promise<number> {
-    const { count } = await this.prisma.creditGift.updateMany({
+    const lapsed = await this.prisma.creditGift.findMany({
       where: {
         status: { in: [CreditGiftStatus.PENDING, CreditGiftStatus.ACCEPTED] },
         expiresAt: { lte: now },
         orders: { none: { status: { in: [...OPEN_ORDER, 'PAID'] } } },
       },
-      data: { status: CreditGiftStatus.EXPIRED, expiredAt: now },
+      take: 200,
+      select: { id: true },
     });
-    return count;
+    let expired = 0;
+    for (const { id } of lapsed) {
+      const done = await this.prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT "id" FROM "CreditGift" WHERE "id" = ${id} FOR UPDATE`;
+        const { count } = await tx.creditGift.updateMany({
+          where: {
+            id,
+            status: {
+              in: [CreditGiftStatus.PENDING, CreditGiftStatus.ACCEPTED],
+            },
+            orders: { none: { status: { in: [...OPEN_ORDER, 'PAID'] } } },
+          },
+          data: { status: CreditGiftStatus.EXPIRED, expiredAt: now },
+        });
+        if (count === 0) return false;
+        const gift = await tx.creditGift.findUniqueOrThrow({ where: { id } });
+        if (gift.senderAuthId) {
+          // The sender learns that the invitation lapsed (nothing charged).
+          await this.notifications.notify(
+            tx,
+            gift.senderAuthId,
+            `gift-expired:${id}`,
+            notificationContent.giftExpired(id, gift.credits),
+          );
+        }
+        return true;
+      }, GIFT_TRANSACTION_OPTIONS);
+      if (done) expired += 1;
+    }
+    return expired;
   }
 
   // -------------------------------------------------------------------------

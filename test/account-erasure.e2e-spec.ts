@@ -327,6 +327,7 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
             subject: 'Verify',
             messageId: `m-${tag}`,
             emailStatus: 'sent',
+            sentAt: new Date(),
           },
         },
         // Authentication state: a signed-in device and an outstanding code.
