@@ -1,0 +1,28 @@
+// ================================
+// AI Credit Settings
+// ================================
+
+// Administrator-managed configuration of the AI credit system. There is one
+// global configuration, stored as a single row whose `id` is always
+// 'default' (CHECK constraint in the migration). No row exists until an
+// administrator saves for the first time; until then the API serves the
+// defaults. Defaults must match CREDIT_SETTINGS_DEFAULTS in
+// src/credit/credit-settings.constants.ts.
+//
+// This is configuration only: credit balances, ledgers and charging of AI
+// usage do not exist yet and will read these values when they are added.
+model CreditSettings {
+  id                             String   @id @default("default") @db.VarChar(20)
+  // Credits granted once to a user starting the free trial.
+  trialAllowanceCredits          Int      @default(50)
+  // Credits granted to a Pro subscriber for each monthly period.
+  proMonthlyAllowanceCredits     Int      @default(1000)
+  // OpenRouter cost represented by one credit, in millionths of a US dollar
+  // (integer, to avoid floating-point rounding): 5000 = $0.005 per credit.
+  openRouterUsdMicrosPerCredit   Int      @default(5000)
+  // Credits a makeup session may use beyond the remaining balance, so a
+  // session in progress is not cut off.
+  sessionOverageAllowanceCredits Int      @default(5)
+  createdAt                      DateTime @default(now())
+  updatedAt                      DateTime @updatedAt
+}

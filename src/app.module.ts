@@ -13,6 +13,7 @@ import { MakeupModule } from './makeup/makeup.module';
 import { DatabaseModule } from './common/modules/database.module';
 import { ProfileModule } from './profile/profile.module';
 import { SubscriptionModule } from './subscription/subscription.module';
+import { CreditModule } from './credit/credit.module';
 import { PrivacyModule } from './privacy/privacy.module';
 import { AccountDeletionModule } from './privacy/account-deletion/account-deletion.module';
 
@@ -41,6 +42,7 @@ import { AccountDeletionModule } from './privacy/account-deletion/account-deleti
     MakeupModule,
     ProfileModule,
     SubscriptionModule,
+    CreditModule,
     PrivacyModule,
     AccountDeletionModule,
   ],

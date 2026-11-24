@@ -18,6 +18,7 @@ The companion mobile application and detailed product specifications live in `..
 - `AiRun` audit records containing operation, provider, model, prompt version, latency, progress, result/error, and status
 - a provider-neutral AI gateway with OpenRouter live mode, multimodal private-image input, strict structured output, runtime validation, bounded retries, and deterministic mock mode
 - a single Pro subscription plan: admin-configured monthly/yearly pricing and free trial, one-time trial activation, date-based Pro access through `ProAccessGuard`, payment/lifecycle records protected by database rules, and Stripe checkout for the monthly and yearly options with webhook-verified activation, automatic renewals, failed-payment handling and recovery, cancellation at period end, and refunds made in Stripe with immediate access revocation (see "Subscriptions" and "Stripe checkout" under API); requesting refunds from MuseCue and disputes are not implemented yet
+- AI credit settings (configuration only): administrators read and change the free-trial credit allowance, the Pro monthly credit allowance, the OpenRouter cost per credit and the per-session overage allowance, persisted in PostgreSQL and audited (see "AI credit settings" under API); credit balances and charging AI usage against them are not implemented yet
 - personal data export: an authenticated user can request an asynchronous ZIP archive of their own account, profile, makeup history, subscription records and private photos, poll its status, and download it through a signed link valid for at most 15 minutes; archives expire 24 hours after export and are deleted by a scheduled retention sweep (see "Personal data export" under API)
 - account deletion: the owner confirms their identity (password and an emailed code, or the code alone for accounts without a password), the account is blocked and every token invalidated at once (`PENDING_DELETION`), and a background sweep hard-deletes the account and all its data and files (including its refresh sessions, one-time codes and queued or retained background jobs), keeping payment records detached (see "Account deletion" under API)
 
@@ -29,7 +30,7 @@ Intentionally deferred:
 - copying images stored on the filesystem before the Supabase migration into the bucket (they remain readable through the `local` provider while its directory is present)
 - additional S3-compatible storage providers (the provider interface is in place; see "Private image storage")
 - generated preview images (recommendation reasoning is live, while the existing curated preview-image contract remains in place)
-- production retention/deletion automation and AI cost accounting
+- production retention/deletion automation and AI cost accounting (credit balances, granting allowances and charging AI runs; only the credit settings exist)
 
 ## Requirements and setup
 
@@ -934,7 +935,7 @@ Migration `20261113120000_add_stripe_checkout` adds `PaymentCustomer` and `Check
 
 Not implemented yet: immediate cancellation (including canceling a past-due subscription to stop Stripe's retries), undoing a cancellation (a cancellation reversed in Stripe is not reflected), the customer portal (so users cannot update their card in-app; Stripe's own emails and hosted invoice page can be used), exposing the past-due state in `GET /v1/subscription`, requesting refunds from MuseCue, disputes (`charge.dispute.*`), canceling the Stripe subscription automatically when a payment is refunded, revoking an active free trial on refund (a trial is not a payment and keeps running), reactions to other `customer.subscription.updated` changes (e.g. `unpaid`), and automatic refunds or cancellation of duplicate payments and subscriptions. Renewal delays within Stripe's retry window (up to 3 days) are handled. If a renewal for an older period arrives after a newer one, the older period is recorded but cannot be merged into the term: the database allows one payment per term change.
 
-Database tests (`test/auth-state.e2e-spec.ts`, `test/postgres-job-queue.e2e-spec.ts`, `test/postgres-mode.e2e-spec.ts`, `test/rate-limit-contract.e2e-spec.ts` (PostgreSQL part), `test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`, `test/privacy-export.e2e-spec.ts`, `test/account-deletion.e2e-spec.ts`, `test/account-erasure.e2e-spec.ts`, `test/stripe-checkout.e2e-spec.ts`, `test/stripe-renewal.e2e-spec.ts`, `test/stripe-payment-failure.e2e-spec.ts`, `test/stripe-cancellation.e2e-spec.ts`, `test/stripe-refund.e2e-spec.ts`, `test/subscription-billing.e2e-spec.ts`, `test/stripe-webhook-reliability.e2e-spec.ts`, `test/stripe-payment-lifecycle.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
+Database tests (`test/auth-state.e2e-spec.ts`, `test/postgres-job-queue.e2e-spec.ts`, `test/postgres-mode.e2e-spec.ts`, `test/rate-limit-contract.e2e-spec.ts` (PostgreSQL part), `test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`, `test/privacy-export.e2e-spec.ts`, `test/account-deletion.e2e-spec.ts`, `test/account-erasure.e2e-spec.ts`, `test/stripe-checkout.e2e-spec.ts`, `test/stripe-renewal.e2e-spec.ts`, `test/stripe-payment-failure.e2e-spec.ts`, `test/stripe-cancellation.e2e-spec.ts`, `test/stripe-refund.e2e-spec.ts`, `test/subscription-billing.e2e-spec.ts`, `test/stripe-webhook-reliability.e2e-spec.ts`, `test/stripe-payment-lifecycle.e2e-spec.ts`, `test/credit-settings.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
 
 ```bash
 TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json test/subscription-plan test/user-subscription test/subscription-trial test/subscription-status test/pro-access test/trial-lifecycle test/billing test/subscription-security test/privacy-export test/account-deletion test/account-erasure
@@ -959,6 +960,50 @@ npm test -- --runInBand stripe   # or: npm run test:stripe
 npm test -- --runInBand subscription-billing
 ```
 
+
+### AI credit settings
+
+Configuration for the upcoming AI credit system. Only the settings exist so far: nothing grants, tracks or charges credits yet. Future balance and charging code should import `CreditModule` and read the values through `CreditSettingsService.getSettings()` (it accepts a transaction client).
+
+Both routes require a bearer token for an `ADMIN` or `SUPERADMIN` account, exactly like the subscription plan routes. Requests without a valid, current access token receive `401`; other roles (`USER`, `MODERATOR`) receive `403` for reading as well as changing.
+
+| Method  | Route                        | Purpose                                |
+| ------- | ---------------------------- | -------------------------------------- |
+| `GET`   | `/v1/admin/credit-settings`  | Read the credit configuration          |
+| `PATCH` | `/v1/admin/credit-settings`  | Change any subset of the configuration |
+
+The settings are a single row in the `CreditSettings` table (migration `20261122120000_add_credit_settings`), so they survive restarts. Before an administrator saves anything, no row exists and the API serves these defaults (the column defaults are the same):
+
+| Field                            | Type    | Default          | Accepted values                                   |
+| -------------------------------- | ------- | ---------------- | ------------------------------------------------- |
+| `trialAllowanceCredits`          | integer | `50`             | `0`–`1000000` credits, granted once with the trial |
+| `proMonthlyAllowanceCredits`     | integer | `1000`           | `0`–`1000000` credits per monthly Pro period       |
+| `openRouterUsdMicrosPerCredit`   | integer | `5000` ($0.005)  | `1`–`1000000` millionths of a US dollar ($0.000001–$1.00) per credit |
+| `sessionOverageAllowanceCredits` | integer | `5`              | `0`–`10000` credits a session may use beyond the balance |
+
+The OpenRouter cost per credit is stored as whole micro-dollars (millionths of a dollar) to avoid floating-point rounding, because $0.005 is less than a cent; send `5000`, not `0.005`. Responses also include `openRouterUsdPerCredit`, a read-only decimal string of the same value (`"0.005"`), and `updatedAt` (`null` until the first save).
+
+`PATCH` accepts any subset of the four editable fields; omitted fields are unchanged. Negative values, a zero cost per credit, values above the limits, fractional numbers, numeric strings, `null`, booleans, objects, empty bodies, and unknown or read-only fields (including `openRouterUsdPerCredit` and `updatedAt`) are rejected with `400`, and the request changes nothing: if any field is invalid, none is written. CHECK constraints in PostgreSQL also reject negative allowances, a non-positive cost per credit, and a second configuration row, whatever the write path. Every change is recorded in `ActivityLogEvent` (table `CreditSettings`, old value, new value, administrator ID) in the same transaction as the settings update.
+
+```json
+{
+  "trialAllowanceCredits": 50,
+  "proMonthlyAllowanceCredits": 1000,
+  "openRouterUsdMicrosPerCredit": 5000,
+  "openRouterUsdPerCredit": "0.005",
+  "sessionOverageAllowanceCredits": 5,
+  "updatedAt": null
+}
+```
+
+Tests:
+
+```bash
+# Unit and HTTP tests (no database needed)
+npm test -- --runInBand credit
+# End to end against PostgreSQL (real HTTP routes, guards and validation; skipped without TEST_DATABASE_URL)
+TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json --runInBand test/credit-settings
+```
 
 ## Domain
 
