@@ -124,20 +124,21 @@ export class MfaVerificationService {
   }
 
   /**
-   * Replaces the recovery codes with a new set of 10, after verifying the
-   * account's second factor (a recovery code used for this is consumed). The
-   * new codes are returned only in this response; every earlier code stops
-   * working in the same transaction.
+   * Replaces the recovery codes with a new set of 10. The caller must hold a
+   * step-up approval (MFA_RECOVERY_CODES) - for an MFA account that means an
+   * authenticator or recovery code was just verified. The new codes are
+   * returned only in this response; every earlier code stops working in the
+   * same transaction.
    */
   async regenerateRecoveryCodes(
     authId: string,
-    factor: MfaFactor,
     meta: ActivityLogMetadata,
     now: Date = new Date(),
   ): Promise<MfaRecoveryCodesView> {
     const outcome = await this.locked(authId, async (locked) => {
-      const verified = await this.checkFactor(locked, factor, now, meta);
-      if (!verified.ok) return verified;
+      if (!locked.credentials.mfaEnabled) {
+        return refuse({ kind: 'NOT_ENABLED' });
+      }
       const before = await locked.recoverySummary();
       const issued = this.recoveryCodes.issue(authId);
       await locked.replaceRecoveryCodes(issued.hashes, now);
@@ -148,7 +149,6 @@ export class MfaVerificationService {
           recoveryCodes: issued.codes,
           generatedAt: now,
           remainingRecoveryCodes: issued.codes.length,
-          verifiedWith: verified.value,
         },
       };
     });

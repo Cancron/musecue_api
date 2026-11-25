@@ -1,3 +1,4 @@
+import { StepUpRepository } from './step-up/step-up.repository';
 import { Test, TestingModule } from '@nestjs/testing';
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
@@ -51,6 +52,11 @@ describe('AuthController', () => {
         {
           provide: AuthUtilsService,
           useValue: mockAuthUtilsService,
+        },
+        {
+          // No step-up re-authentication in progress.
+          provide: StepUpRepository,
+          useValue: { peekChallenge: () => Promise.resolve(null) },
         },
         {
           provide: GoogleOAuthService,

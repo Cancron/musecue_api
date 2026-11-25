@@ -1,3 +1,5 @@
+import { StepUpGuard } from '../../src/auth/step-up/step-up.guard';
+import { STEP_UP_APPROVED } from './step-up-approved';
 import {
   Global,
   INestApplication,
@@ -168,6 +170,10 @@ async function boot(
     .useValue(settings)
     .overrideProvider(STRIPE_CLIENT)
     .useValue(stripeClient)
+    // These users hold minted tokens without a sign-in session; step-up is
+    // covered by test/mfa-step-up.e2e-spec.ts.
+    .overrideGuard(StepUpGuard)
+    .useValue(STEP_UP_APPROVED)
     .compile();
   // Same option as main.ts: keeps the raw body for webhook signatures.
   const app = moduleRef.createNestApplication<INestApplication<App>>({

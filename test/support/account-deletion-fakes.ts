@@ -117,10 +117,12 @@ export class FakeRefreshSessions {
     tokenId: string,
     tokenHash = 'hash',
     expiresAt = new Date(Date.now() + 7 * 24 * 3600_000),
+    sessionId: string = randomUUID(),
   ): void {
     this.sessions.set(tokenId, {
       id: randomUUID(),
       authId,
+      sessionId,
       tokenId,
       tokenHash,
       expiresAt,
@@ -181,6 +183,7 @@ export class FakeRefreshSessions {
           session.tokenId,
           session.tokenHash,
           session.expiresAt,
+          session.sessionId,
         );
         const keep = maxDevicesOverride ?? maxDevices;
         const surplus = this.activeOf(session.authId)
@@ -193,7 +196,7 @@ export class FakeRefreshSessions {
         Promise.resolve(this.sessions.get(tokenId) ?? null),
       rotate: async (
         current: { authId: string; tokenId: string; tokenHash: string },
-        next: NewRefreshSession,
+        next: Omit<NewRefreshSession, 'sessionId'>,
       ) => {
         await this.guard();
         const session = this.sessions.get(current.tokenId);
@@ -208,7 +211,14 @@ export class FakeRefreshSessions {
         }
         session.revokedAt = new Date();
         session.revokedReason = 'ROTATED';
-        this.add(next.authId, next.tokenId, next.tokenHash, next.expiresAt);
+        // The replacement keeps the sign-in session.
+        this.add(
+          next.authId,
+          next.tokenId,
+          next.tokenHash,
+          next.expiresAt,
+          session.sessionId,
+        );
         this.sessions.get(next.tokenId)!.rotatedFromId = session.id;
         return true;
       },
@@ -227,6 +237,16 @@ export class FakeRefreshSessions {
         await this.guard();
         return this.revokeWhere((session) => session.authId === authId, reason);
       },
+      isSessionActive: (authId: string, sessionId: string) =>
+        Promise.resolve(
+          [...this.sessions.values()].some(
+            (session) =>
+              session.authId === authId &&
+              session.sessionId === sessionId &&
+              !session.revokedAt &&
+              session.expiresAt.getTime() > Date.now(),
+          ),
+        ),
       deleteExpired: () => Promise.resolve(0),
     };
     return repository as unknown as RefreshSessionRepository;

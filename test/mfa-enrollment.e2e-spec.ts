@@ -16,6 +16,7 @@ import {
   type TestApplication,
 } from './support/infrastructure-flows';
 import { describeWithDatabase } from './support/migrated-schema';
+import { STEP_UP_HEADER, stepUp } from './support/step-up';
 
 jest.setTimeout(120_000);
 
@@ -64,6 +65,8 @@ interface User {
   email: string;
   ip: string;
   accessToken: string;
+  /** Step-up approval for MFA_SETTINGS (enrolling needs one). */
+  approval: string;
 }
 
 const data = <T>(response: { body: unknown }) =>
@@ -140,7 +143,7 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
       30_000,
       'the welcome email',
     );
-    const user = { email, ip, id: '', accessToken: '' };
+    const user = { email, ip, id: '', accessToken: '', approval: '' };
     await signIn(user);
     return user;
   }
@@ -156,6 +159,20 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
     );
     user.id = login.user.id;
     user.accessToken = login.accessToken;
+    // A new session needs its own approval.
+    await renewApproval(user);
+  }
+
+  /** A step-up approval (10 minutes) to change MFA settings, with the password. */
+  async function renewApproval(user: User): Promise<void> {
+    user.approval = await stepUp(
+      ctx.app.getHttpServer(),
+      user,
+      'MFA_SETTINGS',
+      {
+        password: PASSWORD,
+      },
+    );
   }
 
   const asUser = (user: User) => ({
@@ -168,7 +185,8 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
       const req = http()
         .post('/v1/auth/mfa/enrollment')
         .set('X-Forwarded-For', user.ip)
-        .set('Authorization', `Bearer ${user.accessToken}`);
+        .set('Authorization', `Bearer ${user.accessToken}`)
+        .set(STEP_UP_HEADER, user.approval);
       return body ? req.send(body) : req;
     },
     confirm: (body: object) =>
@@ -176,6 +194,7 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
         .post('/v1/auth/mfa/enrollment/confirm')
         .set('X-Forwarded-For', user.ip)
         .set('Authorization', `Bearer ${user.accessToken}`)
+        .set(STEP_UP_HEADER, user.approval)
         .send(body),
   });
 
@@ -396,6 +415,8 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
 
     // 10 minutes later the enrollment no longer accepts even a valid code.
     travel(10 * MINUTE);
+    // (The step-up approval also lasts 10 minutes: get a new one.)
+    await renewApproval(user);
     expect(
       message(
         await api
@@ -478,6 +499,7 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
     expect((await security(user.id)).mfaEnabled).toBe(false);
 
     travel(14 * MINUTE);
+    await renewApproval(user);
     await api.start().expect(429);
 
     // Once the block is over, a new enrollment can be completed.

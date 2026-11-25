@@ -12,6 +12,11 @@ export class LoginInProgressError extends Error {
 
 export interface NewRefreshSession {
   authId: string;
+  /**
+   * The sign-in's session ID (new at login; a rotation always keeps the
+   * presented session's ID, whatever is passed).
+   */
+  sessionId: string;
   /** The refresh token's JWT ID. */
   tokenId: string;
   /** SHA-256 (hex) of the refresh token. */
@@ -25,6 +30,7 @@ export interface NewRefreshSession {
 export interface StoredRefreshSession {
   id: string;
   authId: string;
+  sessionId: string;
   tokenHash: string;
   expiresAt: Date;
   revokedAt: Date | null;
@@ -77,11 +83,24 @@ export class RefreshSessionRepository {
       select: {
         id: true,
         authId: true,
+        sessionId: true,
         tokenHash: true,
         expiresAt: true,
         revokedAt: true,
       },
     });
+  }
+
+  /** Whether the sign-in `sessionId` of the user is still signed in. */
+  async isSessionActive(
+    authId: string,
+    sessionId: string,
+    now: Date = new Date(),
+  ): Promise<boolean> {
+    const active = await this.prisma.refreshSession.count({
+      where: { authId, sessionId, revokedAt: null, expiresAt: { gt: now } },
+    });
+    return active > 0;
   }
 
   /**
@@ -92,14 +111,14 @@ export class RefreshSessionRepository {
    */
   async rotate(
     current: { authId: string; tokenId: string; tokenHash: string },
-    next: NewRefreshSession,
+    next: Omit<NewRefreshSession, 'sessionId'>,
     now: Date = new Date(),
   ): Promise<boolean> {
     return this.prisma.$transaction(async (tx) => {
       await this.lockSessions(tx, current.authId);
       const session = await tx.refreshSession.findUnique({
         where: { tokenId: current.tokenId },
-        select: { id: true, authId: true, tokenHash: true },
+        select: { id: true, authId: true, tokenHash: true, sessionId: true },
       });
       if (
         !session ||
@@ -115,8 +134,14 @@ export class RefreshSessionRepository {
         data: { revokedAt: now, revokedReason: 'ROTATED' },
       });
       if (revoked.count !== 1) return false;
+      // The replacement stays in the same sign-in session.
       await tx.refreshSession.create({
-        data: { ...next, rotatedFromId: session.id, createdAt: now },
+        data: {
+          ...next,
+          sessionId: session.sessionId,
+          rotatedFromId: session.id,
+          createdAt: now,
+        },
       });
       return true;
     });

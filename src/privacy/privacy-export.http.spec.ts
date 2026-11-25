@@ -1,3 +1,5 @@
+import { StepUpGuard } from '../auth/step-up/step-up.guard';
+import { STEP_UP_APPROVED } from '../../test/support/step-up-approved';
 import {
   Global,
   INestApplication,
@@ -108,7 +110,10 @@ describe('Privacy export endpoints (HTTP)', () => {
         },
         { provide: PrivacyExportStorageService, useValue: storage },
       ],
-    }).compile();
+    })
+      .overrideGuard(StepUpGuard)
+      .useValue(STEP_UP_APPROVED)
+      .compile();
     app = moduleRef.createNestApplication();
     const logger = mock<Logger>();
     app.useGlobalFilters(new AllExceptionsFilter(logger));

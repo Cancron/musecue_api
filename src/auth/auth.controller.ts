@@ -35,6 +35,8 @@ import {
 } from './dto/verify-email.dto';
 import { CompleteMfaChallengeDto, factorOf } from './mfa/mfa.dto';
 import { trustedDeviceTokenOf } from './mfa/trusted-device-header';
+import { StepUpRepository } from './step-up/step-up.repository';
+import { createHash } from 'node:crypto';
 
 interface AuthenticatedRequest extends Request {
   user: {
@@ -51,6 +53,7 @@ export class AuthController {
     private readonly authService: AuthService,
     private readonly googleOAuthService: GoogleOAuthService,
     private readonly customLogger: CustomLoggerService,
+    private readonly stepUps: StepUpRepository,
   ) {}
 
   // Strict rate limit for registration: 5 requests per 15 minutes
@@ -188,6 +191,27 @@ export class AuthController {
         success: false,
         error: 'missing_parameters',
         message: 'Missing authorization code or state parameter',
+      };
+    }
+
+    // A step-up re-authentication (not a sign-in): forward Google's code and
+    // state to the app, which completes it with its own session
+    // (POST /v1/auth/step-up/google/callback). Nothing is consumed here.
+    const stepUp = await this.stepUps.peekChallenge(
+      createHash('sha256').update(state, 'utf8').digest('hex'),
+    );
+    if (stepUp) {
+      if (stepUp.redirectUrl) {
+        const target = new URL(stepUp.redirectUrl);
+        target.searchParams.set('step_up_code', code);
+        target.searchParams.set('step_up_state', state);
+        return res.redirect(target.toString());
+      }
+      return {
+        success: true,
+        message:
+          'Complete the re-authentication with POST /v1/auth/step-up/google/callback',
+        data: { stepUp: true, code, state },
       };
     }
 

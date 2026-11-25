@@ -1,3 +1,5 @@
+import { StepUpGuard } from '../step-up/step-up.guard';
+import { STEP_UP_APPROVED } from '../../../test/support/step-up-approved';
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Test } from '@nestjs/testing';
@@ -113,7 +115,10 @@ describe('MFA enrollment routes (mfa, HTTP)', () => {
         { provide: TokenVersionCache, useClass: NoopTokenVersionCache },
         { provide: WINSTON_MODULE_PROVIDER, useValue: mock<Logger>() },
       ],
-    }).compile();
+    })
+      .overrideGuard(StepUpGuard)
+      .useValue(STEP_UP_APPROVED)
+      .compile();
     app = moduleRef.createNestApplication();
     const logger = mock<Logger>();
     app.useGlobalFilters(new AllExceptionsFilter(logger));
@@ -371,22 +376,17 @@ describe('MFA enrollment routes (mfa, HTTP)', () => {
       expect(messageOf(reused)).toBe('Invalid or expired authentication code');
     });
 
-    it('regenerates with a second factor, returning the new codes once', async () => {
+    it('regenerates (behind step-up), returning the new codes once', async () => {
       const { auth, codes } = await enabled();
-      const response = await regenerate(auth, {
-        recoveryCode: codes[0],
-      }).expect(201);
+      const response = await regenerate(auth, {}).expect(201);
       expect(response.headers['cache-control']).toBe('no-store');
       const fresh = dataOf<MfaRecoveryCodesView>(response);
-      expect(fresh).toMatchObject({
-        remainingRecoveryCodes: 10,
-        verifiedWith: 'recovery_code',
-      });
+      expect(fresh).toMatchObject({ remainingRecoveryCodes: 10 });
       expect(fresh.recoveryCodes).toHaveLength(10);
       await verify(auth, { recoveryCode: codes[1] }).expect(400);
       await verify(auth, { recoveryCode: fresh.recoveryCodes[1] }).expect(200);
-      // Regeneration always needs a factor.
-      await regenerate(auth, {}).expect(400);
+      // The step-up approval is the proof: a factor in the body is refused.
+      await regenerate(auth, { recoveryCode: codes[2] }).expect(400);
     });
 
     it.each([
@@ -421,9 +421,8 @@ describe('MFA enrollment routes (mfa, HTTP)', () => {
         userId: owner.user.account.authId,
       }).expect(400);
       expect(messageOf(named)).toContain('userId should not exist');
-      await regenerate(intruder.auth, {
-        recoveryCode: owner.codes[0],
-      }).expect(400);
+      // Regenerating only ever replaces the caller's own codes.
+      await regenerate(intruder.auth, {}).expect(201);
       expect(
         store
           .get(owner.user.account.authId)

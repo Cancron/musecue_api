@@ -1,3 +1,5 @@
+import { StepUpGuard } from '../../auth/step-up/step-up.guard';
+import { STEP_UP_APPROVED } from '../../../test/support/step-up-approved';
 import {
   Controller,
   Get,
@@ -192,7 +194,10 @@ describe('Account deletion requests (HTTP)', () => {
           useValue: new ConfigService({ NODE_ENV: 'test' }),
         },
       ],
-    }).compile();
+    })
+      .overrideGuard(StepUpGuard)
+      .useValue(STEP_UP_APPROVED)
+      .compile();
     app = moduleRef.createNestApplication();
     const logger = mock<Logger>();
     app.useGlobalFilters(new AllExceptionsFilter(logger));

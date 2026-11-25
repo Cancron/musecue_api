@@ -9,11 +9,14 @@ import { MfaLoginService } from './mfa-login.service';
 import { MfaRecoveryCodeHasher } from './mfa-recovery-code.hasher';
 import { MfaVerificationService } from './mfa-verification.service';
 import { MfaSecretCipher } from './mfa-secret.cipher';
+import { StepUpCoreModule } from '../step-up/step-up-core.module';
 import { MfaController } from './mfa.controller';
 import { MfaService } from './mfa.service';
 
 /** Optional authenticator-app (TOTP) MFA with recovery codes; state lives in PostgreSQL in both infrastructure modes. */
 @Module({
+  // Sensitive MFA changes require a step-up approval.
+  imports: [StepUpCoreModule],
   controllers: [MfaController],
   providers: [
     MfaService,

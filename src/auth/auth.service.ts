@@ -20,7 +20,7 @@ import {
 } from './mfa/mfa-login.service';
 import type { MfaFactor } from './mfa/mfa-verification.service';
 import { AuthChallengeRepository } from './state/auth-challenge.repository';
-import { storeLoginSession } from './state/login-session';
+import { newSessionId, storeLoginSession } from './state/login-session';
 import {
   RefreshSessionRepository,
   type StoredRefreshSession,
@@ -699,12 +699,15 @@ export class AuthService {
 
     // Generate JTI FIRST (cryptographically secure)
     const jti: string = this.authUtilsService.generateSecureId();
+    // The new sign-in's session, kept by every refresh-token rotation.
+    const sessionId = newSessionId();
 
     // Create access token (stateless, minimal payload - no email)
     const accessToken: string = this.authUtilsService.createAccessToken({
       userId: user.id,
       role: user.role as unknown as UserRole,
       tokenVersion: user.tokenVersion, // Include tokenVersion for hybrid JWT validation
+      sid: sessionId,
     });
 
     // Create refresh token with JTI embedded
@@ -724,6 +727,7 @@ export class AuthService {
       jti,
       refreshToken,
       { ip, userAgent, device },
+      sessionId,
     );
 
     // NON-CRITICAL: login history (fire-and-forget)
@@ -832,6 +836,8 @@ export class AuthService {
       userId: user.id,
       role: user.role as unknown as UserRole,
       tokenVersion: user.tokenVersion, // Include tokenVersion for hybrid JWT validation
+      // Same sign-in session: the rotation keeps the session ID.
+      sid: storedData.sessionId,
     });
 
     const newRefreshToken: string = this.authUtilsService.createRefreshToken(

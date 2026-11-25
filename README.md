@@ -20,6 +20,7 @@ The companion mobile application and detailed product specifications live in `..
 - a single Pro subscription plan: admin-configured monthly/yearly pricing and free trial, one-time trial activation, date-based Pro access through `ProAccessGuard`, payment/lifecycle records protected by database rules, and Stripe checkout for the monthly and yearly options with webhook-verified activation, automatic renewals, failed-payment handling and recovery, cancellation at period end, and refunds made in Stripe with immediate access revocation (see "Subscriptions" and "Stripe checkout" under API); requesting refunds from MuseCue and disputes are not implemented yet
 - personal data export: an authenticated user can request an asynchronous ZIP archive of their own account, profile, makeup history, subscription records and private photos, poll its status, and download it through a signed link valid for at most 15 minutes; archives expire 24 hours after export and are deleted by a scheduled retention sweep (see "Personal data export" under API)
 - optional multi-factor authentication with an authenticator app (TOTP): the signed-in owner starts an enrollment, confirms it within 10 minutes with a current 6-digit code, and can check whether MFA is enabled; the secret is stored only encrypted, and 5 incorrect codes within 15 minutes block enrollment for 15 minutes. Enabling MFA issues 10 one-time recovery codes (shown once, stored as keyed hashes) that can replace the authenticator for an MFA verification, and can be regenerated. Password and Google sign-in of an MFA-enabled account return an MFA challenge instead of tokens, completed with an authenticator or recovery code; the device can then be trusted for 30 days, and trusted devices can be listed and revoked (see "Multi-factor authentication (MFA)" and "MFA at sign-in" under API)
+- step-up authentication for sensitive actions (changing MFA settings and trusted devices, regenerating recovery codes, cancelling the subscription, exporting and downloading personal data, deleting the account): a fresh confirmation - MFA code or recovery code, else the current password, else a one-time Google re-authentication - gives a 10-minute approval bound to the user, sign-in session and action; requests without one get `403` and change nothing, also on trusted devices (see "Step-up authentication" under API)
 - account deletion: the owner confirms their identity (password and an emailed code, or the code alone for accounts without a password), the account is blocked and every token invalidated at once (`PENDING_DELETION`), and a background sweep hard-deletes the account and all its data and files (including its refresh sessions, one-time codes and queued or retained background jobs), keeping payment records detached (see "Account deletion" under API)
 
 Migration `20260827174107_add_makeup_workflow` adds the makeup aggregate and removes the dormant job-tracker and subscription starter domains.
@@ -559,9 +560,13 @@ MFA routes act on the bearer token's own account (see "Multi-factor authenticati
 | `POST` | `/v1/auth/mfa/enrollment`         | Start (or restart) an enrollment: new authenticator secret |
 | `POST` | `/v1/auth/mfa/enrollment/confirm` | Confirm with the current 6-digit code and enable MFA; returns the recovery codes once |
 | `POST` | `/v1/auth/mfa/verify`             | Verify the second factor: authenticator code or recovery code |
-| `POST` | `/v1/auth/mfa/recovery-codes`     | Replace all recovery codes (needs a second factor); returns the new codes once |
+| `POST` | `/v1/auth/mfa/recovery-codes`     | Replace all recovery codes (step-up); returns the new codes once |
 | `GET`  | `/v1/auth/mfa/trusted-devices`    | List the user's trusted devices (never their tokens)      |
-| `DELETE` | `/v1/auth/mfa/trusted-devices/:deviceId` | Revoke one of the user's trusted devices          |
+| `DELETE` | `/v1/auth/mfa/trusted-devices/:deviceId` | Revoke one of the user's trusted devices (step-up) |
+| `GET`  | `/v1/auth/step-up`                | How this account confirms sensitive actions (`mfa`, `password`, `google`) |
+| `POST` | `/v1/auth/step-up`                | Step-up approval with an MFA code, recovery code or password |
+| `POST` | `/v1/auth/step-up/google`         | Start a Google re-authentication (no password, no MFA)  |
+| `POST` | `/v1/auth/step-up/google/callback` | Complete it with Google's `code` and `state`            |
 
 Makeup routes require a bearer token:
 
@@ -756,12 +761,13 @@ authenticator's current code) or `{ "recoveryCode": "7K3M-Q9TD-X2WB" }`
 - `409 MFA is not enabled for this account`; `503` when the MFA key is not
   usable.
 
-`POST /v1/auth/mfa/recovery-codes` (same body) verifies the second factor and
-replaces every recovery code with 10 new ones, returned in this `201` response
-only (`{ recoveryCodes, generatedAt, remainingRecoveryCodes, verifiedWith }`).
-All earlier codes, used or not, stop working in the same transaction. Only a
-valid second factor can regenerate codes, so a stolen access token alone
-cannot mint codes that bypass MFA. A recovery code used for this is consumed.
+`POST /v1/auth/mfa/recovery-codes` (no body) needs a step-up approval for
+`MFA_RECOVERY_CODES` - for an MFA account that means an authenticator or
+recovery code was just verified (see "Step-up authentication") - and replaces
+every recovery code with 10 new ones, returned in this `201` response only
+(`{ recoveryCodes, generatedAt, remainingRecoveryCodes }`). All earlier codes,
+used or not, stop working in the same transaction. A stolen access token alone
+therefore cannot mint codes that bypass MFA.
 
 Storage: `MfaRecoveryCode` rows hold only `codeHash`, an HMAC-SHA-256 of the
 user ID and the normalized code under a key derived (HKDF) from the MFA root
@@ -845,12 +851,81 @@ makes a revocation permanent and forbids extending the trust.
 `GET /v1/auth/mfa/trusted-devices` lists the signed-in user's devices, newest
 first, with `status` (`ACTIVE`, `EXPIRED`, `REVOKED`) and `current: true` for
 the device whose token the request sends. `DELETE
-/v1/auth/mfa/trusted-devices/:deviceId` revokes one (`200` with the device;
+/v1/auth/mfa/trusted-devices/:deviceId` (step-up approval for `MFA_SETTINGS`) revokes one (`200` with the device;
 repeating it is harmless; another user's or an unknown device answers `404`).
 Used and expired challenges and ended devices are deleted 30 days later by the
 hourly authentication-state sweep, and everything with the account on erasure.
 Existing sessions and refresh tokens are not affected by enabling MFA or by
 revoking a device.
+
+### Step-up authentication
+
+Sensitive actions need a fresh confirmation of the user's identity, on every
+device (trusted devices only skip the sign-in MFA step, never this):
+
+| Action                    | Protected routes |
+| ------------------------- | ---------------- |
+| `MFA_SETTINGS`            | `POST /v1/auth/mfa/enrollment`, `POST /v1/auth/mfa/enrollment/confirm`, `DELETE /v1/auth/mfa/trusted-devices/:deviceId` |
+| `MFA_RECOVERY_CODES`      | `POST /v1/auth/mfa/recovery-codes` |
+| `SUBSCRIPTION_CANCEL`     | `POST /v1/subscription/cancel` |
+| `PRIVACY_EXPORT`          | `POST /v1/privacy/exports` |
+| `PRIVACY_EXPORT_DOWNLOAD` | `GET /v1/privacy/exports/:exportId/download`, `GET /v1/privacy/exports/:exportId/archive` |
+| `ACCOUNT_DELETION`        | `POST /v1/privacy/account-deletion` (its emailed code and password are still required) |
+
+The protected request sends the approval as the `X-Step-Up-Token` header. A
+request without a valid one answers `403` (`Step-up authentication is
+required for this action (...)`) before anything is read or changed. An
+approval is valid for 10 minutes, for one action, and only for the user and
+sign-in session it was issued to, while that session is signed in: another
+user, another session of the same user (a new sign-in), another action, an
+expired approval, or an approval of a session that signed out are all refused.
+Within its 10 minutes it can be used for several requests of its action
+(for example starting and confirming an enrollment, or getting a link and
+downloading the archive). Refreshing the access token keeps the session.
+
+Sessions: every sign-in gets a session ID, kept by every refresh-token
+rotation (`RefreshSession.sessionId`) and carried in access tokens as `sid`.
+Access tokens issued before this change have no `sid` and must sign in again
+to obtain approvals (they expire within 15 minutes anyway).
+
+`GET /v1/auth/step-up` tells the app which factor the account uses:
+
+- `mfa` (MFA enabled): `POST /v1/auth/step-up` with `{ "action": "...",
+  "code": "123456" }` or `{ "action": "...", "recoveryCode": "..." }`. The
+  password is not accepted. Codes follow the MFA rules (a TOTP step once, a
+  recovery code once - consumed in the transaction that stores the approval,
+  so one code gives at most one approval; incorrect codes count toward the
+  MFA verification block).
+- `password` (no MFA): `{ "action": "...", "password": "..." }`. A wrong
+  password answers `403 Current password is incorrect` and counts toward the
+  account lockout (5 wrong passwords lock the account and sign it out); a
+  locked account gets `403`.
+- `google` (Google sign-in without password and MFA): Google
+  re-authentication, below.
+
+The response (`201`, `Cache-Control: no-store`) is
+`{ approvalToken, action, method, expiresAt }` (`method`: `TOTP`,
+`RECOVERY_CODE`, `PASSWORD` or `GOOGLE`). `StepUpApproval` stores only the
+token's SHA-256 with the user, session, action and expiry; CHECK constraints
+limit an approval to 10 minutes and a trigger forbids changing its binding.
+
+Google re-authentication:
+
+1. `POST /v1/auth/step-up/google` with `{ "action": "...", "redirectUrl":
+   "https://app.example.com/step-up" }` creates a one-time challenge for this
+   user, session and action (10 minutes; only the state's SHA-256 is stored,
+   the PKCE verifier encrypted) and returns `{ url, state, expiresAt }`. The
+   URL asks Google to show the account chooser (`prompt=select_account`,
+   `login_hint` = the account's email).
+2. Google redirects to the usual `GET /auth/google/callback`, which recognizes
+   the step-up state and forwards `step_up_code` and `step_up_state` to
+   `redirectUrl` without using anything (no tokens in that redirect).
+3. The app sends them, with its bearer token, to `POST
+   /v1/auth/step-up/google/callback` (`{ "code", "state" }`), which returns
+   the approval. The challenge is consumed by the first attempt, whatever the
+   outcome; unknown, repeated and expired challenges, a different user or
+   session than the one that started it, a Google account other than the
+   account's own (`sub`), and a code Google refuses are all answered `403`.
 
 ### Subscriptions
 
@@ -1072,7 +1147,7 @@ Cancellations do not add entries; they appear in the billing information.
 
 #### Cancellation at period end
 
-`POST /v1/subscription/cancel` (bearer token, no body) cancels the caller's own paid subscription at the end of its current period. The subscription is always the token user's: user or subscription IDs in the body or query are ignored, so nobody can cancel another user's subscription. Response (`200`):
+`POST /v1/subscription/cancel` (bearer token, `X-Step-Up-Token` approval for `SUBSCRIPTION_CANCEL` - see "Step-up authentication" - no body) cancels the caller's own paid subscription at the end of its current period. The subscription is always the token user's: user or subscription IDs in the body or query are ignored, so nobody can cancel another user's subscription. Response (`200`):
 
 ```json
 {
@@ -1244,7 +1319,8 @@ npx jest private-cloud   # private image storage unit tests
 npm test -- --runInBand mfa   # MFA unit tests (TOTP, encryption, enrollment rules, HTTP contract)
 TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json --runInBand test/mfa-enrollment   # MFA enrollment over HTTP on temporary PostgreSQL schemas
 TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json --runInBand test/mfa-recovery   # recovery codes: issuance, hashing, verification, concurrency, regeneration, no leaks
-TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json --runInBand test/mfa-login   # MFA at sign-in: challenges, tokens, trusted devices, revocation, ownership, key independence
+TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json --runInBand test/mfa-login   # MFA at sign-in: challenges, tokens, trusted devices on every sign-in path, revocation, ownership, key independence
+TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json --runInBand test/mfa-step-up   # step-up: 403 without approval, password/MFA/Google approvals, user/session/action binding, expiry
 TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json test/private-cloud   # storage workflows + cleanup ledger on PostgreSQL (mocked Supabase)
 npm run test:e2e
 npx prisma generate

@@ -78,6 +78,7 @@ describeWithDatabase('Authentication state (PostgreSQL)', () => {
     const tokenId = randomBytes(32).toString('hex');
     return {
       authId,
+      sessionId: randomUUID(),
       tokenId,
       tokenHash: createHash('sha256').update(`token-${tokenId}`).digest('hex'),
       ipAddress: '203.0.113.7',

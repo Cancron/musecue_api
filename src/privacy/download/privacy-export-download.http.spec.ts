@@ -1,3 +1,5 @@
+import { StepUpGuard } from '../../auth/step-up/step-up.guard';
+import { STEP_UP_APPROVED } from '../../../test/support/step-up-approved';
 import {
   Global,
   INestApplication,
@@ -158,7 +160,10 @@ describe('Privacy export downloads (HTTP, time-controlled)', () => {
           useValue: mock<PrivacyExportLifecycleService>(),
         },
       ],
-    }).compile();
+    })
+      .overrideGuard(StepUpGuard)
+      .useValue(STEP_UP_APPROVED)
+      .compile();
     app = moduleRef.createNestApplication();
     app.useGlobalFilters(new AllExceptionsFilter(filterLogger));
     app.useGlobalInterceptors(new TransformInterceptor(interceptorLogger));

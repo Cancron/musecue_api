@@ -9,6 +9,8 @@ import { WINSTON_MODULE_PROVIDER } from 'nest-winston';
 import type { Logger } from 'winston';
 import { MFA_LOGIN, MFA_RECOVERY_CODES } from '../mfa/mfa.constants';
 import { MfaLoginRepository } from '../mfa/mfa-login.repository';
+import { STEP_UP } from '../step-up/step-up.constants';
+import { StepUpRepository } from '../step-up/step-up.repository';
 import { MfaCredentialsRepository } from '../mfa/mfa-credentials.repository';
 import { MfaEnrollmentRepository } from '../mfa/mfa-enrollment.repository';
 import { AuthChallengeRepository } from './auth-challenge.repository';
@@ -20,8 +22,8 @@ export const AUTH_STATE_CLEANUP_INTERVAL_MS = 60 * 60_000;
 /**
  * Removes expired authentication state (refresh sessions, one-time codes,
  * OAuth states, finished MFA enrollments, and MFA recovery codes, sign-in
- * challenges and trusted devices that ended more than 30 days ago) every
- * hour. Expired rows never authenticate anything; the
+ * challenges and trusted devices that ended more than 30 days ago, step-up
+ * approvals and challenges that ended more than a day ago) every hour. Expired rows never authenticate anything; the
  * sweep only keeps the tables small.
  */
 @Injectable()
@@ -36,6 +38,7 @@ export class AuthStateCleanupService implements OnModuleInit, OnModuleDestroy {
     private readonly mfaEnrollments: MfaEnrollmentRepository,
     private readonly mfaCredentials: MfaCredentialsRepository,
     private readonly mfaLogin: MfaLoginRepository,
+    private readonly stepUps: StepUpRepository,
     private readonly config: ConfigService,
     @Inject(WINSTON_MODULE_PROVIDER) private readonly logger: Logger,
   ) {}
@@ -65,6 +68,9 @@ export class AuthStateCleanupService implements OnModuleInit, OnModuleDestroy {
       );
       await this.mfaLogin.deleteStale(
         new Date(now.getTime() - MFA_LOGIN.RETENTION_MS),
+      );
+      await this.stepUps.deleteStale(
+        new Date(now.getTime() - STEP_UP.RETENTION_MS),
       );
     } catch (error) {
       this.logger.warn('Expired authentication state could not be removed', {

@@ -27,6 +27,7 @@ import {
   IdempotencyKey,
   IdempotencyKeyPipe,
 } from './dto/privacy-export.dto';
+import { RequireStepUp } from '../auth/step-up/step-up.decorator';
 import { PrivacyExportService } from './privacy-export.service';
 
 interface AuthenticatedRequest extends Request {
@@ -50,6 +51,7 @@ export class PrivacyExportController {
    * export is returned instead of a new one.
    */
   @Post()
+  @RequireStepUp('PRIVACY_EXPORT')
   @HttpCode(HttpStatus.ACCEPTED)
   @Throttle({ default: THROTTLER_CONFIG.STRICT })
   @ApiHeader({
@@ -86,6 +88,7 @@ export class PrivacyExportController {
    * export. Pending or failed exports return 409, expired exports 410.
    */
   @Get(':exportId/download')
+  @RequireStepUp('PRIVACY_EXPORT_DOWNLOAD')
   @Header('Cache-Control', 'private, no-store')
   createDownloadLink(
     @Req() req: AuthenticatedRequest,
@@ -100,6 +103,7 @@ export class PrivacyExportController {
    * links 410.
    */
   @Get(':exportId/archive')
+  @RequireStepUp('PRIVACY_EXPORT_DOWNLOAD')
   async downloadArchive(
     @Req() req: AuthenticatedRequest,
     @Param('exportId', new ParseUUIDPipe()) exportId: string,

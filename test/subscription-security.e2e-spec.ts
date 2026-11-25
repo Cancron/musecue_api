@@ -1,3 +1,5 @@
+import { StepUpGuard } from '../src/auth/step-up/step-up.guard';
+import { STEP_UP_APPROVED } from './support/step-up-approved';
 import {
   Controller,
   Get,
@@ -135,7 +137,13 @@ describeWithDatabase('Subscription security (PostgreSQL, full stack)', () => {
     config.jwt_access_secret = 'subscription-security-e2e-secret';
     const moduleRef = await Test.createTestingModule({
       imports: [DatabaseTestModule, SubscriptionModule, ProFeatureTestModule],
-    }).compile();
+    })
+      // Minted tokens have no sign-in session. These tests check what the
+      // services do with client-supplied values once a request is allowed;
+      // step-up itself is covered by test/mfa-step-up.e2e-spec.ts.
+      .overrideGuard(StepUpGuard)
+      .useValue(STEP_UP_APPROVED)
+      .compile();
     app = moduleRef.createNestApplication();
     const logger = mock<Logger>();
     app.useGlobalFilters(new AllExceptionsFilter(logger));

@@ -12,11 +12,13 @@ import { AuthStateCleanupService } from './state/auth-state-cleanup.service';
 import { OAuthStateRepository } from './state/oauth-state.repository';
 import { RefreshSessionRepository } from './state/refresh-session.repository';
 import { MfaModule } from './mfa/mfa.module';
+import { StepUpCoreModule } from './step-up/step-up-core.module';
 
 @Module({
   // MfaModule: optional authenticator MFA (/v1/auth/mfa); its stale
   // enrollments are removed by AuthStateCleanupService.
-  imports: [QueueModule, MfaModule],
+  // StepUpCoreModule: the Google callback forwards step-up re-authentications.
+  imports: [QueueModule, MfaModule, StepUpCoreModule],
   controllers: [AuthController],
   providers: [
     AuthService,

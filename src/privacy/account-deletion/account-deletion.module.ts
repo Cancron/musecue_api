@@ -7,10 +7,12 @@ import { AccountDeletionCodeService } from './account-deletion-code.service';
 import { AccountDeletionRecoveryService } from './account-deletion-recovery.service';
 import { AccountDeletionController } from './account-deletion.controller';
 import { AccountDeletionService } from './account-deletion.service';
+import { StepUpCoreModule } from '../../auth/step-up/step-up-core.module';
 import { AccountErasureService } from './account-erasure.service';
 
 @Module({
-  imports: [AuthModule, QueueModule, StorageModule],
+  // Requesting the deletion requires a step-up approval.
+  imports: [AuthModule, QueueModule, StorageModule, StepUpCoreModule],
   controllers: [AccountDeletionController],
   providers: [
     AccountDeletionService,

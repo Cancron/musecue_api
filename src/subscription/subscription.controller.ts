@@ -20,6 +20,7 @@ import { StripeCancellationService } from './stripe/stripe-cancellation.service'
 import { StripeCheckoutService } from './stripe/stripe-checkout.service';
 import { SubscriptionAccessService } from './subscription-access.service';
 import { SubscriptionBillingService } from './subscription-billing.service';
+import { RequireStepUp } from '../auth/step-up/step-up.decorator';
 import { SubscriptionTrialService } from './subscription-trial.service';
 
 interface AuthenticatedRequest extends Request {
@@ -96,6 +97,7 @@ export class SubscriptionController {
    * the token user's. Repeating the request returns the same cancellation.
    */
   @Post('cancel')
+  @RequireStepUp('SUBSCRIPTION_CANCEL')
   @HttpCode(HttpStatus.OK)
   cancelSubscription(@Req() req: AuthenticatedRequest) {
     return this.cancellation.cancelAtPeriodEnd(

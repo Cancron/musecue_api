@@ -24,6 +24,7 @@ import {
   dropSchema,
   migrationNames,
 } from './migrated-schema';
+import { STEP_UP_HEADER, stepUp } from './step-up';
 
 /**
  * End-to-end flows through the complete application (AppModule, HTTP, the
@@ -160,6 +161,9 @@ export async function photo(shade = 120): Promise<Buffer> {
     .toBuffer();
 }
 
+/** The password of the users created by authenticationFlow. */
+export const FLOW_PASSWORD = 'correct horse battery staple';
+
 interface Envelope<T> {
   statusCode: number;
   message: string;
@@ -197,7 +201,7 @@ export async function authenticationFlow(
 ): Promise<SignedInUser> {
   const tag = randomBytes(5).toString('hex');
   const email = `user_${tag}@example.com`;
-  const password = 'correct horse battery staple';
+  const password = FLOW_PASSWORD;
   const ip = `198.51.100.${Math.floor(Math.random() * 250) + 1}`;
   const http = () => request(ctx.app.getHttpServer());
 
@@ -517,10 +521,25 @@ export async function privacyExportFlow(
   const auth = `Bearer ${user.accessToken}`;
   const http = () => request(ctx.app.getHttpServer());
 
+  // Exporting needs a step-up approval (the password, no MFA here).
+  await http()
+    .post('/v1/privacy/exports')
+    .set('Authorization', auth)
+    .expect(403);
+  expect(
+    await ctx.client.dataExport.count({ where: { authId: user.id } }),
+  ).toBe(0);
+  const exportApproval = await stepUp(
+    ctx.app.getHttpServer(),
+    user,
+    'PRIVACY_EXPORT',
+    { password: FLOW_PASSWORD },
+  );
   const requested = data<{ id: string; status: string }>(
     await http()
       .post('/v1/privacy/exports')
       .set('Authorization', auth)
+      .set(STEP_UP_HEADER, exportApproval)
       .set('Idempotency-Key', `export-${user.id}`)
       .expect(202),
   );
@@ -542,15 +561,30 @@ export async function privacyExportFlow(
   );
   expect(completed.sizeBytes).toBeGreaterThan(0);
 
+  // Downloading needs its own approval (another action).
+  await http()
+    .get(`/v1/privacy/exports/${requested.id}/download`)
+    .set('Authorization', auth)
+    .set(STEP_UP_HEADER, exportApproval)
+    .expect(403);
+  const downloadApproval = await stepUp(
+    ctx.app.getHttpServer(),
+    user,
+    'PRIVACY_EXPORT_DOWNLOAD',
+    { password: FLOW_PASSWORD },
+  );
   const link = data<{ url: string }>(
     await http()
       .get(`/v1/privacy/exports/${requested.id}/download`)
       .set('Authorization', auth)
+      .set(STEP_UP_HEADER, downloadApproval)
       .expect(200),
   );
+  await http().get(link.url).set('Authorization', auth).expect(403);
   const archive = await http()
     .get(link.url)
     .set('Authorization', auth)
+    .set(STEP_UP_HEADER, downloadApproval)
     .buffer(true)
     .parse((response, callback) => {
       const chunks: Buffer[] = [];
@@ -595,11 +629,28 @@ export async function accountDeletionFlow(
   });
   expect(challenge.codeHash).not.toContain(sent.code as string);
 
+  // Without a step-up approval nothing happens.
+  await http()
+    .post('/v1/privacy/account-deletion')
+    .set('Authorization', auth)
+    .send({ password: FLOW_PASSWORD, code: sent.code })
+    .expect(403);
+  expect(
+    (await ctx.client.authUser.findUniqueOrThrow({ where: { id: user.id } }))
+      .status,
+  ).toBe('ACTIVE');
+  const deletionApproval = await stepUp(
+    ctx.app.getHttpServer(),
+    user,
+    'ACCOUNT_DELETION',
+    { password: FLOW_PASSWORD },
+  );
   const accepted = data<{ status: string; sessionsRevoked: boolean }>(
     await http()
       .post('/v1/privacy/account-deletion')
       .set('Authorization', auth)
-      .send({ password: 'correct horse battery staple', code: sent.code })
+      .set(STEP_UP_HEADER, deletionApproval)
+      .send({ password: FLOW_PASSWORD, code: sent.code })
       .expect(202),
   );
   expect(accepted).toMatchObject({ status: 'PENDING', sessionsRevoked: true });

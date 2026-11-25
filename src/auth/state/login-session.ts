@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import AppError from '../../common/errors/app.error';
 import { AUTH_CONFIG } from '../config/auth.config';
 import type { AuthUtilsService } from '../services/auth-utils.service';
@@ -14,11 +15,14 @@ export function refreshTokenLifetimeMs(): number {
   return parseInt(match[1], 10) * unit * 1000;
 }
 
+/** A new sign-in's session ID (kept by every refresh-token rotation). */
+export const newSessionId = (): string => randomUUID();
+
 /**
- * Stores the refresh session of a new login (password or Google sign-in):
- * only the token's hash is kept, a concurrent login of the same user is
- * rejected (409), and the oldest sessions beyond the device limit are
- * revoked. Fails with 503 when the session cannot be stored.
+ * Stores the refresh session of a new login (password or Google sign-in)
+ * under `sessionId`: only the token's hash is kept, a concurrent login of the
+ * same user is rejected (409), and the oldest sessions beyond the device
+ * limit are revoked. Fails with 503 when the session cannot be stored.
  */
 export async function storeLoginSession(
   sessions: RefreshSessionRepository,
@@ -27,11 +31,13 @@ export async function storeLoginSession(
   jti: string,
   refreshToken: string,
   meta: { ip: string; userAgent: string; device?: string },
+  sessionId: string,
 ): Promise<void> {
   try {
     await sessions.createForLogin(
       {
         authId: userId,
+        sessionId,
         tokenId: jti,
         tokenHash: utils.hashToken(refreshToken),
         ipAddress: meta.ip,

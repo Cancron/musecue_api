@@ -6,7 +6,7 @@ import { CustomLoggerService } from '../../common/services/custom-logger.service
 import { PrismaService } from '../../common/services/prisma.service';
 import { ActivityLogService } from '../../common/services/activity-log.service';
 import { AuthUtilsService } from './auth-utils.service';
-import { storeLoginSession } from '../state/login-session';
+import { newSessionId, storeLoginSession } from '../state/login-session';
 import { OAuthStateRepository } from '../state/oauth-state.repository';
 import { RefreshSessionRepository } from '../state/refresh-session.repository';
 import {
@@ -334,11 +334,54 @@ export class GoogleOAuthService {
       throw AppError.badRequest('Invalid OAuth state');
     }
 
-    // Exchange code for tokens using PKCE
-    const tokenResponse = await this.exchangeCodeForTokens(
+    // Exchange the code (PKCE) and read the verified Google identity
+    const googleUser = await this.identityFromCode(
       code,
       stateData.codeVerifier,
     );
+
+    // Validate email is verified
+    if (!googleUser.email_verified) {
+      this.customLogger.warn(
+        `Google user email not verified: ${googleUser.email}`,
+        this.context,
+      );
+      throw AppError.forbidden(
+        'Please verify your Google email address before signing in.',
+      );
+    }
+
+    // Find or create user
+    const result = await this.findOrCreateUser(
+      googleUser,
+      { ip, userAgent, device },
+      trustedDeviceToken ?? stateData.trustedDeviceToken,
+    );
+
+    this.customLogger.log(
+      `Google OAuth ${result.isNewUser ? 'sign-up' : 'sign-in'} successful for: ${googleUser.email}`,
+      this.context,
+    );
+
+    // Include redirectUrl from state if it exists
+    return {
+      ...result,
+      redirectUrl: stateData.redirectUrl,
+    };
+  }
+
+  /**
+   * Exchanges an authorization code (with its PKCE verifier) and returns the
+   * Google identity: from the signature-verified ID token, or the userinfo
+   * endpoint when Google returns no ID token. Used by sign-in and by Google
+   * step-up re-authentication.
+   */
+  async identityFromCode(
+    code: string,
+    codeVerifier: string,
+  ): Promise<IGoogleUserInfo> {
+    // Exchange code for tokens using PKCE
+    const tokenResponse = await this.exchangeCodeForTokens(code, codeVerifier);
 
     // Extract user info from ID token with signature verification (most secure)
     let googleUser: IGoogleUserInfo | null = null;
@@ -373,34 +416,40 @@ export class GoogleOAuthService {
       googleUser = await this.getUserInfo(tokenResponse.access_token);
     }
 
-    // Validate email is verified
-    if (!googleUser.email_verified) {
-      this.customLogger.warn(
-        `Google user email not verified: ${googleUser.email}`,
-        this.context,
-      );
-      throw AppError.forbidden(
-        'Please verify your Google email address before signing in.',
-      );
-    }
+    return googleUser;
+  }
 
-    // Find or create user
-    const result = await this.findOrCreateUser(
-      googleUser,
-      { ip, userAgent, device },
-      trustedDeviceToken ?? stateData.trustedDeviceToken,
-    );
-
-    this.customLogger.log(
-      `Google OAuth ${result.isNewUser ? 'sign-up' : 'sign-in'} successful for: ${googleUser.email}`,
-      this.context,
-    );
-
-    // Include redirectUrl from state if it exists
+  /** A new PKCE pair (S256). */
+  createPkcePair(): { codeVerifier: string; codeChallenge: string } {
+    const codeVerifier = this.generateCodeVerifier();
     return {
-      ...result,
-      redirectUrl: stateData.redirectUrl,
+      codeVerifier,
+      codeChallenge: this.generateCodeChallenge(codeVerifier),
     };
+  }
+
+  /** The Google authorization URL for `state` and a PKCE challenge. */
+  buildAuthorizationUrl(params: {
+    state: string;
+    codeChallenge: string;
+    /** Pre-selects the expected account (step-up). */
+    loginHint?: string;
+    prompt?: string;
+  }): string {
+    const { clientId, redirectUri } = getGoogleOAuthCredentials();
+    const query = new URLSearchParams({
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      response_type: GOOGLE_OAUTH_CONFIG.RESPONSE_TYPE,
+      scope: GOOGLE_OAUTH_CONFIG.SCOPES.join(' '),
+      access_type: GOOGLE_OAUTH_CONFIG.ACCESS_TYPE,
+      prompt: params.prompt ?? GOOGLE_OAUTH_CONFIG.PROMPT,
+      state: params.state,
+      code_challenge: params.codeChallenge,
+      code_challenge_method: 'S256',
+    });
+    if (params.loginHint) query.set('login_hint', params.loginHint);
+    return `${GOOGLE_OAUTH_CONFIG.ENDPOINTS.AUTHORIZATION}?${query.toString()}`;
   }
 
   /**
@@ -597,12 +646,15 @@ export class GoogleOAuthService {
 
     // Generate JTI
     const jti = this.authUtilsService.generateSecureId();
+    // The new sign-in's session, kept by every refresh-token rotation.
+    const sessionId = newSessionId();
 
     // Create access token
     const accessToken = this.authUtilsService.createAccessToken({
       userId: user.id,
       role: user.role as unknown as UserRole,
       tokenVersion: user.tokenVersion, // Include tokenVersion for hybrid JWT validation
+      sid: sessionId,
     });
 
     // Create refresh token with JTI
@@ -620,6 +672,7 @@ export class GoogleOAuthService {
       jti,
       refreshToken,
       { ip, userAgent, device },
+      sessionId,
     );
 
     // Log login attempt (fire-and-forget)

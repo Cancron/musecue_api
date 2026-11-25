@@ -53,8 +53,6 @@ export interface MfaRecoveryCodesView {
   recoveryCodes: string[];
   generatedAt: Date;
   remainingRecoveryCodes: number;
-  /** The factor that authorized the regeneration. */
-  verifiedWith: MfaVerificationMethod;
 }
 
 /**

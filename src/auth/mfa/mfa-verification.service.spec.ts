@@ -237,12 +237,7 @@ describe('MfaVerificationService (mfa recovery codes)', () => {
     it('audits the use without the code and never logs a code', async () => {
       const { authId, codes } = await enabledUser();
       await verification.verify(authId, { recoveryCode: codes[0] }, META, T0);
-      await verification.regenerateRecoveryCodes(
-        authId,
-        { recoveryCode: codes[1] },
-        META,
-        T0,
-      );
+      await verification.regenerateRecoveryCodes(authId, META, T0);
       expect(activityLog.logActivity.mock.calls).toEqual(
         expect.arrayContaining([
           [
@@ -319,23 +314,22 @@ describe('MfaVerificationService (mfa recovery codes)', () => {
     });
   });
 
-  describe('regenerating recovery codes', () => {
-    it('replaces every earlier code after verifying the authenticator', async () => {
-      const { authId, secret, codes } = await enabledUser();
+  describe('regenerating recovery codes (behind a step-up approval)', () => {
+    it('replaces every earlier code, used or not, with 10 new ones', async () => {
+      const { authId, codes } = await enabledUser();
       await verification.verify(authId, { recoveryCode: codes[0] }, META, T0);
       const now = at(30_000);
 
       const fresh = await verification.regenerateRecoveryCodes(
         authId,
-        { code: codeAt(secret, now) },
         META,
         now,
       );
 
-      expect(fresh).toMatchObject({
+      expect(fresh).toEqual({
+        recoveryCodes: expect.any(Array) as unknown,
         generatedAt: now,
         remainingRecoveryCodes: 10,
-        verifiedWith: 'totp',
       });
       expect(fresh.recoveryCodes).toHaveLength(10);
       expect(fresh.recoveryCodes.some((c) => codes.includes(c))).toBe(false);
@@ -366,40 +360,49 @@ describe('MfaVerificationService (mfa recovery codes)', () => {
       ).resolves.toMatchObject({ remainingRecoveryCodes: 9 });
     });
 
-    it('can be authorized by a recovery code (which is consumed first)', async () => {
-      const { authId, codes } = await enabledUser();
-      const fresh = await verification.regenerateRecoveryCodes(
+    it('invalidates the previous new set on the next regeneration', async () => {
+      const { authId } = await enabledUser();
+      const first = await verification.regenerateRecoveryCodes(
         authId,
-        { recoveryCode: codes[0] },
         META,
         T0,
       );
-      expect(fresh.verifiedWith).toBe('recovery_code');
-      expect(
-        store
-          .get(authId)
-          .recoveryCodes.find(
-            (c) => c.codeHash === hasher.hash(authId, codes[0]),
-          ),
-      ).toMatchObject({ usedAt: T0, invalidatedAt: T0 });
-    });
-
-    it('regenerates nothing when the factor is wrong', async () => {
-      const { authId, codes } = await enabledUser();
+      const second = await verification.regenerateRecoveryCodes(
+        authId,
+        META,
+        at(MIN),
+      );
       expect(
         await rejection(
-          verification.regenerateRecoveryCodes(
+          verification.verify(
             authId,
-            { recoveryCode: 'ABCD-2345-WXYZ' },
+            { recoveryCode: first.recoveryCodes[0] },
             META,
-            T0,
+            at(MIN),
           ),
         ),
       ).toEqual(INVALID);
-      expect(store.get(authId).recoveryCodes).toHaveLength(10);
       await expect(
-        verification.verify(authId, { recoveryCode: codes[0] }, META, T0),
+        verification.verify(
+          authId,
+          { recoveryCode: second.recoveryCodes[0] },
+          META,
+          at(MIN),
+        ),
       ).resolves.toMatchObject({ verified: true });
+    });
+
+    it('refuses (409) and changes nothing while MFA is not enabled', async () => {
+      const user = store.addUser();
+      expect(
+        await rejection(
+          verification.regenerateRecoveryCodes(user.account.authId, META, T0),
+        ),
+      ).toEqual({
+        status: 409,
+        message: 'MFA is not enabled for this account',
+      });
+      expect(store.get(user.account.authId).recoveryCodes).toHaveLength(0);
     });
   });
 

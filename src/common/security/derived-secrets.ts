@@ -27,6 +27,8 @@ export const SECRET_PURPOSES = {
   // JWT_REFRESH_SECRET, so rotating the JWT secrets cannot break them.
   MFA_SECRET: 'musecue/mfa-totp-secret/v1',
   MFA_RECOVERY_CODE: 'musecue/mfa-recovery-code/v1',
+  // PKCE verifiers of Google step-up re-authentications (10 minutes).
+  STEP_UP_CHALLENGE: 'musecue/step-up-challenge/v1',
 } as const;
 
 export type SecretPurpose =

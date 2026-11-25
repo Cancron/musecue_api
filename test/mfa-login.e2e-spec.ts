@@ -12,6 +12,7 @@ import {
   type TestApplication,
 } from './support/infrastructure-flows';
 import { describeWithDatabase } from './support/migrated-schema';
+import { STEP_UP_HEADER, stepUp } from './support/step-up';
 
 jest.setTimeout(180_000);
 
@@ -226,13 +227,25 @@ describeWithDatabase('MFA at sign-in (e2e, PostgreSQL)', () => {
 
   const bearer = (token: string) => `Bearer ${token}`;
 
-  /** Enables MFA for a signed-in user (the clock must be frozen). */
-  async function enableMfa<T extends User>(user: T): Promise<T & MfaUser> {
+  /**
+   * Enables MFA for a signed-in user (the clock must be frozen). Enrolling
+   * needs a step-up approval: the password unless one is given (Google).
+   */
+  async function enableMfa<T extends User>(
+    user: T,
+    approval?: string,
+  ): Promise<T & MfaUser> {
+    const stepUpToken =
+      approval ??
+      (await stepUp(ctx.app.getHttpServer(), user, 'MFA_SETTINGS', {
+        password: PASSWORD,
+      }));
     const { secret } = data<{ secret: string }>(
       await http()
         .post('/v1/auth/mfa/enrollment')
         .set('X-Forwarded-For', user.ip)
         .set('Authorization', bearer(user.accessToken))
+        .set(STEP_UP_HEADER, stepUpToken)
         .expect(201),
     );
     const { recoveryCodes } = data<{ recoveryCodes: string[] }>(
@@ -240,6 +253,7 @@ describeWithDatabase('MFA at sign-in (e2e, PostgreSQL)', () => {
         .post('/v1/auth/mfa/enrollment/confirm')
         .set('X-Forwarded-For', user.ip)
         .set('Authorization', bearer(user.accessToken))
+        .set(STEP_UP_HEADER, stepUpToken)
         .send({ code: authenticatorCode(secret, clock) })
         .expect(200),
     );
@@ -289,6 +303,91 @@ describeWithDatabase('MFA at sign-in (e2e, PostgreSQL)', () => {
   };
   const sessionCount = (authId: string) =>
     ctx.client.refreshSession.count({ where: { authId } });
+
+  /** A Google account the fake Google knows, with its own client address. */
+  const googleAccount = () => {
+    const sub = `google-${randomBytes(5).toString('hex')}`;
+    return { sub, email: `${sub}@example.com`, ip: nextIp() };
+  };
+  type GoogleAccount = ReturnType<typeof googleAccount>;
+  /** Google's authorization code for `account` (as after a Google login). */
+  const googleCode = (account: GoogleAccount) => {
+    const code = `code-${randomBytes(6).toString('hex')}`;
+    googleAccounts.set(code, { sub: account.sub, email: account.email });
+    return code;
+  };
+  /** GET /auth/google (optionally with the device header): the state. */
+  async function googleStart(
+    account: GoogleAccount,
+    deviceToken?: string,
+    redirectUrl?: string,
+  ): Promise<string> {
+    const req = http()
+      .get('/auth/google')
+      .query(redirectUrl ? { redirectUrl } : {})
+      .set('X-Forwarded-For', account.ip);
+    if (deviceToken) req.set(DEVICE_HEADER, deviceToken);
+    return data<{ state: string }>(await req.expect(200)).state;
+  }
+  /** POST /auth/google/callback: the sign-in result (tokens or challenge). */
+  async function googlePost(
+    account: GoogleAccount,
+    state: string,
+    deviceToken?: string,
+  ) {
+    const req = http()
+      .post('/auth/google/callback')
+      .set('X-Forwarded-For', account.ip);
+    if (deviceToken) req.set(DEVICE_HEADER, deviceToken);
+    const response = await req
+      .send({ code: googleCode(account), state })
+      .expect(201);
+    return data<{ data: Partial<Tokens & Challenge> }>(response).data;
+  }
+  /**
+   * The browser flow: GET /auth/google (device header only here), then
+   * Google's redirect to GET /auth/google/callback; returns where the
+   * callback redirects the browser.
+   */
+  async function googleBrowser(account: GoogleAccount, deviceToken?: string) {
+    const state = await googleStart(
+      account,
+      deviceToken,
+      'https://app.example.com/done',
+    );
+    const response = await http()
+      .get('/auth/google/callback')
+      .query({ code: googleCode(account), state })
+      .set('X-Forwarded-For', account.ip)
+      .expect(302);
+    return new URL(response.headers.location);
+  }
+  /**
+   * Step-up through Google re-authentication (accounts without password
+   * and MFA): start, Google's redirect (forwarded), completion.
+   */
+  async function googleStepUp(
+    account: GoogleAccount,
+    accessToken: string,
+    action: string,
+  ): Promise<string> {
+    const { state } = data<{ state: string }>(
+      await http()
+        .post('/v1/auth/step-up/google')
+        .set('Authorization', bearer(accessToken))
+        .send({ action })
+        .expect(201),
+    );
+    const approval = data<{ approvalToken: string; method: string }>(
+      await http()
+        .post('/v1/auth/step-up/google/callback')
+        .set('Authorization', bearer(accessToken))
+        .send({ code: googleCode(account), state })
+        .expect(201),
+    );
+    expect(approval.method).toBe('GOOGLE');
+    return approval.approvalToken;
+  }
 
   // ------------------------------------------------------------------ tests
 
@@ -605,9 +704,28 @@ describeWithDatabase('MFA at sign-in (e2e, PostgreSQL)', () => {
     // Default name: the device's user agent.
     expect(device.name).toBe('mfa-login-e2e/1.0');
 
+    // Revoking is an MFA settings change: it needs a step-up approval, even
+    // on this trusted device (here with a recovery code).
+    await http()
+      .delete(`/v1/auth/mfa/trusted-devices/${device.id}`)
+      .set('Authorization', bearer(done.accessToken))
+      .set(DEVICE_HEADER, device.token)
+      .expect(403);
+    expect(
+      await ctx.client.mfaTrustedDevice.findUniqueOrThrow({
+        where: { id: device.id },
+      }),
+    ).toMatchObject({ revokedAt: null });
+    const approval = await stepUp(
+      ctx.app.getHttpServer(),
+      { accessToken: done.accessToken, ip: user.ip },
+      'MFA_SETTINGS',
+      { recoveryCode: user.codes[0] },
+    );
     const revoked = await http()
       .delete(`/v1/auth/mfa/trusted-devices/${device.id}`)
       .set('Authorization', bearer(done.accessToken))
+      .set(STEP_UP_HEADER, approval)
       .expect(200);
     expect(data<DeviceView>(revoked)).toMatchObject({
       id: device.id,
@@ -618,6 +736,7 @@ describeWithDatabase('MFA at sign-in (e2e, PostgreSQL)', () => {
     await http()
       .delete(`/v1/auth/mfa/trusted-devices/${device.id}`)
       .set('Authorization', bearer(done.accessToken))
+      .set(STEP_UP_HEADER, approval)
       .expect(200);
 
     await challengeFor(user, device.token);
@@ -636,6 +755,7 @@ describeWithDatabase('MFA at sign-in (e2e, PostgreSQL)', () => {
     await http()
       .delete('/v1/auth/mfa/trusted-devices/not-a-uuid')
       .set('Authorization', bearer(done.accessToken))
+      .set(STEP_UP_HEADER, approval)
       .expect(400);
   });
 
@@ -685,9 +805,17 @@ describeWithDatabase('MFA at sign-in (e2e, PostgreSQL)', () => {
       ),
     );
     expect(otherList).toEqual([]);
+    // Even with its own step-up approval, another account cannot revoke it.
+    const otherApproval = await stepUp(
+      ctx.app.getHttpServer(),
+      { accessToken: otherDone.accessToken, ip: other.ip },
+      'MFA_SETTINGS',
+      { recoveryCode: otherMfa.codes[1] },
+    );
     await http()
       .delete(`/v1/auth/mfa/trusted-devices/${ownerDevice.id}`)
       .set('Authorization', bearer(otherDone.accessToken))
+      .set(STEP_UP_HEADER, otherApproval)
       .expect(404);
     await http().get('/v1/auth/mfa/trusted-devices').expect(401);
     await http()
@@ -744,7 +872,12 @@ describeWithDatabase('MFA at sign-in (e2e, PostgreSQL)', () => {
       accessToken: created.accessToken,
     };
     startClock();
-    const enabled = await enableMfa(user);
+    // No password and no MFA yet: enrolling is approved by re-authenticating
+    // with Google.
+    const enabled = await enableMfa(
+      user,
+      await googleStepUp({ sub, email, ip }, user.accessToken, 'MFA_SETTINGS'),
+    );
     nextStep();
 
     // Now Google sign-in yields a challenge, not tokens.
@@ -823,6 +956,167 @@ describeWithDatabase('MFA at sign-in (e2e, PostgreSQL)', () => {
       await googleSignIn(done.trustedDevice!.token),
     );
     await protectedCall(viaHeader.accessToken).expect(200);
+  });
+
+  it('skips the MFA challenge for a trusted device on every sign-in path (password, browser Google via the encrypted OAuth state, POST Google callback), and only then', async () => {
+    // Password sign-in with a trusted device.
+    const local = await mfaUser();
+    const localChallenge = await challengeFor(local);
+    const localDevice = data<Completed>(
+      await complete(local, {
+        challengeToken: localChallenge.challengeToken,
+        code: authenticatorCode(local.secret, clock),
+        trustDevice: true,
+      }).expect(200),
+    ).trustedDevice!;
+    const viaPassword = data<Tokens>(
+      await login(local, localDevice.token).expect(201),
+    );
+    expect(viaPassword).not.toHaveProperty('mfaRequired');
+    await protectedCall(viaPassword.accessToken).expect(200);
+
+    // A Google-only account with MFA and a trusted device.
+    const account = googleAccount();
+    const created = (await googlePost(
+      account,
+      await googleStart(account),
+    )) as Tokens;
+    const google = {
+      id: created.user.id,
+      email: account.email,
+      ip: account.ip,
+      accessToken: created.accessToken,
+    };
+    const enabled = await enableMfa(
+      google,
+      await googleStepUp(account, google.accessToken, 'MFA_SETTINGS'),
+    );
+    nextStep();
+    const challenge = (await googlePost(
+      account,
+      await googleStart(account),
+    )) as Challenge;
+    expect(challenge.mfaRequired).toBe(true);
+    const trusted = data<Completed>(
+      await complete(google, {
+        challengeToken: challenge.challengeToken,
+        code: authenticatorCode(enabled.secret, clock),
+        trustDevice: true,
+      }).expect(200),
+    );
+    const device = trusted.trustedDevice!;
+
+    // 1. Browser flow: the header is only sent when starting (GET
+    //    /auth/google); the token travels encrypted in the OAuth state ...
+    const browserState = await googleStart(
+      account,
+      device.token,
+      'https://app.example.com/done',
+    );
+    const states = await ctx.client.oAuthState.findMany();
+    expect(states.length).toBeGreaterThan(0);
+    for (const row of states) {
+      expect(row.payload).toMatch(
+        /^v1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/,
+      );
+      expect(row.payload).not.toContain(device.token);
+      expect(row.stateHash).not.toContain(browserState);
+    }
+    // ... to Google's redirect (no header), which signs in without MFA.
+    const redirected = await http()
+      .get('/auth/google/callback')
+      .query({ code: googleCode(account), state: browserState })
+      .set('X-Forwarded-For', account.ip)
+      .expect(302);
+    const location = new URL(redirected.headers.location);
+    expect(location.searchParams.has('mfa_required')).toBe(false);
+    await protectedCall(location.searchParams.get('access_token')!).expect(200);
+    expect(location.searchParams.get('user_id')).toBe(google.id);
+    // 2. POST callback with the header.
+    const viaHeader = (await googlePost(
+      account,
+      await googleStart(account),
+      device.token,
+    )) as Tokens;
+    expect(viaHeader).not.toHaveProperty('mfaRequired');
+    await protectedCall(viaHeader.accessToken).expect(200);
+    // 3. POST callback with the token carried in the state (no header).
+    const viaState = (await googlePost(
+      account,
+      await googleStart(account, device.token),
+    )) as Tokens;
+    expect(viaState).not.toHaveProperty('mfaRequired');
+    await protectedCall(viaState.accessToken).expect(200);
+
+    // Another account's trusted device skips nothing, on any path.
+    expect(
+      (await googleBrowser(account, localDevice.token)).searchParams.get(
+        'mfa_required',
+      ),
+    ).toBe('true');
+    expect(
+      (await googlePost(account, await googleStart(account), localDevice.token))
+        .mfaRequired,
+    ).toBe(true);
+    expect(
+      (await googlePost(account, await googleStart(account, localDevice.token)))
+        .mfaRequired,
+    ).toBe(true);
+    await challengeFor(local, device.token);
+
+    // Trust ends exactly after 30 days, on the Google paths too.
+    const trustedAt = new Date(device.expiresAt).getTime() - 30 * DAY;
+    travelTo(trustedAt + 30 * DAY - SECOND);
+    expect(
+      (await googleBrowser(account, device.token)).searchParams.has(
+        'access_token',
+      ),
+    ).toBe(true);
+    travelTo(trustedAt + 30 * DAY);
+    const expiredBrowser = await googleBrowser(account, device.token);
+    expect(expiredBrowser.searchParams.get('mfa_required')).toBe('true');
+    expect(expiredBrowser.searchParams.has('access_token')).toBe(false);
+    expect(
+      (await googlePost(account, await googleStart(account), device.token))
+        .mfaRequired,
+    ).toBe(true);
+
+    // A revoked device skips nothing either (a new one, then revoked).
+    nextStep();
+    const again = (await googlePost(
+      account,
+      await googleStart(account),
+    )) as Challenge;
+    const second = data<Completed>(
+      await complete(google, {
+        challengeToken: again.challengeToken,
+        code: authenticatorCode(enabled.secret, clock),
+        trustDevice: true,
+      }).expect(200),
+    );
+    const approval = await stepUp(
+      ctx.app.getHttpServer(),
+      { accessToken: second.accessToken, ip: account.ip },
+      'MFA_SETTINGS',
+      { recoveryCode: enabled.codes[0] },
+    );
+    await http()
+      .delete(`/v1/auth/mfa/trusted-devices/${second.trustedDevice!.id}`)
+      .set('Authorization', bearer(second.accessToken))
+      .set(STEP_UP_HEADER, approval)
+      .expect(200);
+    const token = second.trustedDevice!.token;
+    expect(
+      (await googleBrowser(account, token)).searchParams.get('mfa_required'),
+    ).toBe('true');
+    expect(
+      (await googlePost(account, await googleStart(account), token))
+        .mfaRequired,
+    ).toBe(true);
+    expect(
+      (await googlePost(account, await googleStart(account, token)))
+        .mfaRequired,
+    ).toBe(true);
   });
 
   it('keeps MFA working when the JWT secrets rotate, and fails closed without MFA_ENCRYPTION_KEY', async () => {

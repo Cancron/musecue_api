@@ -20,6 +20,8 @@ export interface IAccessTokenPayload {
   userId: string;
   role: UserRole;
   tokenVersion: number; // Incremented on security events (block, password change, etc.)
+  /** The sign-in session (RefreshSession.sessionId); binds step-up approvals. */
+  sid?: string;
   iat?: number;
   exp?: number;
 }

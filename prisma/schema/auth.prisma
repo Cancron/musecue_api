@@ -35,6 +35,8 @@ model authUser {
   mfaRecoveryCodes   MfaRecoveryCode[]
   mfaLoginChallenges MfaLoginChallenge[]
   mfaTrustedDevices  MfaTrustedDevice[]
+  stepUpApprovals    StepUpApproval[]
+  stepUpChallenges   StepUpChallenge[]
 
   @@index([email, id, providerId])
   @@index([username])
@@ -87,6 +89,10 @@ model authSecurity {
 model RefreshSession {
   id            String                    @id @default(uuid())
   authId        String
+  // The sign-in this session belongs to: set at login and kept by every
+  // rotation, so it identifies the device's session for its whole lifetime.
+  // Access tokens carry it as `sid`; step-up approvals are bound to it.
+  sessionId     String
   // The refresh token's JWT ID (`jti`).
   tokenId       String                    @unique @db.VarChar(128)
   // SHA-256 (hex) of the complete refresh token.
@@ -106,6 +112,7 @@ model RefreshSession {
 
   @@index([authId, revokedAt, expiresAt])
   @@index([expiresAt])
+  @@index([sessionId])
 }
 
 // ================================
@@ -267,5 +274,55 @@ model MfaTrustedDevice {
   authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
 
   @@index([authId, revokedAt, expiresAt])
+  @@index([expiresAt])
+}
+
+// ================================
+// Step-up Authentication Models
+// ================================
+
+// A fresh confirmation of the signed-in user's identity for one sensitive
+// action (MFA code or recovery code, else the password, else Google
+// re-authentication). The approval token is sent as the X-Step-Up-Token
+// header; only its SHA-256 (hex) is stored. It is valid for 10 minutes and
+// only for its own user, session (`sessionId` of the access token) and
+// action, while that session is still signed in.
+model StepUpApproval {
+  id         String         @id @default(uuid())
+  authId     String
+  sessionId  String
+  action     StepUpAction
+  method     StepUpMethod
+  tokenHash  String         @unique @db.Char(64)
+  createdAt  DateTime       @default(now())
+  expiresAt  DateTime
+  lastUsedAt DateTime?
+
+  authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
+
+  @@index([authId, sessionId, action])
+  @@index([expiresAt])
+}
+
+// A Google re-authentication in progress (users without password and MFA),
+// created for one user, session and action. Only the hash of the OAuth
+// `state` is stored and the PKCE verifier is encrypted. It is consumed by the
+// first completion attempt (`consumedAt`) and expires after 10 minutes.
+model StepUpChallenge {
+  id           String       @id @default(uuid())
+  authId       String
+  sessionId    String
+  action       StepUpAction
+  stateHash    String       @unique @db.Char(64)
+  // Encrypted PKCE code verifier (bound to stateHash).
+  codeVerifier String
+  redirectUrl  String?
+  createdAt    DateTime     @default(now())
+  expiresAt    DateTime
+  consumedAt   DateTime?
+
+  authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
+
+  @@index([authId])
   @@index([expiresAt])
 }

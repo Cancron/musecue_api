@@ -16,6 +16,7 @@ import { AuthGuard } from '../../common/guards/auth.guard';
 import { requestMetadata } from '../../subscription/request-metadata';
 import { EmptyBodyPipe } from '../dto/privacy-export.dto';
 import { RequestAccountDeletionDto } from './account-deletion.dto';
+import { RequireStepUp } from '../../auth/step-up/step-up.decorator';
 import { AccountDeletionService } from './account-deletion.service';
 
 interface AuthenticatedRequest extends Request {
@@ -54,6 +55,7 @@ export class AccountDeletionController {
    * returns the same deletion.
    */
   @Post()
+  @RequireStepUp('ACCOUNT_DELETION')
   @HttpCode(HttpStatus.ACCEPTED)
   @Throttle({ default: THROTTLER_CONFIG.STRICT })
   requestDeletion(

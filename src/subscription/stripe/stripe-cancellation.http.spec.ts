@@ -1,3 +1,5 @@
+import { StepUpGuard } from '../../auth/step-up/step-up.guard';
+import { STEP_UP_APPROVED } from '../../../test/support/step-up-approved';
 import {
   Global,
   INestApplication,
@@ -66,6 +68,9 @@ describe('POST /v1/subscription/cancel (HTTP)', () => {
     })
       .overrideProvider(StripeCancellationService)
       .useValue(cancellation)
+
+      .overrideGuard(StepUpGuard)
+      .useValue(STEP_UP_APPROVED)
       .compile();
     app = moduleRef.createNestApplication();
     const logger = mock<Logger>();

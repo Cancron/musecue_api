@@ -29,6 +29,7 @@ describe('refresh-token failure and rotation boundaries', () => {
   const active = {
     id: 'session-old',
     authId: 'owner',
+    sessionId: 'sign-in-1',
     tokenHash: 'hash',
     expiresAt: new Date(Date.now() + 3_600_000),
     revokedAt: null,
@@ -49,6 +50,17 @@ describe('refresh-token failure and rotation boundaries', () => {
       tokenVersion: 1,
     } as never);
     sessions.rotate.mockResolvedValue(true);
+  });
+
+  it('keeps the sign-in session (sid) in the rotated access token', async () => {
+    await service.refreshToken('test', META);
+    expect(utils.createAccessToken.mock.calls[0][0]).toMatchObject({
+      userId: 'owner',
+      sid: 'sign-in-1',
+    });
+    // The replacement session is stored without choosing a session ID: the
+    // repository keeps the presented session's.
+    expect(sessions.rotate.mock.calls[0][1]).not.toHaveProperty('sessionId');
   });
 
   it('does not revoke sessions on database read outages', async () => {

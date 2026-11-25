@@ -102,6 +102,8 @@ const USER_DATA_TABLES = [
   'MfaRecoveryCode',
   'MfaLoginChallenge',
   'MfaTrustedDevice',
+  'StepUpApproval',
+  'StepUpChallenge',
 ] as const;
 
 describeWithDatabase('Account erasure (PostgreSQL)', () => {
@@ -299,6 +301,7 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
         // Authentication state: a signed-in device and an outstanding code.
         refreshSessions: {
           create: {
+            sessionId: `sign-in-${tag}`,
             tokenId: `jti-${tag}`,
             tokenHash: 'a'.repeat(64),
             ipAddress: '203.0.113.9',
@@ -348,6 +351,25 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
             tokenHash: `${tag}${'f'.repeat(64 - tag.length)}`,
             name: 'phone',
             expiresAt: new Date(Date.now() + 86_400_000),
+          },
+        },
+        // A step-up approval and a Google re-authentication in progress.
+        stepUpApprovals: {
+          create: {
+            sessionId: `sign-in-${tag}`,
+            action: 'ACCOUNT_DELETION',
+            method: 'PASSWORD',
+            tokenHash: `${tag}${'a'.repeat(64 - tag.length)}`,
+            expiresAt: new Date(Date.now() + 300_000),
+          },
+        },
+        stepUpChallenges: {
+          create: {
+            sessionId: `sign-in-${tag}`,
+            action: 'ACCOUNT_DELETION',
+            stateHash: `${tag}${'b'.repeat(64 - tag.length)}`,
+            codeVerifier: 'v1.aXY.dGFn.Y2lwaGVy',
+            expiresAt: new Date(Date.now() + 300_000),
           },
         },
         // A background job of the PostgreSQL queue driver (a failed email

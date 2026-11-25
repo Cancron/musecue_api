@@ -15,12 +15,15 @@ import { PrivacyExportLifecycleService } from './queues/privacy-export-lifecycle
 import { PrivacyExportRecoveryService } from './queues/privacy-export-recovery.service';
 import { PrivacyExportRetentionService } from './queues/privacy-export-retention.service';
 import { PrivacyExportJobHandler } from './queues/privacy-export-job.handler';
+import { StepUpCoreModule } from '../auth/step-up/step-up-core.module';
 import { PrivacyExportQueueService } from './queues/privacy-export.queue';
 
 @Module({
   imports: [
     QueueModule,
     StorageModule,
+    // Exporting and downloading personal data require a step-up approval.
+    StepUpCoreModule,
     // Read-only use of SubscriptionAccessService for the exported status.
     SubscriptionModule,
   ],

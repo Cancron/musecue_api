@@ -5,6 +5,7 @@ import { AppService } from './app.service';
 // import { BlogModule } from './blog/blog.module';
 import { AuthModule } from './auth/auth.module';
 import { MfaModule } from './auth/mfa/mfa.module';
+import { StepUpModule } from './auth/step-up/step-up.module';
 import { InfrastructureModule } from './infrastructure/infrastructure.module';
 import { MetricsModule } from './metrics/metrics.module';
 import { WinstonModule } from 'nest-winston';
@@ -40,6 +41,7 @@ import { AccountDeletionModule } from './privacy/account-deletion/account-deleti
     // BlogModule,
     AuthModule,
     MfaModule,
+    StepUpModule,
     MakeupModule,
     ProfileModule,
     SubscriptionModule,

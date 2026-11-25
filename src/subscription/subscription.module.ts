@@ -20,9 +20,12 @@ import {
   STRIPE_SETTINGS,
   type StripeSettings,
 } from './stripe/stripe.config';
+import { StepUpCoreModule } from '../auth/step-up/step-up-core.module';
 import { STRIPE_CLIENT, StripeGateway } from './stripe/stripe.gateway';
 
 @Module({
+  // Cancelling a subscription requires a step-up approval.
+  imports: [StepUpCoreModule],
   controllers: [
     SubscriptionPlanController,
     SubscriptionController,

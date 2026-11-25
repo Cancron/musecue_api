@@ -21,6 +21,7 @@ import { EmptyBodyPipe } from '../../privacy/dto/privacy-export.dto';
 import { requestMetadata } from '../../subscription/request-metadata';
 import type { IAccessTokenPayload } from '../interfaces/auth.interface';
 import { ConfirmMfaEnrollmentDto, factorOf, VerifyMfaDto } from './mfa.dto';
+import { RequireStepUp } from '../step-up/step-up.decorator';
 import { MfaService } from './mfa.service';
 import { trustedDeviceTokenOf } from './trusted-device-header';
 import { MfaLoginService } from './mfa-login.service';
@@ -60,6 +61,7 @@ export class MfaController {
    * otpauth:// URI, to confirm within 10 minutes. Takes no body.
    */
   @Post('enrollment')
+  @RequireStepUp('MFA_SETTINGS')
   @HttpCode(HttpStatus.CREATED)
   @Throttle({ default: THROTTLER_CONFIG.STRICT })
   @Header('Cache-Control', 'no-store')
@@ -76,6 +78,7 @@ export class MfaController {
    * enables MFA and returns the 10 recovery codes (this one time only).
    */
   @Post('enrollment/confirm')
+  @RequireStepUp('MFA_SETTINGS')
   @HttpCode(HttpStatus.OK)
   @Throttle({ default: THROTTLER_CONFIG.STRICT })
   @Header('Cache-Control', 'no-store')
@@ -110,20 +113,21 @@ export class MfaController {
 
   /**
    * Replaces the recovery codes with 10 new ones (returned this one time
-   * only) after verifying the second factor; all earlier codes stop working.
+   * only); all earlier codes stop working. Needs a step-up approval (an
+   * authenticator or recovery code) and takes no body.
    */
   @Post('recovery-codes')
+  @RequireStepUp('MFA_RECOVERY_CODES')
   @HttpCode(HttpStatus.CREATED)
   @Throttle({ default: THROTTLER_CONFIG.STRICT })
   @Header('Cache-Control', 'no-store')
   @Header('Pragma', 'no-cache')
   regenerateRecoveryCodes(
-    @Body() dto: VerifyMfaDto,
+    @Body(EmptyBodyPipe) _body: unknown,
     @Req() req: AuthenticatedRequest,
   ) {
     return this.verification.regenerateRecoveryCodes(
       req.user.userId,
-      factorOf(dto),
       requestMetadata(req),
     );
   }
@@ -147,6 +151,7 @@ export class MfaController {
    * needs MFA again. Another user's device answers 404.
    */
   @Delete('trusted-devices/:deviceId')
+  @RequireStepUp('MFA_SETTINGS')
   @Header('Cache-Control', 'no-store')
   revokeTrustedDevice(
     @Param('deviceId', new ParseUUIDPipe()) deviceId: string,

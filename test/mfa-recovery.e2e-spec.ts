@@ -21,6 +21,7 @@ import {
   type TestApplication,
 } from './support/infrastructure-flows';
 import { describeWithDatabase } from './support/migrated-schema';
+import { STEP_UP_HEADER, stepUp } from './support/step-up';
 
 jest.setTimeout(120_000);
 
@@ -51,6 +52,8 @@ interface User {
   email: string;
   ip: string;
   accessToken: string;
+  /** Step-up approval (password) to enroll MFA. */
+  approval: string;
 }
 interface EnabledUser extends User {
   secret: string;
@@ -149,7 +152,20 @@ describeWithDatabase('MFA recovery codes (e2e, PostgreSQL)', () => {
         .send({ email, password: PASSWORD })
         .expect(201),
     );
-    return { id: login.user.id, email, ip, accessToken: login.accessToken };
+    const user = {
+      id: login.user.id,
+      email,
+      ip,
+      accessToken: login.accessToken,
+      approval: '',
+    };
+    user.approval = await stepUp(
+      ctx.app.getHttpServer(),
+      user,
+      'MFA_SETTINGS',
+      { password: PASSWORD },
+    );
+    return user;
   }
 
   const api = (user: User) => {
@@ -174,9 +190,22 @@ describeWithDatabase('MFA recovery codes (e2e, PostgreSQL)', () => {
             .set('Authorization', `Bearer ${user.accessToken}`),
         ),
       verify: (body: object) => track(post('/v1/auth/mfa/verify', body)),
-      regenerate: (body: object) => post('/v1/auth/mfa/recovery-codes', body),
-      start: () => post('/v1/auth/mfa/enrollment'),
-      confirm: (body: object) => post('/v1/auth/mfa/enrollment/confirm', body),
+      /** Step-up (POST /v1/auth/step-up) with an MFA factor. */
+      stepUp: (body: object) =>
+        track(
+          post('/v1/auth/step-up', { action: 'MFA_RECOVERY_CODES', ...body }),
+        ),
+      regenerate: (approval?: string) => {
+        const req = post('/v1/auth/mfa/recovery-codes');
+        return approval ? req.set(STEP_UP_HEADER, approval) : req;
+      },
+      start: () =>
+        post('/v1/auth/mfa/enrollment').set(STEP_UP_HEADER, user.approval),
+      confirm: (body: object) =>
+        post('/v1/auth/mfa/enrollment/confirm', body).set(
+          STEP_UP_HEADER,
+          user.approval,
+        ),
     };
   };
 
@@ -401,15 +430,21 @@ describeWithDatabase('MFA recovery codes (e2e, PostgreSQL)', () => {
       }),
     ]);
 
-    // The same holds for regeneration authorized by one code: one new set.
-    const regenerations = await Promise.all(
+    // The same holds for step-up with one code: exactly one approval, which
+    // then regenerates one new set.
+    const approvals = await Promise.all(
       Array.from({ length: 3 }, () =>
-        api(user).regenerate({ recoveryCode: user.codes[3] }),
+        api(user).stepUp({ recoveryCode: user.codes[3] }),
       ),
     );
-    expect(regenerations.map((r) => r.status).sort()).toEqual([201, 400, 400]);
-    const winner = regenerations.find((r) => r.status === 201)!;
-    issued.push(...data<{ recoveryCodes: string[] }>(winner).recoveryCodes);
+    expect(approvals.map((r) => r.status).sort()).toEqual([201, 400, 400]);
+    const winner = approvals.find((r) => r.status === 201)!;
+    const regenerated = await api(user)
+      .regenerate(data<{ approvalToken: string }>(winner).approvalToken)
+      .expect(201);
+    issued.push(
+      ...data<{ recoveryCodes: string[] }>(regenerated).recoveryCodes,
+    );
     const batches = new Set(
       (await codeRows(user.id)).map((row) => row.batchId),
     );
@@ -420,28 +455,34 @@ describeWithDatabase('MFA recovery codes (e2e, PostgreSQL)', () => {
     const user = await enabledUser();
     await api(user).verify({ recoveryCode: user.codes[0] }).expect(200);
 
-    // Regeneration needs a valid second factor; a wrong one changes nothing.
-    await api(user).regenerate({ recoveryCode: 'ABCD-2345-WXYZ' }).expect(400);
-    await api(user).regenerate({}).expect(400);
+    // Regeneration needs a step-up approval for exactly this action, which
+    // a wrong code does not give; nothing changes meanwhile.
+    await api(user).regenerate().expect(403);
+    await api(user).regenerate(user.approval).expect(403); // MFA_SETTINGS
+    await api(user).stepUp({ recoveryCode: 'ABCD-2345-WXYZ' }).expect(400);
     expect(await codeRows(user.id)).toHaveLength(10);
 
     travel(30 * SECOND);
     const regeneratedAt = clock;
+    const approval = data<{ approvalToken: string; method: string }>(
+      await api(user)
+        .stepUp({ code: authenticatorCode(user.secret, clock) })
+        .expect(201),
+    );
+    expect(approval.method).toBe('TOTP');
     const response = await api(user)
-      .regenerate({ code: authenticatorCode(user.secret, clock) })
+      .regenerate(approval.approvalToken)
       .expect(201);
     expect(response.headers['cache-control']).toBe('no-store');
     const fresh = data<{
       recoveryCodes: string[];
       generatedAt: string;
       remainingRecoveryCodes: number;
-      verifiedWith: string;
     }>(response);
     issued.push(...fresh.recoveryCodes);
     expect(fresh).toMatchObject({
       generatedAt: new Date(regeneratedAt).toISOString(),
       remainingRecoveryCodes: 10,
-      verifiedWith: 'totp',
     });
     expect(fresh.recoveryCodes).toHaveLength(10);
     expect(new Set(fresh.recoveryCodes).size).toBe(10);
@@ -514,9 +555,10 @@ describeWithDatabase('MFA recovery codes (e2e, PostgreSQL)', () => {
           .expect(400),
       ),
     ).toBe(INVALID);
-    await api(intruder)
-      .regenerate({ recoveryCode: owner.codes[1] })
-      .expect(400);
+    // The owner's code gives the intruder no approval, and without one
+    // nothing is regenerated.
+    await api(intruder).stepUp({ recoveryCode: owner.codes[1] }).expect(400);
+    await api(intruder).regenerate().expect(403);
 
     const ownerRows = await codeRows(owner.id);
     expect(
