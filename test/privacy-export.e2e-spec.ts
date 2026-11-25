@@ -412,7 +412,9 @@ describeWithDatabase('Personal data export (PostgreSQL)', () => {
     const secrets = {
       password: `$2b$12$${label}-PASSWORD-HASH-${tag}`,
       providerId: `${label}-GOOGLE-SUBJECT-${tag}`,
-      mfaSecret: `${label}-MFA-SECRET-${tag}`,
+      // Stored authenticator secrets are always encrypted (the database
+      // only accepts the `v1.<iv>.<tag>.<ciphertext>` format).
+      mfaSecret: `v1.${label}-MFA-SECRET-${tag}.tag.ciphertext`,
       idempotencyKey: `${label}-IDEMPOTENCY-KEY-${tag}`,
       aiRawResult: `${label}-AI-RAW-RESULT-${tag}`,
       providerSubscriptionId: `sub_${label}_${tag}`,

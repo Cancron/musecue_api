@@ -4,6 +4,7 @@ import { AppController } from './app.controller';
 import { AppService } from './app.service';
 // import { BlogModule } from './blog/blog.module';
 import { AuthModule } from './auth/auth.module';
+import { MfaModule } from './auth/mfa/mfa.module';
 import { InfrastructureModule } from './infrastructure/infrastructure.module';
 import { MetricsModule } from './metrics/metrics.module';
 import { WinstonModule } from 'nest-winston';
@@ -38,6 +39,7 @@ import { AccountDeletionModule } from './privacy/account-deletion/account-deleti
     MetricsModule,
     // BlogModule,
     AuthModule,
+    MfaModule,
     MakeupModule,
     ProfileModule,
     SubscriptionModule,

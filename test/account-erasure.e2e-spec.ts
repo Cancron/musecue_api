@@ -97,6 +97,7 @@ const USER_DATA_TABLES = [
   'RefreshSession',
   'AuthChallenge',
   'InfrastructureJob',
+  'MfaEnrollment',
 ] as const;
 
 describeWithDatabase('Account erasure (PostgreSQL)', () => {
@@ -306,6 +307,16 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
             codeHash: 'b'.repeat(64),
             maxAttempts: 5,
             expiresAt: new Date(Date.now() + 3600_000),
+          },
+        },
+        // An MFA enrollment in progress (encrypted pending secret and the
+        // failed-code counter).
+        mfaEnrollment: {
+          create: {
+            secret: 'v1.aXY.dGFn.Y2lwaGVydGV4dA',
+            expiresAt: new Date(Date.now() + 600_000),
+            failedAttempts: 1,
+            failureWindowStartedAt: new Date(),
           },
         },
         // A background job of the PostgreSQL queue driver (a failed email

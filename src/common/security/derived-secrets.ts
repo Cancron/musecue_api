@@ -22,6 +22,9 @@ export const SECRET_PURPOSES = {
   OAUTH_STATE: 'musecue/oauth-state/v1',
   JOB_PAYLOAD: 'musecue/infrastructure-job-payload/v1',
   RATE_LIMIT_KEY: 'musecue/rate-limit-key/v1',
+  // Long-lived authenticator secrets. The root key is MFA_ENCRYPTION_KEY when
+  // configured (see MfaSecretCipher), otherwise JWT_REFRESH_SECRET.
+  MFA_SECRET: 'musecue/mfa-totp-secret/v1',
 } as const;
 
 export type SecretPurpose =
@@ -46,6 +49,18 @@ const cache = new Map<string, Buffer>();
  */
 export function deriveKey(purpose: SecretPurpose): Buffer {
   const root = config.jwt_refresh_secret;
+  if (!root) throw new MissingRootSecretError();
+  return deriveKeyFromRoot(root, purpose);
+}
+
+/**
+ * A 32-byte key for `purpose` derived from an explicit root secret (for data
+ * that has its own, separately rotated root key). Cached per root.
+ */
+export function deriveKeyFromRoot(
+  root: string,
+  purpose: SecretPurpose,
+): Buffer {
   if (!root) throw new MissingRootSecretError();
   const cacheKey = `${purpose}\u0000${root}`;
   let key = cache.get(cacheKey);
@@ -94,8 +109,17 @@ export function encryptSecret(
   plaintext: string,
   associatedData: string,
 ): string {
+  return encryptWithKey(deriveKey(purpose), plaintext, associatedData);
+}
+
+/** encryptSecret with an explicit 32-byte key (same output format). */
+export function encryptWithKey(
+  key: Buffer,
+  plaintext: string,
+  associatedData: string,
+): string {
   const iv = randomBytes(IV_BYTES);
-  const cipher = createCipheriv(CIPHER, deriveKey(purpose), iv, {
+  const cipher = createCipheriv(CIPHER, key, iv, {
     authTagLength: TAG_BYTES,
   });
   cipher.setAAD(Buffer.from(associatedData, 'utf8'));
@@ -117,6 +141,18 @@ export function decryptSecret(
   encrypted: string,
   associatedData: string,
 ): string {
+  return decryptWithKey(() => deriveKey(purpose), encrypted, associatedData);
+}
+
+/**
+ * decryptSecret with an explicit key (or a function returning it, read only
+ * once the format is known to be valid).
+ */
+export function decryptWithKey(
+  key: Buffer | (() => Buffer),
+  encrypted: string,
+  associatedData: string,
+): string {
   const parts = encrypted.split('.');
   if (parts.length !== 4 || parts[0] !== FORMAT) {
     throw new SecretDecryptionError();
@@ -127,9 +163,14 @@ export function decryptSecret(
     if (iv.length !== IV_BYTES || tag.length !== TAG_BYTES) {
       throw new SecretDecryptionError();
     }
-    const decipher = createDecipheriv(CIPHER, deriveKey(purpose), iv, {
-      authTagLength: TAG_BYTES,
-    });
+    const decipher = createDecipheriv(
+      CIPHER,
+      typeof key === 'function' ? key() : key,
+      iv,
+      {
+        authTagLength: TAG_BYTES,
+      },
+    );
     decipher.setAAD(Buffer.from(associatedData, 'utf8'));
     decipher.setAuthTag(tag);
     return Buffer.concat([

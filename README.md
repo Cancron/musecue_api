@@ -19,6 +19,7 @@ The companion mobile application and detailed product specifications live in `..
 - a provider-neutral AI gateway with OpenRouter live mode, multimodal private-image input, strict structured output, runtime validation, bounded retries, and deterministic mock mode
 - a single Pro subscription plan: admin-configured monthly/yearly pricing and free trial, one-time trial activation, date-based Pro access through `ProAccessGuard`, payment/lifecycle records protected by database rules, and Stripe checkout for the monthly and yearly options with webhook-verified activation, automatic renewals, failed-payment handling and recovery, cancellation at period end, and refunds made in Stripe with immediate access revocation (see "Subscriptions" and "Stripe checkout" under API); requesting refunds from MuseCue and disputes are not implemented yet
 - personal data export: an authenticated user can request an asynchronous ZIP archive of their own account, profile, makeup history, subscription records and private photos, poll its status, and download it through a signed link valid for at most 15 minutes; archives expire 24 hours after export and are deleted by a scheduled retention sweep (see "Personal data export" under API)
+- optional multi-factor authentication with an authenticator app (TOTP): the signed-in owner starts an enrollment, confirms it within 10 minutes with a current 6-digit code, and can check whether MFA is enabled; the secret is stored only encrypted, and 5 incorrect codes within 15 minutes block enrollment for 15 minutes (see "Multi-factor authentication (MFA)" under API). Sign-in does not require the second factor yet
 - account deletion: the owner confirms their identity (password and an emailed code, or the code alone for accounts without a password), the account is blocked and every token invalidated at once (`PENDING_DELETION`), and a background sweep hard-deletes the account and all its data and files (including its refresh sessions, one-time codes and queued or retained background jobs), keeping payment records detached (see "Account deletion" under API)
 
 Migration `20260827174107_add_makeup_workflow` adds the makeup aggregate and removes the dormant job-tracker and subscription starter domains.
@@ -30,6 +31,7 @@ Intentionally deferred:
 - additional S3-compatible storage providers (the provider interface is in place; see "Private image storage")
 - generated preview images (recommendation reasoning is live, while the existing curated preview-image contract remains in place)
 - production retention/deletion automation and AI cost accounting
+- MFA beyond enrollment: a second-factor step at sign-in (password and Google), disabling or resetting MFA, recovery codes and re-encrypting secrets under a new `MFA_ENCRYPTION_KEY`
 
 ## Requirements and setup
 
@@ -548,6 +550,14 @@ Authentication routes:
 | `POST` | `/auth/logout`                    | Revoke the current session                   |
 | `POST` | `/auth/logout-all`                | Revoke all user sessions                     |
 
+MFA routes act on the bearer token's own account (see "Multi-factor authentication (MFA)"):
+
+| Method | Route                             | Purpose                                                   |
+| ------ | --------------------------------- | --------------------------------------------------------- |
+| `GET`  | `/v1/auth/mfa`                    | Whether MFA is enabled, and the enrollment's progress     |
+| `POST` | `/v1/auth/mfa/enrollment`         | Start (or restart) an enrollment: new authenticator secret |
+| `POST` | `/v1/auth/mfa/enrollment/confirm` | Confirm with the current 6-digit code and enable MFA      |
+
 Makeup routes require a bearer token:
 
 | Method   | Route                                                              | Purpose                                            |
@@ -607,6 +617,101 @@ Successful responses use one envelope:
   "data": {}
 }
 ```
+
+### Multi-factor authentication (MFA)
+
+MFA is optional. A signed-in user adds an authenticator app (Google
+Authenticator, Microsoft Authenticator, 1Password, ...) with TOTP (RFC 6238:
+HMAC-SHA1, 6 digits, 30-second steps). Every route uses the access token's
+user; no route accepts an account ID (a `userId` in a body is rejected with
+`400`), so only the account owner can manage their MFA. Responses carry
+`Cache-Control: no-store`.
+
+1. `POST /v1/auth/mfa/enrollment` (no body) returns `201` with a new secret:
+
+   ```json
+   {
+     "method": "totp",
+     "secret": "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+     "otpauthUrl": "otpauth://totp/MuseCue:ada%40example.com?secret=...&issuer=MuseCue&algorithm=SHA1&digits=6&period=30",
+     "issuer": "MuseCue",
+     "accountName": "ada@example.com",
+     "algorithm": "SHA1",
+     "digits": 6,
+     "period": 30,
+     "expiresAt": "2026-11-22T12:10:00.000Z"
+   }
+   ```
+
+   The app shows `otpauthUrl` as a QR code (or the `secret` for manual
+   entry). This is the only response that contains the secret. The
+   enrollment stays pending until it is confirmed, for at most 10 minutes.
+   Starting again replaces the secret (the previous QR code stops working)
+   and restarts the 10 minutes.
+2. `POST /v1/auth/mfa/enrollment/confirm` with `{ "code": "123456" }` (exactly
+   6 digits) enables MFA with the code currently shown by the app and returns
+   the status below with `enabled: true`. A code is accepted only during its
+   own 30-second step (no clock-drift window), and at most once.
+3. `GET /v1/auth/mfa` returns the status:
+
+   ```json
+   {
+     "enabled": false,
+     "method": null,
+     "enabledAt": null,
+     "enrollment": {
+       "status": "PENDING",
+       "expiresAt": "2026-11-22T12:10:00.000Z",
+       "blockedUntil": null,
+       "remainingAttempts": 5
+     }
+   }
+   ```
+
+   `enrollment.status` is `NONE`, `PENDING`, `EXPIRED` or `BLOCKED`; once MFA is
+   enabled, `enrollment` is `null` and `method` is `totp`.
+
+Refusals of `POST /v1/auth/mfa/enrollment/confirm` (and of starting, where
+they apply):
+
+| Status | Message / cause                                                                  | Counts as incorrect |
+| ------ | -------------------------------------------------------------------------------- | ------------------- |
+| `400`  | `Invalid or expired authentication code`: wrong, expired (an earlier 30-second step) or future code | yes |
+| `400`  | Validation: `code` missing or not exactly 6 digits, or unknown fields             | no                  |
+| `404`  | `No MFA enrollment in progress. Start a new enrollment.`                          | no                  |
+| `410`  | `The MFA enrollment has expired. Start a new enrollment.` (after 10 minutes)      | no                  |
+| `409`  | `MFA is already enabled for this account` (also for a reused code after success) | no                  |
+| `429`  | Enrollment blocked after 5 incorrect codes within 15 minutes                      | -                   |
+| `503`  | `MFA is temporarily unavailable`: no usable encryption key                        | no                  |
+
+The 5th incorrect code within 15 minutes (counted from the first one) is
+answered with `429`, discards the pending secret and blocks both starting and
+confirming for 15 minutes, even with a correct code. Restarting an enrollment
+does not reset the counter. Both `POST` routes also have the `STRICT` request
+limit (10 per minute per client).
+
+Storage (PostgreSQL in both infrastructure modes): the pending secret is kept
+in `MfaEnrollment` (one row per user, with its expiry and the failed-code
+counter and block). Confirming moves the secret to `authSecurity.mfaSecret`,
+sets `mfaEnabled = true`, `mfaMethod = totp`, `mfaEnabledAt` and
+`mfaLastUsedStep` (the time step of the confirming code, which is never
+accepted again), removes the enrollment and writes an activity-log entry, all
+in one transaction. Each user's MFA changes are serialized by a row lock on the
+user, so a code confirms exactly once even under concurrent requests, and no
+concurrent wrong guess escapes the counter. Stale enrollment rows are removed
+by the hourly authentication-state sweep and with the account on erasure. The
+personal data export includes `mfaEnabled` and `mfaMethod`, never the secret.
+
+Secrets are encrypted with AES-256-GCM (`v1.<iv>.<tag>.<ciphertext>`; database
+CHECK constraints refuse anything else). Associated data binds each ciphertext
+to its user and slot (pending or confirmed), so it cannot be moved to another
+account. The key is derived with HKDF-SHA-256 from `MFA_ENCRYPTION_KEY` (at
+least 32 characters). When that is unset, it is derived from
+`JWT_REFRESH_SECRET`. Set `MFA_ENCRYPTION_KEY` before users enroll, keep it in
+your secret store, and do not change it: confirmed secrets cannot be decrypted
+under a different key, and re-encryption is not implemented yet. Without the
+dedicated key, rotating `JWT_REFRESH_SECRET` has the same effect. A pending
+enrollment that can no longer be decrypted answers `410` (start again).
 
 ### Subscriptions
 
@@ -997,6 +1102,8 @@ npm test
 TEST_DATABASE_URL=... REDIS_ENABLED=false npm run test:e2e -- --runInBand   # PostgreSQL-only mode (Redis suites skipped)
 TEST_DATABASE_URL=... TEST_REDIS_URL=redis://127.0.0.1:6379 REDIS_ENABLED=true npm run test:e2e -- --runInBand   # adds Redis mode (see "Testing both modes")
 npx jest private-cloud   # private image storage unit tests
+npm test -- --runInBand mfa   # MFA unit tests (TOTP, encryption, enrollment rules, HTTP contract)
+TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json --runInBand test/mfa-enrollment   # MFA enrollment over HTTP on temporary PostgreSQL schemas
 TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json test/private-cloud   # storage workflows + cleanup ledger on PostgreSQL (mocked Supabase)
 npm run test:e2e
 npx prisma generate

@@ -11,9 +11,12 @@ import { AuthChallengeRepository } from './state/auth-challenge.repository';
 import { AuthStateCleanupService } from './state/auth-state-cleanup.service';
 import { OAuthStateRepository } from './state/oauth-state.repository';
 import { RefreshSessionRepository } from './state/refresh-session.repository';
+import { MfaModule } from './mfa/mfa.module';
 
 @Module({
-  imports: [QueueModule],
+  // MfaModule: optional authenticator MFA (/v1/auth/mfa); its stale
+  // enrollments are removed by AuthStateCleanupService.
+  imports: [QueueModule, MfaModule],
   controllers: [AuthController],
   providers: [
     AuthService,

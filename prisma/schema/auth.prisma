@@ -31,6 +31,7 @@ model authUser {
   refreshSessions    RefreshSession[]
   authChallenges     AuthChallenge[]
   infrastructureJobs InfrastructureJob[]
+  mfaEnrollment      MfaEnrollment?
 
   @@index([email, id, providerId])
   @@index([username])
@@ -48,7 +49,13 @@ model authSecurity {
   lockExpiresAt      DateTime?
   mfaEnabled         Boolean    @default(false)
   mfaMethod          mfaMethod?
+  // Confirmed authenticator secret, encrypted (AES-256-GCM, bound to the
+  // user); never stored or returned in plaintext. See src/auth/mfa.
   mfaSecret          String?
+  mfaEnabledAt       DateTime?
+  // Last accepted TOTP time step (unix time / 30 s): a code of this or an
+  // earlier step is never accepted again.
+  mfaLastUsedStep    Int?
   createdAt          DateTime   @default(now())
   updatedAt          DateTime   @updatedAt
   lastPasswordChange DateTime?
@@ -139,6 +146,34 @@ model OAuthState {
   payload   String
   expiresAt DateTime
   createdAt DateTime @default(now())
+
+  @@index([expiresAt])
+}
+
+// ================================
+// MFA Enrollment Model
+// ================================
+
+// A user's authenticator (TOTP) enrollment in progress, and the failed-code
+// counter that guards it. At most one row per user. `secret` is the pending
+// authenticator secret, encrypted (AES-256-GCM, bound to the user); it and
+// `expiresAt` are set together when an enrollment starts and cleared when it
+// is blocked. Confirming the enrollment moves the secret to
+// authSecurity.mfaSecret and removes this row. The counters are kept across
+// restarted enrollments, so restarting never resets them: 5 wrong codes
+// within 15 minutes block enrollment until `blockedUntil`.
+model MfaEnrollment {
+  id                     String    @id @default(uuid())
+  authId                 String    @unique
+  secret                 String?
+  expiresAt              DateTime?
+  failedAttempts         Int       @default(0)
+  failureWindowStartedAt DateTime?
+  blockedUntil           DateTime?
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
+
+  authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
 
   @@index([expiresAt])
 }
