@@ -48,7 +48,8 @@ const dataOf = (response: { body: unknown }) =>
 describe('Credit settings administration (HTTP)', () => {
   let app: INestApplication<App>;
   let originalSecret: string;
-  let stored: CreditSettings | null;
+  let stored: CreditSettings;
+  const seededAt = new Date('2026-11-22T00:00:00.000Z');
   const updatedAt = new Date('2026-11-22T12:00:00.000Z');
   const tokens = new AuthUtilsService(mock<RateLimitStore>());
 
@@ -59,6 +60,8 @@ describe('Credit settings administration (HTTP)', () => {
     originalSecret = config.jwt_access_secret;
     config.jwt_access_secret = 'credit-settings-spec-secret';
 
+    // Startup stores the configuration row if it is missing (onModuleInit).
+    prisma.creditSettings.createMany.mockResolvedValue({ count: 0 });
     const moduleRef = await Test.createTestingModule({
       imports: [TestInfrastructureModule, CreditModule],
     }).compile();
@@ -76,6 +79,9 @@ describe('Credit settings administration (HTTP)', () => {
       }),
     );
     await app.init();
+    expect(prisma.creditSettings.createMany.mock.calls).toEqual([
+      [{ data: [{ id: 'default' }], skipDuplicates: true }],
+    ]);
   });
 
   afterAll(async () => {
@@ -85,29 +91,29 @@ describe('Credit settings administration (HTTP)', () => {
 
   beforeEach(() => {
     jest.resetAllMocks();
-    stored = null;
+    // The migration-seeded configuration row.
+    stored = {
+      id: 'default',
+      trialAllowanceCredits: 50,
+      proMonthlyAllowanceCredits: 1000,
+      openRouterUsdMicrosPerCredit: 5000,
+      sessionOverageAllowanceCredits: 5,
+      createdAt: seededAt,
+      updatedAt: seededAt,
+    };
     tokenVersions.get.mockResolvedValue(1);
     prisma.$transaction.mockImplementation(((
       callback: (tx: PrismaService) => Promise<unknown>,
     ) => callback(prisma)) as never);
+    prisma.creditSettings.createMany.mockResolvedValue({ count: 0 });
     prisma.creditSettings.findUnique.mockImplementation((() =>
       Promise.resolve(stored)) as never);
-    prisma.creditSettings.upsert.mockImplementation(((args: {
-      create: Partial<CreditSettings>;
-      update: Partial<CreditSettings>;
+    prisma.creditSettings.findUniqueOrThrow.mockImplementation((() =>
+      Promise.resolve(stored)) as never);
+    prisma.creditSettings.update.mockImplementation(((args: {
+      data: Partial<CreditSettings>;
     }) => {
-      stored = stored
-        ? { ...stored, ...args.update, updatedAt }
-        : {
-            id: 'default',
-            trialAllowanceCredits: 50,
-            proMonthlyAllowanceCredits: 1000,
-            openRouterUsdMicrosPerCredit: 5000,
-            sessionOverageAllowanceCredits: 5,
-            createdAt: updatedAt,
-            updatedAt,
-            ...args.create,
-          };
+      stored = { ...stored, ...args.data, updatedAt };
       return Promise.resolve(stored);
     }) as never);
   });
@@ -130,7 +136,7 @@ describe('Credit settings administration (HTTP)', () => {
         .patch(ROUTE)
         .send({ trialAllowanceCredits: 1 })
         .expect(401);
-      expect(prisma.creditSettings.upsert.mock.calls).toHaveLength(0);
+      expect(prisma.creditSettings.update.mock.calls).toHaveLength(0);
     });
 
     it('rejects a token signed with another secret', async () => {
@@ -141,7 +147,7 @@ describe('Credit settings administration (HTTP)', () => {
 
       await get(forged).expect(401);
       await patch({ trialAllowanceCredits: 1 }, forged).expect(401);
-      expect(prisma.creditSettings.upsert.mock.calls).toHaveLength(0);
+      expect(prisma.creditSettings.update.mock.calls).toHaveLength(0);
     });
 
     it.each([UserRole.USER, UserRole.MODERATOR, 'admin', ''])(
@@ -150,7 +156,7 @@ describe('Credit settings administration (HTTP)', () => {
         await get(bearer(role)).expect(403);
         await patch({ trialAllowanceCredits: 1000 }, bearer(role)).expect(403);
         expect(prisma.creditSettings.findUnique.mock.calls).toHaveLength(0);
-        expect(prisma.creditSettings.upsert.mock.calls).toHaveLength(0);
+        expect(prisma.creditSettings.update.mock.calls).toHaveLength(0);
         expect(prisma.activityLogEvent.create.mock.calls).toHaveLength(0);
       },
     );
@@ -160,7 +166,7 @@ describe('Credit settings administration (HTTP)', () => {
       async (role) => {
         await get(bearer(role)).expect(200);
         await patch({ trialAllowanceCredits: 60 }, bearer(role)).expect(200);
-        expect(prisma.creditSettings.upsert.mock.calls).toHaveLength(1);
+        expect(prisma.creditSettings.update.mock.calls).toHaveLength(1);
       },
     );
 
@@ -181,7 +187,7 @@ describe('Credit settings administration (HTTP)', () => {
   });
 
   describe('default values', () => {
-    it('serves the defaults in the standard envelope before anything is saved', async () => {
+    it('serves the stored defaults in the standard envelope before any administrator change', async () => {
       const response = await get(bearer(UserRole.ADMIN)).expect(200);
       expect(response.body).toEqual({
         statusCode: 200,
@@ -192,7 +198,7 @@ describe('Credit settings administration (HTTP)', () => {
           openRouterUsdMicrosPerCredit: 5000,
           openRouterUsdPerCredit: '0.005',
           sessionOverageAllowanceCredits: 5,
-          updatedAt: null,
+          updatedAt: seededAt.toISOString(),
         },
       });
     });
@@ -255,7 +261,7 @@ describe('Credit settings administration (HTTP)', () => {
     ])('rejects %s with 400 and persists nothing', async (_case, body) => {
       const response = await patch(body).expect(400);
       expect(response.body).toMatchObject({ success: false, statusCode: 400 });
-      expect(prisma.creditSettings.upsert.mock.calls).toHaveLength(0);
+      expect(prisma.creditSettings.update.mock.calls).toHaveLength(0);
       expect(prisma.activityLogEvent.create.mock.calls).toHaveLength(0);
     });
 
@@ -280,7 +286,7 @@ describe('Credit settings administration (HTTP)', () => {
       ],
     ])('accepts %s', async (_case, body) => {
       await patch(body).expect(200);
-      expect(prisma.creditSettings.upsert.mock.calls).toHaveLength(1);
+      expect(prisma.creditSettings.update.mock.calls).toHaveLength(1);
     });
   });
 });

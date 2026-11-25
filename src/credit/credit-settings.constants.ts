@@ -1,17 +1,11 @@
 /**
- * Values used before an administrator has saved the credit settings. They
- * must match the column defaults in prisma/schema/credit.prisma.
+ * The default settings are not defined in code: they are the column defaults
+ * of "CreditSettings" (prisma/schema/credit.prisma), stored as the single
+ * configuration row by migration 20261123120000_seed_credit_settings and
+ * re-created with those column defaults at startup if the row is missing:
+ * 50 trial credits, 1,000 Pro credits per month, 5,000 micro-dollars
+ * ($0.005) per credit and 5 overage credits per session.
  */
-export const CREDIT_SETTINGS_DEFAULTS = {
-  /** Credits granted once with the free trial. */
-  trialAllowanceCredits: 50,
-  /** Credits granted for each monthly Pro period. */
-  proMonthlyAllowanceCredits: 1_000,
-  /** $0.005 of OpenRouter cost per credit, in millionths of a US dollar. */
-  openRouterUsdMicrosPerCredit: 5_000,
-  /** Credits a session may use beyond the remaining balance. */
-  sessionOverageAllowanceCredits: 5,
-} as const;
 
 /**
  * Request validation bounds. Zero is a valid allowance (no credits); the cost

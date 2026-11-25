@@ -15,8 +15,8 @@ export interface CreditSettingsView extends CreditSettingsValues {
    * dollars (e.g. "0.005"). Change the micro-dollar field to update it.
    */
   openRouterUsdPerCredit: string;
-  /** Null while the defaults are in use and nothing has been saved. */
-  updatedAt: string | null;
+  /** When the stored configuration last changed (or was created). */
+  updatedAt: string;
 }
 
 export type UpdateCreditSettingsInput = Partial<CreditSettingsValues>;

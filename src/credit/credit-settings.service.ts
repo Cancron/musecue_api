@@ -1,14 +1,14 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, OnModuleInit } from '@nestjs/common';
 import { Prisma, type CreditSettings } from '@prisma/client';
 import AppError from '../common/errors/app.error';
 import {
   ActivityLogService,
   type FieldChange,
 } from '../common/services/activity-log.service';
+import { CustomLoggerService } from '../common/services/custom-logger.service';
 import { PrismaService } from '../common/services/prisma.service';
 import {
   CREDIT_SETTINGS_AUDIT_TABLE,
-  CREDIT_SETTINGS_DEFAULTS,
   CREDIT_SETTINGS_ID,
   USD_MICROS_PER_USD,
 } from './credit-settings.constants';
@@ -39,32 +39,58 @@ export function formatUsdMicros(micros: number): string {
 }
 
 /**
- * The administrator-managed configuration of the AI credit system. Only
- * configuration lives here; balances and charging are not implemented yet and
- * should read the values through `getSettings`.
+ * The administrator-managed configuration of the AI credit system, stored as
+ * a single PostgreSQL row. The defaults are the column defaults: the row is
+ * seeded by a migration and re-created at startup if it is missing, and an
+ * existing row is never overwritten except by an administrator update.
  */
 @Injectable()
-export class CreditSettingsService {
+export class CreditSettingsService implements OnModuleInit {
   constructor(
     private readonly prisma: PrismaService,
     private readonly activityLog: ActivityLogService,
+    private readonly logger: CustomLoggerService,
   ) {}
+
+  /** Makes sure the configuration row exists when the application starts. */
+  async onModuleInit(): Promise<void> {
+    if (await this.ensureStored()) {
+      this.logger.log(
+        'Stored the default AI credit settings (no configuration row existed)',
+        CreditSettingsService.name,
+      );
+    }
+  }
+
+  /**
+   * Inserts the configuration row with the column defaults unless it already
+   * exists (INSERT ... ON CONFLICT DO NOTHING), so concurrent API instances
+   * and restarts never overwrite saved settings. Returns whether a row was
+   * inserted.
+   */
+  async ensureStored(
+    client: Prisma.TransactionClient = this.prisma,
+  ): Promise<boolean> {
+    const { count } = await client.creditSettings.createMany({
+      data: [{ id: CREDIT_SETTINGS_ID }],
+      skipDuplicates: true,
+    });
+    return count > 0;
+  }
 
   /** Pass a transaction client to read the settings inside that transaction. */
   async getSettings(
     client: Prisma.TransactionClient = this.prisma,
   ): Promise<CreditSettingsView> {
-    const settings = await client.creditSettings.findUnique({
-      where: { id: CREDIT_SETTINGS_ID },
-    });
-    return this.toView(settings);
+    return this.toView(await this.readStored(client));
   }
 
   /**
    * Applies a partial update and records an audit event with the old and new
-   * values. The settings write and the audit record are committed together,
-   * so a change is never persisted without its audit trail, and a failed
-   * write leaves the stored settings unchanged.
+   * values. The row is locked for the transaction, so concurrent updates are
+   * applied one after another with accurate old values; the settings write
+   * and the audit record are committed together, and a failed write leaves
+   * the stored settings unchanged.
    */
   async updateSettings(
     input: UpdateCreditSettingsInput,
@@ -78,22 +104,24 @@ export class CreditSettingsService {
     }
 
     return this.prisma.$transaction(async (tx) => {
-      const before = await tx.creditSettings.findUnique({
+      await this.ensureStored(tx);
+      await tx.$queryRaw`
+        SELECT "id" FROM "CreditSettings" WHERE "id" = ${CREDIT_SETTINGS_ID} FOR UPDATE`;
+      const before = await tx.creditSettings.findUniqueOrThrow({
         where: { id: CREDIT_SETTINGS_ID },
       });
-      const after = await tx.creditSettings.upsert({
+      const after = await tx.creditSettings.update({
         where: { id: CREDIT_SETTINGS_ID },
-        create: { id: CREDIT_SETTINGS_ID, ...data },
-        update: data,
+        data,
       });
 
-      const changes = this.diff(before ?? CREDIT_SETTINGS_DEFAULTS, after);
+      const changes = this.diff(before, after);
       if (changes.length > 0) {
         await this.activityLog.logActivity(
           {
             tableName: CREDIT_SETTINGS_AUDIT_TABLE,
             recordId: CREDIT_SETTINGS_ID,
-            action: before ? 'update' : 'create',
+            action: 'update',
             changes,
             metadata: actor,
           },
@@ -101,6 +129,20 @@ export class CreditSettingsService {
         );
       }
       return this.toView(after);
+    });
+  }
+
+  /** The stored row; re-created with the column defaults if it was deleted. */
+  private async readStored(
+    client: Prisma.TransactionClient,
+  ): Promise<CreditSettings> {
+    const stored = await client.creditSettings.findUnique({
+      where: { id: CREDIT_SETTINGS_ID },
+    });
+    if (stored) return stored;
+    await this.ensureStored(client);
+    return client.creditSettings.findUniqueOrThrow({
+      where: { id: CREDIT_SETTINGS_ID },
     });
   }
 
@@ -129,17 +171,16 @@ export class CreditSettingsService {
     );
   }
 
-  private toView(settings: CreditSettings | null): CreditSettingsView {
-    const values = settings ?? CREDIT_SETTINGS_DEFAULTS;
+  private toView(settings: CreditSettings): CreditSettingsView {
     return {
-      trialAllowanceCredits: values.trialAllowanceCredits,
-      proMonthlyAllowanceCredits: values.proMonthlyAllowanceCredits,
-      openRouterUsdMicrosPerCredit: values.openRouterUsdMicrosPerCredit,
+      trialAllowanceCredits: settings.trialAllowanceCredits,
+      proMonthlyAllowanceCredits: settings.proMonthlyAllowanceCredits,
+      openRouterUsdMicrosPerCredit: settings.openRouterUsdMicrosPerCredit,
       openRouterUsdPerCredit: formatUsdMicros(
-        values.openRouterUsdMicrosPerCredit,
+        settings.openRouterUsdMicrosPerCredit,
       ),
-      sessionOverageAllowanceCredits: values.sessionOverageAllowanceCredits,
-      updatedAt: settings ? settings.updatedAt.toISOString() : null,
+      sessionOverageAllowanceCredits: settings.sessionOverageAllowanceCredits,
+      updatedAt: settings.updatedAt.toISOString(),
     };
   }
 }

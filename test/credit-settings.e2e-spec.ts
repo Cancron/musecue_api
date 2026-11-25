@@ -6,9 +6,11 @@ import {
 } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { PrismaPg } from '@prisma/adapter-pg';
-import { Prisma, PrismaClient, userRole, userStatus } from '@prisma/client';
+import { PrismaClient, userRole, userStatus } from '@prisma/client';
 import { mock } from 'jest-mock-extended';
 import { randomBytes } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import request from 'supertest';
 import type { App } from 'supertest/types';
 import type { Logger } from 'winston';
@@ -77,12 +79,17 @@ describeWithDatabase('AI credit settings (PostgreSQL, full stack)', () => {
   let apiClient: PrismaClient | undefined;
   let app: INestApplication<App> | undefined;
   let originalSecret: string;
+  let stateAfterMigrations: Awaited<ReturnType<typeof storedState>>;
   const tokens = new AuthUtilsService(mock<RateLimitStore>());
 
   const connect = () =>
     new PrismaClient({
       adapter: new PrismaPg(
-        { connectionString: TEST_DATABASE_URL as string },
+        {
+          connectionString: TEST_DATABASE_URL as string,
+          // Raw SQL (row locks, direct checks) resolves tables via search_path.
+          options: `-c search_path=${schema}`,
+        },
         { schema },
       ),
     });
@@ -136,12 +143,6 @@ describeWithDatabase('AI credit settings (PostgreSQL, full stack)', () => {
   const dataOf = (response: { body: unknown }) =>
     (response.body as { data: Data }).data;
 
-  /**
-   * The table qualified with the test schema: the adapter's `schema` option
-   * only applies to model queries, raw SQL resolves through `search_path`.
-   */
-  const table = () => Prisma.raw(`"${schema}"."CreditSettings"`);
-
   const createAccount = async (
     role: userRole,
     status: userStatus = userStatus.ACTIVE,
@@ -186,7 +187,19 @@ describeWithDatabase('AI credit settings (PostgreSQL, full stack)', () => {
       SELECT "id", "trialAllowanceCredits", "proMonthlyAllowanceCredits",
              "openRouterUsdMicrosPerCredit", "sessionOverageAllowanceCredits",
              "createdAt", "updatedAt"
-      FROM ${table()}`;
+      FROM "CreditSettings"`;
+  /** The seed migration, exactly as a deployment runs it. */
+  const seedMigration = readFileSync(
+    join(
+      __dirname,
+      '..',
+      'prisma',
+      'migrations',
+      '20261123120000_seed_credit_settings',
+      'migration.sql',
+    ),
+    'utf8',
+  );
   const auditEvents = () =>
     db.activityLogEvent.findMany({
       where: { tableName: 'CreditSettings' },
@@ -214,6 +227,8 @@ describeWithDatabase('AI credit settings (PostgreSQL, full stack)', () => {
     schema = await createSchema();
     await applyMigrations(schema, migrationNames());
     db = connect();
+    // Captured before the API starts and before any administrator action.
+    stateAfterMigrations = await storedState();
     await startApi();
   });
 
@@ -225,16 +240,28 @@ describeWithDatabase('AI credit settings (PostgreSQL, full stack)', () => {
   });
 
   beforeEach(async () => {
-    // Each test starts from a never-configured system.
-    await db.$executeRaw`DELETE FROM ${table()}`;
+    // Each test starts like a fresh installation: only the seeded defaults.
+    await db.$executeRaw`DELETE FROM "CreditSettings"`;
+    await db.$executeRawUnsafe(seedMigration);
     await db.activityLogEvent.deleteMany({
       where: { tableName: 'CreditSettings' },
     });
   });
 
-  describe('default values', () => {
-    it('serves 50 trial credits, 1,000 Pro credits a month, $0.005 per credit and 5 overage credits without writing a row', async () => {
+  describe('default values stored in PostgreSQL', () => {
+    const defaultRow: unknown = expect.objectContaining({
+      id: 'default',
+      ...DEFAULTS,
+    });
+
+    it('are stored by the migrations, before the API starts or any administrator change', () => {
+      expect(stateAfterMigrations.rows).toEqual([defaultRow]);
+      expect(stateAfterMigrations.audit).toEqual([]);
+    });
+
+    it('are served from the stored row', async () => {
       const admin = await createAccount(userRole.ADMIN);
+      const [row] = await settingsRows();
 
       const response = await getSettings(bearerFor(admin)).expect(200);
 
@@ -244,29 +271,50 @@ describeWithDatabase('AI credit settings (PostgreSQL, full stack)', () => {
         data: {
           ...DEFAULTS,
           openRouterUsdPerCredit: '0.005',
-          updatedAt: null,
+          updatedAt: row.updatedAt.toISOString(),
         },
       });
-      await expect(settingsRows()).resolves.toEqual([]);
+      await expect(settingsRows()).resolves.toEqual([row]);
     });
 
-    it('stores the same defaults in PostgreSQL for every field the first save leaves out', async () => {
+    it('are stored again at startup if the row is missing', async () => {
+      await db.$executeRaw`DELETE FROM "CreditSettings"`;
+
+      await restartApi();
+
+      await expect(settingsRows()).resolves.toEqual([defaultRow]);
+    });
+
+    it('are re-stored if the row disappears while the API is running', async () => {
       const admin = await createAccount(userRole.ADMIN);
+      await db.$executeRaw`DELETE FROM "CreditSettings"`;
 
-      await patchSettings(
-        { sessionOverageAllowanceCredits: 7 },
-        bearerFor(admin),
-      ).expect(200);
+      await expect(
+        getSettings(bearerFor(admin)).then(dataOf),
+      ).resolves.toMatchObject(DEFAULTS);
+      await expect(settingsRows()).resolves.toEqual([defaultRow]);
+    });
 
-      await expect(settingsRows()).resolves.toEqual([
-        expect.objectContaining({
-          id: 'default',
-          trialAllowanceCredits: 50,
-          proMonthlyAllowanceCredits: 1000,
-          openRouterUsdMicrosPerCredit: 5000,
-          sessionOverageAllowanceCredits: 7,
-        }),
-      ]);
+    it('never overwrite administrator changes: not at startup, and not by re-running the seed', async () => {
+      const admin = await createAccount(userRole.ADMIN);
+      const changed = {
+        trialAllowanceCredits: 20,
+        proMonthlyAllowanceCredits: 800,
+        openRouterUsdMicrosPerCredit: 6000,
+        sessionOverageAllowanceCredits: 2,
+      };
+      await patchSettings(changed, bearerFor(admin)).expect(200);
+      const saved = await settingsRows();
+      expect(saved).toEqual([expect.objectContaining(changed)]);
+
+      await restartApi();
+      await restartApi();
+      await db.$executeRawUnsafe(seedMigration);
+
+      await expect(settingsRows()).resolves.toEqual(saved);
+      await expect(
+        getSettings(bearerFor(admin)).then(dataOf),
+      ).resolves.toMatchObject(changed);
     });
   });
 
@@ -523,10 +571,10 @@ describeWithDatabase('AI credit settings (PostgreSQL, full stack)', () => {
         ).rejects.toThrow(/check constraint/i);
       }
       await expect(
-        db.$executeRaw`UPDATE ${table()} SET "openRouterUsdMicrosPerCredit" = 0`,
+        db.$executeRaw`UPDATE "CreditSettings" SET "openRouterUsdMicrosPerCredit" = 0`,
       ).rejects.toThrow(/check constraint/i);
       await expect(
-        db.$executeRaw`INSERT INTO ${table()} ("id", "updatedAt") VALUES ('second', now())`,
+        db.$executeRaw`INSERT INTO "CreditSettings" ("id", "updatedAt") VALUES ('second', now())`,
       ).rejects.toThrow(/check constraint/i);
 
       await expect(storedState()).resolves.toEqual(before);
@@ -570,7 +618,7 @@ describeWithDatabase('AI credit settings (PostgreSQL, full stack)', () => {
       await expect(auditEvents()).resolves.toEqual([
         {
           recordId: 'default',
-          action: 'create',
+          action: 'update',
           actionedBy: admin.id,
           userAgent: 'credit-e2e',
           details: [
@@ -637,17 +685,30 @@ describeWithDatabase('AI credit settings (PostgreSQL, full stack)', () => {
       await expect(auditEvents()).resolves.toHaveLength(1);
     });
 
-    it('keeps a single row under concurrent first saves', async () => {
+    it('applies concurrent updates one at a time, with an accurate audit trail', async () => {
       const admin = await createAccount(userRole.ADMIN);
+      const values = [10, 20, 30, 40, 60];
 
       const responses = await Promise.all(
-        [10, 20, 30, 40, 50].map((trial) =>
+        values.map((trial) =>
           patchSettings({ trialAllowanceCredits: trial }, bearerFor(admin)),
         ),
       );
 
-      expect(responses.map((r) => r.status)).toEqual([200, 200, 200, 200, 200]);
-      await expect(settingsRows()).resolves.toHaveLength(1);
+      expect(responses.map((r) => r.status)).toEqual(values.map(() => 200));
+      const rows = await settingsRows();
+      expect(rows).toHaveLength(1);
+      // Each audit event's old value is the previous event's new value,
+      // starting from the default and ending at the stored value.
+      const changes = (await auditEvents()).map((event) => event.details[0]);
+      expect(changes).toHaveLength(values.length);
+      expect(changes[0].oldValue).toBe('50');
+      for (let i = 1; i < changes.length; i++) {
+        expect(changes[i].oldValue).toBe(changes[i - 1].newValue);
+      }
+      expect(changes[changes.length - 1].newValue).toBe(
+        String(rows[0].trialAllowanceCredits),
+      );
     });
   });
 
@@ -686,8 +747,9 @@ describeWithDatabase('AI credit settings (PostgreSQL, full stack)', () => {
       ).resolves.toMatchObject({ ...saved, sessionOverageAllowanceCredits: 0 });
     });
 
-    it('keeps serving the defaults after a restart when nothing was saved', async () => {
+    it('keeps the stored defaults unchanged across restarts when nothing was saved', async () => {
       const admin = await createAccount(userRole.ADMIN);
+      const before = await settingsRows();
 
       await restartApi();
 
@@ -695,10 +757,10 @@ describeWithDatabase('AI credit settings (PostgreSQL, full stack)', () => {
         {
           ...DEFAULTS,
           openRouterUsdPerCredit: '0.005',
-          updatedAt: null,
+          updatedAt: before[0].updatedAt.toISOString(),
         },
       );
-      await expect(settingsRows()).resolves.toEqual([]);
+      await expect(settingsRows()).resolves.toEqual(before);
     });
   });
 });

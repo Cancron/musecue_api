@@ -3,17 +3,25 @@ import { join } from 'node:path';
 import type { CreditSettings } from '@prisma/client';
 import { mock, mockDeep } from 'jest-mock-extended';
 import { ActivityLogService } from '../common/services/activity-log.service';
+import { CustomLoggerService } from '../common/services/custom-logger.service';
 import { PrismaService } from '../common/services/prisma.service';
-import { CREDIT_SETTINGS_DEFAULTS } from './credit-settings.constants';
 import {
   CreditSettingsService,
   formatUsdMicros,
 } from './credit-settings.service';
 
+const DEFAULTS = {
+  trialAllowanceCredits: 50,
+  proMonthlyAllowanceCredits: 1000,
+  openRouterUsdMicrosPerCredit: 5000,
+  sessionOverageAllowanceCredits: 5,
+};
+
 describe('CreditSettingsService', () => {
   const prisma = mockDeep<PrismaService>();
   const activityLog = mock<ActivityLogService>();
-  const service = new CreditSettingsService(prisma, activityLog);
+  const logger = mock<CustomLoggerService>();
+  const service = new CreditSettingsService(prisma, activityLog, logger);
   const actor = { actionedBy: 'admin-id', ip: '127.0.0.1', userAgent: 'jest' };
   const updatedAt = new Date('2026-11-22T12:00:00.000Z');
 
@@ -21,94 +29,39 @@ describe('CreditSettingsService', () => {
     overrides: Partial<CreditSettings> = {},
   ): CreditSettings => ({
     id: 'default',
-    trialAllowanceCredits: 50,
-    proMonthlyAllowanceCredits: 1000,
-    openRouterUsdMicrosPerCredit: 5000,
-    sessionOverageAllowanceCredits: 5,
+    ...DEFAULTS,
     createdAt: updatedAt,
     updatedAt,
     ...overrides,
   });
 
-  /** Makes upsert behave like the database: apply `update` or `create`. */
-  const upsertAppliesTo = (existing: CreditSettings | null) =>
-    prisma.creditSettings.upsert.mockImplementation(((args: {
-      create: Partial<CreditSettings>;
-      update: Partial<CreditSettings>;
-    }) =>
-      Promise.resolve(
-        existing
-          ? { ...existing, ...args.update }
-          : storedSettings({ ...args.create }),
-      )) as never);
+  /** Makes update behave like the database: apply `data` to the row. */
+  const updateAppliesTo = (existing: CreditSettings) =>
+    prisma.creditSettings.update.mockImplementation(((args: {
+      data: Partial<CreditSettings>;
+    }) => Promise.resolve({ ...existing, ...args.data })) as never);
 
   beforeEach(() => {
     jest.resetAllMocks();
     prisma.$transaction.mockImplementation(((
       callback: (tx: PrismaService) => Promise<unknown>,
     ) => callback(prisma)) as never);
+    prisma.creditSettings.createMany.mockResolvedValue({ count: 0 });
   });
 
-  describe('default values', () => {
-    it('serves 50 trial credits, 1,000 Pro credits a month, $0.005 per credit and 5 overage credits before anything is saved', async () => {
-      prisma.creditSettings.findUnique.mockResolvedValue(null);
+  describe('defaults stored in PostgreSQL', () => {
+    const root = join(__dirname, '..', '..', 'prisma');
+    const read = (...path: string[]) =>
+      readFileSync(join(root, ...path), 'utf8');
 
-      await expect(service.getSettings()).resolves.toEqual({
-        trialAllowanceCredits: 50,
-        proMonthlyAllowanceCredits: 1000,
-        openRouterUsdMicrosPerCredit: 5000,
-        openRouterUsdPerCredit: '0.005',
-        sessionOverageAllowanceCredits: 5,
-        updatedAt: null,
-      });
-      expect(prisma.creditSettings.upsert.mock.calls).toHaveLength(0);
-    });
-
-    it('returns the persisted settings once saved', async () => {
-      prisma.creditSettings.findUnique.mockResolvedValue(
-        storedSettings({
-          trialAllowanceCredits: 75,
-          openRouterUsdMicrosPerCredit: 2500,
-        }),
+    it('defines 50 / 1,000 / $0.005 (5000 micro-dollars) / 5 as the column defaults in the schema and the table migration', () => {
+      const schema = read('schema', 'credit.prisma');
+      const migration = read(
+        'migrations',
+        '20261122120000_add_credit_settings',
+        'migration.sql',
       );
-
-      await expect(service.getSettings()).resolves.toMatchObject({
-        trialAllowanceCredits: 75,
-        openRouterUsdMicrosPerCredit: 2500,
-        openRouterUsdPerCredit: '0.0025',
-        updatedAt: updatedAt.toISOString(),
-      });
-    });
-
-    it('reads through a supplied transaction client', async () => {
-      const tx = mockDeep<PrismaService>();
-      tx.creditSettings.findUnique.mockResolvedValue(null);
-
-      await service.getSettings(tx);
-
-      expect(tx.creditSettings.findUnique.mock.calls).toEqual([
-        [{ where: { id: 'default' } }],
-      ]);
-      expect(prisma.creditSettings.findUnique.mock.calls).toHaveLength(0);
-    });
-
-    it('matches the column defaults of the Prisma schema and the migration', () => {
-      const root = join(__dirname, '..', '..', 'prisma');
-      const schema = readFileSync(
-        join(root, 'schema', 'credit.prisma'),
-        'utf8',
-      );
-      const migration = readFileSync(
-        join(
-          root,
-          'migrations',
-          '20261122120000_add_credit_settings',
-          'migration.sql',
-        ),
-        'utf8',
-      );
-
-      for (const [field, value] of Object.entries(CREDIT_SETTINGS_DEFAULTS)) {
+      for (const [field, value] of Object.entries(DEFAULTS)) {
         expect(schema).toMatch(
           new RegExp(`\\b${field}\\s+Int\\s+@default\\(${value}\\)`),
         );
@@ -116,6 +69,83 @@ describe('CreditSettingsService', () => {
           new RegExp(`"${field}" INTEGER NOT NULL DEFAULT ${value},`),
         );
       }
+    });
+
+    it('seeds the configuration row with the column defaults without overwriting an existing row', () => {
+      const seed = read(
+        'migrations',
+        '20261123120000_seed_credit_settings',
+        'migration.sql',
+      );
+      expect(seed).toMatch(
+        /INSERT INTO "CreditSettings" \("id", "updatedAt"\)\s+VALUES \('default', CURRENT_TIMESTAMP\)\s+ON CONFLICT \("id"\) DO NOTHING;/,
+      );
+      expect(seed).not.toMatch(/\bUPDATE\b|DO UPDATE/);
+    });
+
+    it('re-creates a missing row at startup with INSERT ... ON CONFLICT DO NOTHING', async () => {
+      prisma.creditSettings.createMany.mockResolvedValue({ count: 1 });
+
+      await service.onModuleInit();
+
+      expect(prisma.creditSettings.createMany.mock.calls).toEqual([
+        [{ data: [{ id: 'default' }], skipDuplicates: true }],
+      ]);
+      expect(logger.log.mock.calls).toHaveLength(1);
+    });
+
+    it('never updates an existing row at startup, so administrator changes survive restarts', async () => {
+      prisma.creditSettings.createMany.mockResolvedValue({ count: 0 });
+
+      await service.onModuleInit();
+
+      expect(prisma.creditSettings.update.mock.calls).toHaveLength(0);
+      expect(prisma.creditSettings.upsert.mock.calls).toHaveLength(0);
+      expect(logger.log.mock.calls).toHaveLength(0);
+    });
+  });
+
+  describe('reading', () => {
+    it('returns the stored row', async () => {
+      prisma.creditSettings.findUnique.mockResolvedValue(
+        storedSettings({
+          trialAllowanceCredits: 75,
+          openRouterUsdMicrosPerCredit: 2500,
+        }),
+      );
+
+      await expect(service.getSettings()).resolves.toEqual({
+        ...DEFAULTS,
+        trialAllowanceCredits: 75,
+        openRouterUsdMicrosPerCredit: 2500,
+        openRouterUsdPerCredit: '0.0025',
+        updatedAt: updatedAt.toISOString(),
+      });
+      expect(prisma.creditSettings.createMany.mock.calls).toHaveLength(0);
+    });
+
+    it('re-stores the defaults when the row was deleted, instead of serving values from code', async () => {
+      prisma.creditSettings.findUnique.mockResolvedValue(null);
+      prisma.creditSettings.findUniqueOrThrow.mockResolvedValue(
+        storedSettings(),
+      );
+
+      await expect(service.getSettings()).resolves.toMatchObject(DEFAULTS);
+      expect(prisma.creditSettings.createMany.mock.calls).toEqual([
+        [{ data: [{ id: 'default' }], skipDuplicates: true }],
+      ]);
+    });
+
+    it('reads through a supplied transaction client', async () => {
+      const tx = mockDeep<PrismaService>();
+      tx.creditSettings.findUnique.mockResolvedValue(storedSettings());
+
+      await service.getSettings(tx);
+
+      expect(tx.creditSettings.findUnique.mock.calls).toEqual([
+        [{ where: { id: 'default' } }],
+      ]);
+      expect(prisma.creditSettings.findUnique.mock.calls).toHaveLength(0);
     });
   });
 
@@ -125,43 +155,39 @@ describe('CreditSettingsService', () => {
       [{ proMonthlyAllowanceCredits: 2000 }],
       [{ openRouterUsdMicrosPerCredit: 4000 }],
       [{ sessionOverageAllowanceCredits: 10 }],
-    ])('writes only %p and keeps the other settings', async (input) => {
-      const existing = storedSettings();
-      prisma.creditSettings.findUnique.mockResolvedValue(existing);
-      upsertAppliesTo(existing);
+    ])(
+      'locks the row and writes only %p, keeping the other settings',
+      async (input) => {
+        const existing = storedSettings();
+        prisma.creditSettings.findUniqueOrThrow.mockResolvedValue(existing);
+        updateAppliesTo(existing);
 
-      const result = await service.updateSettings(input, actor);
+        const result = await service.updateSettings(input, actor);
 
-      expect(prisma.creditSettings.upsert.mock.calls).toEqual([
-        [
-          {
-            where: { id: 'default' },
-            create: { id: 'default', ...input },
-            update: input,
-          },
-        ],
-      ]);
-      expect(result).toMatchObject({
-        trialAllowanceCredits: 50,
-        proMonthlyAllowanceCredits: 1000,
-        openRouterUsdMicrosPerCredit: 5000,
-        sessionOverageAllowanceCredits: 5,
-        ...input,
-        updatedAt: updatedAt.toISOString(),
-      });
-    });
+        expect(prisma.$queryRaw.mock.calls).toHaveLength(1);
+        expect(
+          Array.from(
+            prisma.$queryRaw.mock.calls[0]?.[0] as TemplateStringsArray,
+          ).join('?'),
+        ).toMatch(/FOR UPDATE/);
+        expect(prisma.creditSettings.update.mock.calls).toEqual([
+          [{ where: { id: 'default' }, data: input }],
+        ]);
+        expect(result).toMatchObject({ ...DEFAULTS, ...input });
+      },
+    );
 
     it('ignores undefined fields', async () => {
       const existing = storedSettings();
-      prisma.creditSettings.findUnique.mockResolvedValue(existing);
-      upsertAppliesTo(existing);
+      prisma.creditSettings.findUniqueOrThrow.mockResolvedValue(existing);
+      updateAppliesTo(existing);
 
       await service.updateSettings(
         { trialAllowanceCredits: undefined, sessionOverageAllowanceCredits: 0 },
         actor,
       );
 
-      expect(prisma.creditSettings.upsert.mock.calls[0]?.[0].update).toEqual({
+      expect(prisma.creditSettings.update.mock.calls[0]?.[0].data).toEqual({
         sessionOverageAllowanceCredits: 0,
       });
     });
@@ -175,15 +201,13 @@ describe('CreditSettingsService', () => {
   });
 
   describe('audit trail', () => {
-    it('records the first save as a create, diffed against the defaults', async () => {
-      prisma.creditSettings.findUnique.mockResolvedValue(null);
-      upsertAppliesTo(null);
+    it('records an update with old and new values', async () => {
+      const existing = storedSettings({ trialAllowanceCredits: 60 });
+      prisma.creditSettings.findUniqueOrThrow.mockResolvedValue(existing);
+      updateAppliesTo(existing);
 
       await service.updateSettings(
-        {
-          proMonthlyAllowanceCredits: 1500,
-          openRouterUsdMicrosPerCredit: 4000,
-        },
+        { trialAllowanceCredits: 40, openRouterUsdMicrosPerCredit: 4000 },
         actor,
       );
 
@@ -192,12 +216,12 @@ describe('CreditSettingsService', () => {
           {
             tableName: 'CreditSettings',
             recordId: 'default',
-            action: 'create',
+            action: 'update',
             changes: [
               {
-                fieldName: 'proMonthlyAllowanceCredits',
-                oldValue: '1000',
-                newValue: '1500',
+                fieldName: 'trialAllowanceCredits',
+                oldValue: '60',
+                newValue: '40',
               },
               {
                 fieldName: 'openRouterUsdMicrosPerCredit',
@@ -212,29 +236,10 @@ describe('CreditSettingsService', () => {
       ]);
     });
 
-    it('records later saves as updates with old and new values', async () => {
-      const existing = storedSettings({ trialAllowanceCredits: 60 });
-      prisma.creditSettings.findUnique.mockResolvedValue(existing);
-      upsertAppliesTo(existing);
-
-      await service.updateSettings({ trialAllowanceCredits: 40 }, actor);
-
-      expect(activityLog.logActivity.mock.calls[0]?.[0]).toMatchObject({
-        action: 'update',
-        changes: [
-          {
-            fieldName: 'trialAllowanceCredits',
-            oldValue: '60',
-            newValue: '40',
-          },
-        ],
-      });
-    });
-
     it('does not write an audit event when nothing actually changes', async () => {
       const existing = storedSettings();
-      prisma.creditSettings.findUnique.mockResolvedValue(existing);
-      upsertAppliesTo(existing);
+      prisma.creditSettings.findUniqueOrThrow.mockResolvedValue(existing);
+      updateAppliesTo(existing);
 
       await service.updateSettings({ trialAllowanceCredits: 50 }, actor);
 
@@ -242,8 +247,10 @@ describe('CreditSettingsService', () => {
     });
 
     it('propagates audit failures so the transaction rolls back the change', async () => {
-      prisma.creditSettings.findUnique.mockResolvedValue(storedSettings());
-      upsertAppliesTo(storedSettings());
+      prisma.creditSettings.findUniqueOrThrow.mockResolvedValue(
+        storedSettings(),
+      );
+      updateAppliesTo(storedSettings());
       activityLog.logActivity.mockRejectedValue(new Error('audit failed'));
 
       await expect(

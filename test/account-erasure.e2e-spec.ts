@@ -45,6 +45,8 @@ import { PrivacyExportJobHandler } from '../src/privacy/queues/privacy-export-jo
 import { ActivityLogService } from '../src/common/services/activity-log.service';
 import { SubscriptionAccessService } from '../src/subscription/subscription-access.service';
 import { SubscriptionPlanService } from '../src/subscription/subscription-plan.service';
+import { CreditSettingsService } from '../src/credit/credit-settings.service';
+import { CreditWalletService } from '../src/credit/credit-wallet.service';
 import type { JobExecution } from '../src/infrastructure/jobs/job.types';
 import {
   PrivateImageStorageService,
@@ -97,6 +99,11 @@ const USER_DATA_TABLES = [
   'RefreshSession',
   'AuthChallenge',
   'InfrastructureJob',
+  'CreditWallet',
+  'CreditAllocation',
+  'CreditTransaction',
+  'CreditTransactionEntry',
+  'CreditSessionOverage',
 ] as const;
 
 describeWithDatabase('Account erasure (PostgreSQL)', () => {
@@ -420,6 +427,29 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
       },
     });
 
+    // AI credits: an allocation, a deduction and session overage, written
+    // through the real wallet service (wallet, allocation, ledger, entries).
+    const credits = new CreditWalletService(
+      prisma,
+      new CreditSettingsService(
+        prisma,
+        new ActivityLogService(prisma, mock<CustomLoggerService>()),
+        mock<CustomLoggerService>(),
+      ),
+    );
+    await credits.allocate({
+      authId: user.id,
+      source: 'PURCHASE',
+      sourceReference: `erasure-purchase-${tag}`,
+      credits: '2.5',
+    });
+    await credits.deduct({
+      authId: user.id,
+      credits: 4,
+      idempotencyKey: `erasure-run-${tag}`,
+      sessionId: session.id,
+    });
+
     const running = await client.dataExport.create({
       data: {
         authId: user.id,
@@ -525,7 +555,9 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
                   ? `"guideId" IN (SELECT g."id" FROM "Guide" g JOIN "MakeupSession" s ON s."id" = g."sessionId" WHERE s."authId" = '${authId}')`
                   : ['StepAttempt', 'Question'].includes(table)
                     ? `"stepId" IN (SELECT st."id" FROM "GuideStep" st JOIN "Guide" g ON g."id" = st."guideId" JOIN "MakeupSession" s ON s."id" = g."sessionId" WHERE s."authId" = '${authId}')`
-                    : `"authId" = '${authId}'`;
+                    : table.startsWith('Credit') && table !== 'CreditWallet'
+                      ? `"walletId" IN (SELECT "id" FROM "CreditWallet" WHERE "authId" = '${authId}')`
+                      : `"authId" = '${authId}'`;
         const { rows } = await pg.query<{ count: string }>(
           `SELECT count(*)::text AS count FROM "${table}" WHERE ${where}`,
         );

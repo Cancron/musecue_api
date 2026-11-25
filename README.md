@@ -18,7 +18,7 @@ The companion mobile application and detailed product specifications live in `..
 - `AiRun` audit records containing operation, provider, model, prompt version, latency, progress, result/error, and status
 - a provider-neutral AI gateway with OpenRouter live mode, multimodal private-image input, strict structured output, runtime validation, bounded retries, and deterministic mock mode
 - a single Pro subscription plan: admin-configured monthly/yearly pricing and free trial, one-time trial activation, date-based Pro access through `ProAccessGuard`, payment/lifecycle records protected by database rules, and Stripe checkout for the monthly and yearly options with webhook-verified activation, automatic renewals, failed-payment handling and recovery, cancellation at period end, and refunds made in Stripe with immediate access revocation (see "Subscriptions" and "Stripe checkout" under API); requesting refunds from MuseCue and disputes are not implemented yet
-- AI credit settings (configuration only): administrators read and change the free-trial credit allowance, the Pro monthly credit allowance, the OpenRouter cost per credit and the per-session overage allowance, persisted in PostgreSQL and audited (see "AI credit settings" under API); credit balances and charging AI usage against them are not implemented yet
+- AI credits: administrator-managed credit settings (trial allowance, Pro monthly allowance, OpenRouter cost per credit, per-session overage), stored in PostgreSQL from the start and audited, and a persistent per-user credit wallet and append-only ledger (allocations by source with expiry, exact fractional balances, deductions with session overage, expirations) protected by database rules (see "AI credit settings" and "AI credit wallet and ledger" under API); nothing grants or charges credits yet
 - personal data export: an authenticated user can request an asynchronous ZIP archive of their own account, profile, makeup history, subscription records and private photos, poll its status, and download it through a signed link valid for at most 15 minutes; archives expire 24 hours after export and are deleted by a scheduled retention sweep (see "Personal data export" under API)
 - account deletion: the owner confirms their identity (password and an emailed code, or the code alone for accounts without a password), the account is blocked and every token invalidated at once (`PENDING_DELETION`), and a background sweep hard-deletes the account and all its data and files (including its refresh sessions, one-time codes and queued or retained background jobs), keeping payment records detached (see "Account deletion" under API)
 
@@ -30,7 +30,7 @@ Intentionally deferred:
 - copying images stored on the filesystem before the Supabase migration into the bucket (they remain readable through the `local` provider while its directory is present)
 - additional S3-compatible storage providers (the provider interface is in place; see "Private image storage")
 - generated preview images (recommendation reasoning is live, while the existing curated preview-image contract remains in place)
-- production retention/deletion automation and AI cost accounting (credit balances, granting allowances and charging AI runs; only the credit settings exist)
+- production retention/deletion automation and AI cost accounting (granting trial/Pro allowances, charging AI runs, credit purchases and referrals, user-facing credit routes and a scheduled expiry sweep; the credit settings and the wallet/ledger foundation exist)
 
 ## Requirements and setup
 
@@ -935,7 +935,7 @@ Migration `20261113120000_add_stripe_checkout` adds `PaymentCustomer` and `Check
 
 Not implemented yet: immediate cancellation (including canceling a past-due subscription to stop Stripe's retries), undoing a cancellation (a cancellation reversed in Stripe is not reflected), the customer portal (so users cannot update their card in-app; Stripe's own emails and hosted invoice page can be used), exposing the past-due state in `GET /v1/subscription`, requesting refunds from MuseCue, disputes (`charge.dispute.*`), canceling the Stripe subscription automatically when a payment is refunded, revoking an active free trial on refund (a trial is not a payment and keeps running), reactions to other `customer.subscription.updated` changes (e.g. `unpaid`), and automatic refunds or cancellation of duplicate payments and subscriptions. Renewal delays within Stripe's retry window (up to 3 days) are handled. If a renewal for an older period arrives after a newer one, the older period is recorded but cannot be merged into the term: the database allows one payment per term change.
 
-Database tests (`test/auth-state.e2e-spec.ts`, `test/postgres-job-queue.e2e-spec.ts`, `test/postgres-mode.e2e-spec.ts`, `test/rate-limit-contract.e2e-spec.ts` (PostgreSQL part), `test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`, `test/privacy-export.e2e-spec.ts`, `test/account-deletion.e2e-spec.ts`, `test/account-erasure.e2e-spec.ts`, `test/stripe-checkout.e2e-spec.ts`, `test/stripe-renewal.e2e-spec.ts`, `test/stripe-payment-failure.e2e-spec.ts`, `test/stripe-cancellation.e2e-spec.ts`, `test/stripe-refund.e2e-spec.ts`, `test/subscription-billing.e2e-spec.ts`, `test/stripe-webhook-reliability.e2e-spec.ts`, `test/stripe-payment-lifecycle.e2e-spec.ts`, `test/credit-settings.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
+Database tests (`test/auth-state.e2e-spec.ts`, `test/postgres-job-queue.e2e-spec.ts`, `test/postgres-mode.e2e-spec.ts`, `test/rate-limit-contract.e2e-spec.ts` (PostgreSQL part), `test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`, `test/privacy-export.e2e-spec.ts`, `test/account-deletion.e2e-spec.ts`, `test/account-erasure.e2e-spec.ts`, `test/stripe-checkout.e2e-spec.ts`, `test/stripe-renewal.e2e-spec.ts`, `test/stripe-payment-failure.e2e-spec.ts`, `test/stripe-cancellation.e2e-spec.ts`, `test/stripe-refund.e2e-spec.ts`, `test/subscription-billing.e2e-spec.ts`, `test/stripe-webhook-reliability.e2e-spec.ts`, `test/stripe-payment-lifecycle.e2e-spec.ts`, `test/credit-settings.e2e-spec.ts`, `test/credit-wallet.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
 
 ```bash
 TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json test/subscription-plan test/user-subscription test/subscription-trial test/subscription-status test/pro-access test/trial-lifecycle test/billing test/subscription-security test/privacy-export test/account-deletion test/account-erasure
@@ -963,7 +963,7 @@ npm test -- --runInBand subscription-billing
 
 ### AI credit settings
 
-Configuration for the upcoming AI credit system. Only the settings exist so far: nothing grants, tracks or charges credits yet. Future balance and charging code should import `CreditModule` and read the values through `CreditSettingsService.getSettings()` (it accepts a transaction client).
+Configuration of the AI credit system. Code that needs the values imports `CreditModule` and reads them through `CreditSettingsService.getSettings()` (it accepts a transaction client).
 
 Both routes require a bearer token for an `ADMIN` or `SUPERADMIN` account, exactly like the subscription plan routes. Requests without a valid, current access token receive `401`; other roles (`USER`, `MODERATOR`) receive `403` for reading as well as changing.
 
@@ -972,7 +972,7 @@ Both routes require a bearer token for an `ADMIN` or `SUPERADMIN` account, exact
 | `GET`   | `/v1/admin/credit-settings`  | Read the credit configuration          |
 | `PATCH` | `/v1/admin/credit-settings`  | Change any subset of the configuration |
 
-The settings are a single row in the `CreditSettings` table (migration `20261122120000_add_credit_settings`), so they survive restarts. Before an administrator saves anything, no row exists and the API serves these defaults (the column defaults are the same):
+The settings are a single row in the `CreditSettings` table (migration `20261122120000_add_credit_settings`). The defaults are the table's column defaults and are stored in PostgreSQL from the start: migration `20261123120000_seed_credit_settings` inserts the row, and the API inserts it again at startup if it is missing (`INSERT ... ON CONFLICT DO NOTHING`, also when read). Neither ever overwrites an existing row, so administrator changes survive restarts and redeployments; the values are not defined in application code.
 
 | Field                            | Type    | Default          | Accepted values                                   |
 | -------------------------------- | ------- | ---------------- | ------------------------------------------------- |
@@ -981,9 +981,9 @@ The settings are a single row in the `CreditSettings` table (migration `20261122
 | `openRouterUsdMicrosPerCredit`   | integer | `5000` ($0.005)  | `1`–`1000000` millionths of a US dollar ($0.000001–$1.00) per credit |
 | `sessionOverageAllowanceCredits` | integer | `5`              | `0`–`10000` credits a session may use beyond the balance |
 
-The OpenRouter cost per credit is stored as whole micro-dollars (millionths of a dollar) to avoid floating-point rounding, because $0.005 is less than a cent; send `5000`, not `0.005`. Responses also include `openRouterUsdPerCredit`, a read-only decimal string of the same value (`"0.005"`), and `updatedAt` (`null` until the first save).
+The OpenRouter cost per credit is stored as whole micro-dollars (millionths of a dollar) to avoid floating-point rounding, because $0.005 is less than a cent; send `5000`, not `0.005`. Responses also include `openRouterUsdPerCredit`, a read-only decimal string of the same value (`"0.005"`), and `updatedAt` (when the row was created or last changed).
 
-`PATCH` accepts any subset of the four editable fields; omitted fields are unchanged. Negative values, a zero cost per credit, values above the limits, fractional numbers, numeric strings, `null`, booleans, objects, empty bodies, and unknown or read-only fields (including `openRouterUsdPerCredit` and `updatedAt`) are rejected with `400`, and the request changes nothing: if any field is invalid, none is written. CHECK constraints in PostgreSQL also reject negative allowances, a non-positive cost per credit, and a second configuration row, whatever the write path. Every change is recorded in `ActivityLogEvent` (table `CreditSettings`, old value, new value, administrator ID) in the same transaction as the settings update.
+`PATCH` accepts any subset of the four editable fields; omitted fields are unchanged. Negative values, a zero cost per credit, values above the limits, fractional numbers, numeric strings, `null`, booleans, objects, empty bodies, and unknown or read-only fields (including `openRouterUsdPerCredit` and `updatedAt`) are rejected with `400`, and the request changes nothing: if any field is invalid, none is written. CHECK constraints in PostgreSQL also reject negative allowances, a non-positive cost per credit, and a second configuration row, whatever the write path. Updates lock the row, so concurrent changes are applied one after another. Every change is recorded in `ActivityLogEvent` (table `CreditSettings`, old value, new value, administrator ID) in the same transaction as the settings update.
 
 ```json
 {
@@ -992,7 +992,7 @@ The OpenRouter cost per credit is stored as whole micro-dollars (millionths of a
   "openRouterUsdMicrosPerCredit": 5000,
   "openRouterUsdPerCredit": "0.005",
   "sessionOverageAllowanceCredits": 5,
-  "updatedAt": null
+  "updatedAt": "2026-11-23T12:00:00.000Z"
 }
 ```
 
@@ -1005,6 +1005,39 @@ npm test -- --runInBand credit
 TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json --runInBand test/credit-settings
 ```
 
+### AI credit wallet and ledger
+
+Foundation only: `CreditWalletService` (exported by `CreditModule`) keeps every user's credits in PostgreSQL, but no route or feature calls it yet. Trial activation, Pro renewals, purchases, referrals and AI runs will allocate and deduct through it.
+
+| Table                    | Contents                                                                                                   |
+| ------------------------ | ---------------------------------------------------------------------------------------------------------- |
+| `CreditWallet`           | One per user (`authId`): `balanceCredits` and `outstandingOverageCredits`                                  |
+| `CreditAllocation`       | A grant of credits: `source` (`TRIAL`, `SUBSCRIPTION`, `PURCHASE`, `REFERRAL`), `sourceReference`, granted and remaining credits, `expiresAt`, `expiredAt` |
+| `CreditTransaction`      | The append-only ledger: `ALLOCATION`, `DEDUCTION`, `EXPIRATION`, `OVERAGE_SETTLEMENT`, numbered per wallet with running totals, an idempotency key, and the session and caller reference of deductions |
+| `CreditTransactionEntry` | How much of each transaction came from (or went to) each allocation                                      |
+| `CreditSessionOverage`   | Overage used per makeup session: the session's limit, overage used, and the part repaid                   |
+
+Rules (migration `20261124120000_add_credit_wallet_ledger`):
+
+- **Amounts** are exact decimals with up to 6 fractional digits (`NUMERIC(20,6)`, `Prisma.Decimal` in code, decimal strings in results). Amounts with more digits are rejected, never rounded.
+- **Sources and expiry.** `TRIAL` and `SUBSCRIPTION` allocations must have an `expiresAt` after they are granted. `PURCHASE` and `REFERRAL` allocations never expire. A user has at most one `TRIAL` allocation, and a `(source, sourceReference)` event can be allocated only once, to one user. Repeating the same allocation returns the existing one; reusing the event with other terms or for another user is a `409`.
+- **Expired credits never count.** `getBalance` excludes them at read time. Every wallet operation first expires due allocations with an `EXPIRATION` transaction dated at `expiresAt`. `expireAllDueCredits()` does the same across wallets; it is not scheduled yet.
+- **Spending** uses the soonest-expiring credits first, then non-expiring ones. A deduction that does not fit is refused as a whole (`402 Insufficient credits`). Deductions are idempotent per user and key.
+- **Session overage.** A deduction for one of the user's makeup sessions may exceed the balance by up to `sessionOverageAllowanceCredits`. The session keeps the limit that applied when it first used overage. New allocations repay outstanding overage first (`OVERAGE_SETTLEMENT`), so a wallet never has both a balance and unpaid overage.
+- **Concurrency.** Every change runs in one transaction that locks the user's wallet row (`SELECT ... FOR UPDATE`), so concurrent operations for a user are applied one at a time. Unique constraints reject duplicates that could otherwise race (the same source event for two users, a second trial, a reused sequence number).
+- **Database-enforced consistency.** Triggers and CHECK constraints make the ledger append-only and keep allocation terms immutable. Remaining credits only decrease. Nothing can be deleted while its user exists; deleting the user cascades, as in account erasure. At commit, the database checks that:
+  - the wallet balance equals both the last transaction's running total and the sum of remaining credits;
+  - the outstanding overage equals the unsettled session overage;
+  - every transaction and allocation equals the sum of its entries.
+  A write that breaks any of these is rolled back.
+
+Tests:
+
+```bash
+npm test -- --runInBand credit   # includes credit-ledger.policy and credit-wallet.service unit tests
+TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json --runInBand test/credit-wallet
+```
+
 ## Domain
 
 ```text
@@ -1014,6 +1047,7 @@ authUser
 |-- InfrastructureJob (PostgreSQL queue driver; deleted with the account)
 |-- PaymentCustomer (0..1 per provider)
 |-- UserSubscription (0..1)
+|-- CreditWallet (0..1) -> CreditAllocation, CreditTransaction -> CreditTransactionEntry, CreditSessionOverage
 |-- DataExport
 |-- (AccountDeletionRequest -> AccountDeletionFile: references authId without a foreign key)
 `-- MakeupSession

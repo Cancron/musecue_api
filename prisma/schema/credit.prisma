@@ -4,13 +4,11 @@
 
 // Administrator-managed configuration of the AI credit system. There is one
 // global configuration, stored as a single row whose `id` is always
-// 'default' (CHECK constraint in the migration). No row exists until an
-// administrator saves for the first time; until then the API serves the
-// defaults. Defaults must match CREDIT_SETTINGS_DEFAULTS in
-// src/credit/credit-settings.constants.ts.
-//
-// This is configuration only: credit balances, ledgers and charging of AI
-// usage do not exist yet and will read these values when they are added.
+// 'default' (CHECK constraint in the migration). The column defaults below
+// are the default settings: migration 20261123120000_seed_credit_settings
+// stores the row, and the API re-creates it with these defaults at startup
+// if it is missing. An existing row is never overwritten except by an
+// administrator update.
 model CreditSettings {
   id                             String   @id @default("default") @db.VarChar(20)
   // Credits granted once to a user starting the free trial.
@@ -25,4 +23,157 @@ model CreditSettings {
   sessionOverageAllowanceCredits Int      @default(5)
   createdAt                      DateTime @default(now())
   updatedAt                      DateTime @updatedAt
+}
+
+// ================================
+// AI Credit Wallet and Ledger
+// ================================
+//
+// Credit amounts are exact decimals with up to 6 fractional digits
+// (NUMERIC(20,6)); they are never floating-point numbers. All writes go
+// through src/credit/credit-wallet.service.ts, which locks the wallet row for
+// the whole transaction. The database independently enforces the ledger
+// invariants (CHECK constraints and triggers in migration
+// 20261124120000_add_credit_wallet_ledger, which Prisma does not model):
+//   * wallet balance = the latest transaction's balance after = the sum of
+//     the remaining credits of its allocations;
+//   * wallet outstanding overage = the latest transaction's overage after =
+//     the sum of unsettled session overage;
+//   * an allocation's remaining credits = the sum of its ledger entries, and a
+//     transaction's amount = the sum of its entries;
+//   * transactions are numbered 1, 2, 3, ... per wallet and each one's
+//     balance after is the previous one plus its amount;
+//   * transactions and entries are append-only; allocation terms never
+//     change, remaining credits only decrease, and nothing can be deleted
+//     while its owner exists (deleting the user cascades).
+
+// One wallet per user, created with the user's first credit operation.
+model CreditWallet {
+  id                        String   @id @default(uuid())
+  authId                    String   @unique
+  // Sum of the remaining credits of all allocations. Credits past their
+  // expiry count here until their EXPIRATION transaction is written (on the
+  // next wallet operation or by the expiry sweep); the spendable balance
+  // excludes them (CreditWalletService.getBalance).
+  balanceCredits            Decimal  @default(0) @db.Decimal(20, 6)
+  // Session overage used beyond the balance and not yet repaid. New
+  // allocations repay it first, so it is only non-zero while the balance is 0.
+  outstandingOverageCredits Decimal  @default(0) @db.Decimal(20, 6)
+  createdAt                 DateTime @default(now())
+  updatedAt                 DateTime @updatedAt
+
+  authUser        authUser                 @relation(fields: [authId], references: [id], onDelete: Cascade)
+  allocations     CreditAllocation[]
+  transactions    CreditTransaction[]
+  entries         CreditTransactionEntry[]
+  sessionOverages CreditSessionOverage[]
+}
+
+// A grant of credits from one source to one wallet. (source,
+// sourceReference) identifies the granting event (e.g. a trial, a paid
+// subscription period, a purchase or a referral reward) and is globally
+// unique, so the same event can never be allocated twice or to two users.
+model CreditAllocation {
+  id               String       @id @default(uuid())
+  walletId         String
+  source           CreditSource
+  sourceReference  String       @db.VarChar(200)
+  grantedCredits   Decimal      @db.Decimal(20, 6)
+  // Not yet used, expired or used to repay overage. Only decreases.
+  remainingCredits Decimal      @db.Decimal(20, 6)
+  // Required for TRIAL and SUBSCRIPTION, always NULL for PURCHASE and
+  // REFERRAL (CHECK constraint).
+  expiresAt        DateTime?
+  // When the EXPIRATION transaction removed the unused credits.
+  expiredAt        DateTime?
+  grantedAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  wallet       CreditWallet             @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  transactions CreditTransaction[]
+  entries      CreditTransactionEntry[]
+
+  @@unique([source, sourceReference])
+  // Target of the composite foreign keys that keep ledger rows in the
+  // allocation's wallet.
+  @@unique([id, walletId])
+  @@index([walletId, expiresAt])
+}
+
+// Append-only credit ledger: one row per balance change, numbered per wallet.
+model CreditTransaction {
+  id                             String                @id @default(uuid())
+  walletId                       String
+  // 1, 2, 3, ... per wallet, without gaps.
+  sequence                       Int
+  type                           CreditTransactionType
+  // Change of the wallet balance: positive for ALLOCATION, negative for
+  // EXPIRATION and OVERAGE_SETTLEMENT, zero or negative for DEDUCTION.
+  amountCredits                  Decimal               @db.Decimal(20, 6)
+  // Change of the outstanding overage: positive when a DEDUCTION used
+  // overage, negative for OVERAGE_SETTLEMENT, otherwise zero.
+  overageChangeCredits           Decimal               @default(0) @db.Decimal(20, 6)
+  balanceAfterCredits            Decimal               @db.Decimal(20, 6)
+  outstandingOverageAfterCredits Decimal               @db.Decimal(20, 6)
+  // Unique per wallet; makes every operation safe to retry.
+  idempotencyKey                 String                @db.VarChar(200)
+  // The allocation an ALLOCATION, EXPIRATION or OVERAGE_SETTLEMENT is about.
+  allocationId                   String?
+  // The makeup session a DEDUCTION was charged to (no foreign key: the
+  // ledger outlives deleted sessions).
+  sessionId                      String?               @db.VarChar(64)
+  // Caller reference, e.g. the AI run a deduction paid for.
+  reference                      String?               @db.VarChar(200)
+  // When the change took effect: the expiry time for EXPIRATION, otherwise
+  // the time it was recorded.
+  effectiveAt                    DateTime
+  createdAt                      DateTime              @default(now())
+
+  wallet     CreditWallet             @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  allocation CreditAllocation?        @relation(fields: [allocationId, walletId], references: [id, walletId], onDelete: Cascade)
+  entries    CreditTransactionEntry[]
+
+  @@unique([walletId, sequence])
+  @@unique([walletId, idempotencyKey])
+  @@unique([id, walletId])
+  @@index([allocationId])
+  @@index([sessionId])
+}
+
+// How much of a transaction's amount came from (or went to) each allocation.
+model CreditTransactionEntry {
+  id            String  @id @default(uuid())
+  transactionId String
+  walletId      String
+  allocationId  String
+  // Non-zero: positive adds to the allocation, negative uses it.
+  amountCredits Decimal @db.Decimal(20, 6)
+
+  wallet      CreditWallet      @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  transaction CreditTransaction @relation(fields: [transactionId, walletId], references: [id, walletId], onDelete: Cascade)
+  allocation  CreditAllocation  @relation(fields: [allocationId, walletId], references: [id, walletId], onDelete: Cascade)
+
+  @@unique([transactionId, allocationId])
+  @@index([allocationId])
+  @@index([walletId])
+}
+
+// Overage used by one makeup session beyond the wallet balance, capped by
+// the per-session allowance in effect when the session first used overage.
+model CreditSessionOverage {
+  id             String   @id @default(uuid())
+  walletId       String
+  // The makeup session (no foreign key: the record outlives the session).
+  sessionId      String   @unique @db.VarChar(64)
+  limitCredits   Decimal  @db.Decimal(20, 6)
+  // Total overage used by the session; only increases, never above the limit.
+  overageCredits Decimal  @db.Decimal(20, 6)
+  // Part of the overage repaid by later allocations; only increases.
+  settledCredits Decimal  @default(0) @db.Decimal(20, 6)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  wallet CreditWallet @relation(fields: [walletId], references: [id], onDelete: Cascade)
+
+  @@index([walletId])
 }
