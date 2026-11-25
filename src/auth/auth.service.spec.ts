@@ -1,4 +1,5 @@
 import { mock, mockDeep, mockReset } from 'jest-mock-extended';
+import { noMfaLogin } from '../../test/support/no-mfa-login';
 import { AuthService } from './auth.service';
 import { AuthUtilsService } from './services/auth-utils.service';
 import { PrismaService } from '../common/services/prisma.service';
@@ -57,6 +58,7 @@ describe('AuthService', () => {
     mock<TokenVersionCache>(),
     emailQueueService,
     mock<CustomLoggerService>(),
+    noMfaLogin(),
   );
 
   /** Runs every transaction callback with `tx` as its client. */

@@ -9,12 +9,16 @@ const hasherWith = (
 ) => new MfaRecoveryCodeHasher(new ConfigService(env));
 
 describe('MfaRecoveryCodeHasher (mfa)', () => {
-  const originalRefresh = config.jwt_refresh_secret;
+  const original = {
+    refresh: config.jwt_refresh_secret,
+    access: config.jwt_access_secret,
+  };
   beforeEach(() => {
     config.jwt_refresh_secret = 'mfa-recovery-hasher-refresh-0123456789';
   });
   afterAll(() => {
-    config.jwt_refresh_secret = originalRefresh;
+    config.jwt_refresh_secret = original.refresh;
+    config.jwt_access_secret = original.access;
   });
 
   it('issues 10 codes with their hashes (lowercase hex, no code inside)', () => {
@@ -55,10 +59,13 @@ describe('MfaRecoveryCodeHasher (mfa)', () => {
         'ABCD-2345-WXYZ',
       ),
     );
-    // Separate from the secret-encryption key and the fallback root.
-    expect(hasherWith().hash('user-1', 'ABCD-2345-WXYZ')).not.toBe(
-      hasherWith({}).hash('user-1', 'ABCD-2345-WXYZ'),
-    );
+  });
+
+  it('is independent of the JWT secrets: rotating them keeps codes usable', () => {
+    const before = hasherWith().hash('user-1', 'ABCD-2345-WXYZ');
+    config.jwt_refresh_secret = 'rotated-refresh-secret-0123456789abcdef';
+    config.jwt_access_secret = 'rotated-access-secret-0123456789abcdef';
+    expect(hasherWith().hash('user-1', 'ABCD-2345-WXYZ')).toBe(before);
   });
 
   it('returns null for anything that cannot be a recovery code', () => {
@@ -66,12 +73,15 @@ describe('MfaRecoveryCodeHasher (mfa)', () => {
     expect(hasherWith().hash('user-1', 'ABCD-2345-WXYU')).toBeNull();
   });
 
-  it('fails closed without a usable key', () => {
+  it('fails closed without a usable key, never falling back to JWT_REFRESH_SECRET', () => {
     expect(() =>
       hasherWith({ MFA_ENCRYPTION_KEY: 'short' }).hash('u', 'ABCD-2345-WXYZ'),
     ).toThrow(MfaEncryptionUnavailableError);
-    config.jwt_refresh_secret = '';
+    // JWT_REFRESH_SECRET is set (beforeEach) and still not used.
     expect(() => hasherWith({}).hash('u', 'ABCD-2345-WXYZ')).toThrow(
+      MfaEncryptionUnavailableError,
+    );
+    expect(() => hasherWith({}).issue('u')).toThrow(
       MfaEncryptionUnavailableError,
     );
   });

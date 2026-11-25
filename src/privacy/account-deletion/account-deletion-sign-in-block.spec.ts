@@ -1,4 +1,6 @@
+import type { ILoginResponse } from '../../auth/interfaces/auth.interface';
 import * as bcrypt from 'bcryptjs';
+import { noMfaLogin } from '../../../test/support/no-mfa-login';
 import { mock } from 'jest-mock-extended';
 import {
   AccountStore,
@@ -55,6 +57,7 @@ describe('Accounts pending deletion cannot sign in again (privacy)', () => {
       new FakeTokenVersionCache(),
       mock<EmailQueueService>(),
       mock<CustomLoggerService>(),
+      noMfaLogin(),
     );
   });
 
@@ -73,7 +76,9 @@ describe('Accounts pending deletion cannot sign in again (privacy)', () => {
       META,
     );
 
-    expect(session.accessToken).toEqual(expect.any(String));
+    // No MFA on this account: tokens, not a challenge.
+    expect('mfaRequired' in session).toBe(false);
+    expect((session as ILoginResponse).accessToken).toEqual(expect.any(String));
   });
 
   it('refuses a password login with the generic invalid-credentials error', async () => {
@@ -122,6 +127,7 @@ describe('Accounts pending deletion cannot sign in again (privacy)', () => {
       store.prisma,
       mock<ActivityLogService>(),
       utils,
+      noMfaLogin(),
     );
     const createAccessToken = jest.spyOn(utils, 'createAccessToken');
     const findOrCreateUser = (

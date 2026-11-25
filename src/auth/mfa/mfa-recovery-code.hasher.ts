@@ -13,8 +13,8 @@ export interface IssuedRecoveryCodes {
 
 /**
  * Hashes MFA recovery codes for storage and lookup: HMAC-SHA-256 under a key
- * derived from the MFA root key (MFA_ENCRYPTION_KEY, else
- * JWT_REFRESH_SECRET), over the user ID and the normalized code. The key is
+ * derived from MFA_ENCRYPTION_KEY only (never the JWT secrets), over the user
+ * ID and the normalized code. The key is
  * not in the database, so stored hashes cannot be brute-forced from a
  * database copy; binding the user means a code only ever matches for the
  * account it was issued to. Codes have 60 random bits, so a keyed hash (not a

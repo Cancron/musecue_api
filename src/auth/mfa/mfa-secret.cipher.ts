@@ -19,11 +19,10 @@ export type MfaSecretSlot = 'enrollment' | 'active';
 /**
  * Encrypts authenticator (TOTP) secrets for PostgreSQL with AES-256-GCM.
  *
- * The key is derived with HKDF from MFA_ENCRYPTION_KEY (at least 32
- * characters) when configured, otherwise from JWT_REFRESH_SECRET, under an
- * MFA-specific purpose. Each ciphertext is bound to its user and slot, so it
- * cannot be moved to another account. Changing the root key makes stored
- * secrets unreadable (affected users must enroll again).
+ * The key is derived with HKDF from MFA_ENCRYPTION_KEY only (at least 32
+ * characters; never from the JWT secrets), under an MFA-specific purpose.
+ * Each ciphertext is bound to its user and slot, so it cannot be moved to
+ * another account. Without the key every operation fails closed.
  */
 @Injectable()
 export class MfaSecretCipher {
@@ -35,7 +34,9 @@ export class MfaSecretCipher {
 
   /** Throws SecretDecryptionError when the value was not encrypted for this user and slot. */
   decrypt(authId: string, slot: MfaSecretSlot, encrypted: string): string {
-    return decryptWithKey(() => this.key(), encrypted, this.aad(authId, slot));
+    // Resolve the key first: a missing key is a configuration error (503),
+    // never "this value cannot be decrypted".
+    return decryptWithKey(this.key(), encrypted, this.aad(authId, slot));
   }
 
   private aad(authId: string, slot: MfaSecretSlot): string {

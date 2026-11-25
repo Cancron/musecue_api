@@ -19,7 +19,7 @@ The companion mobile application and detailed product specifications live in `..
 - a provider-neutral AI gateway with OpenRouter live mode, multimodal private-image input, strict structured output, runtime validation, bounded retries, and deterministic mock mode
 - a single Pro subscription plan: admin-configured monthly/yearly pricing and free trial, one-time trial activation, date-based Pro access through `ProAccessGuard`, payment/lifecycle records protected by database rules, and Stripe checkout for the monthly and yearly options with webhook-verified activation, automatic renewals, failed-payment handling and recovery, cancellation at period end, and refunds made in Stripe with immediate access revocation (see "Subscriptions" and "Stripe checkout" under API); requesting refunds from MuseCue and disputes are not implemented yet
 - personal data export: an authenticated user can request an asynchronous ZIP archive of their own account, profile, makeup history, subscription records and private photos, poll its status, and download it through a signed link valid for at most 15 minutes; archives expire 24 hours after export and are deleted by a scheduled retention sweep (see "Personal data export" under API)
-- optional multi-factor authentication with an authenticator app (TOTP): the signed-in owner starts an enrollment, confirms it within 10 minutes with a current 6-digit code, and can check whether MFA is enabled; the secret is stored only encrypted, and 5 incorrect codes within 15 minutes block enrollment for 15 minutes. Enabling MFA issues 10 one-time recovery codes (shown once, stored as keyed hashes) that can replace the authenticator for an MFA verification, and can be regenerated (see "Multi-factor authentication (MFA)" under API). Sign-in does not require the second factor yet
+- optional multi-factor authentication with an authenticator app (TOTP): the signed-in owner starts an enrollment, confirms it within 10 minutes with a current 6-digit code, and can check whether MFA is enabled; the secret is stored only encrypted, and 5 incorrect codes within 15 minutes block enrollment for 15 minutes. Enabling MFA issues 10 one-time recovery codes (shown once, stored as keyed hashes) that can replace the authenticator for an MFA verification, and can be regenerated. Password and Google sign-in of an MFA-enabled account return an MFA challenge instead of tokens, completed with an authenticator or recovery code; the device can then be trusted for 30 days, and trusted devices can be listed and revoked (see "Multi-factor authentication (MFA)" and "MFA at sign-in" under API)
 - account deletion: the owner confirms their identity (password and an emailed code, or the code alone for accounts without a password), the account is blocked and every token invalidated at once (`PENDING_DELETION`), and a background sweep hard-deletes the account and all its data and files (including its refresh sessions, one-time codes and queued or retained background jobs), keeping payment records detached (see "Account deletion" under API)
 
 Migration `20260827174107_add_makeup_workflow` adds the makeup aggregate and removes the dormant job-tracker and subscription starter domains.
@@ -31,7 +31,7 @@ Intentionally deferred:
 - additional S3-compatible storage providers (the provider interface is in place; see "Private image storage")
 - generated preview images (recommendation reasoning is live, while the existing curated preview-image contract remains in place)
 - production retention/deletion automation and AI cost accounting
-- MFA at sign-in: a second-factor step after password and Google sign-in (it should call `MfaVerificationService`), disabling or resetting MFA, and re-keying secrets and recovery codes under a new `MFA_ENCRYPTION_KEY`
+- disabling or resetting MFA, revoking trusted devices on security events (for example sign-out everywhere), and re-keying secrets and recovery codes under a new `MFA_ENCRYPTION_KEY`
 
 ## Requirements and setup
 
@@ -549,6 +549,7 @@ Authentication routes:
 | `POST` | `/auth/refresh-token`             | Rotate the refresh token                     |
 | `POST` | `/auth/logout`                    | Revoke the current session                   |
 | `POST` | `/auth/logout-all`                | Revoke all user sessions                     |
+| `POST` | `/auth/mfa/challenge`             | Complete an MFA-enabled sign-in (see "MFA at sign-in") |
 
 MFA routes act on the bearer token's own account (see "Multi-factor authentication (MFA)"):
 
@@ -559,6 +560,8 @@ MFA routes act on the bearer token's own account (see "Multi-factor authenticati
 | `POST` | `/v1/auth/mfa/enrollment/confirm` | Confirm with the current 6-digit code and enable MFA; returns the recovery codes once |
 | `POST` | `/v1/auth/mfa/verify`             | Verify the second factor: authenticator code or recovery code |
 | `POST` | `/v1/auth/mfa/recovery-codes`     | Replace all recovery codes (needs a second factor); returns the new codes once |
+| `GET`  | `/v1/auth/mfa/trusted-devices`    | List the user's trusted devices (never their tokens)      |
+| `DELETE` | `/v1/auth/mfa/trusted-devices/:deviceId` | Revoke one of the user's trusted devices          |
 
 Makeup routes require a bearer token:
 
@@ -711,14 +714,18 @@ personal data export includes `mfaEnabled` and `mfaMethod`, never the secret.
 Secrets are encrypted with AES-256-GCM (`v1.<iv>.<tag>.<ciphertext>`; database
 CHECK constraints refuse anything else). Associated data binds each ciphertext
 to its user and slot (pending or confirmed), so it cannot be moved to another
-account. The key is derived with HKDF-SHA-256 from `MFA_ENCRYPTION_KEY` (at
-least 32 characters). When that is unset, it is derived from
-`JWT_REFRESH_SECRET`. Set `MFA_ENCRYPTION_KEY` before users enroll, keep it in
-your secret store, and do not change it: confirmed secrets cannot be decrypted
-under a different key, and re-encryption is not implemented yet. Without the
-dedicated key, rotating `JWT_REFRESH_SECRET` has the same effect. Recovery
-codes are hashed under a key derived from the same root, so changing it also
-makes every recovery code unusable. A pending enrollment that can no longer be
+account. The key is derived with HKDF-SHA-256 from `MFA_ENCRYPTION_KEY` only
+(at least 32 characters), never from the JWT secrets, so `JWT_ACCESS_SECRET`
+and `JWT_REFRESH_SECRET` can be rotated without affecting authenticator
+secrets or recovery codes (recovery codes are hashed under a second key derived
+from the same root). `MFA_ENCRYPTION_KEY` is required for MFA: without it,
+enrollment, verification and completing an MFA sign-in answer `503`, and MFA
+is never skipped (accounts without MFA are not affected). A key that is set
+but shorter than 32 characters stops the application at startup; a missing
+key is logged at startup (as an error when MFA-enabled accounts exist). Keep
+the key in your secret store and do not change it: stored secrets cannot be
+decrypted and recovery codes not matched under a different key, and
+re-keying is not implemented yet. A pending enrollment that can no longer be
 decrypted answers `410` (start again).
 
 #### Recovery codes and MFA verification
@@ -758,7 +765,7 @@ cannot mint codes that bypass MFA. A recovery code used for this is consumed.
 
 Storage: `MfaRecoveryCode` rows hold only `codeHash`, an HMAC-SHA-256 of the
 user ID and the normalized code under a key derived (HKDF) from the MFA root
-key (`MFA_ENCRYPTION_KEY`, else `JWT_REFRESH_SECRET`). The key is not in the
+key (`MFA_ENCRYPTION_KEY`, never the JWT secrets). The key is not in the
 database, so a database copy does not reveal or allow guessing the codes, and
 a code only matches for its own account. `usedAt` records the consumption and
 `invalidatedAt` the replacement; a trigger makes both permanent and the hash
@@ -770,10 +777,80 @@ hourly authentication-state sweep, and all codes with the account on erasure.
 Use and regeneration are recorded in the activity log as the change of the
 remaining count, never with a code.
 
-`MfaVerificationService.verify` is the building block for a second-factor
-step at sign-in, which is not implemented yet: today `POST
-/v1/auth/mfa/verify` only confirms the factor (for example before a sensitive
-action in the app) and does not change what an access token allows.
+`POST /v1/auth/mfa/verify` confirms the factor for a signed-in user (for
+example before a sensitive action in the app); it does not change what an
+access token allows. Sign-in itself uses the challenge below.
+
+#### MFA at sign-in
+
+Accounts without MFA sign in exactly as before. For an MFA-enabled account, a
+successful `POST /auth/login` (password) or Google sign-in does not return
+tokens but a challenge (no session is created):
+
+```json
+{
+  "mfaRequired": true,
+  "challengeToken": "q3Yx...43 characters",
+  "challengeExpiresAt": "2026-11-24T12:05:00.000Z",
+  "methods": ["totp", "recovery_code"]
+}
+```
+
+`POST /auth/mfa/challenge` completes it (no bearer token; `Cache-Control:
+no-store`):
+
+```json
+{ "challengeToken": "q3Yx...", "code": "123456", "trustDevice": true, "deviceName": "Ada's iPhone" }
+```
+
+with exactly one of `code` (the authenticator's current code, not one already
+used) or `recoveryCode` (an unused recovery code, consumed). It answers `200`
+with the regular login response plus `mfa: { method, remainingRecoveryCodes }`
+and `trustedDevice` (`null` unless `trustDevice` was `true`). Refusals:
+
+- `401 The MFA challenge is invalid or has expired. Please sign in again.` for
+  an unknown, used or expired (after 5 minutes) challenge; not counted as an
+  incorrect code, and no code is consumed.
+- `400 Invalid or expired authentication code` for a wrong, used, replaced or
+  other account's code; the challenge stays usable until it expires, and
+  incorrect codes count toward the MFA verification block (5 within 15
+  minutes, then `429` for 15 minutes).
+- `503` without a usable `MFA_ENCRYPTION_KEY`.
+
+The challenge token is an opaque random value (not a JWT): it is refused as a
+bearer token (`401`) and as a refresh token (`400`), and only its SHA-256 is
+stored (`MfaLoginChallenge`). It is consumed in the same transaction that
+accepts the code (under the user's row lock), so it completes once even under
+concurrent requests, and a refused completion consumes nothing. The challenge
+decides the account: tokens are only ever issued for the challenge's own user.
+
+Google sign-in: `POST /auth/google/callback` answers `{ success, message: "MFA
+verification required", data: <challenge> }`; the browser callback (`GET
+/auth/google/callback` with a `redirectUrl`) redirects with `mfa_required=true`,
+`mfa_challenge_token` and `mfa_challenge_expires_at` instead of tokens.
+
+Trusted devices: with `trustDevice: true` the response contains
+`trustedDevice: { id, token, name, expiresAt }`. The token is shown only this
+once; the app stores it securely and sends it as the `X-Trusted-Device-Token`
+header on `POST /auth/login`, `POST /auth/google/callback` or `GET
+/auth/google` (browser flow: it is kept encrypted in the OAuth state). For 30
+days from the verification (use does not extend it), sign-ins of that account
+with that token skip the challenge. A device only counts for its own account;
+a revoked or expired device, another account's device, or an unknown token
+leads to the normal challenge (never an error). `MfaTrustedDevice` stores only
+the token's SHA-256, the name (`deviceName`, else the `X-Device` header or user
+agent), IP, user agent, `expiresAt`, `lastUsedAt` and `revokedAt`; a trigger
+makes a revocation permanent and forbids extending the trust.
+
+`GET /v1/auth/mfa/trusted-devices` lists the signed-in user's devices, newest
+first, with `status` (`ACTIVE`, `EXPIRED`, `REVOKED`) and `current: true` for
+the device whose token the request sends. `DELETE
+/v1/auth/mfa/trusted-devices/:deviceId` revokes one (`200` with the device;
+repeating it is harmless; another user's or an unknown device answers `404`).
+Used and expired challenges and ended devices are deleted 30 days later by the
+hourly authentication-state sweep, and everything with the account on erasure.
+Existing sessions and refresh tokens are not affected by enabling MFA or by
+revoking a device.
 
 ### Subscriptions
 
@@ -1167,6 +1244,7 @@ npx jest private-cloud   # private image storage unit tests
 npm test -- --runInBand mfa   # MFA unit tests (TOTP, encryption, enrollment rules, HTTP contract)
 TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json --runInBand test/mfa-enrollment   # MFA enrollment over HTTP on temporary PostgreSQL schemas
 TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json --runInBand test/mfa-recovery   # recovery codes: issuance, hashing, verification, concurrency, regeneration, no leaks
+TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json --runInBand test/mfa-login   # MFA at sign-in: challenges, tokens, trusted devices, revocation, ownership, key independence
 TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json test/private-cloud   # storage workflows + cleanup ledger on PostgreSQL (mocked Supabase)
 npm run test:e2e
 npx prisma generate

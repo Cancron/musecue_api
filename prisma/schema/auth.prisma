@@ -33,6 +33,8 @@ model authUser {
   infrastructureJobs InfrastructureJob[]
   mfaEnrollment      MfaEnrollment?
   mfaRecoveryCodes   MfaRecoveryCode[]
+  mfaLoginChallenges MfaLoginChallenge[]
+  mfaTrustedDevices  MfaTrustedDevice[]
 
   @@index([email, id, providerId])
   @@index([username])
@@ -210,4 +212,60 @@ model MfaRecoveryCode {
   @@unique([authId, codeHash])
   @@index([authId, invalidatedAt, usedAt])
   @@index([invalidatedAt])
+}
+
+// ================================
+// MFA Login Challenge Model
+// ================================
+
+// The second step of a sign-in (password or Google) of an MFA-enabled user.
+// The challenge token is returned instead of access and refresh tokens; only
+// its SHA-256 (hex) is stored. It is not a JWT, so it never works as an
+// access or refresh token. POST /auth/mfa/challenge consumes it (`consumedAt`)
+// together with a valid authenticator or recovery code, in one transaction,
+// and only then are tokens issued. It expires after 5 minutes.
+model MfaLoginChallenge {
+  id         String    @id @default(uuid())
+  authId     String
+  tokenHash  String    @unique @db.Char(64)
+  // The completed first factor: `local` (password) or `google`.
+  provider   String    @db.VarChar(32)
+  ipAddress  String?
+  userAgent  String?
+  device     String?
+  createdAt  DateTime  @default(now())
+  expiresAt  DateTime
+  consumedAt DateTime?
+
+  authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
+
+  @@index([authId])
+  @@index([expiresAt])
+}
+
+// ================================
+// MFA Trusted Device Model
+// ================================
+
+// A device on which the owner completed MFA and chose to trust it: for 30
+// days (`expiresAt`, not extended by use), sign-ins of that user presenting
+// the device's token skip the MFA challenge. Only the SHA-256 (hex) of the
+// token is stored. A device only ever counts for its own user, and stops
+// counting once revoked (`revokedAt`) or expired.
+model MfaTrustedDevice {
+  id         String    @id @default(uuid())
+  authId     String
+  tokenHash  String    @unique @db.Char(64)
+  name       String    @db.VarChar(100)
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime  @default(now())
+  expiresAt  DateTime
+  lastUsedAt DateTime?
+  revokedAt  DateTime?
+
+  authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
+
+  @@index([authId, revokedAt, expiresAt])
+  @@index([expiresAt])
 }

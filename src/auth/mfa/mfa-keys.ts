@@ -1,5 +1,4 @@
 import type { ConfigService } from '@nestjs/config';
-import config from '../../common/config/app.config';
 import {
   deriveKeyFromRoot,
   type SecretPurpose,
@@ -12,28 +11,37 @@ import {
 /** No usable key: MFA operations fail closed (never store plaintext). */
 export class MfaEncryptionUnavailableError extends Error {
   constructor() {
-    super('MFA secret encryption is not configured');
+    super('MFA_ENCRYPTION_KEY is not configured');
     this.name = 'MfaEncryptionUnavailableError';
   }
 }
 
+/** Whether MFA_ENCRYPTION_KEY is set, and long enough. */
+export function mfaKeyStatus(
+  configService: ConfigService,
+): 'MISSING' | 'TOO_SHORT' | 'OK' {
+  const key = configService.get<string>(MFA_ENCRYPTION_KEY_ENV);
+  if (!key) return 'MISSING';
+  return key.length < MFA_ENCRYPTION_KEY_MIN_LENGTH ? 'TOO_SHORT' : 'OK';
+}
+
 /**
  * A key for one MFA purpose (secret encryption, recovery-code hashing),
- * derived with HKDF from MFA_ENCRYPTION_KEY (at least 32 characters) when
- * configured, otherwise from JWT_REFRESH_SECRET. Changing the root key makes
- * stored MFA secrets unreadable and recovery codes unusable.
+ * derived with HKDF only from MFA_ENCRYPTION_KEY (at least 32 characters).
+ * It deliberately never falls back to the JWT secrets: those can be rotated
+ * at any time, while stored authenticator secrets and recovery-code hashes
+ * must stay usable. Without the key, MFA operations fail closed (503);
+ * changing it makes stored secrets unreadable and recovery codes unusable.
  */
 export function mfaKey(
   configService: ConfigService,
   purpose: SecretPurpose,
 ): Buffer {
-  const dedicated = configService.get<string>(MFA_ENCRYPTION_KEY_ENV);
-  if (dedicated) {
-    if (dedicated.length < MFA_ENCRYPTION_KEY_MIN_LENGTH) {
-      throw new MfaEncryptionUnavailableError();
-    }
-    return deriveKeyFromRoot(dedicated, purpose);
+  if (mfaKeyStatus(configService) !== 'OK') {
+    throw new MfaEncryptionUnavailableError();
   }
-  if (!config.jwt_refresh_secret) throw new MfaEncryptionUnavailableError();
-  return deriveKeyFromRoot(config.jwt_refresh_secret, purpose);
+  return deriveKeyFromRoot(
+    configService.get<string>(MFA_ENCRYPTION_KEY_ENV) as string,
+    purpose,
+  );
 }

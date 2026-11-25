@@ -49,6 +49,21 @@ export const MFA_RECOVERY_CODES = {
   INVALIDATED_RETENTION_MS: 30 * 24 * 60 * 60_000,
 } as const;
 
-/** Optional dedicated root key for authenticator secrets (>= 32 characters). */
+/** MFA as the second step of sign-in (password or Google). */
+export const MFA_LOGIN = {
+  /** A sign-in challenge must be completed within 5 minutes. */
+  CHALLENGE_TTL_MS: 5 * 60_000,
+  /** A device trusted after MFA skips the challenge for 30 days. */
+  TRUSTED_DEVICE_TTL_MS: 30 * 24 * 60 * 60_000,
+  /** Request header carrying a trusted device's token at sign-in. */
+  TRUSTED_DEVICE_HEADER: 'x-trusted-device-token',
+  /** Used/expired challenges and ended devices are deleted after this. */
+  RETENTION_MS: 30 * 24 * 60 * 60_000,
+} as const;
+
+/**
+ * Required root key (>= 32 characters) of authenticator-secret encryption and
+ * recovery-code hashing; independent of the JWT secrets.
+ */
 export const MFA_ENCRYPTION_KEY_ENV = 'MFA_ENCRYPTION_KEY';
 export const MFA_ENCRYPTION_KEY_MIN_LENGTH = 32;

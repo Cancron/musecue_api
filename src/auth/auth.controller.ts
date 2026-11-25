@@ -8,6 +8,9 @@ import {
   Res,
   Logger,
   UseGuards,
+  Header,
+  HttpCode,
+  HttpStatus,
 } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
@@ -24,11 +27,14 @@ import { CustomLoggerService } from '../common/services/custom-logger.service';
 import { THROTTLER_CONFIG } from '../common/config/throttler.config';
 import { AuthGuard } from '../common/guards/auth.guard';
 import { LoginDto } from './dto/login.dto';
+import { requestMetadata } from '../subscription/request-metadata';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
 import {
   ResendVerificationEmailDto,
   VerifyEmailDto,
 } from './dto/verify-email.dto';
+import { CompleteMfaChallengeDto, factorOf } from './mfa/mfa.dto';
+import { trustedDeviceTokenOf } from './mfa/trusted-device-header';
 
 interface AuthenticatedRequest extends Request {
   user: {
@@ -130,6 +136,7 @@ export class AuthController {
     const { url, state } = await this.googleOAuthService.getAuthorizationUrl(
       meta,
       query.redirectUrl,
+      trustedDeviceTokenOf(req),
     );
 
     return {
@@ -208,6 +215,28 @@ export class AuthController {
       meta,
     );
 
+    // MFA-enabled account: only the challenge, never tokens.
+    if ('mfaRequired' in result) {
+      if (result.redirectUrl) {
+        const redirectUrl = new URL(result.redirectUrl);
+        redirectUrl.searchParams.set('mfa_required', 'true');
+        redirectUrl.searchParams.set(
+          'mfa_challenge_token',
+          result.challengeToken,
+        );
+        redirectUrl.searchParams.set(
+          'mfa_challenge_expires_at',
+          result.challengeExpiresAt.toISOString(),
+        );
+        return res.redirect(redirectUrl.toString());
+      }
+      return {
+        success: true,
+        message: 'MFA verification required',
+        data: result,
+      };
+    }
+
     // If redirectUrl is provided, redirect to it with tokens as query params
     if (result.redirectUrl) {
       const redirectUrl = new URL(result.redirectUrl);
@@ -263,13 +292,17 @@ export class AuthController {
       body.code,
       body.state,
       meta,
+      trustedDeviceTokenOf(req),
     );
 
     return {
       success: true,
-      message: result.isNewUser
-        ? 'Account created successfully via Google'
-        : 'Signed in successfully via Google',
+      message:
+        'mfaRequired' in result
+          ? 'MFA verification required'
+          : result.isNewUser
+            ? 'Account created successfully via Google'
+            : 'Signed in successfully via Google',
       data: result,
     };
   }
@@ -305,7 +338,39 @@ export class AuthController {
           : req.headers['sec-ch-ua-platform']),
     };
 
-    return this.authService.login(payload, meta);
+    // A trusted device of an MFA-enabled account skips the MFA challenge.
+    return this.authService.login(payload, meta, trustedDeviceTokenOf(req));
+  }
+
+  /**
+   * Second step of a sign-in (password or Google) of an MFA-enabled account:
+   * the challenge token with the authenticator's current code or an unused
+   * recovery code. Returns the regular tokens (and, with `trustDevice`, a
+   * trusted-device token shown once). The challenge token itself never
+   * grants access.
+   */
+  @Throttle({ default: THROTTLER_CONFIG.STRICT })
+  @Post('mfa/challenge')
+  @HttpCode(HttpStatus.OK)
+  @Header('Cache-Control', 'no-store')
+  @Header('Pragma', 'no-cache')
+  async completeMfaChallenge(
+    @Body() payload: CompleteMfaChallengeDto,
+    @Req() req: Request,
+  ) {
+    return this.authService.completeMfaLogin(
+      {
+        challengeToken: payload.challengeToken,
+        factor: factorOf(payload),
+        trustDevice: payload.trustDevice,
+        deviceName: payload.deviceName,
+      },
+      {
+        ip: req.ip || 'unknown',
+        userAgent: req.headers['user-agent'] || 'unknown',
+        device: requestMetadata(req).device,
+      },
+    );
   }
 
   /**

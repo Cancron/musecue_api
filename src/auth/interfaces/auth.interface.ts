@@ -61,3 +61,22 @@ export interface ILoginResponse {
   };
   expiresIn: number;
 }
+
+/**
+ * Response of a completed MFA sign-in (POST /auth/mfa/challenge): the
+ * regular tokens, how MFA was satisfied, and - when the device was trusted -
+ * its trusted-device token (shown this one time; send it as the
+ * X-Trusted-Device-Token header on later sign-ins).
+ */
+export interface IMfaLoginResponse extends ILoginResponse {
+  mfa: {
+    method: 'totp' | 'recovery_code';
+    remainingRecoveryCodes: number;
+  };
+  trustedDevice: {
+    id: string;
+    token: string;
+    name: string;
+    expiresAt: Date;
+  } | null;
+}

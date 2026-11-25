@@ -36,6 +36,7 @@ export interface IGoogleOAuthState {
   state: string;
   codeVerifier: string; // For PKCE
   redirectUrl?: string; // Where to redirect after successful auth
+  trustedDeviceToken?: string; // X-Trusted-Device-Token sent when starting
   ip: string;
   userAgent: string;
   createdAt: string;
@@ -87,6 +88,19 @@ export interface IGoogleOAuthLoginResponse {
     providerId: string;
   };
   expiresIn: number;
+  isNewUser: boolean;
+  redirectUrl?: string;
+}
+
+/**
+ * Google sign-in of an MFA-enabled account: an MFA challenge instead of
+ * tokens, completed through POST /auth/mfa/challenge.
+ */
+export interface IGoogleOAuthMfaChallengeResponse {
+  mfaRequired: true;
+  challengeToken: string;
+  challengeExpiresAt: Date;
+  methods: ('totp' | 'recovery_code')[];
   isNewUser: boolean;
   redirectUrl?: string;
 }

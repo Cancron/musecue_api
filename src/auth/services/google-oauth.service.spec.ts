@@ -1,3 +1,5 @@
+import { MfaLoginService } from '../mfa/mfa-login.service';
+import { noMfaLogin } from '../../../test/support/no-mfa-login';
 import { Test, TestingModule } from '@nestjs/testing';
 import { GoogleOAuthService } from './google-oauth.service';
 import { CustomLoggerService } from '../../common/services/custom-logger.service';
@@ -67,6 +69,7 @@ describe('GoogleOAuthService', () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         GoogleOAuthService,
+        { provide: MfaLoginService, useValue: noMfaLogin() },
         {
           provide: CustomLoggerService,
           useValue: mockCustomLoggerService,

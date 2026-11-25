@@ -578,6 +578,31 @@ describe('MfaService (mfa)', () => {
       expect(store.get(user.account.authId).enrollment).toBeNull();
     });
 
+    it('answers 503 and keeps the pending enrollment when the key disappears (never "expired")', async () => {
+      const user = store.addUser();
+      const authId = user.account.authId;
+      const { secret } = await service.startEnrollment(authId, T0);
+      const pendingBefore = store.get(authId).enrollment?.secret;
+      const withoutKey = new MfaService(
+        store.asRepository(),
+        store.asCredentialsRepository(),
+        new MfaSecretCipher(new ConfigService({})),
+        hasher,
+        activityLog,
+        logger,
+      );
+      expect(
+        await rejection(
+          withoutKey.confirmEnrollment(authId, codeAt(secret, T0), META, T0),
+        ),
+      ).toEqual({ status: 503, message: 'MFA is temporarily unavailable' });
+      expect(store.get(authId).enrollment?.secret).toBe(pendingBefore);
+      // Once the key is back, the same enrollment still confirms.
+      await expect(
+        service.confirmEnrollment(authId, codeAt(secret, T0), META, T0),
+      ).resolves.toMatchObject({ enabled: true });
+    });
+
     it('commits nothing when the audit log write fails', async () => {
       const user = store.addUser();
       const authId = user.account.authId;

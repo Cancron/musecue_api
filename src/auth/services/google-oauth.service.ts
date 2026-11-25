@@ -19,10 +19,12 @@ import {
   IGoogleUserInfo,
   IGoogleOAuthState,
   IGoogleOAuthLoginResponse,
+  IGoogleOAuthMfaChallengeResponse,
   IGoogleIdTokenClaims,
 } from '../interfaces/google-oauth.interface';
 import { UserRole } from '../interfaces/auth.interface';
 import AppError from '../../common/errors/app.error';
+import { MfaLoginService } from '../mfa/mfa-login.service';
 
 /* eslint-disable @typescript-eslint/no-unsafe-assignment */
 
@@ -42,6 +44,7 @@ export class GoogleOAuthService {
     private readonly prismaService: PrismaService,
     private readonly activityLogService: ActivityLogService,
     private readonly authUtilsService: AuthUtilsService,
+    private readonly mfaLogin: MfaLoginService,
   ) {
     // Initialize JWKS client for Google public key retrieval
     // Keys are cached and automatically rotated
@@ -182,6 +185,7 @@ export class GoogleOAuthService {
   async getAuthorizationUrl(
     meta: { ip: string; userAgent: string },
     redirectUrl?: string,
+    trustedDeviceToken?: string,
   ): Promise<{ url: string; state: string }> {
     const { clientId, redirectUri } = getGoogleOAuthCredentials();
 
@@ -195,6 +199,9 @@ export class GoogleOAuthService {
       state,
       codeVerifier,
       redirectUrl,
+      // Kept encrypted in the state for the browser callback (GET), which
+      // cannot send the X-Trusted-Device-Token header itself.
+      trustedDeviceToken,
       ip: meta.ip,
       userAgent: meta.userAgent,
       createdAt: new Date().toISOString(),
@@ -301,7 +308,8 @@ export class GoogleOAuthService {
     code: string,
     state: string,
     meta: { ip: string; userAgent: string; device?: string },
-  ): Promise<IGoogleOAuthLoginResponse> {
+    trustedDeviceToken?: string,
+  ): Promise<IGoogleOAuthLoginResponse | IGoogleOAuthMfaChallengeResponse> {
     const { ip, userAgent, device } = meta;
 
     // Validate and consume the state parameter (single-use, atomic)
@@ -377,11 +385,11 @@ export class GoogleOAuthService {
     }
 
     // Find or create user
-    const result = await this.findOrCreateUser(googleUser, {
-      ip,
-      userAgent,
-      device,
-    });
+    const result = await this.findOrCreateUser(
+      googleUser,
+      { ip, userAgent, device },
+      trustedDeviceToken ?? stateData.trustedDeviceToken,
+    );
 
     this.customLogger.log(
       `Google OAuth ${result.isNewUser ? 'sign-up' : 'sign-in'} successful for: ${googleUser.email}`,
@@ -401,7 +409,8 @@ export class GoogleOAuthService {
   private async findOrCreateUser(
     googleUser: IGoogleUserInfo,
     meta: { ip: string; userAgent: string; device?: string },
-  ): Promise<IGoogleOAuthLoginResponse> {
+    trustedDeviceToken?: string,
+  ): Promise<IGoogleOAuthLoginResponse | IGoogleOAuthMfaChallengeResponse> {
     const { ip, userAgent, device } = meta;
 
     // Check if user exists by provider ID (Google's sub)
@@ -536,6 +545,27 @@ export class GoogleOAuthService {
       if (user.status !== 'ACTIVE') {
         throw AppError.unauthorized('Invalid credentials');
       }
+    }
+
+    // MFA-enabled accounts get a challenge instead of tokens, unless this is
+    // one of their trusted devices (new accounts never have MFA yet).
+    const gate = await this.mfaLogin.beginLogin(
+      user.id,
+      'google',
+      trustedDeviceToken,
+      { ip, userAgent, device },
+    );
+    if (gate.kind === 'CHALLENGE') {
+      void this.logLoginAttempt({
+        authId: user.id,
+        ip,
+        userAgent,
+        device,
+        success: false,
+        failureReason: 'mfa_required',
+        provider: 'google',
+      });
+      return { ...gate.challenge, isNewUser };
     }
 
     // Generate tokens

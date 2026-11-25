@@ -1,3 +1,4 @@
+import { noMfaLogin } from './support/no-mfa-login';
 import {
   FakeSupabaseStorage,
   FAKE_SUPABASE,
@@ -99,6 +100,8 @@ const USER_DATA_TABLES = [
   'InfrastructureJob',
   'MfaEnrollment',
   'MfaRecoveryCode',
+  'MfaLoginChallenge',
+  'MfaTrustedDevice',
 ] as const;
 
 describeWithDatabase('Account erasure (PostgreSQL)', () => {
@@ -160,6 +163,7 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
       new NoopTokenVersionCache(),
       mock<EmailQueueService>(),
       mock<CustomLoggerService>(),
+      noMfaLogin(),
     );
     emailQueue.sendAccountDeletionCode.mockResolvedValue();
     codes = new AccountDeletionCodeService(challenges, utils, emailQueue);
@@ -330,6 +334,21 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
               usedAt: new Date(),
             },
           ],
+        },
+        // An open MFA sign-in challenge and a trusted device (hashes only).
+        mfaLoginChallenges: {
+          create: {
+            tokenHash: `${tag}${'e'.repeat(64 - tag.length)}`,
+            provider: 'local',
+            expiresAt: new Date(Date.now() + 300_000),
+          },
+        },
+        mfaTrustedDevices: {
+          create: {
+            tokenHash: `${tag}${'f'.repeat(64 - tag.length)}`,
+            name: 'phone',
+            expiresAt: new Date(Date.now() + 86_400_000),
+          },
         },
         // A background job of the PostgreSQL queue driver (a failed email
         // kept for diagnosis).

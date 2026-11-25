@@ -1,10 +1,13 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Header,
   HttpCode,
   HttpStatus,
+  Param,
+  ParseUUIDPipe,
   Post,
   Req,
   UseGuards,
@@ -19,6 +22,8 @@ import { requestMetadata } from '../../subscription/request-metadata';
 import type { IAccessTokenPayload } from '../interfaces/auth.interface';
 import { ConfirmMfaEnrollmentDto, factorOf, VerifyMfaDto } from './mfa.dto';
 import { MfaService } from './mfa.service';
+import { trustedDeviceTokenOf } from './trusted-device-header';
+import { MfaLoginService } from './mfa-login.service';
 import { MfaVerificationService } from './mfa-verification.service';
 
 interface AuthenticatedRequest extends Request {
@@ -39,6 +44,7 @@ export class MfaController {
   constructor(
     private readonly mfa: MfaService,
     private readonly verification: MfaVerificationService,
+    private readonly mfaLogin: MfaLoginService,
   ) {}
 
   /** Whether MFA is enabled, and the progress of an enrollment. */
@@ -120,5 +126,32 @@ export class MfaController {
       factorOf(dto),
       requestMetadata(req),
     );
+  }
+
+  /**
+   * The signed-in user's trusted devices (active, expired and revoked),
+   * never their tokens. `current` marks the device whose token this request
+   * sends in the X-Trusted-Device-Token header.
+   */
+  @Get('trusted-devices')
+  @Header('Cache-Control', 'no-store')
+  listTrustedDevices(@Req() req: AuthenticatedRequest) {
+    return this.mfaLogin.listTrustedDevices(
+      req.user.userId,
+      trustedDeviceTokenOf(req),
+    );
+  }
+
+  /**
+   * Revokes one of the signed-in user's trusted devices: its next sign-in
+   * needs MFA again. Another user's device answers 404.
+   */
+  @Delete('trusted-devices/:deviceId')
+  @Header('Cache-Control', 'no-store')
+  revokeTrustedDevice(
+    @Param('deviceId', new ParseUUIDPipe()) deviceId: string,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    return this.mfaLogin.revokeTrustedDevice(req.user.userId, deviceId);
   }
 }

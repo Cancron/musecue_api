@@ -24,6 +24,7 @@ import type { RateLimitStore } from '../../infrastructure/rate-limit/rate-limit.
 import { MfaCredentialsRepository } from './mfa-credentials.repository';
 import { MfaEnrollmentRepository } from './mfa-enrollment.repository';
 import { MfaRecoveryCodeHasher } from './mfa-recovery-code.hasher';
+import { MfaLoginService } from './mfa-login.service';
 import { MfaVerificationService } from './mfa-verification.service';
 import { MfaSecretCipher } from './mfa-secret.cipher';
 import { MfaController } from './mfa.controller';
@@ -36,6 +37,8 @@ import type {
 } from './mfa.interface';
 import { MfaService } from './mfa.service';
 import { totpCode, totpTimeStep } from './totp';
+
+const MFA_KEY = 'mfa-http-spec-dedicated-key-0123456789abcdef';
 
 const dataOf = <T>(response: { body: unknown }) =>
   (response.body as { data: T }).data;
@@ -86,6 +89,7 @@ describe('MFA enrollment routes (mfa, HTTP)', () => {
       providers: [
         MfaService,
         MfaVerificationService,
+        { provide: MfaLoginService, useValue: mock<MfaLoginService>() },
         AuthGuard,
         { provide: MfaEnrollmentRepository, useValue: store.asRepository() },
         {
@@ -94,11 +98,15 @@ describe('MFA enrollment routes (mfa, HTTP)', () => {
         },
         {
           provide: MfaRecoveryCodeHasher,
-          useValue: new MfaRecoveryCodeHasher(new ConfigService({})),
+          useValue: new MfaRecoveryCodeHasher(
+            new ConfigService({ MFA_ENCRYPTION_KEY: MFA_KEY }),
+          ),
         },
         {
           provide: MfaSecretCipher,
-          useValue: new MfaSecretCipher(new ConfigService({})),
+          useValue: new MfaSecretCipher(
+            new ConfigService({ MFA_ENCRYPTION_KEY: MFA_KEY }),
+          ),
         },
         { provide: ActivityLogService, useValue: activityLog },
         { provide: PrismaService, useValue: prisma },

@@ -1,4 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
+import type { Prisma } from '@prisma/client';
 import { WINSTON_MODULE_PROVIDER } from 'nest-winston';
 import type { Logger } from 'winston';
 import AppError from '../../common/errors/app.error';
@@ -29,6 +30,15 @@ import { verifyTotp } from './totp';
 
 /** The second factor presented: the authenticator's code or a recovery code. */
 export type MfaFactor = { code: string } | { recoveryCode: string };
+
+/** Work that commits together with a verification (see verifyWithin). */
+export interface MfaVerificationHooks<T> {
+  precheck?: (tx: Prisma.TransactionClient) => Promise<void>;
+  onVerified?: (
+    tx: Prisma.TransactionClient,
+    method: MfaVerificationMethod,
+  ) => Promise<T>;
+}
 
 type Refusal =
   | { kind: 'NOT_ENABLED' }
@@ -72,9 +82,32 @@ export class MfaVerificationService {
     meta: ActivityLogMetadata,
     now: Date = new Date(),
   ): Promise<MfaVerificationView> {
+    const { verified, method, remainingRecoveryCodes } =
+      await this.verifyWithin(authId, factor, meta, now, {});
+    return { verified, method, remainingRecoveryCodes };
+  }
+
+  /**
+   * Verifies the factor inside the account's locked transaction, with hooks
+   * for work that must commit together with it (a sign-in challenge):
+   * `precheck` runs first (throwing refuses without counting an incorrect
+   * code), `onVerified` runs after the factor was accepted and consumed; if
+   * it throws, nothing - not even the factor's consumption - is committed.
+   */
+  async verifyWithin<T>(
+    authId: string,
+    factor: MfaFactor,
+    meta: ActivityLogMetadata,
+    now: Date,
+    hooks: MfaVerificationHooks<T>,
+  ): Promise<MfaVerificationView & { result: T | undefined }> {
     const outcome = await this.locked(authId, async (locked) => {
+      if (hooks.precheck) await hooks.precheck(locked.tx);
       const verified = await this.checkFactor(locked, factor, now, meta);
       if (!verified.ok) return verified;
+      const result = hooks.onVerified
+        ? await hooks.onVerified(locked.tx, verified.value)
+        : undefined;
       const { remaining } = await locked.recoverySummary();
       return {
         ok: true as const,
@@ -82,6 +115,7 @@ export class MfaVerificationService {
           verified: true as const,
           method: verified.value,
           remainingRecoveryCodes: remaining,
+          result,
         },
       };
     });

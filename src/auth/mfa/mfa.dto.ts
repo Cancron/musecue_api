@@ -1,7 +1,10 @@
 import {
+  IsBoolean,
   IsOptional,
   IsString,
   Matches,
+  MaxLength,
+  MinLength,
   Validate,
   ValidateIf,
   ValidatorConstraint,
@@ -50,6 +53,29 @@ export class VerifyMfaDto {
     message: 'recoveryCode must look like XXXX-XXXX-XXXX',
   })
   recoveryCode?: string;
+}
+
+/**
+ * Completes a sign-in of an MFA-enabled account: the `challengeToken` from
+ * the sign-in response and exactly one of `code` / `recoveryCode`. With
+ * `trustDevice: true` the response includes a trusted-device token that
+ * skips the challenge on this device for 30 days.
+ */
+export class CompleteMfaChallengeDto extends VerifyMfaDto {
+  @IsString()
+  @Matches(/^[A-Za-z0-9_-]{43}$/, { message: 'challengeToken is malformed' })
+  challengeToken!: string;
+
+  @IsOptional()
+  @IsBoolean()
+  trustDevice?: boolean;
+
+  /** A name for the trusted device (default: the device header or user agent). */
+  @IsOptional()
+  @IsString()
+  @MinLength(1)
+  @MaxLength(100)
+  deviceName?: string;
 }
 
 /** The factor of a verified DTO. */

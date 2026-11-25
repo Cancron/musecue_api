@@ -1,4 +1,5 @@
 import { PrismaPg } from '@prisma/adapter-pg';
+import { noMfaLogin } from './support/no-mfa-login';
 import { PrismaClient } from '@prisma/client';
 import * as bcrypt from 'bcryptjs';
 import { mock } from 'jest-mock-extended';
@@ -80,6 +81,7 @@ describeWithDatabase('Account deletion requests (PostgreSQL)', () => {
       new NoopTokenVersionCache(),
       mock<EmailQueueService>(),
       mock<CustomLoggerService>(),
+      noMfaLogin(),
     );
     emailQueue.sendAccountDeletionCode.mockResolvedValue();
     deletions = new AccountDeletionService(

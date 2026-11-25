@@ -22,10 +22,10 @@ export const SECRET_PURPOSES = {
   OAUTH_STATE: 'musecue/oauth-state/v1',
   JOB_PAYLOAD: 'musecue/infrastructure-job-payload/v1',
   RATE_LIMIT_KEY: 'musecue/rate-limit-key/v1',
-  // Long-lived authenticator secrets. The root key is MFA_ENCRYPTION_KEY when
-  // configured (see MfaSecretCipher), otherwise JWT_REFRESH_SECRET.
+  // Long-lived MFA data: authenticator secrets and recovery-code hashes.
+  // Their root key is only ever MFA_ENCRYPTION_KEY (see mfa-keys.ts), never
+  // JWT_REFRESH_SECRET, so rotating the JWT secrets cannot break them.
   MFA_SECRET: 'musecue/mfa-totp-secret/v1',
-  // HMAC of MFA recovery codes (same root key as MFA_SECRET).
   MFA_RECOVERY_CODE: 'musecue/mfa-recovery-code/v1',
 } as const;
 

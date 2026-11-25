@@ -1,4 +1,5 @@
 import { mock, mockDeep } from 'jest-mock-extended';
+import { noMfaLogin } from '../../test/support/no-mfa-login';
 import { AuthService } from './auth.service';
 import { AuthUtilsService } from './services/auth-utils.service';
 import { AuthChallengeRepository } from './state/auth-challenge.repository';
@@ -22,6 +23,7 @@ describe('refresh-token failure and rotation boundaries', () => {
     mock<TokenVersionCache>(),
     mock<EmailQueueService>(),
     mock<CustomLoggerService>(),
+    noMfaLogin(),
   );
   const META = { ip: 'test', userAgent: 'test' };
   const active = {

@@ -9,7 +9,16 @@ import { CustomLoggerService } from '../common/services/custom-logger.service';
 import AppError from '../common/errors/app.error';
 import * as bcrypt from 'bcryptjs';
 import { TokenVersionCache } from '../infrastructure/token-version/token-version.cache';
-import { ILoginResponse, UserRole } from './interfaces/auth.interface';
+import {
+  ILoginResponse,
+  IMfaLoginResponse,
+  UserRole,
+} from './interfaces/auth.interface';
+import {
+  MfaLoginService,
+  type MfaChallengeView,
+} from './mfa/mfa-login.service';
+import type { MfaFactor } from './mfa/mfa-verification.service';
 import { AuthChallengeRepository } from './state/auth-challenge.repository';
 import { storeLoginSession } from './state/login-session';
 import {
@@ -35,6 +44,7 @@ export class AuthService {
     private readonly tokenVersions: TokenVersionCache,
     private readonly emailQueueService: EmailQueueService,
     private readonly customLogger: CustomLoggerService,
+    private readonly mfaLogin: MfaLoginService,
   ) {}
 
   async create(
@@ -420,10 +430,16 @@ export class AuthService {
     return { message: 'Verification email sent successfully' };
   }
 
+  /**
+   * Password sign-in. Accounts without MFA receive tokens; MFA-enabled
+   * accounts receive an MFA challenge (no tokens) unless `trustedDeviceToken`
+   * is a valid trusted device of that account.
+   */
   async login(
     payload: { email: string; password: string },
     meta: { ip: string; userAgent: string; device?: string },
-  ): Promise<ILoginResponse> {
+    trustedDeviceToken?: string,
+  ): Promise<ILoginResponse | MfaChallengeView> {
     const { email, password } = payload;
     const { ip, userAgent, device } = meta;
 
@@ -576,6 +592,111 @@ export class AuthService {
       );
     }
 
+    // The password was correct: forget earlier wrong passwords
+    // (NON-CRITICAL, fire-and-forget).
+    if (security) {
+      void this.prismaService.authSecurity
+        .update({
+          where: { id: security.id },
+          data: { failedAttempts: 0, lastFailedAt: null, lockExpiresAt: null },
+        })
+        .catch((error) => {
+          console.error('Non-critical login post-process failed:', error);
+        });
+    }
+
+    // MFA-enabled accounts get a challenge instead of tokens, unless this is
+    // one of their trusted devices.
+    const gate = await this.mfaLogin.beginLogin(
+      user.id,
+      'local',
+      trustedDeviceToken,
+      { ip, userAgent, device },
+    );
+    if (gate.kind === 'CHALLENGE') {
+      void this.logLoginAttempt({
+        authId: user.id,
+        ip,
+        userAgent,
+        device,
+        success: false,
+        failureReason: 'mfa_required',
+      });
+      return gate.challenge;
+    }
+
+    return this.issueLoginTokens(user, { ip, userAgent, device });
+  }
+
+  /**
+   * Completes the sign-in of an MFA-enabled account (password or Google):
+   * verifies the challenge and the authenticator or recovery code, then
+   * issues tokens as a regular login does. With `trustDevice`, the device's
+   * trusted-device token is returned once, for 30 days of sign-ins without
+   * the challenge.
+   */
+  async completeMfaLogin(
+    payload: {
+      challengeToken: string;
+      factor: MfaFactor;
+      trustDevice?: boolean;
+      deviceName?: string;
+    },
+    meta: { ip: string; userAgent: string; device?: string },
+  ): Promise<IMfaLoginResponse> {
+    const completion = await this.mfaLogin.completeChallenge(
+      payload.challengeToken,
+      payload.factor,
+      {
+        trustDevice: payload.trustDevice ?? false,
+        deviceName: payload.deviceName,
+      },
+      meta,
+    );
+    const user = await this.prismaService.authUser.findUnique({
+      where: { id: completion.authId },
+      select: {
+        id: true,
+        email: true,
+        username: true,
+        role: true,
+        verified: true,
+        status: true,
+        tokenVersion: true,
+      },
+    });
+    // The account may have been blocked or deleted meanwhile.
+    if (!user || user.status !== 'ACTIVE') {
+      throw AppError.unauthorized('Invalid email or password');
+    }
+    const tokens = await this.issueLoginTokens(user, meta);
+    return {
+      ...tokens,
+      mfa: {
+        method: completion.method,
+        remainingRecoveryCodes: completion.remainingRecoveryCodes,
+      },
+      trustedDevice: completion.trustedDevice,
+    };
+  }
+
+  /**
+   * Issues the access and refresh tokens of a completed sign-in and stores
+   * the refresh session (hash only).
+   */
+  private async issueLoginTokens(
+    user: {
+      id: string;
+      email: string;
+      username: string;
+      role: string;
+      verified: boolean;
+      tokenVersion: number;
+    },
+    meta: { ip: string; userAgent: string; device?: string },
+  ): Promise<ILoginResponse> {
+    const { ip, userAgent, device } = meta;
+
     // Generate JTI FIRST (cryptographically secure)
     const jti: string = this.authUtilsService.generateSecureId();
 
@@ -605,31 +726,13 @@ export class AuthService {
       { ip, userAgent, device },
     );
 
-    // NON-CRITICAL: DB operations (fire-and-forget with detailed logging)
-    void Promise.allSettled([
-      security
-        ? this.prismaService.authSecurity.update({
-            where: { id: security.id },
-            data: {
-              failedAttempts: 0,
-              lastFailedAt: null,
-              lockExpiresAt: null,
-            },
-          })
-        : Promise.resolve(),
-      this.logLoginAttempt({
-        authId: user.id,
-        ip,
-        userAgent,
-        device,
-        success: true,
-      }),
-    ]).then((results) => {
-      results.forEach((result) => {
-        if (result.status === 'rejected') {
-          console.error('Non-critical login post-process failed:', result);
-        }
-      });
+    // NON-CRITICAL: login history (fire-and-forget)
+    void this.logLoginAttempt({
+      authId: user.id,
+      ip,
+      userAgent,
+      device,
+      success: true,
     });
 
     return {
