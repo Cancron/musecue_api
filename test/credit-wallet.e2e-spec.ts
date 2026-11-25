@@ -19,6 +19,7 @@ import { createUser } from './support/subscription-fixtures';
 
 jest.setTimeout(120_000);
 
+const INSUFFICIENT = { status: 403, message: 'Insufficient credits' };
 const HOUR = 3_600_000;
 
 /**
@@ -396,7 +397,7 @@ describeWithDatabase('AI credit wallet and ledger (PostgreSQL)', () => {
           idempotencyKey: 'after-expiry',
           now: afterExpiry,
         }),
-      ).rejects.toMatchObject({ status: 402 });
+      ).rejects.toMatchObject(INSUFFICIENT);
 
       // The refused deduction rolled back; the expiry is written by the next
       // successful operation (here the sweep), dated at the expiry time.
@@ -495,7 +496,7 @@ describeWithDatabase('AI credit wallet and ledger (PostgreSQL)', () => {
           idempotencyKey: 'run-2',
           sessionId: session,
         }),
-      ).rejects.toMatchObject({ status: 402 });
+      ).rejects.toMatchObject(INSUFFICIENT);
       // Without a session there is no overage at all.
       await expect(
         wallets.deduct({
@@ -503,7 +504,7 @@ describeWithDatabase('AI credit wallet and ledger (PostgreSQL)', () => {
           credits: '0.1',
           idempotencyKey: 'run-3',
         }),
-      ).rejects.toMatchObject({ status: 402 });
+      ).rejects.toMatchObject(INSUFFICIENT);
 
       const [row] = await client.$queryRaw<
         { limit: string; overage: string; settled: string }[]
@@ -570,7 +571,7 @@ describeWithDatabase('AI credit wallet and ledger (PostgreSQL)', () => {
           idempotencyKey: 'second-1',
           sessionId: second,
         }),
-      ).rejects.toMatchObject({ status: 402 });
+      ).rejects.toMatchObject(INSUFFICIENT);
       await wallets.deduct({
         authId: alice,
         credits: 2,
@@ -774,7 +775,7 @@ describeWithDatabase('AI credit wallet and ledger (PostgreSQL)', () => {
       expect(succeeded).toHaveLength(15); // 15 x 0.333333 = 4.999995 <= 5
       for (const r of results) {
         if (r.status === 'rejected') {
-          expect(r.reason).toMatchObject({ status: 402 });
+          expect(r.reason).toMatchObject(INSUFFICIENT);
         }
       }
       await expect(available(alice)).resolves.toBe('0.000005');

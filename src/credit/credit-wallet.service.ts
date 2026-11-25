@@ -70,6 +70,8 @@ const MAX_KEY_LENGTH = 150;
 const MAX_REFERENCE_LENGTH = 200;
 const MAX_SESSION_ID_LENGTH = 64;
 const SWEEP_BATCH_DEFAULT = 100;
+/** Reference of EXPIRATION transactions that end trial credits at Pro activation. */
+export const TRIAL_ENDED_BY_PRO_REFERENCE = 'trial-ended:pro-activated';
 
 /**
  * The persistent credit wallet and ledger. Every balance change runs in one
@@ -197,6 +199,70 @@ export class CreditWalletService {
    * session overage is repaid from the new credits first.
    */
   async allocate(input: AllocateCreditsInput): Promise<AllocationResult> {
+    const request = this.allocationRequest(input);
+    return this.write((tx) => this.allocateLocked(tx, input.authId, request));
+  }
+
+  /**
+   * `allocate` inside the caller's transaction, so the allocation commits or
+   * rolls back together with the caller's writes (e.g. trial activation).
+   * Takes the wallet lock for the rest of that transaction.
+   */
+  async allocateInTransaction(
+    tx: Tx,
+    input: AllocateCreditsInput,
+  ): Promise<AllocationResult> {
+    const request = this.allocationRequest(input);
+    return this.allocateLocked(tx, input.authId, request);
+  }
+
+  /**
+   * Ends the user's trial credits early, inside the caller's transaction
+   * (used when a paid Pro term starts during the trial). Allocations already
+   * past their expiry are expired as usual (dated at `expiresAt`); unused
+   * trial credits that have not expired yet get an EXPIRATION transaction
+   * dated `now` with reference `trial-ended:pro-activated`. Purchased,
+   * referral and subscription credits are not touched. Idempotent: returns
+   * the number of trial allocations ended early (0 when there are none).
+   */
+  async expireTrialCredits(
+    tx: Tx,
+    authId: string,
+    now: Date = new Date(),
+  ): Promise<number> {
+    const cursor = await this.lockExistingWallet(tx, { authId });
+    if (!cursor) return 0;
+    await this.expireDue(tx, cursor, now);
+
+    const open = await tx.creditAllocation.findMany({
+      where: {
+        walletId: cursor.walletId,
+        source: CreditSource.TRIAL,
+        remainingCredits: { gt: 0 },
+      },
+      orderBy: [{ grantedAt: 'asc' }, { id: 'asc' }],
+    });
+    for (const allocation of open) {
+      const lost = allocation.remainingCredits.neg();
+      await this.append(tx, cursor, {
+        type: CreditTransactionType.EXPIRATION,
+        amount: lost,
+        idempotencyKey: `expiration:${allocation.id}`,
+        allocationId: allocation.id,
+        reference: TRIAL_ENDED_BY_PRO_REFERENCE,
+        effectiveAt: now,
+        entries: [{ allocationId: allocation.id, amount: lost }],
+      });
+      await tx.creditAllocation.update({
+        where: { id: allocation.id },
+        data: { remainingCredits: ZERO_CREDITS, expiredAt: now },
+      });
+    }
+    await this.saveWallet(tx, cursor);
+    return open.length;
+  }
+
+  private allocationRequest(input: AllocateCreditsInput) {
     const now = input.now ?? new Date();
     const credits = this.rule(() => parseCreditAmount(input.credits));
     const sourceReference = this.requireText(
@@ -206,78 +272,84 @@ export class CreditWalletService {
     );
     const expiresAt = input.expiresAt ?? null;
     this.rule(() => assertAllocationExpiry(input.source, expiresAt, now));
+    return { source: input.source, now, credits, sourceReference, expiresAt };
+  }
 
-    return this.write(async (tx) => {
-      const cursor = await this.openWallet(tx, input.authId);
+  private async allocateLocked(
+    tx: Tx,
+    authId: string,
+    request: ReturnType<CreditWalletService['allocationRequest']>,
+  ): Promise<AllocationResult> {
+    const { source, now, credits, sourceReference, expiresAt } = request;
+    const cursor = await this.openWallet(tx, authId);
 
-      const existing = await tx.creditAllocation.findUnique({
-        where: {
-          source_sourceReference: { source: input.source, sourceReference },
-        },
-      });
-      if (existing) {
-        const same =
-          existing.walletId === cursor.walletId &&
-          existing.grantedCredits.eq(credits) &&
-          (existing.expiresAt?.getTime() ?? null) ===
-            (expiresAt?.getTime() ?? null);
-        if (!same) {
-          throw new CreditConflictError(
-            'This credit source was already allocated with different terms or to another user',
-          );
-        }
-        return { created: false, allocation: this.allocationView(existing) };
-      }
-      if (input.source === CreditSource.TRIAL) {
-        const trial = await tx.creditAllocation.findFirst({
-          where: { walletId: cursor.walletId, source: CreditSource.TRIAL },
-          select: { id: true },
-        });
-        if (trial) {
-          throw new CreditConflictError(
-            'Trial credits were already allocated to this user',
-          );
-        }
-      }
-
-      await this.expireDue(tx, cursor, now);
-
-      const allocation = await tx.creditAllocation.create({
-        data: {
-          walletId: cursor.walletId,
-          source: input.source,
-          sourceReference,
-          grantedCredits: credits,
-          remainingCredits: credits,
-          expiresAt,
-          grantedAt: now,
-        },
-      });
-      await this.append(tx, cursor, {
-        type: CreditTransactionType.ALLOCATION,
-        amount: credits,
-        idempotencyKey: `allocation:${allocation.id}`,
-        allocationId: allocation.id,
-        effectiveAt: now,
-        entries: [{ allocationId: allocation.id, amount: credits }],
-      });
-
-      let remaining = credits;
-      if (cursor.overage.gt(0)) {
-        remaining = remaining.minus(
-          await this.settleOverage(tx, cursor, allocation.id, credits, now),
+    const existing = await tx.creditAllocation.findUnique({
+      where: {
+        source_sourceReference: { source, sourceReference },
+      },
+    });
+    if (existing) {
+      const same =
+        existing.walletId === cursor.walletId &&
+        existing.grantedCredits.eq(credits) &&
+        (existing.expiresAt?.getTime() ?? null) ===
+          (expiresAt?.getTime() ?? null);
+      if (!same) {
+        throw new CreditConflictError(
+          'This credit source was already allocated with different terms or to another user',
         );
       }
-      const stored = remaining.eq(credits)
-        ? allocation
-        : await tx.creditAllocation.update({
-            where: { id: allocation.id },
-            data: { remainingCredits: remaining },
-          });
+      return { created: false, allocation: this.allocationView(existing) };
+    }
+    if (source === CreditSource.TRIAL) {
+      const trial = await tx.creditAllocation.findFirst({
+        where: { walletId: cursor.walletId, source: CreditSource.TRIAL },
+        select: { id: true },
+      });
+      if (trial) {
+        throw new CreditConflictError(
+          'Trial credits were already allocated to this user',
+        );
+      }
+    }
 
-      await this.saveWallet(tx, cursor);
-      return { created: true, allocation: this.allocationView(stored) };
+    await this.expireDue(tx, cursor, now);
+
+    const allocation = await tx.creditAllocation.create({
+      data: {
+        walletId: cursor.walletId,
+        source,
+        sourceReference,
+        grantedCredits: credits,
+        remainingCredits: credits,
+        expiresAt,
+        grantedAt: now,
+      },
     });
+    await this.append(tx, cursor, {
+      type: CreditTransactionType.ALLOCATION,
+      amount: credits,
+      idempotencyKey: `allocation:${allocation.id}`,
+      allocationId: allocation.id,
+      effectiveAt: now,
+      entries: [{ allocationId: allocation.id, amount: credits }],
+    });
+
+    let remaining = credits;
+    if (cursor.overage.gt(0)) {
+      remaining = remaining.minus(
+        await this.settleOverage(tx, cursor, allocation.id, credits, now),
+      );
+    }
+    const stored = remaining.eq(credits)
+      ? allocation
+      : await tx.creditAllocation.update({
+          where: { id: allocation.id },
+          data: { remainingCredits: remaining },
+        });
+
+    await this.saveWallet(tx, cursor);
+    return { created: true, allocation: this.allocationView(stored) };
   }
 
   /**

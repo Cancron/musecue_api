@@ -4,6 +4,8 @@ import { mock } from 'jest-mock-extended';
 import { ActivityLogService } from '../src/common/services/activity-log.service';
 import type { CustomLoggerService } from '../src/common/services/custom-logger.service';
 import type { PrismaService } from '../src/common/services/prisma.service';
+import { CreditSettingsService } from '../src/credit/credit-settings.service';
+import { CreditWalletService } from '../src/credit/credit-wallet.service';
 import { SubscriptionAccessService } from '../src/subscription/subscription-access.service';
 import { SubscriptionPlanService } from '../src/subscription/subscription-plan.service';
 import { SubscriptionTrialService } from '../src/subscription/subscription-trial.service';
@@ -30,6 +32,10 @@ describeWithDatabase('Free trial activation (PostgreSQL)', () => {
   let prisma: PrismaService;
   let plans: SubscriptionPlanService;
   let trials: SubscriptionTrialService;
+  let credits: {
+    settings: CreditSettingsService;
+    wallets: CreditWalletService;
+  };
   let access: SubscriptionAccessService;
   let adminId: string;
 
@@ -43,7 +49,11 @@ describeWithDatabase('Free trial activation (PostgreSQL)', () => {
     await applyMigrations(schema, migrationNames());
     client = new PrismaClient({
       adapter: new PrismaPg(
-        { connectionString: TEST_DATABASE_URL as string },
+        {
+          connectionString: TEST_DATABASE_URL as string,
+          // Raw SQL (the credit wallet row lock) resolves tables via search_path.
+          options: `-c search_path=${schema}`,
+        },
         { schema },
       ),
     });
@@ -53,7 +63,22 @@ describeWithDatabase('Free trial activation (PostgreSQL)', () => {
       mock<CustomLoggerService>(),
     );
     plans = new SubscriptionPlanService(prisma, activityLog);
-    trials = new SubscriptionTrialService(prisma, plans, activityLog);
+    const creditSettings = new CreditSettingsService(
+      prisma,
+      activityLog,
+      mock<CustomLoggerService>(),
+    );
+    credits = {
+      settings: creditSettings,
+      wallets: new CreditWalletService(prisma, creditSettings),
+    };
+    trials = new SubscriptionTrialService(
+      prisma,
+      plans,
+      activityLog,
+      credits.settings,
+      credits.wallets,
+    );
     access = new SubscriptionAccessService(prisma, plans);
     adminId = await createUser(client);
   });
@@ -79,6 +104,12 @@ describeWithDatabase('Free trial activation (PostgreSQL)', () => {
         accessExpiresAt: '2026-03-08T09:30:00.000Z',
         trialStartedAt: '2026-03-01T09:30:00.000Z',
         trialExpiresAt: '2026-03-08T09:30:00.000Z',
+        // The trial allowance (default 50), expiring with the trial.
+        trialCredits: {
+          allocationId: expect.any(String) as unknown,
+          credits: '50',
+          expiresAt: '2026-03-08T09:30:00.000Z',
+        },
       });
 
       await expect(recordOf(userId)).resolves.toMatchObject({
@@ -303,7 +334,13 @@ describeWithDatabase('Free trial activation (PostgreSQL)', () => {
 
         const failingLog = mock<ActivityLogService>();
         failingLog.logActivity.mockRejectedValue(new Error('audit store down'));
-        const failing = new SubscriptionTrialService(prisma, plans, failingLog);
+        const failing = new SubscriptionTrialService(
+          prisma,
+          plans,
+          failingLog,
+          credits.settings,
+          credits.wallets,
+        );
 
         await expect(failing.activateTrial(userId, meta, now)).rejects.toThrow(
           'audit store down',

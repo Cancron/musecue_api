@@ -1,11 +1,13 @@
 import { Injectable } from '@nestjs/common';
-import { Prisma, SubscriptionStatus } from '@prisma/client';
+import { CreditSource, Prisma, SubscriptionStatus } from '@prisma/client';
 import AppError from '../common/errors/app.error';
 import {
   ActivityLogService,
   type ActivityLogMetadata,
 } from '../common/services/activity-log.service';
 import { PrismaService } from '../common/services/prisma.service';
+import { CreditSettingsService } from '../credit/credit-settings.service';
+import { CreditWalletService } from '../credit/credit-wallet.service';
 import {
   getTrialIneligibility,
   isTrialAccountEligible,
@@ -25,6 +27,15 @@ export interface TrialActivationView {
   accessExpiresAt: string | null;
   trialStartedAt: string;
   trialExpiresAt: string;
+  /**
+   * The trial credits allocated with this activation (the admin-configured
+   * trial allowance, expiring with the trial); null when the allowance is 0.
+   */
+  trialCredits: {
+    allocationId: string;
+    credits: string;
+    expiresAt: string;
+  } | null;
 }
 
 const INELIGIBLE: Record<TrialIneligibilityReason, () => AppError> = {
@@ -46,6 +57,8 @@ export class SubscriptionTrialService {
     private readonly prisma: PrismaService,
     private readonly plans: SubscriptionPlanService,
     private readonly activityLog: ActivityLogService,
+    private readonly creditSettings: CreditSettingsService,
+    private readonly wallets: CreditWalletService,
   ) {}
 
   /**
@@ -56,6 +69,12 @@ export class SubscriptionTrialService {
    * whole activation back, so a failed attempt never consumes the trial.
    * The trial is claimed with a conditional update, so concurrent or repeated
    * requests cannot create a second trial or move the expiry date.
+   *
+   * In the same transaction the trial allowance (CreditSettings
+   * trialAllowanceCredits, default 50) is allocated as TRIAL credits that
+   * expire with the trial. Only the activation that claims the trial
+   * allocates them, so they are granted once; the allocation is also unique
+   * per trial (`trial:<subscription id>`) and per user (database index).
    */
   async activateTrial(
     authId: string,
@@ -140,6 +159,14 @@ export class SubscriptionTrialService {
         tx,
       );
 
+      const trialCredits = await this.allocateTrialCredits(
+        tx,
+        authId,
+        record.id,
+        trialExpiresAt,
+        now,
+      );
+
       const access = resolveSubscriptionAccess(record, now);
       return {
         status: access.status,
@@ -148,8 +175,34 @@ export class SubscriptionTrialService {
         accessExpiresAt: access.accessExpiresAt?.toISOString() ?? null,
         trialStartedAt: trialStartedAt.toISOString(),
         trialExpiresAt: trialExpiresAt.toISOString(),
+        trialCredits,
       };
     });
+  }
+
+  /** Allocates the configured trial allowance, expiring with the trial. */
+  private async allocateTrialCredits(
+    tx: Prisma.TransactionClient,
+    authId: string,
+    subscriptionId: string,
+    trialExpiresAt: Date,
+    now: Date,
+  ): Promise<TrialActivationView['trialCredits']> {
+    const { trialAllowanceCredits } = await this.creditSettings.getSettings(tx);
+    if (trialAllowanceCredits <= 0) return null;
+    const { allocation } = await this.wallets.allocateInTransaction(tx, {
+      authId,
+      source: CreditSource.TRIAL,
+      sourceReference: `trial:${subscriptionId}`,
+      credits: trialAllowanceCredits,
+      expiresAt: trialExpiresAt,
+      now,
+    });
+    return {
+      allocationId: allocation.id,
+      credits: allocation.grantedCredits,
+      expiresAt: allocation.expiresAt as string,
+    };
   }
 
   private findRecord(tx: Prisma.TransactionClient, authId: string) {

@@ -2,6 +2,8 @@ import { BillingInterval, type UserSubscription } from '@prisma/client';
 import { mock, mockDeep } from 'jest-mock-extended';
 import { ActivityLogService } from '../common/services/activity-log.service';
 import { PrismaService } from '../common/services/prisma.service';
+import type { CreditSettingsService } from '../credit/credit-settings.service';
+import type { CreditWalletService } from '../credit/credit-wallet.service';
 import type { SubscriptionPlanView } from './interfaces/subscription-plan.interface';
 import { SubscriptionPlanService } from './subscription-plan.service';
 import { SubscriptionTrialService } from './subscription-trial.service';
@@ -10,7 +12,15 @@ describe('SubscriptionTrialService', () => {
   const prisma = mockDeep<PrismaService>();
   const plans = mock<SubscriptionPlanService>();
   const activityLog = mock<ActivityLogService>();
-  const service = new SubscriptionTrialService(prisma, plans, activityLog);
+  const creditSettings = mock<CreditSettingsService>();
+  const wallets = mock<CreditWalletService>();
+  const service = new SubscriptionTrialService(
+    prisma,
+    plans,
+    activityLog,
+    creditSettings,
+    wallets,
+  );
   const now = new Date('2026-03-01T09:30:00.000Z');
   const meta = { ip: '127.0.0.1', userAgent: 'jest' };
 
@@ -55,6 +65,30 @@ describe('SubscriptionTrialService', () => {
       deletedAt: null,
     } as never);
     plans.getProPlan.mockResolvedValue(plan());
+    // Trial credits (see subscription-trial-credit.spec.ts).
+    creditSettings.getSettings.mockResolvedValue({
+      trialAllowanceCredits: 50,
+      proMonthlyAllowanceCredits: 1000,
+      openRouterUsdMicrosPerCredit: 5000,
+      openRouterUsdPerCredit: '0.005',
+      sessionOverageAllowanceCredits: 5,
+      updatedAt: now.toISOString(),
+    });
+    wallets.allocateInTransaction.mockImplementation((_tx, input) =>
+      Promise.resolve({
+        created: true,
+        allocation: {
+          id: 'trial-allocation',
+          source: input.source,
+          sourceReference: input.sourceReference,
+          grantedCredits: String(input.credits),
+          remainingCredits: String(input.credits),
+          expiresAt: input.expiresAt?.toISOString() ?? null,
+          expiredAt: null,
+          grantedAt: now.toISOString(),
+        },
+      }),
+    );
     prisma.userSubscription.findUnique.mockResolvedValue(null);
     prisma.userSubscription.createMany.mockResolvedValue({ count: 1 });
     prisma.userSubscription.updateMany.mockResolvedValue({ count: 1 });
@@ -84,6 +118,11 @@ describe('SubscriptionTrialService', () => {
           accessExpiresAt: '2026-03-08T09:30:00.000Z',
           trialStartedAt: '2026-03-01T09:30:00.000Z',
           trialExpiresAt: '2026-03-08T09:30:00.000Z',
+          trialCredits: {
+            allocationId: 'trial-allocation',
+            credits: '50',
+            expiresAt: '2026-03-08T09:30:00.000Z',
+          },
         },
       );
 

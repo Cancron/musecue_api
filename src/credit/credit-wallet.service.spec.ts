@@ -10,8 +10,13 @@ import {
 import { mock, mockDeep } from 'jest-mock-extended';
 import { PrismaService } from '../common/services/prisma.service';
 import { CreditSettingsService } from './credit-settings.service';
-import { CreditWalletService } from './credit-wallet.service';
+import {
+  CreditWalletService,
+  TRIAL_ENDED_BY_PRO_REFERENCE,
+} from './credit-wallet.service';
+import { InsufficientCreditsError } from './credit.errors';
 
+const INSUFFICIENT = { status: 403, message: 'Insufficient credits' };
 const d = (value: string | number) => new Prisma.Decimal(value);
 const NOW = new Date('2026-11-24T12:00:00.000Z');
 const LATER = new Date('2026-12-24T12:00:00.000Z');
@@ -380,14 +385,17 @@ describe('CreditWalletService', () => {
       expect(amounts(deductionTx, 'balanceAfterCredits')).toBe('8.75');
     });
 
-    it('refuses a deduction that does not fit (402) and writes nothing', async () => {
+    it('refuses a deduction that does not fit (403 Insufficient credits) and writes nothing', async () => {
       givenWallet({ balanceCredits: d(1) }, 1);
       prisma.creditAllocation.findMany
         .mockResolvedValueOnce([])
         .mockResolvedValueOnce([allocationRow({ remainingCredits: d(1) })]);
 
-      await expect(service.deduct(deduction)).rejects.toMatchObject({
-        status: 402,
+      const refusal = service.deduct(deduction);
+      await expect(refusal).rejects.toBeInstanceOf(InsufficientCreditsError);
+      await expect(refusal).rejects.toMatchObject({
+        status: 403,
+        message: 'Insufficient credits',
       });
       expect(prisma.creditTransaction.create.mock.calls).toHaveLength(0);
       expect(prisma.creditAllocation.update.mock.calls).toHaveLength(0);
@@ -447,7 +455,7 @@ describe('CreditWalletService', () => {
       // The settings now allow 5, but this session keeps its limit of 2.
       await expect(
         service.deduct({ ...deduction, credits: '1', sessionId: 'session-1' }),
-      ).rejects.toMatchObject({ status: 402 });
+      ).rejects.toMatchObject(INSUFFICIENT);
       expect(settings.getSettings.mock.calls).toHaveLength(0);
     });
 
@@ -515,6 +523,85 @@ describe('CreditWalletService', () => {
         expect(prisma.$transaction.mock.calls).toHaveLength(0);
       },
     );
+  });
+
+  describe("trial credits (inside the caller's transaction)", () => {
+    const tx = prisma;
+
+    it('allocateInTransaction writes through the given transaction without opening its own', async () => {
+      const result = await service.allocateInTransaction(tx, {
+        authId: AUTH_ID,
+        source: CreditSource.TRIAL,
+        sourceReference: 'trial:sub-1',
+        credits: 50,
+        expiresAt: LATER,
+        now: NOW,
+      });
+
+      expect(prisma.$transaction.mock.calls).toHaveLength(0);
+      expect(
+        prisma.creditAllocation.create.mock.calls[0]?.[0].data,
+      ).toMatchObject({
+        source: CreditSource.TRIAL,
+        sourceReference: 'trial:sub-1',
+        grantedCredits: d(50),
+        expiresAt: LATER,
+        grantedAt: NOW,
+      });
+      expect(result.created).toBe(true);
+    });
+
+    it('expireTrialCredits ends unused trial credits early, dated now, and leaves other sources alone', async () => {
+      givenWallet({ balanceCredits: d(62) }, 3);
+      const trial = allocationRow({
+        id: 'trial',
+        source: CreditSource.TRIAL,
+        remainingCredits: d(42),
+        expiresAt: LATER,
+      });
+      prisma.creditAllocation.findMany
+        .mockResolvedValueOnce([]) // nothing due for regular expiry
+        .mockResolvedValueOnce([trial]);
+
+      await expect(service.expireTrialCredits(tx, AUTH_ID, NOW)).resolves.toBe(
+        1,
+      );
+
+      // Only TRIAL allocations with credits left are selected.
+      expect(
+        prisma.creditAllocation.findMany.mock.calls[1]?.[0]?.where,
+      ).toEqual({
+        walletId: WALLET_ID,
+        source: CreditSource.TRIAL,
+        remainingCredits: { gt: 0 },
+      });
+      const [expiration] = written();
+      expect(expiration).toMatchObject({
+        sequence: 4,
+        type: CreditTransactionType.EXPIRATION,
+        idempotencyKey: 'expiration:trial',
+        allocationId: 'trial',
+        reference: TRIAL_ENDED_BY_PRO_REFERENCE,
+        effectiveAt: NOW,
+      });
+      expect(amounts(expiration, 'amountCredits')).toBe('-42');
+      expect(amounts(expiration, 'balanceAfterCredits')).toBe('20');
+      expect(prisma.creditAllocation.update.mock.calls[0]?.[0]).toEqual({
+        where: { id: 'trial' },
+        data: { remainingCredits: d(0), expiredAt: NOW },
+      });
+      expect(prisma.$transaction.mock.calls).toHaveLength(0);
+    });
+
+    it('expireTrialCredits does nothing for a user without a wallet', async () => {
+      prisma.$queryRaw.mockResolvedValue([]);
+
+      await expect(service.expireTrialCredits(tx, AUTH_ID, NOW)).resolves.toBe(
+        0,
+      );
+      expect(prisma.creditTransaction.create.mock.calls).toHaveLength(0);
+      expect(prisma.creditWallet.createMany.mock.calls).toHaveLength(0);
+    });
   });
 
   describe('errors', () => {

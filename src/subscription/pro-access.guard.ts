@@ -9,6 +9,10 @@ import { Reflector } from '@nestjs/core';
 import type { Request } from 'express';
 import AppError from '../common/errors/app.error';
 import { CreditWalletService } from '../credit/credit-wallet.service';
+import {
+  INSUFFICIENT_CREDITS_MESSAGE,
+  InsufficientCreditsError,
+} from '../credit/credit.errors';
 import type { CreditBalanceView } from '../credit/interfaces/credit-wallet.interface';
 import type { SubscriptionAccess } from './subscription-access.policy';
 import { SubscriptionAccessService } from './subscription-access.service';
@@ -29,7 +33,7 @@ export interface CreditAccessRequest extends Request {
 
 export const PRO_ACCESS_REQUIRED_MESSAGE =
   'An active Pro subscription or free trial is required';
-export const INSUFFICIENT_CREDITS_MESSAGE = 'Insufficient credits';
+export { INSUFFICIENT_CREDITS_MESSAGE };
 
 export const CREDITS_REQUIRED_KEY = 'proAccess:creditsRequired';
 
@@ -80,7 +84,7 @@ export class ProAccessGuard implements CanActivate {
     if (creditsRequired === true) {
       const balance = await this.credits.getBalance(userId);
       if (!hasAvailableCredits(balance)) {
-        throw AppError.forbidden(INSUFFICIENT_CREDITS_MESSAGE);
+        throw new InsufficientCreditsError();
       }
       Object.assign(request, { creditAccess: balance });
       return true;

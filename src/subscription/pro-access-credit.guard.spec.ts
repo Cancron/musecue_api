@@ -8,6 +8,7 @@ import { Reflector } from '@nestjs/core';
 import { CreditSource } from '@prisma/client';
 import { mock } from 'jest-mock-extended';
 import type { CreditWalletService } from '../credit/credit-wallet.service';
+import { InsufficientCreditsError } from '../credit/credit.errors';
 import type { CreditBalanceView } from '../credit/interfaces/credit-wallet.interface';
 import {
   INSUFFICIENT_CREDITS_MESSAGE,
@@ -89,7 +90,10 @@ describe('ProAccessGuard credit eligibility', () => {
   it('refuses a user without credits with 403 "Insufficient credits"', async () => {
     credits.getBalance.mockResolvedValue(balance());
 
-    await expect(run('createSession')).rejects.toMatchObject({
+    const refusal = run('createSession');
+    // The same error (and response) as a deduction beyond the balance.
+    await expect(refusal).rejects.toBeInstanceOf(InsufficientCreditsError);
+    await expect(refusal).rejects.toMatchObject({
       status: 403,
       message: INSUFFICIENT_CREDITS_MESSAGE,
     });

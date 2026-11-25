@@ -1,3 +1,4 @@
+import type { CreditWalletService } from '../credit/credit-wallet.service';
 import { BillingInterval } from '@prisma/client';
 import { mock } from 'jest-mock-extended';
 import {
@@ -84,6 +85,8 @@ describe('SubscriptionBillingService', () => {
       logger,
       cancellation,
       new StripeRefundService(prisma, gateway, activityLog, logger),
+      // Trial credit expiry at activation is covered by test/credit-trial.
+      mock<CreditWalletService>(),
     );
     billing = new SubscriptionBillingService(prisma);
   });

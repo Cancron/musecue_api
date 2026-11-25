@@ -52,6 +52,11 @@ describe('POST /v1/subscription/trial (HTTP)', () => {
     accessExpiresAt: '2026-03-08T09:30:00.000Z',
     trialStartedAt: '2026-03-01T09:30:00.000Z',
     trialExpiresAt: '2026-03-08T09:30:00.000Z',
+    trialCredits: {
+      allocationId: 'allocation-1',
+      credits: '50',
+      expiresAt: '2026-03-08T09:30:00.000Z',
+    },
   };
 
   beforeAll(async () => {

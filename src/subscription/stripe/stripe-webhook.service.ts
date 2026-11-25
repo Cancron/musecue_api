@@ -18,6 +18,7 @@ import {
 } from '../../common/services/activity-log.service';
 import { CustomLoggerService } from '../../common/services/custom-logger.service';
 import { PrismaService } from '../../common/services/prisma.service';
+import { CreditWalletService } from '../../credit/credit-wallet.service';
 import { isProActive } from '../subscription-access.policy';
 import { StripeCancellationService } from './stripe-cancellation.service';
 import { StripeRefundService } from './stripe-refund.service';
@@ -154,6 +155,7 @@ export class StripeWebhookService {
     private readonly logger: CustomLoggerService,
     private readonly cancellation: StripeCancellationService,
     private readonly refunds: StripeRefundService,
+    private readonly wallets: CreditWalletService,
   ) {}
 
   /**
@@ -513,6 +515,10 @@ export class StripeWebhookService {
         },
       });
       await this.audit(tx, record, next, metadata);
+      // A paid Pro term ends the free trial's credits (purchased and referral
+      // credits are kept). Same transaction: activation and expiry commit
+      // together, and a redelivered event never gets here again.
+      await this.wallets.expireTrialCredits(tx, record.authId, now);
       return 'ACTIVATED';
     });
   }
