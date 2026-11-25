@@ -89,6 +89,9 @@ describe('SubscriptionTrialService trial credits', () => {
             expiresAt: input.expiresAt?.toISOString() ?? null,
             expiredAt: null,
             grantedAt: now.toISOString(),
+            subscriptionId: null,
+            paymentId: null,
+            periodStartsAt: null,
           },
         }),
     );

@@ -109,6 +109,8 @@ model PaymentTransaction {
   event           SubscriptionEvent?
   checkoutSession CheckoutSession?
   refunds         PaymentRefund[]
+  // The monthly Pro credits this payment funded (SUBSCRIPTION allocation).
+  creditAllocation CreditAllocation?
 
   @@unique([provider, providerPaymentId])
   @@index([subscriptionId, createdAt])

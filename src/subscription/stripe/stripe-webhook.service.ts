@@ -3,6 +3,7 @@ import {
   type CheckoutSession,
   CheckoutSessionStatus,
   PaymentStatus,
+  type PaymentTransaction,
   Prisma,
   SubscriptionEventType,
   SubscriptionStatus,
@@ -519,7 +520,30 @@ export class StripeWebhookService {
       // credits are kept). Same transaction: activation and expiry commit
       // together, and a redelivered event never gets here again.
       await this.wallets.expireTrialCredits(tx, record.authId, now);
+      await this.grantProCredits(tx, record, saved, now);
       return 'ACTIVATED';
+    });
+  }
+
+  /**
+   * The monthly Pro credits paid by a newly recorded, successful payment,
+   * valid for its billing period (the previous period's credits expire at
+   * the boundary). Runs in the payment's transaction, so the payment and its
+   * credits are committed together, and only paths that record a new payment
+   * get here: failed, duplicate, refused and redelivered payments never do.
+   * The allocation is also unique per payment in the database.
+   */
+  private async grantProCredits(
+    tx: Prisma.TransactionClient,
+    record: UserSubscription,
+    payment: PaymentTransaction,
+    now: Date,
+  ): Promise<void> {
+    await this.wallets.allocateProMonthlyCreditsInTransaction(tx, {
+      authId: record.authId,
+      subscriptionId: record.id,
+      payment,
+      now,
     });
   }
 
@@ -737,6 +761,7 @@ export class StripeWebhookService {
         // but never move the term backwards or overwrite it. The collection
         // still ends a past-due state.
         await tx.subscriptionEvent.create({ data: renewedEvent });
+        await this.grantProCredits(tx, record, saved, now);
         if (record.pastDueSince !== null) {
           const cleared = { pastDueSince: null };
           await tx.userSubscription.update({
@@ -772,6 +797,7 @@ export class StripeWebhookService {
       });
       await tx.subscriptionEvent.create({ data: renewedEvent });
       await this.audit(tx, record, next, metadata);
+      await this.grantProCredits(tx, record, saved, now);
       return 'RENEWED';
     });
   }

@@ -11,7 +11,11 @@ import {
   eventually,
   type TestApplication,
 } from './support/infrastructure-flows';
-import { daysFrom, givenProPurchased } from './support/subscription-fixtures';
+import {
+  daysFrom,
+  givenPaidMonth,
+  givenProPurchased,
+} from './support/subscription-fixtures';
 
 jest.setTimeout(120_000);
 
@@ -250,22 +254,36 @@ describeWithDatabase('Credit access to makeup sessions (e2e)', () => {
       },
     );
 
-    it.each([CreditSource.TRIAL, CreditSource.SUBSCRIPTION])(
-      'can create sessions with unexpired %s credits',
-      async (source) => {
-        const account = await signUp();
-        const token = await login(account);
-        await wallets.allocate({
-          authId: account.id,
-          source,
-          sourceReference: `${source}:${account.id}`,
-          credits: source === CreditSource.TRIAL ? 50 : 1000,
-          expiresAt: new Date(Date.now() + 24 * HOUR),
-        });
+    it('can create sessions with unexpired TRIAL credits', async () => {
+      const account = await signUp();
+      const token = await login(account);
+      await wallets.allocate({
+        authId: account.id,
+        source: CreditSource.TRIAL,
+        sourceReference: `TRIAL:${account.id}`,
+        credits: 50,
+        expiresAt: new Date(Date.now() + 24 * HOUR),
+      });
 
-        await createSession(token).expect(201);
-      },
-    );
+      await createSession(token).expect(201);
+    });
+
+    it('can create sessions with unexpired SUBSCRIPTION credits of a paid month', async () => {
+      const account = await signUp();
+      const token = await login(account);
+      const paid = await givenPaidMonth(
+        ctx.client,
+        account.id,
+        new Date(Date.now() - HOUR),
+      );
+      await wallets.allocateSubscriptionCredits({
+        authId: account.id,
+        ...paid,
+        credits: 1000,
+      });
+
+      await createSession(token).expect(201);
+    });
 
     it('only need some credits: a fraction of a credit is enough', async () => {
       const account = await signUp();
@@ -287,13 +305,18 @@ describeWithDatabase('Credit access to makeup sessions (e2e)', () => {
       const token = await login(account);
       const subscription = await givenExpiredPro(account.id);
       // The ended Pro period's monthly credits, expired with it.
-      await wallets.allocate({
+      const lastPayment = await ctx.client.paymentTransaction.findFirstOrThrow({
+        where: { subscriptionId: subscription.id },
+        orderBy: { periodEnd: 'desc' },
+      });
+      await wallets.allocateSubscriptionCredits({
         authId: account.id,
-        source: CreditSource.SUBSCRIPTION,
-        sourceReference: `pro:${subscription.id}:last-period`,
+        subscriptionId: subscription.id,
+        paymentId: lastPayment.id,
+        periodStart: lastPayment.periodStart,
+        periodEnd: lastPayment.periodEnd,
         credits: 1000,
-        expiresAt: subscription.proExpiresAt!,
-        now: daysFrom(subscription.proExpiresAt!, -31),
+        now: lastPayment.periodStart,
       });
 
       const status = await http()

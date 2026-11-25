@@ -1,4 +1,8 @@
-import type { CreditSource, CreditTransactionType } from '@prisma/client';
+import type {
+  BillingInterval,
+  CreditSource,
+  CreditTransactionType,
+} from '@prisma/client';
 import type { CreditAmountInput } from '../credit-ledger.policy';
 
 /** Credit amounts are exact decimal strings, e.g. "12.5" or "0.000125". */
@@ -18,6 +22,32 @@ export interface AllocateCreditsInput {
   /** Required for TRIAL and SUBSCRIPTION, not allowed for PURCHASE and REFERRAL. */
   expiresAt?: Date | null;
   /** Defaults to the current time; exposed for deterministic tests. */
+  now?: Date;
+}
+
+/** The credits of one paid Pro period (see allocateSubscriptionCredits). */
+export interface SubscriptionCreditsInput {
+  authId: string;
+  subscriptionId: string;
+  /** The SUCCEEDED PaymentTransaction that paid for the period. */
+  paymentId: string;
+  periodStart: Date;
+  /** The billing boundary: the credits expire here. */
+  periodEnd: Date;
+  credits: CreditAmountInput;
+  now?: Date;
+}
+
+/** A recorded successful payment, for the monthly Pro allowance. */
+export interface ProMonthlyCreditsInput {
+  authId: string;
+  subscriptionId: string;
+  payment: {
+    id: string;
+    billingInterval: BillingInterval;
+    periodStart: Date;
+    periodEnd: Date;
+  };
   now?: Date;
 }
 
@@ -43,6 +73,11 @@ export interface CreditAllocationView {
   expiresAt: string | null;
   expiredAt: string | null;
   grantedAt: string;
+  /** SUBSCRIPTION credits only: the paid Pro period they belong to. */
+  subscriptionId: string | null;
+  paymentId: string | null;
+  /** Start of the paid period; it ends at `expiresAt`. */
+  periodStartsAt: string | null;
 }
 
 export interface CreditTransactionView {

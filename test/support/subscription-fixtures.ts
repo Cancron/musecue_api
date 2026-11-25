@@ -222,3 +222,30 @@ export async function givenPaidProHistory(
 export async function givenFreeRecord(client: PrismaClient, authId: string) {
   return client.userSubscription.create({ data: { authId } });
 }
+
+/**
+ * A SUCCEEDED monthly payment for the calendar month starting at
+ * `periodStart`, on the user's subscription (created if missing). Paid
+ * periods are what SUBSCRIPTION credits must be linked to.
+ */
+export async function givenPaidMonth(
+  client: PrismaClient,
+  authId: string,
+  periodStart: Date,
+) {
+  const subscription =
+    (await client.userSubscription.findUnique({ where: { authId } })) ??
+    (await client.userSubscription.create({ data: { authId } }));
+  const periodEnd = addBillingInterval(periodStart, BillingInterval.MONTHLY);
+  const payment = await recordPayment(client, subscription.id, {
+    billingInterval: BillingInterval.MONTHLY,
+    periodStart,
+    periodEnd,
+  });
+  return {
+    subscriptionId: subscription.id,
+    paymentId: payment.id,
+    periodStart,
+    periodEnd,
+  };
+}

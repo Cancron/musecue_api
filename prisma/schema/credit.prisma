@@ -89,7 +89,18 @@ model CreditAllocation {
   grantedAt        DateTime     @default(now())
   updatedAt        DateTime     @updatedAt
 
+  // SUBSCRIPTION allocations only (required for them, NULL otherwise): the
+  // paid Pro period they belong to. A database trigger checks at insert that
+  // the payment SUCCEEDED, belongs to this subscription and to the wallet's
+  // user, and that periodStartsAt/expiresAt are its billing period. One
+  // allocation per payment. subscriptionId has no foreign key (like the
+  // payment's own link, it must not block account erasure).
+  subscriptionId String?
+  paymentId      String?   @unique
+  periodStartsAt DateTime?
+
   wallet       CreditWallet             @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  payment      PaymentTransaction?      @relation(fields: [paymentId], references: [id], onDelete: Restrict)
   transactions CreditTransaction[]
   entries      CreditTransactionEntry[]
 
@@ -98,6 +109,7 @@ model CreditAllocation {
   // allocation's wallet.
   @@unique([id, walletId])
   @@index([walletId, expiresAt])
+  @@index([subscriptionId])
 }
 
 // Append-only credit ledger: one row per balance change, numbered per wallet.

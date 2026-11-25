@@ -15,7 +15,12 @@ import {
   dropSchema,
   migrationNames,
 } from './support/migrated-schema';
-import { createUser } from './support/subscription-fixtures';
+import { addBillingInterval } from '../src/subscription/billing.validation';
+import {
+  createUser,
+  givenPaidMonth,
+  recordPayment,
+} from './support/subscription-fixtures';
 
 jest.setTimeout(120_000);
 
@@ -89,6 +94,23 @@ describeWithDatabase('AI credit wallet and ledger (PostgreSQL)', () => {
       now: options.now,
     });
 
+  /** Monthly Pro credits for a real, SUCCEEDED payment of `periodStart`'s month. */
+  const allocatePaidMonth = async (
+    authId: string,
+    credits: number | string,
+    periodStart: Date,
+    now?: Date,
+  ) => {
+    const paid = await givenPaidMonth(client, authId, periodStart);
+    const result = await wallets.allocateSubscriptionCredits({
+      authId,
+      ...paid,
+      credits,
+      now,
+    });
+    return { ...paid, ...result };
+  };
+
   const available = async (authId: string, now?: Date) =>
     (await wallets.getBalance(authId, now)).availableCredits;
 
@@ -146,16 +168,13 @@ describeWithDatabase('AI credit wallet and ledger (PostgreSQL)', () => {
       const alice = await newUser();
       const bob = await newUser();
       const trialEnd = inHours(24 * 7);
-      const periodEnd = inHours(24 * 30);
 
       await allocate(alice, CreditSource.TRIAL, 50, {
         ref: `trial:${alice}`,
         expiresAt: trialEnd,
       });
-      await allocate(alice, CreditSource.SUBSCRIPTION, 1000, {
-        ref: `pro:${alice}:2026-11`,
-        expiresAt: periodEnd,
-      });
+      const paid = await allocatePaidMonth(alice, 1000, inHours(-1));
+      const periodEnd = paid.periodEnd;
       await allocate(alice, CreditSource.PURCHASE, '250.5', {
         ref: `payment:${alice}`,
       });
@@ -191,7 +210,7 @@ describeWithDatabase('AI credit wallet and ledger (PostgreSQL)', () => {
         {
           authId: alice,
           source: 'SUBSCRIPTION',
-          sourceReference: `pro:${alice}:2026-11`,
+          sourceReference: `pro:${paid.paymentId}`,
           granted: '1000.000000',
           remaining: '1000.000000',
           expiresAt: periodEnd,
@@ -278,6 +297,7 @@ describeWithDatabase('AI credit wallet and ledger (PostgreSQL)', () => {
       await expect(
         allocate(alice, CreditSource.PURCHASE, 5, { expiresAt: inHours(1) }),
       ).rejects.toMatchObject({ status: 400 });
+      // Subscription credits only come from a paid period.
       await expect(
         allocate(alice, CreditSource.SUBSCRIPTION, 5, { expiresAt: null }),
       ).rejects.toMatchObject({ status: 400 });
@@ -344,10 +364,13 @@ describeWithDatabase('AI credit wallet and ledger (PostgreSQL)', () => {
         expiresAt: inHours(1, t0),
         now: t0,
       });
-      await allocate(alice, CreditSource.SUBSCRIPTION, 1000, {
-        expiresAt: inHours(2, t0),
-        now: t0,
-      });
+      // A paid month that started 20 days ago (ends 8-11 days from now).
+      const paid = await allocatePaidMonth(
+        alice,
+        1000,
+        inHours(-20 * 24, t0),
+        t0,
+      );
       await allocate(alice, CreditSource.PURCHASE, 30, { now: t0 });
       await allocate(alice, CreditSource.REFERRAL, 5, { now: t0 });
 
@@ -362,7 +385,7 @@ describeWithDatabase('AI credit wallet and ledger (PostgreSQL)', () => {
         },
         outstandingOverageCredits: '0',
         nextExpiration: {
-          expiresAt: inHours(2, t0).toISOString(),
+          expiresAt: paid.periodEnd.toISOString(),
           credits: '1000',
         },
       });
@@ -437,7 +460,7 @@ describeWithDatabase('AI credit wallet and ledger (PostgreSQL)', () => {
       const t0 = new Date();
       const users = [await newUser(), await newUser(), await newUser()];
       for (const user of users) {
-        await allocate(user, CreditSource.SUBSCRIPTION, 100, {
+        await allocate(user, CreditSource.TRIAL, 100, {
           expiresAt: inHours(1, t0),
           now: t0,
         });
@@ -694,14 +717,17 @@ describeWithDatabase('AI credit wallet and ledger (PostgreSQL)', () => {
   });
 
   describe('concurrent operations', () => {
-    it('creates one allocation when the same allocation is requested concurrently', async () => {
+    it('creates one allocation when the same payment is allocated concurrently', async () => {
       const alice = await newUser();
-      const ref = `pro:${alice}:concurrent`;
-      const expiresAt = inHours(24 * 30);
+      const paid = await givenPaidMonth(client, alice, inHours(-1));
 
       const results = await Promise.all(
         Array.from({ length: 25 }, () =>
-          allocate(alice, CreditSource.SUBSCRIPTION, 1000, { ref, expiresAt }),
+          wallets.allocateSubscriptionCredits({
+            authId: alice,
+            ...paid,
+            credits: 1000,
+          }),
         ),
       );
 
@@ -807,7 +833,7 @@ describeWithDatabase('AI credit wallet and ledger (PostgreSQL)', () => {
       const alice = await newUser();
       const session = await newSession(alice);
       const t0 = new Date();
-      await allocate(alice, CreditSource.SUBSCRIPTION, 3, {
+      await allocate(alice, CreditSource.TRIAL, 3, {
         expiresAt: inHours(1, t0),
         now: t0,
       });
@@ -837,7 +863,7 @@ describeWithDatabase('AI credit wallet and ledger (PostgreSQL)', () => {
       expect(overage).toBeLessThanOrEqual(5);
       expect(overage === 0 || Number(wallet.balance) === 0).toBe(true);
       await expect(wallets.getBalance(alice, later)).resolves.toMatchObject({
-        availableBySource: { SUBSCRIPTION: '0' },
+        availableBySource: { TRIAL: '0' },
       });
     });
   });
@@ -858,7 +884,7 @@ describeWithDatabase('AI credit wallet and ledger (PostgreSQL)', () => {
         await allocate(user, CreditSource.REFERRAL, 5, { now: t0 });
       }
       const active = await newUser();
-      await allocate(active, CreditSource.SUBSCRIPTION, 10, {
+      await allocate(active, CreditSource.TRIAL, 10, {
         expiresAt: inHours(24),
       });
 
@@ -1062,6 +1088,66 @@ describeWithDatabase('AI credit wallet and ledger (PostgreSQL)', () => {
       ).rejects.toThrow();
       const after = await reconcile(ownerId);
       expect(after).toEqual(before);
+    });
+
+    it("PostgreSQL refuses subscription credits that do not match a succeeded payment of the user's subscription period", async () => {
+      const alice = await newUser();
+      const bob = await newUser();
+      const periodStart = inHours(-1);
+      const paid = await givenPaidMonth(client, alice, periodStart);
+      const bobs = await givenPaidMonth(client, bob, inHours(-2));
+      const failed = await recordPayment(client, paid.subscriptionId, {
+        status: 'FAILED',
+        billingInterval: 'MONTHLY',
+        periodStart: inHours(-3 * 24),
+        periodEnd: addBillingInterval(inHours(-3 * 24), 'MONTHLY'),
+      });
+      const attempt = (
+        overrides: Partial<
+          Parameters<typeof wallets.allocateSubscriptionCredits>[0]
+        >,
+      ) =>
+        wallets.allocateSubscriptionCredits({
+          authId: alice,
+          ...paid,
+          credits: 1000,
+          ...overrides,
+        });
+
+      await expect(
+        attempt({
+          paymentId: failed.id,
+          periodStart: failed.periodStart,
+          periodEnd: failed.periodEnd,
+        }),
+      ).rejects.toThrow(/require a succeeded payment/);
+      await expect(
+        attempt({ subscriptionId: bobs.subscriptionId }),
+      ).rejects.toThrow(/does not belong to this subscription/);
+      await expect(attempt({ ...bobs })).rejects.toThrow(
+        /belongs to another user/,
+      );
+      await expect(
+        attempt({ periodEnd: inHours(24 * 40, periodStart) }),
+      ).rejects.toThrow(/exactly the paid period/);
+      await expect(attempt({ paymentId: 'no-such-payment' })).rejects.toThrow(
+        /require a succeeded payment/,
+      );
+      await expect(
+        client.creditWallet.count({ where: { authId: alice } }),
+      ).resolves.toBe(0);
+
+      // The matching payment is accepted once; a payment funds one allocation.
+      await expect(attempt({})).resolves.toMatchObject({ created: true });
+      await expect(
+        client.$executeRaw`INSERT INTO "CreditAllocation"
+          ("id", "walletId", "source", "sourceReference", "grantedCredits", "remainingCredits",
+           "expiresAt", "grantedAt", "updatedAt", "subscriptionId", "paymentId", "periodStartsAt")
+          SELECT 'second', a."walletId", 'SUBSCRIPTION', 'pro:second', 1, 1, a."expiresAt",
+                 a."grantedAt", now(), a."subscriptionId", a."paymentId", a."periodStartsAt"
+          FROM "CreditAllocation" a WHERE a."paymentId" = ${paid.paymentId}`,
+      ).rejects.toThrow();
+      await reconcile(alice);
     });
 
     it('removes all credit records when the user is deleted (account erasure)', async () => {

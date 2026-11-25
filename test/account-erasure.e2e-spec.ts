@@ -489,6 +489,16 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
     const payment = await client.paymentTransaction.findFirstOrThrow({
       where: { subscriptionId: subscription.id },
     });
+    // Monthly Pro credits linked to that payment: erasure removes them and
+    // keeps the payment.
+    await credits.allocateSubscriptionCredits({
+      authId: user.id,
+      subscriptionId: subscription.id,
+      paymentId: payment.id,
+      periodStart: payment.periodStart,
+      periodEnd: payment.periodEnd,
+      credits: 1000,
+    });
     const providerCustomerId = `cus_erasure_${tag}`;
     await client.paymentCustomer.create({
       data: { authId: user.id, provider: 'stripe', providerCustomerId },

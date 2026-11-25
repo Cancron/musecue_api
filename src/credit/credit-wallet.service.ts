@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import {
+  BillingInterval,
   CreditSource,
   CreditTransactionType,
   Prisma,
@@ -33,9 +34,18 @@ import type {
   DeductCreditsInput,
   DeductionResult,
   ExpirationSweepResult,
+  ProMonthlyCreditsInput,
+  SubscriptionCreditsInput,
 } from './interfaces/credit-wallet.interface';
 
 type Tx = Prisma.TransactionClient;
+
+/** The paid Pro period a SUBSCRIPTION allocation belongs to. */
+interface AllocationLink {
+  subscriptionId: string;
+  paymentId: string;
+  periodStartsAt: Date;
+}
 
 /** The wallet's running totals while one locked transaction writes to it. */
 interface LedgerCursor {
@@ -204,6 +214,82 @@ export class CreditWalletService {
   }
 
   /**
+   * Allocates the credits of one paid Pro period: SUBSCRIPTION credits linked
+   * to the subscription and the payment, valid for the payment's billing
+   * period (they expire at its end, the billing boundary). Keyed by the
+   * payment (`pro:<paymentId>`, one allocation per payment), so repeating it
+   * returns the existing allocation. The database refuses it unless the
+   * payment SUCCEEDED and belongs to this user's subscription and period.
+   */
+  async allocateSubscriptionCredits(
+    input: SubscriptionCreditsInput,
+  ): Promise<AllocationResult> {
+    const request = this.subscriptionRequest(input);
+    return this.write((tx) => this.allocateLocked(tx, input.authId, request));
+  }
+
+  /** `allocateSubscriptionCredits` inside the caller's transaction. */
+  async allocateSubscriptionCreditsInTransaction(
+    tx: Tx,
+    input: SubscriptionCreditsInput,
+  ): Promise<AllocationResult> {
+    const request = this.subscriptionRequest(input);
+    return this.allocateLocked(tx, input.authId, request);
+  }
+
+  /**
+   * The monthly Pro allowance for a successful payment, inside the payment's
+   * transaction (used by the Stripe webhook when it records a payment).
+   * Allocates CreditSettings.proMonthlyAllowanceCredits (default 1000) for
+   * the payment's period. Nothing is allocated for yearly payments (not
+   * supported yet), when the allowance is 0, or when the period has already
+   * ended. Returns the allocation, or null when nothing was allocated.
+   */
+  async allocateProMonthlyCreditsInTransaction(
+    tx: Tx,
+    input: ProMonthlyCreditsInput,
+  ): Promise<AllocationResult | null> {
+    const now = input.now ?? new Date();
+    const { payment } = input;
+    if (payment.billingInterval !== BillingInterval.MONTHLY) return null;
+    if (payment.periodEnd.getTime() <= now.getTime()) return null;
+    const { proMonthlyAllowanceCredits } = await this.settings.getSettings(tx);
+    if (proMonthlyAllowanceCredits <= 0) return null;
+    return this.allocateSubscriptionCreditsInTransaction(tx, {
+      authId: input.authId,
+      subscriptionId: input.subscriptionId,
+      paymentId: payment.id,
+      periodStart: payment.periodStart,
+      periodEnd: payment.periodEnd,
+      credits: proMonthlyAllowanceCredits,
+      now,
+    });
+  }
+
+  private subscriptionRequest(input: SubscriptionCreditsInput) {
+    const paymentId = this.requireText(input.paymentId, 'paymentId', 100);
+    const subscriptionId = this.requireText(
+      input.subscriptionId,
+      'subscriptionId',
+      100,
+    );
+    if (input.periodStart.getTime() >= input.periodEnd.getTime()) {
+      throw AppError.badRequest('The paid period must end after it starts');
+    }
+    return this.validatedRequest(
+      {
+        authId: input.authId,
+        source: CreditSource.SUBSCRIPTION,
+        sourceReference: `pro:${paymentId}`,
+        credits: input.credits,
+        expiresAt: input.periodEnd,
+        now: input.now,
+      },
+      { subscriptionId, paymentId, periodStartsAt: input.periodStart },
+    );
+  }
+
+  /**
    * `allocate` inside the caller's transaction, so the allocation commits or
    * rolls back together with the caller's writes (e.g. trial activation).
    * Takes the wallet lock for the rest of that transaction.
@@ -263,6 +349,18 @@ export class CreditWalletService {
   }
 
   private allocationRequest(input: AllocateCreditsInput) {
+    if (input.source === CreditSource.SUBSCRIPTION) {
+      throw AppError.badRequest(
+        'Subscription credits are allocated from a paid Pro period (allocateSubscriptionCredits)',
+      );
+    }
+    return this.validatedRequest(input, null);
+  }
+
+  private validatedRequest(
+    input: AllocateCreditsInput,
+    link: AllocationLink | null,
+  ) {
     const now = input.now ?? new Date();
     const credits = this.rule(() => parseCreditAmount(input.credits));
     const sourceReference = this.requireText(
@@ -272,15 +370,22 @@ export class CreditWalletService {
     );
     const expiresAt = input.expiresAt ?? null;
     this.rule(() => assertAllocationExpiry(input.source, expiresAt, now));
-    return { source: input.source, now, credits, sourceReference, expiresAt };
+    return {
+      source: input.source,
+      now,
+      credits,
+      sourceReference,
+      expiresAt,
+      link,
+    };
   }
 
   private async allocateLocked(
     tx: Tx,
     authId: string,
-    request: ReturnType<CreditWalletService['allocationRequest']>,
+    request: ReturnType<CreditWalletService['validatedRequest']>,
   ): Promise<AllocationResult> {
-    const { source, now, credits, sourceReference, expiresAt } = request;
+    const { source, now, credits, sourceReference, expiresAt, link } = request;
     const cursor = await this.openWallet(tx, authId);
 
     const existing = await tx.creditAllocation.findUnique({
@@ -293,7 +398,9 @@ export class CreditWalletService {
         existing.walletId === cursor.walletId &&
         existing.grantedCredits.eq(credits) &&
         (existing.expiresAt?.getTime() ?? null) ===
-          (expiresAt?.getTime() ?? null);
+          (expiresAt?.getTime() ?? null) &&
+        existing.paymentId === (link?.paymentId ?? null) &&
+        existing.subscriptionId === (link?.subscriptionId ?? null);
       if (!same) {
         throw new CreditConflictError(
           'This credit source was already allocated with different terms or to another user',
@@ -324,6 +431,9 @@ export class CreditWalletService {
         remainingCredits: credits,
         expiresAt,
         grantedAt: now,
+        subscriptionId: link?.subscriptionId ?? null,
+        paymentId: link?.paymentId ?? null,
+        periodStartsAt: link?.periodStartsAt ?? null,
       },
     });
     await this.append(tx, cursor, {
@@ -803,6 +913,9 @@ export class CreditWalletService {
       expiresAt: row.expiresAt?.toISOString() ?? null,
       expiredAt: row.expiredAt?.toISOString() ?? null,
       grantedAt: row.grantedAt.toISOString(),
+      subscriptionId: row.subscriptionId,
+      paymentId: row.paymentId,
+      periodStartsAt: row.periodStartsAt?.toISOString() ?? null,
     };
   }
 

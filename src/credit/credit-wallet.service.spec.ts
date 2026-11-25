@@ -56,6 +56,9 @@ describe('CreditWalletService', () => {
     expiredAt: null,
     grantedAt: NOW,
     updatedAt: NOW,
+    subscriptionId: null,
+    paymentId: null,
+    periodStartsAt: null,
     ...overrides,
   });
 
@@ -138,6 +141,10 @@ describe('CreditWalletService', () => {
         remainingCredits: d('10.5'),
         expiresAt: null,
         grantedAt: NOW,
+        // Only SUBSCRIPTION credits are linked to a paid period.
+        subscriptionId: null,
+        paymentId: null,
+        periodStartsAt: null,
       });
       const [tx] = written();
       expect(tx).toMatchObject({
@@ -523,6 +530,150 @@ describe('CreditWalletService', () => {
         expect(prisma.$transaction.mock.calls).toHaveLength(0);
       },
     );
+  });
+
+  describe('monthly Pro credits (SUBSCRIPTION, linked to a paid period)', () => {
+    const PERIOD_START = new Date('2026-11-20T08:00:00.000Z');
+    const PERIOD_END = new Date('2026-12-20T08:00:00.000Z');
+    const payment = (
+      overrides: Partial<{
+        billingInterval: 'MONTHLY' | 'YEARLY';
+        periodEnd: Date;
+      }> = {},
+    ) => ({
+      id: 'pay-1',
+      billingInterval: 'MONTHLY' as 'MONTHLY' | 'YEARLY',
+      periodStart: PERIOD_START,
+      periodEnd: PERIOD_END,
+      ...overrides,
+    });
+    const givenAllowance = (proMonthlyAllowanceCredits: number) =>
+      settings.getSettings.mockResolvedValue({
+        trialAllowanceCredits: 50,
+        proMonthlyAllowanceCredits,
+        openRouterUsdMicrosPerCredit: 5000,
+        openRouterUsdPerCredit: '0.005',
+        sessionOverageAllowanceCredits: 5,
+        updatedAt: NOW.toISOString(),
+      });
+    const linkedRow = (subscriptionId: string) =>
+      allocationRow({
+        source: CreditSource.SUBSCRIPTION,
+        sourceReference: 'pro:pay-1',
+        grantedCredits: d(1000),
+        expiresAt: PERIOD_END,
+        subscriptionId,
+        paymentId: 'pay-1',
+        periodStartsAt: PERIOD_START,
+      });
+    const sameAllocation = {
+      authId: AUTH_ID,
+      subscriptionId: 'sub-1',
+      paymentId: 'pay-1',
+      periodStart: PERIOD_START,
+      periodEnd: PERIOD_END,
+      credits: 1000,
+      now: NOW,
+    };
+
+    it('refuses SUBSCRIPTION credits through the generic allocate (400): they only come from a paid period', async () => {
+      await expect(
+        service.allocate({
+          authId: AUTH_ID,
+          source: CreditSource.SUBSCRIPTION,
+          sourceReference: 'pro:manual',
+          credits: 1000,
+          expiresAt: LATER,
+          now: NOW,
+        }),
+      ).rejects.toMatchObject({ status: 400 });
+      expect(prisma.$transaction.mock.calls).toHaveLength(0);
+    });
+
+    it("allocates the admin-configured allowance for the payment's period, linked to user, subscription and payment", async () => {
+      givenAllowance(1500);
+
+      const result = await service.allocateProMonthlyCreditsInTransaction(
+        prisma,
+        {
+          authId: AUTH_ID,
+          subscriptionId: 'sub-1',
+          payment: payment(),
+          now: NOW,
+        },
+      );
+
+      expect(settings.getSettings.mock.calls).toEqual([[prisma]]);
+      expect(prisma.creditAllocation.create.mock.calls[0]?.[0].data).toEqual({
+        walletId: WALLET_ID,
+        source: CreditSource.SUBSCRIPTION,
+        sourceReference: 'pro:pay-1',
+        grantedCredits: d(1500),
+        remainingCredits: d(1500),
+        expiresAt: PERIOD_END,
+        grantedAt: NOW,
+        subscriptionId: 'sub-1',
+        paymentId: 'pay-1',
+        periodStartsAt: PERIOD_START,
+      });
+      const [allocationTx] = written();
+      expect(allocationTx).toMatchObject({
+        type: CreditTransactionType.ALLOCATION,
+        allocationId: 'alloc-1',
+      });
+      expect(amounts(allocationTx, 'amountCredits')).toBe('1500');
+      expect(result?.created).toBe(true);
+      expect(prisma.$transaction.mock.calls).toHaveLength(0);
+    });
+
+    it.each([
+      [
+        'a yearly payment (not supported yet)',
+        payment({ billingInterval: 'YEARLY' }),
+        1000,
+      ],
+      ['a period that has already ended', payment({ periodEnd: NOW }), 1000],
+      ['an allowance of 0', payment(), 0],
+    ])('allocates nothing for %s', async (_case, paid, allowance) => {
+      givenAllowance(allowance);
+
+      await expect(
+        service.allocateProMonthlyCreditsInTransaction(prisma, {
+          authId: AUTH_ID,
+          subscriptionId: 'sub-1',
+          payment: paid,
+          now: NOW,
+        }),
+      ).resolves.toBeNull();
+      expect(prisma.creditAllocation.create.mock.calls).toHaveLength(0);
+      expect(prisma.creditTransaction.create.mock.calls).toHaveLength(0);
+    });
+
+    it('returns the existing allocation when the same payment is allocated again', async () => {
+      prisma.creditAllocation.findUnique.mockResolvedValue(linkedRow('sub-1'));
+
+      const again = await service.allocateSubscriptionCredits(sameAllocation);
+
+      expect(again).toMatchObject({
+        created: false,
+        allocation: {
+          paymentId: 'pay-1',
+          subscriptionId: 'sub-1',
+          periodStartsAt: PERIOD_START.toISOString(),
+        },
+      });
+      expect(prisma.creditAllocation.create.mock.calls).toHaveLength(0);
+    });
+
+    it("refuses to reuse a payment's allocation for another subscription (409)", async () => {
+      prisma.creditAllocation.findUnique.mockResolvedValue(
+        linkedRow('other-sub'),
+      );
+
+      await expect(
+        service.allocateSubscriptionCredits(sameAllocation),
+      ).rejects.toMatchObject({ status: 409 });
+    });
   });
 
   describe("trial credits (inside the caller's transaction)", () => {

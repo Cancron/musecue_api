@@ -366,36 +366,62 @@ describeWithDatabase(
         });
         jest.useRealTimers();
         const ledger = await ledgerOf(userId);
-        expect(ledger[ledger.length - 1]).toEqual({
-          sequence: 5,
-          type: 'EXPIRATION',
-          amount: '-40.000000',
-          balanceAfter: '25.000000',
-          reference: 'trial-ended:pro-activated',
-          effectiveAt: day(2),
-        });
-        await expect(creditsOf(userId)).resolves.toEqual([
-          expect.objectContaining({
-            source: 'TRIAL',
-            remaining: '0.000000',
-            expiresAt: TRIAL_END, // the original terms stay traceable
-            expiredAt: day(2),
-          }),
-          expect.objectContaining({
-            source: 'PURCHASE',
-            remaining: '20.000000',
-            expiredAt: null,
-          }),
-          expect.objectContaining({
-            source: 'REFERRAL',
-            remaining: '5.000000',
-            expiredAt: null,
-          }),
+        expect(ledger.slice(-2)).toEqual([
+          {
+            sequence: 5,
+            type: 'EXPIRATION',
+            amount: '-40.000000',
+            balanceAfter: '25.000000',
+            reference: 'trial-ended:pro-activated',
+            effectiveAt: day(2),
+          },
+          // Then the first month's Pro credits (test/credit-subscription).
+          {
+            sequence: 6,
+            type: 'ALLOCATION',
+            amount: '1000.000000',
+            balanceAfter: '1025.000000',
+            reference: null,
+            effectiveAt: day(2),
+          },
         ]);
+        // Order-independent: the SQL grants use the database clock, the
+        // allocations the controlled clock.
+        const credits = await creditsOf(userId);
+        expect(credits).toHaveLength(4);
+        expect(credits).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              source: 'TRIAL',
+              remaining: '0.000000',
+              expiresAt: TRIAL_END, // the original terms stay traceable
+              expiredAt: day(2),
+            }),
+            expect.objectContaining({
+              source: 'PURCHASE',
+              remaining: '20.000000',
+              expiredAt: null,
+            }),
+            expect.objectContaining({
+              source: 'REFERRAL',
+              remaining: '5.000000',
+              expiredAt: null,
+            }),
+            expect.objectContaining({
+              source: 'SUBSCRIPTION',
+              remaining: '1000.000000',
+            }),
+          ]),
+        );
         await expect(wallets.getBalance(userId, day(3))).resolves.toMatchObject(
           {
-            availableCredits: '25',
-            availableBySource: { TRIAL: '0', PURCHASE: '20', REFERRAL: '5' },
+            availableCredits: '1025',
+            availableBySource: {
+              TRIAL: '0',
+              SUBSCRIPTION: '1000',
+              PURCHASE: '20',
+              REFERRAL: '5',
+            },
           },
         );
 
@@ -429,17 +455,31 @@ describeWithDatabase(
             reference: null,
             effectiveAt: TRIAL_END,
           }),
+          expect.objectContaining({
+            type: 'ALLOCATION',
+            amount: '1000.000000',
+          }),
         ]);
       });
 
-      it('buying Pro without a trial writes no credit records', async () => {
+      it('buying Pro without a trial allocates only the monthly Pro credits', async () => {
         const userId = await createUser(harness.client);
 
         await buyPro(userId, T0);
 
         jest.useRealTimers();
-        await expect(creditsOf(userId)).resolves.toEqual([]);
-        await expect(ledgerOf(userId)).resolves.toEqual([]);
+        await expect(creditsOf(userId)).resolves.toEqual([
+          expect.objectContaining({
+            source: 'SUBSCRIPTION',
+            granted: '1000.000000',
+          }),
+        ]);
+        await expect(ledgerOf(userId)).resolves.toEqual([
+          expect.objectContaining({
+            type: 'ALLOCATION',
+            amount: '1000.000000',
+          }),
+        ]);
       });
     });
   },
