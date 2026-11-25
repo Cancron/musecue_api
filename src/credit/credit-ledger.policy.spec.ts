@@ -1,6 +1,8 @@
 import { CreditSource, Prisma } from '@prisma/client';
 import {
   assertAllocationExpiry,
+  creditsForCost,
+  parseUsdCost,
   compareSpendingOrder,
   CreditRuleViolation,
   formatCredits,
@@ -277,6 +279,62 @@ describe('credit ledger policy', () => {
         { id: 'a', unsettled: d('0.25') },
       ]);
       expect(formatCredits(plan.settled)).toBe('0.25');
+    });
+  });
+
+  describe('AI cost conversion', () => {
+    it.each([
+      // [cost in USD, rate in micro-dollars per credit, credits]
+      ['0.025', 5000, '5'], // $0.005 per credit: $0.025 = 5 credits
+      ['0.005', 5000, '1'],
+      ['0.0123', 5000, '2.46'],
+      ['0.0000123', 5000, '0.00246'],
+      ['1.5', 5000, '300'],
+      ['0.025', 2500, '10'], // $0.0025 per credit
+      ['0.025', 10000, '2.5'],
+      ['0.0000000025', 5000, '0.000001'], // rounds half up at 6 places
+      ['0.0000000024', 5000, '0'],
+      ['0', 5000, '0'],
+    ])(
+      '$%s at %d micro-dollars per credit = %s credits',
+      (cost, rate, credits) => {
+        expect(formatCredits(creditsForCost(d(cost), rate))).toBe(credits);
+      },
+    );
+
+    it('is exact where floating point is not', () => {
+      // 0.1 + 0.2 dollars at $0.005 per credit is exactly 60 credits.
+      expect(formatCredits(creditsForCost(d('0.1').plus(d('0.2')), 5000))).toBe(
+        '60',
+      );
+    });
+
+    it('refuses a non-positive or fractional rate', () => {
+      expect(() => creditsForCost(d('1'), 0)).toThrow(CreditRuleViolation);
+      expect(() => creditsForCost(d('1'), 2.5)).toThrow(CreditRuleViolation);
+    });
+
+    it.each([
+      [0.025, '0.025'],
+      ['0.0000123', '0.0000123'],
+      [1.23e-7, '0.000000123'],
+      // Stored with 12 decimal places, rounded half up like PostgreSQL.
+      ['0.0000000000005', '0.000000000001'],
+      [0, '0'],
+    ])('parses the provider cost %p as $%s', (value, expected) => {
+      expect(parseUsdCost(value)?.toFixed()).toBe(expected);
+    });
+
+    it.each([
+      [-0.01],
+      ['-1'],
+      [Number.NaN],
+      ['1e-3'],
+      ['abc'],
+      [null],
+      [undefined],
+    ])('reports no usable cost for %p', (value) => {
+      expect(parseUsdCost(value)).toBeNull();
     });
   });
 });

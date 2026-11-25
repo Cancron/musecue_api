@@ -327,3 +327,19 @@ enum CreditTransactionType {
   // Credits of a new allocation used to repay outstanding session overage.
   OVERAGE_SETTLEMENT
 }
+
+// Whether the cost of an AI provider request was charged in credits.
+enum AiUsageChargeStatus {
+  // Recorded; the run's result has not been published yet.
+  PENDING
+  // Deducted from the wallet (see AiUsage.creditTransactionId).
+  CHARGED
+  // The reported cost converts to 0 credits: nothing to deduct.
+  FREE
+  // Not charged: a failed request, a retried attempt, an unpublished
+  // result, a run already charged, or no cost reported by the provider.
+  NOT_CHARGED
+  // The cost exceeded the available credits and session overage: the run
+  // failed and its result was not published.
+  INSUFFICIENT_CREDITS
+}

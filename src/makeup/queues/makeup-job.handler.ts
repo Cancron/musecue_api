@@ -38,6 +38,21 @@ import {
   readRunJobInput,
 } from './run-lifecycle';
 import { lockSession } from '../workflow-lock';
+import { CreditUsageService } from '../../credit/credit-usage.service';
+import {
+  INSUFFICIENT_CREDITS_MESSAGE,
+  InsufficientCreditsError,
+} from '../../credit/credit.errors';
+
+/** A job's data plus what this attempt needs for usage accounting. */
+type RunContext = MakeupAiJob & {
+  operation: AiOperation;
+  /** Job attempt (1, 2, ...). */
+  attempt: number;
+  provider: string;
+  /** Whether requests are billed (recorded and charged in credits). */
+  billable: boolean;
+};
 
 /** A Prisma/driver error code (e.g. P1001) for logs; never the message. */
 function errorCodeOf(error: unknown): string | undefined {
@@ -63,6 +78,7 @@ export class MakeupJobHandler implements JobHandler<MakeupAiJob> {
     private readonly imageStorage: PrivateImageStorageService,
     @Inject(WINSTON_MODULE_PROVIDER) private readonly logger: Logger,
     private readonly config: ConfigService,
+    private readonly credits: CreditUsageService,
   ) {}
 
   async process(job: JobExecution<MakeupAiJob>): Promise<void> {
@@ -79,8 +95,15 @@ export class MakeupJobHandler implements JobHandler<MakeupAiJob> {
       return;
     // The input recorded on the run is authoritative; the queue payload only
     // carries it for runs created before it was recorded.
-    const data = { ...job.data, ...readRunJobInput(existingRun.jobInput) };
     const descriptor = this.ai.describe(job.name as AiOperation);
+    const data: RunContext = {
+      ...job.data,
+      ...readRunJobInput(existingRun.jobInput),
+      operation: job.name as AiOperation,
+      attempt: job.attemptsMade + 1,
+      provider: descriptor.provider,
+      billable: descriptor.billable,
+    };
     const claim = await this.prisma.$transaction(async (tx) => {
       await lockSession(tx, data.authId, data.sessionId);
       return tx.aiRun.updateMany({
@@ -99,6 +122,19 @@ export class MakeupJobHandler implements JobHandler<MakeupAiJob> {
     if (!claim.count) return;
 
     try {
+      // A billable request is only made while the user can still pay for it
+      // (available credits or session overage room); the cost is charged
+      // when the result is published.
+      if (
+        data.billable &&
+        !(await this.credits.hasSpendableCredits(data.authId, data.sessionId))
+      ) {
+        throw new AiProviderError(
+          'INSUFFICIENT_CREDITS',
+          INSUFFICIENT_CREDITS_MESSAGE,
+          false,
+        );
+      }
       switch (job.name) {
         case 'PERSONALIZATION':
           await this.personalize(data, startedAt);
@@ -116,6 +152,19 @@ export class MakeupJobHandler implements JobHandler<MakeupAiJob> {
           throw new Error(`Unsupported makeup job: ${job.name}`);
       }
     } catch (error) {
+      // The provider answered (and billed) but the answer was rejected: the
+      // request is still recorded, without a charge.
+      if (error instanceof AiProviderError && error.billedResponse) {
+        await this.recordUsage(data, error.billedResponse, false).catch(
+          (recordError: unknown) =>
+            this.logger.warn('AI usage of a failed request was not recorded', {
+              context: 'MakeupProcessor',
+              runId: data.runId,
+              errorType:
+                recordError instanceof Error ? recordError.name : 'unknown',
+            }),
+        );
+      }
       const propagatedError = await this.handleFailure(job, error, startedAt);
       throw propagatedError;
     }
@@ -134,7 +183,7 @@ export class MakeupJobHandler implements JobHandler<MakeupAiJob> {
     );
   }
 
-  private async personalize(data: MakeupAiJob, startedAt: number) {
+  private async personalize(data: RunContext, startedAt: number) {
     const session = await this.prisma.makeupSession.findFirstOrThrow({
       where: { id: data.sessionId, authId: data.authId },
       include: {
@@ -162,43 +211,41 @@ export class MakeupJobHandler implements JobHandler<MakeupAiJob> {
       },
     });
     const result = response.data;
-    await this.prisma.$transaction(async (tx) => {
-      if (!(await canPublishRun(tx, data, startedAt))) return;
-      await tx.faceAnalysis.upsert({
-        where: { sessionId: data.sessionId },
-        create: { sessionId: data.sessionId, ...result.analysis },
-        update: result.analysis,
-      });
-      await tx.recommendation.deleteMany({
-        where: { sessionId: data.sessionId },
-      });
-      await tx.recommendation.createMany({
-        data: result.recommendations.map((item) => ({
-          sessionId: data.sessionId,
-          rank: item.rank,
-          name: item.name,
-          tagline: item.tagline,
-          matchScore: item.matchScore,
-          imageUrl: item.imageUrl,
-          palette: item.palette,
-          rationale: item.rationale,
-        })),
-      });
-      await tx.makeupSession.update({
-        where: { id: data.sessionId },
-        data: { status: 'RECOMMENDATIONS_READY' },
-      });
-      await this.completeRun(
-        tx,
-        data.runId,
-        result,
-        startedAt,
-        response.metadata,
-      );
-    });
+    await this.publish(
+      data,
+      startedAt,
+      response.metadata,
+      result,
+      async (tx) => {
+        await tx.faceAnalysis.upsert({
+          where: { sessionId: data.sessionId },
+          create: { sessionId: data.sessionId, ...result.analysis },
+          update: result.analysis,
+        });
+        await tx.recommendation.deleteMany({
+          where: { sessionId: data.sessionId },
+        });
+        await tx.recommendation.createMany({
+          data: result.recommendations.map((item) => ({
+            sessionId: data.sessionId,
+            rank: item.rank,
+            name: item.name,
+            tagline: item.tagline,
+            matchScore: item.matchScore,
+            imageUrl: item.imageUrl,
+            palette: item.palette,
+            rationale: item.rationale,
+          })),
+        });
+        await tx.makeupSession.update({
+          where: { id: data.sessionId },
+          data: { status: 'RECOMMENDATIONS_READY' },
+        });
+      },
+    );
   }
 
-  private async generateGuide(data: MakeupAiJob, startedAt: number) {
+  private async generateGuide(data: RunContext, startedAt: number) {
     const session = await this.prisma.makeupSession.findFirstOrThrow({
       where: { id: data.sessionId, authId: data.authId },
       include: {
@@ -234,40 +281,38 @@ export class MakeupJobHandler implements JobHandler<MakeupAiJob> {
         : null,
     });
     const result = response.data;
-    await this.prisma.$transaction(async (tx) => {
-      if (!(await canPublishRun(tx, data, startedAt))) return;
-      const existing = await tx.guide.findUnique({
-        where: { sessionId: data.sessionId },
-      });
-      if (existing) await tx.guide.delete({ where: { id: existing.id } });
-      await tx.guide.create({
-        data: {
-          sessionId: data.sessionId,
-          recommendationId: selected.id,
-          status: 'READY',
-          steps: {
-            create: result.steps.map((step) => ({
-              ...step,
-              status: step.position === 0 ? 'CURRENT' : 'LOCKED',
-            })),
+    await this.publish(
+      data,
+      startedAt,
+      response.metadata,
+      result,
+      async (tx) => {
+        const existing = await tx.guide.findUnique({
+          where: { sessionId: data.sessionId },
+        });
+        if (existing) await tx.guide.delete({ where: { id: existing.id } });
+        await tx.guide.create({
+          data: {
+            sessionId: data.sessionId,
+            recommendationId: selected.id,
+            status: 'READY',
+            steps: {
+              create: result.steps.map((step) => ({
+                ...step,
+                status: step.position === 0 ? 'CURRENT' : 'LOCKED',
+              })),
+            },
           },
-        },
-      });
-      await tx.makeupSession.update({
-        where: { id: data.sessionId },
-        data: { status: 'GUIDE_READY' },
-      });
-      await this.completeRun(
-        tx,
-        data.runId,
-        result,
-        startedAt,
-        response.metadata,
-      );
-    });
+        });
+        await tx.makeupSession.update({
+          where: { id: data.sessionId },
+          data: { status: 'GUIDE_READY' },
+        });
+      },
+    );
   }
 
-  private async evaluateStep(data: MakeupAiJob, startedAt: number) {
+  private async evaluateStep(data: RunContext, startedAt: number) {
     if (!data.stepId || !data.imageId) {
       throw new Error('Guide step or progress image is missing');
     }
@@ -304,22 +349,20 @@ export class MakeupJobHandler implements JobHandler<MakeupAiJob> {
         : null,
     });
     const result = response.data;
-    await this.prisma.$transaction(async (tx) => {
-      if (!(await canPublishRun(tx, data, startedAt))) return;
-      await tx.stepAttempt.create({
-        data: { stepId: step.id, imageId: data.imageId, ...result },
-      });
-      await this.completeRun(
-        tx,
-        data.runId,
-        result,
-        startedAt,
-        response.metadata,
-      );
-    });
+    await this.publish(
+      data,
+      startedAt,
+      response.metadata,
+      result,
+      async (tx) => {
+        await tx.stepAttempt.create({
+          data: { stepId: step.id, imageId: data.imageId, ...result },
+        });
+      },
+    );
   }
 
-  private async answerQuestion(data: MakeupAiJob, startedAt: number) {
+  private async answerQuestion(data: RunContext, startedAt: number) {
     if (!data.stepId || !data.question) {
       throw new Error('Guide step or question is missing');
     }
@@ -357,23 +400,21 @@ export class MakeupJobHandler implements JobHandler<MakeupAiJob> {
         : undefined,
     });
     const result = response.data;
-    await this.prisma.$transaction(async (tx) => {
-      if (!(await canPublishRun(tx, data, startedAt))) return;
-      await tx.question.create({
-        data: {
-          stepId: step.id,
-          question,
-          answer: result.answer,
-        },
-      });
-      await this.completeRun(
-        tx,
-        data.runId,
-        result,
-        startedAt,
-        response.metadata,
-      );
-    });
+    await this.publish(
+      data,
+      startedAt,
+      response.metadata,
+      result,
+      async (tx) => {
+        await tx.question.create({
+          data: {
+            stepId: step.id,
+            question,
+            answer: result.answer,
+          },
+        });
+      },
+    );
   }
 
   /**
@@ -459,6 +500,73 @@ export class MakeupJobHandler implements JobHandler<MakeupAiJob> {
         )
       : [];
     return { ...recommendation, palette };
+  }
+
+  /**
+   * Publishes a run's result: records the request's usage, then writes the
+   * result, charges the usage and completes the run in one transaction, so
+   * a result is never published without its charge and never charged
+   * without being published. A result that cannot be published (the run was
+   * superseded or recovered) is not charged. Costs exceeding the credits and
+   * session overage fail the run with "Insufficient credits".
+   */
+  private async publish(
+    data: RunContext,
+    startedAt: number,
+    metadata: AiCallMetadata | undefined,
+    result: object,
+    write: (tx: Prisma.TransactionClient) => Promise<void>,
+  ): Promise<void> {
+    const usage = await this.recordUsage(data, metadata, true);
+    try {
+      await this.prisma.$transaction(async (tx) => {
+        if (!(await canPublishRun(tx, data, startedAt))) return;
+        await write(tx);
+        if (usage) await this.credits.chargeInTransaction(tx, usage.id);
+        await this.completeRun(tx, data.runId, result, startedAt, metadata);
+      });
+    } catch (error) {
+      if (usage && error instanceof InsufficientCreditsError) {
+        await this.credits.close(usage.id, 'INSUFFICIENT_CREDITS');
+        throw new AiProviderError(
+          'INSUFFICIENT_CREDITS',
+          INSUFFICIENT_CREDITS_MESSAGE,
+          false,
+        );
+      }
+      throw error;
+    } finally {
+      // Not charged (not published, or the transaction failed): close it.
+      if (usage) await this.credits.close(usage.id);
+    }
+  }
+
+  /** Records a billable provider request of this run (null when free). */
+  private async recordUsage(
+    data: RunContext,
+    metadata: AiCallMetadata | undefined,
+    succeeded: boolean,
+  ) {
+    if (!data.billable) return null;
+    return this.credits.recordUsage(
+      {
+        authId: data.authId,
+        sessionId: data.sessionId,
+        aiRunId: data.runId,
+        operation: data.operation,
+        attempt: data.attempt,
+      },
+      {
+        provider: data.provider,
+        model: metadata?.model,
+        providerRequestId: metadata?.responseId,
+        succeeded,
+        inputTokens: metadata?.usage?.promptTokens,
+        outputTokens: metadata?.usage?.completionTokens,
+        totalTokens: metadata?.usage?.totalTokens,
+        costUsd: metadata?.usage?.costUsd,
+      },
+    );
   }
 
   private async completeRun(

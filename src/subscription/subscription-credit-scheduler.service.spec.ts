@@ -40,6 +40,7 @@ describe('SubscriptionCreditSchedulerService', () => {
     periodStart: YEAR_START,
     periodEnd: YEAR_END,
     event: { type: 'CREATED' },
+    creditAllocations: [] as { periodIndex: number }[],
     subscription: {
       id: 'sub-1',
       authId: 'user-1',
@@ -105,7 +106,7 @@ describe('SubscriptionCreditSchedulerService', () => {
   });
 
   describe('run', () => {
-    it('looks only at succeeded yearly payments that granted access, in their paid year, with an active subscription', async () => {
+    it('looks only at succeeded yearly payments that granted access and whose months are not all recorded', async () => {
       await scheduler.run(NOW);
 
       expect(
@@ -114,29 +115,35 @@ describe('SubscriptionCreditSchedulerService', () => {
         status: 'SUCCEEDED',
         billingInterval: 'YEARLY',
         periodStart: { lte: NOW },
-        periodEnd: { gt: NOW },
         event: { type: { in: ['CREATED', 'RENEWED'] } },
-        subscription: { proExpiresAt: { gt: NOW } },
+        subscription: { isNot: null },
+        creditAllocations: { none: { periodIndex: 11 } },
       });
     });
 
-    it('grants the due month only where it is missing', async () => {
+    it('grants only where a started month is missing, counting missed months separately', async () => {
       prisma.paymentTransaction.findMany.mockResolvedValueOnce([
-        candidate('already', [0, 1, 2]),
-        candidate('missing', [0, 1]),
+        candidate('up-to-date', [0, 1, 2]),
+        candidate('missing-current', [0, 1]),
+        candidate('missing-history', [0]),
       ] as never);
       const grant = jest
-        .spyOn(scheduler, 'grantDueMonth')
-        .mockResolvedValue('GRANTED');
+        .spyOn(scheduler, 'grantDueMonths')
+        .mockResolvedValueOnce({ granted: 1, historical: 0 })
+        .mockResolvedValueOnce({ granted: 1, historical: 1 });
 
       await expect(scheduler.run(NOW)).resolves.toEqual({
-        checked: 2,
-        granted: 1,
+        checked: 3,
+        granted: 2,
+        historical: 1,
         alreadyGranted: 1,
         skipped: 0,
         failed: 0,
       });
-      expect(grant.mock.calls).toEqual([['missing', NOW]]);
+      expect(grant.mock.calls).toEqual([
+        ['missing-current', NOW],
+        ['missing-history', NOW],
+      ]);
     });
 
     it('pages through every candidate', async () => {
@@ -147,7 +154,9 @@ describe('SubscriptionCreditSchedulerService', () => {
       prisma.paymentTransaction.findMany
         .mockResolvedValueOnce(page(0, CREDIT_GRANT_BATCH_SIZE) as never)
         .mockResolvedValueOnce(page(CREDIT_GRANT_BATCH_SIZE, 3) as never);
-      jest.spyOn(scheduler, 'grantDueMonth').mockResolvedValue('GRANTED');
+      jest
+        .spyOn(scheduler, 'grantDueMonths')
+        .mockResolvedValue({ granted: 1, historical: 0 });
 
       await expect(scheduler.run(NOW)).resolves.toMatchObject({
         checked: CREDIT_GRANT_BATCH_SIZE + 3,
@@ -169,9 +178,9 @@ describe('SubscriptionCreditSchedulerService', () => {
         candidate('fine'),
       ] as never);
       jest
-        .spyOn(scheduler, 'grantDueMonth')
+        .spyOn(scheduler, 'grantDueMonths')
         .mockRejectedValueOnce(new Error('lock timeout'))
-        .mockResolvedValueOnce('GRANTED');
+        .mockResolvedValueOnce({ granted: 1, historical: 0 });
 
       await expect(scheduler.run(NOW)).resolves.toMatchObject({
         granted: 1,
@@ -206,15 +215,18 @@ describe('SubscriptionCreditSchedulerService', () => {
         candidate('first'),
         candidate('second'),
       ] as never);
-      let finishFirst: (outcome: 'GRANTED') => void = () => {};
+      let finishFirst: (outcome: {
+        granted: number;
+        historical: number;
+      }) => void = () => {};
       const grant = jest
-        .spyOn(scheduler, 'grantDueMonth')
+        .spyOn(scheduler, 'grantDueMonths')
         .mockReturnValueOnce(
           new Promise((resolve) => {
             finishFirst = resolve;
           }),
         )
-        .mockResolvedValue('GRANTED');
+        .mockResolvedValue({ granted: 1, historical: 0 });
 
       const run = scheduler.run(NOW);
       await new Promise((resolve) => setImmediate(resolve));
@@ -225,7 +237,7 @@ describe('SubscriptionCreditSchedulerService', () => {
       await new Promise((resolve) => setImmediate(resolve));
       expect(stopped).toBe(false); // still waiting for the first grant
 
-      finishFirst('GRANTED');
+      finishFirst({ granted: 1, historical: 0 });
       await shutdown;
       await expect(run).resolves.toMatchObject({ granted: 1, checked: 1 });
       expect(grant.mock.calls.map(([id]) => id)).toEqual(['first']);
@@ -233,20 +245,36 @@ describe('SubscriptionCreditSchedulerService', () => {
     });
   });
 
-  describe('grantDueMonth', () => {
-    beforeEach(() => {
+  describe('grantDueMonths', () => {
+    const givenLocked = (overrides: Record<string, unknown> = {}) => {
+      prisma.paymentTransaction.findUnique.mockReset();
       prisma.paymentTransaction.findUnique
         .mockResolvedValueOnce({ subscriptionId: 'sub-1' } as never)
-        .mockResolvedValueOnce(lockedPayment() as never);
-      wallets.allocateProMonthlyCreditsInTransaction.mockResolvedValue(
+        .mockResolvedValueOnce(lockedPayment(overrides) as never);
+    };
+    const grantedMonths = () =>
+      wallets.allocateProMonthCreditsInTransaction.mock.calls.map(
+        ([, input]) => [
+          input.month.index,
+          input.month.end.getTime() <= NOW.getTime() ? 'ended' : 'current',
+        ],
+      );
+
+    beforeEach(() => {
+      wallets.allocateProMonthCreditsInTransaction.mockResolvedValue(
         allocation(true),
       );
     });
 
-    it('locks the subscription, re-checks, and allocates the due month in the same transaction', async () => {
-      await expect(scheduler.grantDueMonth('pay-1', NOW)).resolves.toBe(
-        'GRANTED',
-      );
+    it('locks the subscription, re-checks, and allocates the current month in the same transaction', async () => {
+      givenLocked({
+        creditAllocations: [0, 1].map((periodIndex) => ({ periodIndex })),
+      });
+
+      await expect(scheduler.grantDueMonths('pay-1', NOW)).resolves.toEqual({
+        granted: 1,
+        historical: 0,
+      });
 
       expect(
         Array.from(
@@ -257,29 +285,67 @@ describe('SubscriptionCreditSchedulerService', () => {
       expect(prisma.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
         prisma.paymentTransaction.findUnique.mock.invocationCallOrder[1],
       );
-      expect(wallets.allocateProMonthlyCreditsInTransaction.mock.calls).toEqual(
+      expect(wallets.allocateProMonthCreditsInTransaction.mock.calls).toEqual([
         [
-          [
-            prisma,
-            {
-              authId: 'user-1',
-              subscriptionId: 'sub-1',
-              payment: expect.objectContaining({ id: 'pay-1' }) as unknown,
-              now: NOW,
-            },
-          ],
+          prisma,
+          expect.objectContaining({
+            authId: 'user-1',
+            subscriptionId: 'sub-1',
+            payment: expect.objectContaining({ id: 'pay-1' }) as unknown,
+            month: expect.objectContaining({ index: 2 }) as unknown,
+            now: NOW,
+          }),
         ],
-      );
+      ]);
     });
 
-    it('reports a month that already has its allocation', async () => {
-      wallets.allocateProMonthlyCreditsInTransaction.mockResolvedValue(
+    it('records missed months that already ended, oldest first, before the current month', async () => {
+      givenLocked({ creditAllocations: [{ periodIndex: 0 }] });
+
+      await expect(scheduler.grantDueMonths('pay-1', NOW)).resolves.toEqual({
+        granted: 1,
+        historical: 1,
+      });
+      expect(grantedMonths()).toEqual([
+        [1, 'ended'],
+        [2, 'current'],
+      ]);
+    });
+
+    it('records the months of an ended paid year that the term covered', async () => {
+      givenLocked({
+        creditAllocations: [{ periodIndex: 0 }],
+        subscription: {
+          id: 'sub-1',
+          authId: 'user-1',
+          proStartedAt: YEAR_START,
+          // Revoked during month 1: months 2+ were never paid for.
+          proExpiresAt: new Date('2026-07-15T00:00:00.000Z'),
+        },
+      });
+
+      await expect(
+        scheduler.grantDueMonths('pay-1', new Date('2027-08-01T00:00:00.000Z')),
+      ).resolves.toEqual({ granted: 0, historical: 1 });
+      expect(
+        wallets.allocateProMonthCreditsInTransaction.mock.calls.map(
+          ([, input]) => input.month.index,
+        ),
+      ).toEqual([1]);
+    });
+
+    it('does not count a month that already has its allocation', async () => {
+      givenLocked({
+        creditAllocations: [0, 1].map((periodIndex) => ({ periodIndex })),
+      });
+      wallets.allocateProMonthCreditsInTransaction.mockResolvedValue(
         allocation(false),
       );
 
-      await expect(scheduler.grantDueMonth('pay-1', NOW)).resolves.toBe(
-        'ALREADY_GRANTED',
-      );
+      await expect(scheduler.grantDueMonths('pay-1', NOW)).resolves.toEqual({
+        granted: 0,
+        historical: 0,
+      });
     });
 
     it.each([
@@ -287,32 +353,35 @@ describe('SubscriptionCreditSchedulerService', () => {
       ['a partially refunded payment', { status: 'PARTIALLY_REFUNDED' }],
       ['a monthly payment', { billingInterval: 'MONTHLY' }],
       ['a duplicate payment (no granting event)', { event: null }],
-      ['a payment whose year has ended', { periodEnd: NOW }],
-      ['a payment whose year has not started', { periodStart: YEAR_END }],
-      [
-        'a subscription whose paid term has ended (e.g. revoked by a refund)',
-        {
-          subscription: {
-            id: 'sub-1',
-            authId: 'user-1',
-            proStartedAt: YEAR_START,
-            proExpiresAt: new Date('2026-08-01T00:00:00.000Z'),
-          },
-        },
-      ],
       ['a detached payment', { subscription: null }],
     ])('skips %s without allocating', async (_case, overrides) => {
-      prisma.paymentTransaction.findUnique.mockReset();
-      prisma.paymentTransaction.findUnique
-        .mockResolvedValueOnce({ subscriptionId: 'sub-1' } as never)
-        .mockResolvedValueOnce(lockedPayment(overrides) as never);
+      givenLocked({ creditAllocations: [], ...overrides });
 
-      await expect(scheduler.grantDueMonth('pay-1', NOW)).resolves.toBe(
-        'SKIPPED',
-      );
+      await expect(scheduler.grantDueMonths('pay-1', NOW)).resolves.toEqual({
+        granted: 0,
+        historical: 0,
+      });
       expect(
-        wallets.allocateProMonthlyCreditsInTransaction.mock.calls,
+        wallets.allocateProMonthCreditsInTransaction.mock.calls,
       ).toHaveLength(0);
+    });
+
+    it('does not grant the current month once the paid term has ended (e.g. revoked), but still records the covered months', async () => {
+      givenLocked({
+        creditAllocations: [{ periodIndex: 0 }],
+        subscription: {
+          id: 'sub-1',
+          authId: 'user-1',
+          proStartedAt: YEAR_START,
+          proExpiresAt: new Date('2026-08-01T00:00:00.000Z'),
+        },
+      });
+
+      await expect(scheduler.grantDueMonths('pay-1', NOW)).resolves.toEqual({
+        granted: 0,
+        historical: 1,
+      });
+      expect(grantedMonths()).toEqual([[1, 'ended']]);
     });
   });
 });

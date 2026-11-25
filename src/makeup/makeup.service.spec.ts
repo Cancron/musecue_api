@@ -191,6 +191,7 @@ describe('MakeupService history media and deletion', () => {
       provider: 'openrouter',
       model: 'model',
       promptVersion: 'version',
+      billable: false,
     });
     // 1st transaction stores the image; the run insert then loses the
     // idempotency race; the discard transaction succeeds.
@@ -274,6 +275,7 @@ describe('MakeupService history media and deletion', () => {
       provider: 'mock',
       model: 'model',
       promptVersion: 'version',
+      billable: false,
     });
     const created = { id: 'run-id', status: 'QUEUED' };
     prisma.aiRun.create.mockResolvedValue(created as never);

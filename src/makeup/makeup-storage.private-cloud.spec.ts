@@ -1,3 +1,4 @@
+import type { CreditUsageService } from '../credit/credit-usage.service';
 import { ConfigService } from '@nestjs/config';
 import type { Prisma } from '@prisma/client';
 import { mock, mockDeep } from 'jest-mock-extended';
@@ -441,6 +442,7 @@ describe('MakeupJobHandler private cloud storage reads', () => {
       provider: 'mock',
       model: 'test',
       promptVersion: 'test',
+      billable: false,
     });
     prisma.guideStep.findFirstOrThrow.mockResolvedValue({
       id: 'step',
@@ -463,6 +465,7 @@ describe('MakeupJobHandler private cloud storage reads', () => {
       storage,
       mock<Logger>(),
       new ConfigService(),
+      mock<CreditUsageService>(),
     );
     const discard = jest.fn();
     const job = {

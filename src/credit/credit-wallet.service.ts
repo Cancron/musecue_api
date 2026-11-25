@@ -21,9 +21,11 @@ import {
   planOverageSettlement,
   sessionOverageRoom,
   ZERO_CREDITS,
+  creditsForCost,
+  parseUsdCost,
 } from './credit-ledger.policy';
 import { CreditSettingsService } from './credit-settings.service';
-import { creditMonthAt } from './credit-subscription.policy';
+import { creditMonthAt, type CreditMonth } from './credit-subscription.policy';
 import { CreditConflictError, InsufficientCreditsError } from './credit.errors';
 import type {
   AllocateCreditsInput,
@@ -64,6 +66,8 @@ interface LedgerWrite {
   allocationId?: string;
   sessionId?: string;
   reference?: string;
+  costUsd?: CreditAmount;
+  usdMicrosPerCredit?: number;
   effectiveAt: Date;
   entries: { allocationId: string; amount: CreditAmount }[];
 }
@@ -273,6 +277,33 @@ export class CreditWalletService {
     });
   }
 
+  /**
+   * The monthly Pro allowance for one given month of a paid period, inside
+   * the caller's transaction (used by the grant scheduler for yearly
+   * payments). A month that has not ended yet is granted now and usable; a
+   * month that already ended (missed while the scheduler was stopped) is
+   * recorded as a historical grant at the month's start and expired at its
+   * end in the same transaction, so it is traceable but never spendable.
+   * Idempotent per payment and month; null when the allowance is 0.
+   */
+  async allocateProMonthCreditsInTransaction(
+    tx: Tx,
+    input: ProMonthlyCreditsInput & { month: CreditMonth },
+  ): Promise<AllocationResult | null> {
+    const { proMonthlyAllowanceCredits } = await this.settings.getSettings(tx);
+    if (proMonthlyAllowanceCredits <= 0) return null;
+    return this.allocateSubscriptionCreditsInTransaction(tx, {
+      authId: input.authId,
+      subscriptionId: input.subscriptionId,
+      paymentId: input.payment.id,
+      periodIndex: input.month.index,
+      periodStart: input.month.start,
+      periodEnd: input.month.end,
+      credits: proMonthlyAllowanceCredits,
+      now: input.now,
+    });
+  }
+
   private subscriptionRequest(input: SubscriptionCreditsInput) {
     const paymentId = this.requireText(input.paymentId, 'paymentId', 100);
     const subscriptionId = this.requireText(
@@ -287,6 +318,8 @@ export class CreditWalletService {
     if (!Number.isInteger(periodIndex) || periodIndex < 0 || periodIndex > 11) {
       throw AppError.badRequest('periodIndex must be a month from 0 to 11');
     }
+    const now = input.now ?? new Date();
+    const historical = input.periodEnd.getTime() <= now.getTime();
     return this.validatedRequest(
       {
         authId: input.authId,
@@ -305,6 +338,7 @@ export class CreditWalletService {
         periodIndex,
         periodStartsAt: input.periodStart,
       },
+      historical ? input.periodStart : undefined,
     );
   }
 
@@ -376,9 +410,15 @@ export class CreditWalletService {
     return this.validatedRequest(input, null);
   }
 
+  /**
+   * `grantedAt` defaults to `now`. A historical grant (a paid month that
+   * already ended, recorded late) is granted at the month's start and must
+   * expire after it was granted rather than after `now`.
+   */
   private validatedRequest(
     input: AllocateCreditsInput,
     link: AllocationLink | null,
+    grantedAt?: Date,
   ) {
     const now = input.now ?? new Date();
     const credits = this.rule(() => parseCreditAmount(input.credits));
@@ -388,10 +428,12 @@ export class CreditWalletService {
       MAX_REFERENCE_LENGTH,
     );
     const expiresAt = input.expiresAt ?? null;
-    this.rule(() => assertAllocationExpiry(input.source, expiresAt, now));
+    const granted = grantedAt ?? now;
+    this.rule(() => assertAllocationExpiry(input.source, expiresAt, granted));
     return {
       source: input.source,
       now,
+      grantedAt: granted,
       credits,
       sourceReference,
       expiresAt,
@@ -404,7 +446,18 @@ export class CreditWalletService {
     authId: string,
     request: ReturnType<CreditWalletService['validatedRequest']>,
   ): Promise<AllocationResult> {
-    const { source, now, credits, sourceReference, expiresAt, link } = request;
+    const {
+      source,
+      now,
+      grantedAt,
+      credits,
+      sourceReference,
+      expiresAt,
+      link,
+    } = request;
+    // Already over: recorded for traceability, expired at once, never usable.
+    const historical =
+      expiresAt !== null && expiresAt.getTime() <= now.getTime();
     const cursor = await this.openWallet(tx, authId);
 
     const existing = await tx.creditAllocation.findUnique({
@@ -450,7 +503,7 @@ export class CreditWalletService {
         grantedCredits: credits,
         remainingCredits: credits,
         expiresAt,
-        grantedAt: now,
+        grantedAt,
         subscriptionId: link?.subscriptionId ?? null,
         paymentId: link?.paymentId ?? null,
         periodIndex: link?.periodIndex ?? null,
@@ -462,9 +515,20 @@ export class CreditWalletService {
       amount: credits,
       idempotencyKey: `allocation:${allocation.id}`,
       allocationId: allocation.id,
-      effectiveAt: now,
+      effectiveAt: grantedAt,
       entries: [{ allocationId: allocation.id, amount: credits }],
     });
+
+    if (historical) {
+      // EXPIRATION dated at the month's end; the credits never become
+      // spendable and never repay overage.
+      await this.expireDue(tx, cursor, now);
+      await this.saveWallet(tx, cursor);
+      const expired = await tx.creditAllocation.findUniqueOrThrow({
+        where: { id: allocation.id },
+      });
+      return { created: true, allocation: this.allocationView(expired) };
+    }
 
     let remaining = credits;
     if (cursor.overage.gt(0)) {
@@ -491,6 +555,24 @@ export class CreditWalletService {
    * idempotency key returns the original transaction.
    */
   async deduct(input: DeductCreditsInput): Promise<DeductionResult> {
+    const request = this.deductionRequest(input);
+    return this.write((tx) => this.deductLocked(tx, input.authId, request));
+  }
+
+  /**
+   * `deduct` inside the caller's transaction (e.g. the transaction that
+   * publishes an AI result, so the charge and the result commit together).
+   * Takes the wallet lock for the rest of that transaction.
+   */
+  async deductInTransaction(
+    tx: Tx,
+    input: DeductCreditsInput,
+  ): Promise<DeductionResult> {
+    const request = this.deductionRequest(input);
+    return this.deductLocked(tx, input.authId, request);
+  }
+
+  private deductionRequest(input: DeductCreditsInput) {
     const now = input.now ?? new Date();
     const credits = this.rule(() => parseCreditAmount(input.credits));
     const key = `deduction:${this.requireText(input.idempotencyKey, 'idempotencyKey', MAX_KEY_LENGTH)}`;
@@ -502,134 +584,152 @@ export class CreditWalletService {
       input.reference === undefined
         ? undefined
         : this.requireText(input.reference, 'reference', MAX_REFERENCE_LENGTH);
-
-    return this.write(async (tx) => {
-      const cursor = await this.openWallet(tx, input.authId);
-
-      const existing = await tx.creditTransaction.findUnique({
-        where: {
-          walletId_idempotencyKey: {
-            walletId: cursor.walletId,
-            idempotencyKey: key,
-          },
-        },
-        include: { entries: { orderBy: { id: 'asc' } } },
-      });
-      if (existing) {
-        const total = existing.overageChangeCredits.minus(
-          existing.amountCredits,
+    let cost: { usd: CreditAmount; usdMicrosPerCredit: number } | undefined;
+    if (input.cost) {
+      const usd = parseUsdCost(input.cost.usd);
+      if (!usd || usd.lte(0)) {
+        throw AppError.badRequest('cost.usd must be a positive amount');
+      }
+      const expected = this.rule(() =>
+        creditsForCost(usd, input.cost!.usdMicrosPerCredit),
+      );
+      if (!expected.eq(credits)) {
+        throw AppError.badRequest(
+          'credits must equal the cost converted at the given rate',
         );
-        if (!total.eq(credits) || existing.sessionId !== (sessionId ?? null)) {
-          throw new CreditConflictError(
-            'This idempotency key was already used for a different deduction',
-          );
-        }
-        return { duplicate: true, transaction: this.transactionView(existing) };
       }
+      cost = { usd, usdMicrosPerCredit: input.cost.usdMicrosPerCredit };
+    }
+    return { now, credits, key, sessionId, reference, cost };
+  }
 
-      if (sessionId !== undefined) {
-        const session = await tx.makeupSession.findFirst({
-          where: { id: sessionId, authId: input.authId },
-          select: { id: true },
-        });
-        if (!session) throw AppError.notFound('Makeup session not found');
-      }
+  private async deductLocked(
+    tx: Tx,
+    authId: string,
+    request: ReturnType<CreditWalletService['deductionRequest']>,
+  ): Promise<DeductionResult> {
+    const { now, credits, key, sessionId, reference, cost } = request;
+    const cursor = await this.openWallet(tx, authId);
 
-      await this.expireDue(tx, cursor, now);
-
-      const allocations = await tx.creditAllocation.findMany({
-        where: {
+    const existing = await tx.creditTransaction.findUnique({
+      where: {
+        walletId_idempotencyKey: {
           walletId: cursor.walletId,
-          remainingCredits: { gt: 0 },
-          OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
+          idempotencyKey: key,
         },
-      });
-
-      let overageRow: { id: string; overageCredits: CreditAmount } | null =
-        null;
-      let overageLimit = ZERO_CREDITS;
-      let overageRoom = ZERO_CREDITS;
-      if (sessionId !== undefined) {
-        const row = await tx.creditSessionOverage.findUnique({
-          where: { sessionId },
-        });
-        if (row && row.walletId !== cursor.walletId) {
-          throw new CreditConflictError(
-            'The session overage belongs to another user',
-          );
-        }
-        overageRow = row;
-        overageLimit =
-          row?.limitCredits ??
-          new Prisma.Decimal(
-            (await this.settings.getSettings(tx))
-              .sessionOverageAllowanceCredits,
-          );
-        overageRoom = sessionOverageRoom(
-          overageLimit,
-          row?.overageCredits ?? ZERO_CREDITS,
+      },
+      include: { entries: { orderBy: { id: 'asc' } } },
+    });
+    if (existing) {
+      const total = existing.overageChangeCredits.minus(existing.amountCredits);
+      if (!total.eq(credits) || existing.sessionId !== (sessionId ?? null)) {
+        throw new CreditConflictError(
+          'This idempotency key was already used for a different deduction',
         );
       }
+      return { duplicate: true, transaction: this.transactionView(existing) };
+    }
 
-      const plan = planDeduction(allocations, credits, overageRoom, now);
-      if (!plan.ok) {
-        throw new InsufficientCreditsError({
-          requestedCredits: formatCredits(credits),
-          availableCredits: formatCredits(plan.available),
-          overageRoomCredits: formatCredits(plan.overageRoom),
-        });
-      }
-
-      const transaction = await this.append(tx, cursor, {
-        type: CreditTransactionType.DEDUCTION,
-        amount: plan.fromBalance.isZero()
-          ? ZERO_CREDITS
-          : plan.fromBalance.neg(),
-        overageChange: plan.overage,
-        idempotencyKey: key,
-        sessionId,
-        reference,
-        effectiveAt: now,
-        entries: plan.entries.map((entry) => ({
-          allocationId: entry.allocationId,
-          amount: entry.credits.neg(),
-        })),
+    if (sessionId !== undefined) {
+      const session = await tx.makeupSession.findFirst({
+        where: { id: sessionId, authId: authId },
+        select: { id: true },
       });
+      if (!session) throw AppError.notFound('Makeup session not found');
+    }
 
-      const byId = new Map(allocations.map((a) => [a.id, a]));
-      for (const entry of plan.entries) {
-        const allocation = byId.get(entry.allocationId) as CreditAllocation;
-        await tx.creditAllocation.update({
-          where: { id: entry.allocationId },
+    await this.expireDue(tx, cursor, now);
+
+    const allocations = await tx.creditAllocation.findMany({
+      where: {
+        walletId: cursor.walletId,
+        remainingCredits: { gt: 0 },
+        OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
+      },
+    });
+
+    let overageRow: { id: string; overageCredits: CreditAmount } | null = null;
+    let overageLimit = ZERO_CREDITS;
+    let overageRoom = ZERO_CREDITS;
+    if (sessionId !== undefined) {
+      const row = await tx.creditSessionOverage.findUnique({
+        where: { sessionId },
+      });
+      if (row && row.walletId !== cursor.walletId) {
+        throw new CreditConflictError(
+          'The session overage belongs to another user',
+        );
+      }
+      overageRow = row;
+      overageLimit =
+        row?.limitCredits ??
+        new Prisma.Decimal(
+          (await this.settings.getSettings(tx)).sessionOverageAllowanceCredits,
+        );
+      overageRoom = sessionOverageRoom(
+        overageLimit,
+        row?.overageCredits ?? ZERO_CREDITS,
+      );
+    }
+
+    const plan = planDeduction(allocations, credits, overageRoom, now);
+    if (!plan.ok) {
+      throw new InsufficientCreditsError({
+        requestedCredits: formatCredits(credits),
+        availableCredits: formatCredits(plan.available),
+        overageRoomCredits: formatCredits(plan.overageRoom),
+      });
+    }
+
+    const transaction = await this.append(tx, cursor, {
+      type: CreditTransactionType.DEDUCTION,
+      amount: plan.fromBalance.isZero() ? ZERO_CREDITS : plan.fromBalance.neg(),
+      overageChange: plan.overage,
+      idempotencyKey: key,
+      sessionId,
+      reference,
+      costUsd: cost?.usd,
+      usdMicrosPerCredit: cost?.usdMicrosPerCredit,
+      effectiveAt: now,
+      entries: plan.entries.map((entry) => ({
+        allocationId: entry.allocationId,
+        amount: entry.credits.neg(),
+      })),
+    });
+
+    const byId = new Map(allocations.map((a) => [a.id, a]));
+    for (const entry of plan.entries) {
+      const allocation = byId.get(entry.allocationId) as CreditAllocation;
+      await tx.creditAllocation.update({
+        where: { id: entry.allocationId },
+        data: {
+          remainingCredits: allocation.remainingCredits.minus(entry.credits),
+        },
+      });
+    }
+
+    if (plan.overage.gt(0) && sessionId !== undefined) {
+      if (overageRow) {
+        await tx.creditSessionOverage.update({
+          where: { id: overageRow.id },
           data: {
-            remainingCredits: allocation.remainingCredits.minus(entry.credits),
+            overageCredits: overageRow.overageCredits.plus(plan.overage),
+          },
+        });
+      } else {
+        await tx.creditSessionOverage.create({
+          data: {
+            walletId: cursor.walletId,
+            sessionId,
+            limitCredits: overageLimit,
+            overageCredits: plan.overage,
           },
         });
       }
+    }
 
-      if (plan.overage.gt(0) && sessionId !== undefined) {
-        if (overageRow) {
-          await tx.creditSessionOverage.update({
-            where: { id: overageRow.id },
-            data: {
-              overageCredits: overageRow.overageCredits.plus(plan.overage),
-            },
-          });
-        } else {
-          await tx.creditSessionOverage.create({
-            data: {
-              walletId: cursor.walletId,
-              sessionId,
-              limitCredits: overageLimit,
-              overageCredits: plan.overage,
-            },
-          });
-        }
-      }
-
-      await this.saveWallet(tx, cursor);
-      return { duplicate: false, transaction };
-    });
+    await this.saveWallet(tx, cursor);
+    return { duplicate: false, transaction };
   }
 
   /**
@@ -844,6 +944,8 @@ export class CreditWalletService {
         allocationId: write.allocationId ?? null,
         sessionId: write.sessionId ?? null,
         reference: write.reference ?? null,
+        costUsd: write.costUsd ?? null,
+        usdMicrosPerCredit: write.usdMicrosPerCredit ?? null,
         effectiveAt: write.effectiveAt,
       },
     });
@@ -955,6 +1057,8 @@ export class CreditWalletService {
       allocationId: row.allocationId,
       sessionId: row.sessionId,
       reference: row.reference,
+      costUsd: row.costUsd ? row.costUsd.toFixed() : null,
+      usdMicrosPerCredit: row.usdMicrosPerCredit,
       effectiveAt: row.effectiveAt.toISOString(),
       createdAt: row.createdAt.toISOString(),
       entries: row.entries.map((entry) => ({

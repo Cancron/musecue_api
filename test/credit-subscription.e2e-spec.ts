@@ -744,13 +744,31 @@ describeWithDatabase(
       it('grants nothing between paid years; a yearly renewal starts a new year of monthly grants', async () => {
         const userId = await createUser(harness.client);
         const { stripeSubscriptionId } = await subscribe(userId, T0, 'YEARLY');
+        // The scheduler first runs in month 11: months 1-10 were missed and
+        // are recorded as granted and expired; month 11 is usable.
         await scheduler.run(after(month(11), MINUTE));
+        const firstYear = await proAllocationsOf(userId);
+        expect(firstYear.map((a) => a.periodIndex)).toEqual([
+          ...Array(12).keys(),
+        ]);
+        expect(
+          firstYear
+            .slice(1, 11)
+            .every(
+              (a, i) =>
+                a.grantedAt.getTime() === month(i + 1).getTime() &&
+                a.remaining === '0.000000' &&
+                a.expiredAt?.getTime() === after(month(11), MINUTE).getTime(),
+            ),
+        ).toBe(true);
+        expect(firstYear[11]).toMatchObject({
+          remaining: '1000.000000',
+          expiredAt: null,
+        });
 
-        // The year has ended and the renewal is not paid yet: nothing is due.
-        await expect(
-          scheduler.run(after(YEAR_END, MINUTE)),
-        ).resolves.toMatchObject({ checked: 0, granted: 0 });
-        await expect(proAllocationsOf(userId)).resolves.toHaveLength(2);
+        // The year has ended and the renewal is not paid yet: nothing more.
+        await scheduler.run(after(YEAR_END, MINUTE));
+        await expect(proAllocationsOf(userId)).resolves.toHaveLength(12);
 
         const renewal = api.renewSubscription(stripeSubscriptionId)
           .id as string;
@@ -772,8 +790,12 @@ describeWithDatabase(
             a.expiresAt,
           ]),
         ).toEqual([
-          [expect.any(String), 0, T0, month(1)],
-          [expect.any(String), 11, month(11), YEAR_END],
+          ...Array.from({ length: 12 }, (_, k): unknown[] => [
+            expect.any(String) as unknown,
+            k,
+            month(k),
+            month(k + 1),
+          ]),
           [renewal, 0, YEAR_END, nextMonth],
           [renewal, 1, nextMonth, addMonthsClamped(YEAR_END, 2)],
         ]);
@@ -812,11 +834,11 @@ describeWithDatabase(
           const result = await scheduler.run(after(month(k), MINUTE));
           expect(result?.failed).toBe(0);
           await expect(
-            scheduler.grantDueMonth(
+            scheduler.grantDueMonths(
               (await subscriptionOf(userId)).payments[0].id,
               after(month(k), MINUTE),
             ),
-          ).resolves.toBe('SKIPPED');
+          ).resolves.toEqual({ granted: 0, historical: 0 });
         }
         await expect(proAllocationsOf(userId)).resolves.toHaveLength(2);
         await expect(
@@ -841,14 +863,14 @@ describeWithDatabase(
         const [runResult, ...outcomes] = await Promise.all([
           scheduler.run(monthOne),
           ...Array.from({ length: 6 }, () =>
-            scheduler.grantDueMonth(payment.id, monthOne),
+            scheduler.grantDueMonths(payment.id, monthOne),
           ),
         ]);
         await scheduler.run(monthOne);
         await scheduler.run(after(monthOne, HOUR));
         // Exactly one grant in total, whichever caller made it.
         expect(
-          outcomes.filter((outcome) => outcome === 'GRANTED').length +
+          outcomes.reduce((sum, outcome) => sum + outcome.granted, 0) +
             (runResult?.granted ?? 0),
         ).toBe(1);
 
@@ -869,8 +891,8 @@ describeWithDatabase(
         );
         await scheduler.run(after(month(2), MINUTE));
         await expect(
-          scheduler.grantDueMonth(duplicate.id, after(month(2), MINUTE)),
-        ).resolves.toBe('SKIPPED');
+          scheduler.grantDueMonths(duplicate.id, after(month(2), MINUTE)),
+        ).resolves.toEqual({ granted: 0, historical: 0 });
 
         const allocations = await proAllocationsOf(userId);
         expect(allocations.map((a) => [a.paymentId, a.periodIndex])).toEqual([

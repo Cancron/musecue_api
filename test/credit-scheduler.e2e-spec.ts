@@ -31,7 +31,9 @@ interface GrantRow {
   periodStartsAt: Date;
   expiresAt: Date;
   grantedAt: Date;
+  expiredAt: Date | null;
   granted: string;
+  remaining: string;
 }
 
 /**
@@ -135,7 +137,8 @@ describeWithDatabase(
     const grantsOf = (userId: string) =>
       harness.client.$queryRaw<GrantRow[]>`
         SELECT a."periodIndex", a."periodStartsAt", a."expiresAt", a."grantedAt",
-               a."grantedCredits"::text AS granted
+               a."expiredAt", a."grantedCredits"::text AS granted,
+               a."remainingCredits"::text AS remaining
         FROM "CreditAllocation" a JOIN "CreditWallet" w ON w."id" = a."walletId"
         WHERE w."authId" = ${userId} AND a."source" = 'SUBSCRIPTION'
         ORDER BY a."periodIndex"`;
@@ -162,7 +165,7 @@ describeWithDatabase(
         CREATE TRIGGER "test_worker_failure" BEFORE INSERT ON "CreditAllocation"
           FOR EACH ROW EXECUTE FUNCTION "test_worker_failure"();`);
 
-    it('grants the month that is due after a restart when the worker was stopped across month starts', async () => {
+    it('records the months missed while the worker was stopped as granted and expired, and grants the current month', async () => {
       const a = await subscribeYearly();
       const b = await subscribeYearly();
       expect(await monthsOf(a.userId)).toEqual([0]);
@@ -179,31 +182,64 @@ describeWithDatabase(
 
       for (const user of [a, b]) {
         const grants = await grantsOf(user.userId);
-        // Months 1 and 2 ended during the outage; their credits would have
-        // expired already, so only the month that is due is granted.
-        expect(grants.map((g) => g.periodIndex)).toEqual([0, 3]);
-        expect(grants[1]).toMatchObject({
+        expect(grants.map((g) => g.periodIndex)).toEqual([0, 1, 2, 3]);
+        // Months 1 and 2 ended during the outage: recorded as granted at the
+        // month's start and expired at its end, never spendable.
+        for (const k of [1, 2]) {
+          expect(grants[k]).toEqual({
+            periodIndex: k,
+            periodStartsAt: month(k),
+            expiresAt: month(k + 1),
+            grantedAt: month(k),
+            expiredAt: restartAt,
+            granted: '1000.000000',
+            remaining: '0.000000',
+          });
+        }
+        // Month 3 is the current month: granted now and usable.
+        expect(grants[3]).toEqual({
+          periodIndex: 3,
           periodStartsAt: month(3),
           expiresAt: month(4),
           grantedAt: restartAt,
+          expiredAt: null,
           granted: '1000.000000',
+          remaining: '1000.000000',
         });
       }
-      // The startup expiry sweep logged month 0's expiry at its end.
+      // Every grant and expiry is in the ledger, dated when it took effect
+      // (month 0's expiry is written by the startup expiry sweep).
       await eventually(
-        async () =>
-          (await ledgerOf(a.userId)).some((t) => t.type === 'EXPIRATION'),
-        'the startup expiry sweep',
+        async () => (await ledgerOf(a.userId)).length === 7,
+        'the complete history',
       );
-      await expect(ledgerOf(a.userId)).resolves.toEqual([
-        expect.objectContaining({ type: 'ALLOCATION', effectiveAt: T0 }),
-        expect.objectContaining({
-          type: 'EXPIRATION',
-          amount: '-1000.000000',
-          effectiveAt: month(1),
-        }),
-        expect.objectContaining({ type: 'ALLOCATION', effectiveAt: restartAt }),
-      ]);
+      const history = (await ledgerOf(a.userId))
+        .map((t) => [t.type, t.amount, t.effectiveAt.toISOString()])
+        .sort((x, y) => (x[2] + x[0]).localeCompare(y[2] + y[0]));
+      expect(history).toEqual(
+        [
+          ['ALLOCATION', '1000.000000', T0],
+          ['ALLOCATION', '1000.000000', month(1)],
+          ['EXPIRATION', '-1000.000000', month(1)],
+          ['ALLOCATION', '1000.000000', month(2)],
+          ['EXPIRATION', '-1000.000000', month(2)],
+          ['EXPIRATION', '-1000.000000', month(3)],
+          ['ALLOCATION', '1000.000000', restartAt],
+        ].map(([type, amount, at]) => [
+          type,
+          amount,
+          (at as Date).toISOString(),
+        ]),
+      );
+      // Only the current month can be spent.
+      await expect(
+        harness.app
+          .get(CreditWalletService, { strict: false })
+          .getBalance(a.userId, restartAt),
+      ).resolves.toMatchObject({
+        availableCredits: '1000',
+        availableBySource: { SUBSCRIPTION: '1000' },
+      });
 
       // Another restart in the same month grants nothing more.
       await restartWorkerAt(after(restartAt, HOUR));
@@ -211,8 +247,64 @@ describeWithDatabase(
         async () => (await scheduler().run(after(restartAt, HOUR))) !== null,
         'the startup run to finish',
       );
-      expect(await monthsOf(a.userId)).toEqual([0, 3]);
-      expect(await monthsOf(b.userId)).toEqual([0, 3]);
+      expect(await monthsOf(a.userId)).toEqual([0, 1, 2, 3]);
+      expect(await monthsOf(b.userId)).toEqual([0, 1, 2, 3]);
+      await expect(ledgerOf(a.userId)).resolves.toHaveLength(7);
+    });
+
+    it('records every month of a paid year that ended while the worker was stopped, all expired', async () => {
+      const user = await subscribeYearly();
+      const yearEnd = addBillingInterval(T0, BillingInterval.YEARLY);
+
+      // The worker comes back ten days after the paid year ended.
+      const restartAt = after(yearEnd, 10 * DAY);
+      await restartWorkerAt(restartAt);
+      await eventually(
+        async () => (await monthsOf(user.userId)).length === 12,
+        'the missed months of the year',
+      );
+
+      const grants = await grantsOf(user.userId);
+      grants.slice(1).forEach((grant, i) => {
+        const k = i + 1;
+        expect(grant).toEqual({
+          periodIndex: k,
+          periodStartsAt: month(k),
+          expiresAt: k === 11 ? yearEnd : month(k + 1),
+          grantedAt: month(k),
+          expiredAt: restartAt,
+          granted: '1000.000000',
+          remaining: '0.000000',
+        });
+      });
+      await eventually(
+        async () =>
+          (await ledgerOf(user.userId)).filter((t) => t.type === 'EXPIRATION')
+            .length === 12,
+        'all expirations',
+      );
+      const expirations = (await ledgerOf(user.userId))
+        .filter((t) => t.type === 'EXPIRATION')
+        .map((t) => t.effectiveAt.getTime())
+        .sort((x, y) => x - y);
+      expect(expirations).toEqual(
+        Array.from({ length: 12 }, (_, k) =>
+          (k === 11 ? yearEnd : month(k + 1)).getTime(),
+        ),
+      );
+      await expect(
+        harness.app
+          .get(CreditWalletService, { strict: false })
+          .getBalance(user.userId, restartAt),
+      ).resolves.toMatchObject({ availableCredits: '0' });
+
+      // Restarting again records nothing twice.
+      await restartWorkerAt(after(restartAt, HOUR));
+      await eventually(
+        async () => (await scheduler().run(after(restartAt, HOUR))) !== null,
+        'the startup run to finish',
+      );
+      await expect(ledgerOf(user.userId)).resolves.toHaveLength(24);
     });
 
     it('finishes a run that was halted part-way after the restart, without duplicating what was granted', async () => {
@@ -276,7 +368,7 @@ describeWithDatabase(
         CREATE TRIGGER "test_worker_failure" BEFORE INSERT ON "CreditAllocation"
           FOR EACH ROW EXECUTE FUNCTION "test_worker_failure"();`);
 
-      const grant = scheduler().grantDueMonth(
+      const grant = scheduler().grantDueMonths(
         user.paymentId,
         after(month(1), MINUTE),
       );
@@ -328,8 +420,8 @@ describeWithDatabase(
         scheduler().run(now),
         other.run(now),
         ...users.flatMap((u) => [
-          scheduler().grantDueMonth(u.paymentId, now),
-          other.grantDueMonth(u.paymentId, now),
+          scheduler().grantDueMonths(u.paymentId, now),
+          other.grantDueMonths(u.paymentId, now),
         ]),
       ]);
       expect(results.length).toBe(6);

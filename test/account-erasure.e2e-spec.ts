@@ -104,6 +104,7 @@ const USER_DATA_TABLES = [
   'CreditTransaction',
   'CreditTransactionEntry',
   'CreditSessionOverage',
+  'AiUsage',
 ] as const;
 
 describeWithDatabase('Account erasure (PostgreSQL)', () => {
@@ -416,7 +417,7 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
       },
       include: { steps: true },
     });
-    await client.aiRun.create({
+    const aiRun = await client.aiRun.create({
       data: {
         authId: user.id,
         sessionId: session.id,
@@ -498,6 +499,37 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
       periodStart: payment.periodStart,
       periodEnd: payment.periodEnd,
       credits: 1000,
+    });
+    // An AI request charged by its cost: the usage and its ledger deduction.
+    const charge = await credits.deduct({
+      authId: user.id,
+      credits: 5,
+      idempotencyKey: `ai-run:${aiRun.id}`,
+      sessionId: session.id,
+      reference: `ai-run:${aiRun.id}`,
+      cost: { usd: '0.025', usdMicrosPerCredit: 5000 },
+    });
+    await client.aiUsage.create({
+      data: {
+        authId: user.id,
+        sessionId: session.id,
+        aiRunId: aiRun.id,
+        operation: 'GUIDE_QUESTION',
+        attempt: 1,
+        provider: 'openrouter',
+        model: 'openai/gpt-4.1-mini',
+        providerRequestId: `gen-erasure-${tag}`,
+        succeeded: true,
+        inputTokens: 100,
+        outputTokens: 20,
+        totalTokens: 120,
+        costUsd: '0.025',
+        chargeStatus: 'CHARGED',
+        creditTransactionId: charge.transaction.id,
+        chargedCredits: 5,
+        usdMicrosPerCredit: 5000,
+        chargedAt: new Date(),
+      },
     });
     const providerCustomerId = `cus_erasure_${tag}`;
     await client.paymentCustomer.create({

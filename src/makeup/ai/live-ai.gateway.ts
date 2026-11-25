@@ -12,6 +12,7 @@ import type {
   QuestionResult,
 } from '../interfaces/makeup.interface';
 import type {
+  AiCallMetadata,
   AiGateway,
   AiGatewayResponse,
   AiRunDescriptor,
@@ -57,6 +58,7 @@ export class LiveAiGateway implements AiGateway {
       provider: this.provider.name,
       model: this.provider.modelFor(operation),
       promptVersion: PROMPT_VERSIONS[operation],
+      billable: true,
     };
   }
 
@@ -75,10 +77,13 @@ export class LiveAiGateway implements AiGateway {
       response.data.recommendations.map((item) => item.name),
     );
     if (names.size !== response.data.recommendations.length) {
-      throw new AiProviderError(
-        'AI_DUPLICATE_RECOMMENDATIONS',
-        'AI returned duplicate recommendations',
-        true,
+      throw billedError(
+        new AiProviderError(
+          'AI_DUPLICATE_RECOMMENDATIONS',
+          'AI returned duplicate recommendations',
+          true,
+        ),
+        response.metadata,
       );
     }
     const recommendations = [...response.data.recommendations]
@@ -109,10 +114,13 @@ export class LiveAiGateway implements AiGateway {
         (step) => step.substeps.length !== step.spokenSubsteps.length,
       )
     ) {
-      throw new AiProviderError(
-        'AI_SCHEMA_VALIDATION_FAILED',
-        'Spoken instructions do not match guide substeps',
-        true,
+      throw billedError(
+        new AiProviderError(
+          'AI_SCHEMA_VALIDATION_FAILED',
+          'Spoken instructions do not match guide substeps',
+          true,
+        ),
+        response.metadata,
       );
     }
     return {
@@ -180,21 +188,31 @@ When an image is supplied, use it only to answer the current question. Give a sh
       userContext,
       image,
     });
+    const metadata = {
+      responseId: response.responseId,
+      model: response.model,
+      usage: response.usage,
+    };
     const parsed = schema.safeParse(response.value);
     if (!parsed.success) {
-      throw new AiProviderError(
-        'AI_SCHEMA_VALIDATION_FAILED',
-        'AI output failed application validation',
-        true,
+      throw billedError(
+        new AiProviderError(
+          'AI_SCHEMA_VALIDATION_FAILED',
+          'AI output failed application validation',
+          true,
+        ),
+        metadata,
       );
     }
-    return {
-      data: parsed.data,
-      metadata: {
-        responseId: response.responseId,
-        model: response.model,
-        usage: response.usage,
-      },
-    };
+    return { data: parsed.data, metadata };
   }
+}
+
+/** An error for an answered request whose result is rejected: keeps its usage. */
+function billedError(
+  error: AiProviderError,
+  metadata: AiCallMetadata | undefined,
+): AiProviderError {
+  error.billedResponse = metadata;
+  return error;
 }

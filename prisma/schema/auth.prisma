@@ -32,6 +32,7 @@ model authUser {
   authChallenges     AuthChallenge[]
   infrastructureJobs InfrastructureJob[]
   creditWallet       CreditWallet?
+  aiUsages           AiUsage[]
 
   @@index([email, id, providerId])
   @@index([username])

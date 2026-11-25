@@ -39,6 +39,31 @@ const openRouterEnvelopeSchema = z.object({
     .optional(),
 });
 
+/** Request ID, model and usage of an answered (billed) request. */
+type BilledResponse = Omit<StructuredGenerationResponse, 'value'>;
+
+// Usage accounting (request `usage: { include: true }`): token counts and
+// the cost of the request in US dollars. Read from every parsed response,
+// including ones that are then rejected, so billed requests are tracked.
+const usageSchema = z.object({
+  id: z.string().max(200).optional().catch(undefined),
+  model: z.string().max(200).optional().catch(undefined),
+  usage: z
+    .object({
+      prompt_tokens: z.number().int().nonnegative().optional().catch(undefined),
+      completion_tokens: z
+        .number()
+        .int()
+        .nonnegative()
+        .optional()
+        .catch(undefined),
+      total_tokens: z.number().int().nonnegative().optional().catch(undefined),
+      cost: z.number().nonnegative().finite().optional().catch(undefined),
+    })
+    .nullish()
+    .catch(undefined),
+});
+
 // Parse only metadata; never retain upstream messages or reasoning text.
 const responseMetadataSchema = z.object({
   error: z
@@ -196,6 +221,7 @@ export class OpenRouterProvider implements StructuredAiProvider {
       timeoutMs: this.timeoutFor(request.operation),
     };
     const controller = new AbortController();
+    let billed: BilledResponse | undefined;
     const timeout = setTimeout(
       () => controller.abort(),
       this.timeoutFor(request.operation),
@@ -219,6 +245,8 @@ export class OpenRouterProvider implements StructuredAiProvider {
           ],
           temperature: 0.2,
           max_tokens: diagnostics.maxTokens,
+          // Usage accounting: the response reports usage.cost in USD.
+          usage: { include: true },
           ...this.reasoningOptions(request.operation),
           response_format: {
             type: 'json_schema',
@@ -273,6 +301,9 @@ export class OpenRouterProvider implements StructuredAiProvider {
           true,
         );
       }
+      // From here on the request was answered: keep its usage, also when
+      // the answer is rejected below.
+      billed = this.billedMetadata(responseBody, request.operation);
       const metadata = responseMetadataSchema.safeParse(responseBody);
       if (metadata.success) {
         const choice = metadata.data.choices?.[0];
@@ -357,21 +388,11 @@ export class OpenRouterProvider implements StructuredAiProvider {
         );
       }
 
-      return {
-        value,
-        responseId: envelope.data.id,
-        model: envelope.data.model ?? this.modelFor(request.operation),
-        usage: envelope.data.usage
-          ? {
-              promptTokens: envelope.data.usage.prompt_tokens,
-              completionTokens: envelope.data.usage.completion_tokens,
-              totalTokens: envelope.data.usage.total_tokens,
-            }
-          : undefined,
-      };
+      return { value, ...billed };
     } catch (error) {
       if (error instanceof AiProviderError) {
         error.diagnostics = diagnostics;
+        error.billedResponse = billed;
         throw error;
       }
       if (error instanceof Error && error.name === 'AbortError') {
@@ -393,6 +414,28 @@ export class OpenRouterProvider implements StructuredAiProvider {
     } finally {
       clearTimeout(timeout);
     }
+  }
+
+  /** Request ID, model and usage of a parsed response (never its content). */
+  private billedMetadata(
+    body: unknown,
+    operation: AiOperation,
+  ): BilledResponse {
+    const parsed = usageSchema.safeParse(body);
+    const data = parsed.success ? parsed.data : {};
+    const usage = data.usage;
+    return {
+      responseId: data.id,
+      model: data.model ?? this.modelFor(operation),
+      usage: usage
+        ? {
+            promptTokens: usage.prompt_tokens,
+            completionTokens: usage.completion_tokens,
+            totalTokens: usage.total_tokens,
+            costUsd: usage.cost,
+          }
+        : undefined,
+    };
   }
 
   private userContent(

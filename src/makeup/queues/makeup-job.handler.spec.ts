@@ -1,3 +1,4 @@
+import type { CreditUsageService } from '../../credit/credit-usage.service';
 import type { Prisma } from '@prisma/client';
 import { mock, mockDeep } from 'jest-mock-extended';
 import type { Logger } from 'winston';
@@ -52,6 +53,7 @@ describe('MakeupJobHandler delivery semantics', () => {
         provider: 'openrouter',
         model: 'test',
         promptVersion: 'test',
+        billable: false,
       });
       ai.generateGuide.mockRejectedValue(error);
       prisma.makeupSession.findFirstOrThrow.mockResolvedValue({
@@ -65,6 +67,7 @@ describe('MakeupJobHandler delivery semantics', () => {
         mock<PrivateImageStorageService>(),
         logger,
         new ConfigService(),
+        mock<CreditUsageService>(),
       );
       const discard = jest.fn();
       await expect(
@@ -139,6 +142,7 @@ describe('MakeupJobHandler delivery semantics', () => {
       mock<PrivateImageStorageService>(),
       mock<Logger>(),
       new ConfigService(),
+      mock<CreditUsageService>(),
     );
     await processor.process({
       name: 'GUIDE_GENERATION',
@@ -171,6 +175,7 @@ describe('MakeupJobHandler delivery semantics', () => {
       provider: 'mock',
       model: 'test',
       promptVersion: 'test',
+      billable: false,
     });
     ai.evaluateStep.mockResolvedValue({ data: evaluation });
     prisma.guideStep.findFirstOrThrow.mockResolvedValue({
@@ -197,6 +202,7 @@ describe('MakeupJobHandler delivery semantics', () => {
       storage,
       mock<Logger>(),
       new ConfigService(),
+      mock<CreditUsageService>(),
     );
     await processor.process({
       name: 'VISION_CHECK',
@@ -231,6 +237,7 @@ describe('MakeupJobHandler delivery semantics', () => {
       storage,
       logger,
       new ConfigService(),
+      mock<CreditUsageService>(),
     );
     prisma.aiRun.findUnique.mockResolvedValue({ status: 'COMPLETED' } as never);
     const job = {
@@ -260,6 +267,7 @@ describe('MakeupJobHandler delivery semantics', () => {
       storage,
       logger,
       new ConfigService({ AI_QUEUE_MAX_PROVIDER_PAUSE_MS: '120000' }),
+      mock<CreditUsageService>(),
     );
     prisma.aiRun.findUnique.mockResolvedValue({
       id: 'run-id',
@@ -292,6 +300,7 @@ describe('MakeupJobHandler delivery semantics', () => {
       provider: 'openrouter',
       model: 'free-model',
       promptVersion: 'v1',
+      billable: false,
     });
     ai.personalize.mockRejectedValue(
       new AiProviderError(
@@ -346,6 +355,7 @@ describe('MakeupJobHandler delivery semantics', () => {
         provider: 'mock',
         model: 'test',
         promptVersion: 'test',
+        billable: false,
       });
       const evaluation = {
         result: 'PASS' as const,
@@ -375,6 +385,7 @@ describe('MakeupJobHandler delivery semantics', () => {
         storage,
         mock<Logger>(),
         new ConfigService(),
+        mock<CreditUsageService>(),
       );
       const job = {
         id: 'run',
@@ -429,6 +440,7 @@ describe('MakeupJobHandler delivery semantics', () => {
         provider: 'openrouter',
         model: 'test',
         promptVersion: 'test',
+        billable: false,
       });
       ai.generateGuide.mockRejectedValue(
         new AiProviderError('AI_HTTP_429', 'Slow down', true, 5_000),
@@ -448,6 +460,7 @@ describe('MakeupJobHandler delivery semantics', () => {
         mock<PrivateImageStorageService>(),
         mock<Logger>(),
         new ConfigService(),
+        mock<CreditUsageService>(),
       );
 
       await expect(
@@ -492,6 +505,7 @@ describe('MakeupJobHandler delivery semantics', () => {
         mock<PrivateImageStorageService>(),
         mock<Logger>(),
         new ConfigService(),
+        mock<CreditUsageService>(),
       );
 
       await handler.onAbandoned({

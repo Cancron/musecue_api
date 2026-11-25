@@ -64,6 +64,12 @@ export interface DeductCreditsInput {
   sessionId?: string;
   /** Caller reference stored with the transaction, e.g. an AI run ID. */
   reference?: string;
+  /**
+   * For AI usage: the provider's cost in US dollars and the conversion rate
+   * (micro-dollars per credit). Stored on the transaction; `credits` must be
+   * the cost converted at that rate (creditsForCost).
+   */
+  cost?: { usd: string | number; usdMicrosPerCredit: number };
   now?: Date;
 }
 
@@ -96,6 +102,9 @@ export interface CreditTransactionView {
   allocationId: string | null;
   sessionId: string | null;
   reference: string | null;
+  /** AI deductions: the USD cost and the conversion rate used. */
+  costUsd: string | null;
+  usdMicrosPerCredit: number | null;
   effectiveAt: string;
   createdAt: string;
   entries: { allocationId: string; amountCredits: CreditAmountString }[];

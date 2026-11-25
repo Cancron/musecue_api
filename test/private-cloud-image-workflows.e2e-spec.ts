@@ -1,3 +1,4 @@
+import type { CreditUsageService } from '../src/credit/credit-usage.service';
 import { ConfigService } from '@nestjs/config';
 import { randomBytes } from 'node:crypto';
 import { PrismaPg } from '@prisma/adapter-pg';
@@ -42,6 +43,18 @@ import {
 import { createUser } from './support/subscription-fixtures';
 
 jest.setTimeout(60_000);
+
+/**
+ * Credits are not under test here (see test/credit-usage.e2e-spec.ts): AI
+ * requests may be made, and no usage is recorded or charged. A plain object,
+ * so jest.resetAllMocks() cannot change it.
+ */
+const creditsNotUnderTest = {
+  hasSpendableCredits: () => Promise.resolve(true),
+  recordUsage: () => Promise.resolve(null),
+  chargeInTransaction: () => Promise.resolve(undefined),
+  close: () => Promise.resolve(undefined),
+} as unknown as CreditUsageService;
 
 type ImageFormat = 'jpeg' | 'png' | 'webp';
 
@@ -245,6 +258,7 @@ describeWithDatabase(
         storage,
         logger,
         new ConfigService(),
+        creditsNotUnderTest,
       );
       owner = await createUser(client);
       intruder = await createUser(client);
@@ -1764,6 +1778,7 @@ describeWithDatabase(
             storageService,
             logger,
             new ConfigService(),
+            creditsNotUnderTest,
           ),
         };
       }
@@ -2148,6 +2163,7 @@ describeWithDatabase(
           storage,
           mock<Logger>(),
           new ConfigService(),
+          creditsNotUnderTest,
         );
         openRouterCalls = [];
         spies = [

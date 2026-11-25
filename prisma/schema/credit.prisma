@@ -141,6 +141,13 @@ model CreditTransaction {
   sessionId                      String?               @db.VarChar(64)
   // Caller reference, e.g. the AI run a deduction paid for.
   reference                      String?               @db.VarChar(200)
+  // DEDUCTIONs for AI usage: the provider's cost in US dollars and the
+  // conversion rate in force when it was charged (micro-dollars per credit),
+  // kept so later rate changes never alter history. The credits charged
+  // (overage change minus amount) equal round(costUsd * 1e6 / rate, 6)
+  // (CHECK constraint). Both NULL for other transactions.
+  costUsd                        Decimal?              @db.Decimal(24, 12)
+  usdMicrosPerCredit             Int?
   // When the change took effect: the expiry time for EXPIRATION, otherwise
   // the time it was recorded.
   effectiveAt                    DateTime
@@ -149,6 +156,7 @@ model CreditTransaction {
   wallet     CreditWallet             @relation(fields: [walletId], references: [id], onDelete: Cascade)
   allocation CreditAllocation?        @relation(fields: [allocationId, walletId], references: [id, walletId], onDelete: Cascade)
   entries    CreditTransactionEntry[]
+  aiUsage    AiUsage?
 
   @@unique([walletId, sequence])
   @@unique([walletId, idempotencyKey])
@@ -193,4 +201,56 @@ model CreditSessionOverage {
   wallet CreditWallet @relation(fields: [walletId], references: [id], onDelete: Cascade)
 
   @@index([walletId])
+}
+
+// ================================
+// AI Usage
+// ================================
+
+// One row per AI provider request (e.g. each OpenRouter chat completion),
+// whatever its outcome: the owner, makeup session and AI run it served (a
+// database trigger checks they belong together at insert), token counts and
+// the provider's reported cost in US dollars. Sessions and runs are plain
+// IDs (no foreign keys) so usage history outlives a deleted session.
+//
+// Each AI run is charged once, for the request whose result is published:
+// the charge is made in the transaction that publishes the result
+// (CreditTransaction DEDUCTION, idempotency key `ai-run:<runId>`), at the
+// conversion rate in force then. Requests of failed attempts, retries and
+// unpublished results are recorded but not charged.
+model AiUsage {
+  id                 String              @id @default(uuid())
+  authId             String
+  sessionId          String
+  aiRunId            String
+  operation          AiOperation
+  // Job attempt of the run that made the request (1, 2, ...).
+  attempt            Int
+  provider           String              @db.VarChar(50)
+  model              String?             @db.VarChar(200)
+  // The provider's ID of the request (OpenRouter generation ID).
+  providerRequestId  String?             @db.VarChar(200)
+  // Whether the response was valid and usable as the run's result.
+  succeeded          Boolean
+  inputTokens        Int?
+  outputTokens       Int?
+  totalTokens        Int?
+  // usage.cost reported by the provider, in US dollars; NULL if not reported.
+  costUsd            Decimal?            @db.Decimal(24, 12)
+  chargeStatus       AiUsageChargeStatus @default(PENDING)
+  // When CHARGED: the deduction, its credits and the rate used.
+  creditTransactionId String?            @unique
+  chargedCredits     Decimal?            @db.Decimal(20, 6)
+  usdMicrosPerCredit Int?
+  chargedAt          DateTime?
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+
+  authUser          authUser           @relation(fields: [authId], references: [id], onDelete: Cascade)
+  creditTransaction CreditTransaction? @relation(fields: [creditTransactionId], references: [id], onDelete: SetNull)
+
+  @@unique([provider, providerRequestId])
+  @@index([sessionId, createdAt])
+  @@index([aiRunId])
+  @@index([authId, createdAt])
 }

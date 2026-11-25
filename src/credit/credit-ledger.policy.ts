@@ -251,3 +251,47 @@ export function planOverageSettlement(
   }
   return { settled: granted.minus(left), bySession };
 }
+
+/** Fractional digits of stored USD costs (NUMERIC(24,12)). */
+export const USD_COST_DECIMAL_PLACES = 12;
+
+/**
+ * Parses a provider-reported cost in US dollars (e.g. OpenRouter
+ * `usage.cost`): a finite, non-negative number or decimal string, rounded
+ * half up to 12 decimal places (as PostgreSQL stores NUMERIC(24,12)). Null
+ * when the provider reported no usable cost.
+ */
+export function parseUsdCost(value: unknown): Prisma.Decimal | null {
+  let cost: Prisma.Decimal;
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    cost = new Prisma.Decimal(value);
+  } else if (typeof value === 'string' && /^\d+(\.\d+)?$/.test(value.trim())) {
+    cost = new Prisma.Decimal(value.trim());
+  } else {
+    return null;
+  }
+  if (cost.isNegative()) return null;
+  return cost.toDecimalPlaces(
+    USD_COST_DECIMAL_PLACES,
+    Prisma.Decimal.ROUND_HALF_UP,
+  );
+}
+
+/**
+ * Credits for a cost in US dollars at a conversion rate in micro-dollars per
+ * credit (CreditSettings.openRouterUsdMicrosPerCredit; 5000 = $0.005 per
+ * credit): round(costUsd * 1e6 / rate, 6), half up. The database checks the
+ * same formula on every AI deduction. Example: $0.025 at 5000 = 5 credits.
+ */
+export function creditsForCost(
+  costUsd: Prisma.Decimal,
+  usdMicrosPerCredit: number,
+): CreditAmount {
+  if (!Number.isInteger(usdMicrosPerCredit) || usdMicrosPerCredit <= 0) {
+    throw new CreditRuleViolation('The conversion rate must be positive');
+  }
+  return costUsd
+    .times(1_000_000)
+    .dividedBy(usdMicrosPerCredit)
+    .toDecimalPlaces(CREDIT_DECIMAL_PLACES, Prisma.Decimal.ROUND_HALF_UP);
+}

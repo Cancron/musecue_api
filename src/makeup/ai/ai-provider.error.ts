@@ -1,3 +1,5 @@
+import type { AiCallMetadata } from './ai.gateway';
+
 /** Allowlisted metadata only: never provider text, prompts, images or headers. */
 export interface AiFailureDiagnostics {
   httpStatus?: number;
@@ -18,6 +20,13 @@ export interface AiFailureDiagnostics {
 
 export class AiProviderError extends Error {
   diagnostics?: AiFailureDiagnostics;
+  /**
+   * Set when the provider answered (and billed) the request but the answer
+   * could not be used: its request ID, model and usage, so the cost is
+   * still recorded. Not enumerable: serialized or logged errors keep only
+   * the allowlisted diagnostics, never provider-supplied values.
+   */
+  declare billedResponse?: AiCallMetadata;
 
   constructor(
     readonly code: string,
@@ -27,6 +36,12 @@ export class AiProviderError extends Error {
   ) {
     super(message);
     this.name = 'AiProviderError';
+    Object.defineProperty(this, 'billedResponse', {
+      value: undefined,
+      enumerable: false,
+      writable: true,
+      configurable: true,
+    });
   }
 }
 

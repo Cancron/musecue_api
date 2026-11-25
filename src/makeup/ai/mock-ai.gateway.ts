@@ -30,6 +30,7 @@ export class MockAiGateway implements AiGateway {
       provider: 'mock',
       model: 'musecue-deterministic-v1',
       promptVersion: PROMPT_VERSIONS[operation],
+      billable: false,
     };
   }
 

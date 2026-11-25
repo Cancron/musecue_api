@@ -16,16 +16,27 @@ export interface AiRunDescriptor {
   provider: string;
   model: string;
   promptVersion: string;
+  /**
+   * Whether the provider bills requests: its usage is recorded and charged
+   * in credits (false for the deterministic mock gateway).
+   */
+  billable: boolean;
+}
+
+/** Usage reported by the provider for one request. */
+export interface AiUsageReport {
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
+  /** The provider's cost in US dollars (OpenRouter `usage.cost`). */
+  costUsd?: number;
 }
 
 export interface AiCallMetadata {
+  /** The provider's request ID (OpenRouter generation ID). */
   responseId?: string;
   model?: string;
-  usage?: {
-    promptTokens?: number;
-    completionTokens?: number;
-    totalTokens?: number;
-  };
+  usage?: AiUsageReport;
 }
 
 export interface AiGatewayResponse<T> {

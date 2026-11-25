@@ -55,6 +55,7 @@ describe('workflow concurrency guards', () => {
       provider: 'mock',
       model: 'test',
       promptVersion: 'test',
+      billable: false,
     });
     await expect(
       service.startAnalysis('owner', 'session', 'key'),

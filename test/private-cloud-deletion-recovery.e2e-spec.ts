@@ -1,3 +1,4 @@
+import type { CreditUsageService } from '../src/credit/credit-usage.service';
 import { ConfigService } from '@nestjs/config';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient } from '@prisma/client';
@@ -807,6 +808,7 @@ describeWithDatabase(
           storage,
           mock<Logger>(),
           new ConfigService(),
+          mock<CreditUsageService>(),
         );
 
         await expect(

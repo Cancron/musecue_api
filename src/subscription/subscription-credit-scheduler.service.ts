@@ -6,7 +6,10 @@ import {
 } from '@prisma/client';
 import { CustomLoggerService } from '../common/services/custom-logger.service';
 import { PrismaService } from '../common/services/prisma.service';
-import { creditMonthAt } from '../credit/credit-subscription.policy';
+import {
+  type CreditMonth,
+  creditMonths,
+} from '../credit/credit-subscription.policy';
 import { CreditWalletService } from '../credit/credit-wallet.service';
 import { isProActive } from './subscription-access.policy';
 
@@ -23,19 +26,46 @@ const GRANTING_EVENTS = [
   SubscriptionEventType.RENEWED,
 ];
 
-export type MonthlyGrantOutcome = 'GRANTED' | 'ALREADY_GRANTED' | 'SKIPPED';
+/** Months allocated for one payment by one grant. */
+export interface MonthlyGrantOutcome {
+  /** The current month, granted and usable. */
+  granted: number;
+  /** Months that ended before they were granted: recorded and expired. */
+  historical: number;
+}
 
 export interface MonthlyGrantRunResult {
-  /** Yearly payments in their paid year with an active subscription. */
+  /** Yearly payments whose paid months are not all recorded yet. */
   checked: number;
-  /** Months newly allocated in this run. */
+  /** Current months newly allocated in this run. */
   granted: number;
-  /** Months that already had their allocation. */
+  /** Ended (missed) months newly recorded as granted and expired. */
+  historical: number;
+  /** Payments whose started months all have their allocation. */
   alreadyGranted: number;
-  /** Payments no longer eligible under the lock (refunded, ended, ...). */
+  /** Payments no longer eligible under the lock (refunded, ...). */
   skipped: number;
   /** Payments whose grant failed; retried by the next run. */
   failed: number;
+}
+
+/**
+ * The months of a payment that are due and missing at `now`, in order:
+ * started months without an allocation.
+ */
+function missingMonths(
+  payment: {
+    billingInterval: BillingInterval;
+    periodStart: Date;
+    periodEnd: Date;
+  },
+  granted: readonly (number | null)[],
+  now: Date,
+): CreditMonth[] {
+  return creditMonths(payment).filter(
+    (month) =>
+      month.start.getTime() <= now.getTime() && !granted.includes(month.index),
+  );
 }
 
 /**
@@ -126,6 +156,7 @@ export class SubscriptionCreditSchedulerService
     const result: MonthlyGrantRunResult = {
       checked: 0,
       granted: 0,
+      historical: 0,
       alreadyGranted: 0,
       skipped: 0,
       failed: 0,
@@ -138,9 +169,11 @@ export class SubscriptionCreditSchedulerService
             status: PaymentStatus.SUCCEEDED,
             billingInterval: BillingInterval.YEARLY,
             periodStart: { lte: now },
-            periodEnd: { gt: now },
             event: { type: { in: GRANTING_EVENTS } },
-            subscription: { proExpiresAt: { gt: now } },
+            subscription: { isNot: null },
+            // Not every month recorded yet (months are recorded in order, so
+            // a recorded last month means the whole year is done).
+            creditAllocations: { none: { periodIndex: 11 } },
           },
           select: {
             id: true,
@@ -157,19 +190,22 @@ export class SubscriptionCreditSchedulerService
         for (const payment of batch) {
           if (this.stopping) return result;
           result.checked += 1;
-          const month = creditMonthAt(payment, now);
-          if (
-            month &&
-            payment.creditAllocations.some((a) => a.periodIndex === month.index)
-          ) {
+          const missing = missingMonths(
+            payment,
+            payment.creditAllocations.map((a) => a.periodIndex),
+            now,
+          );
+          if (missing.length === 0) {
             result.alreadyGranted += 1;
             continue;
           }
           try {
-            const outcome = await this.grantDueMonth(payment.id, now);
-            if (outcome === 'GRANTED') result.granted += 1;
-            else if (outcome === 'ALREADY_GRANTED') result.alreadyGranted += 1;
-            else result.skipped += 1;
+            const outcome = await this.grantDueMonths(payment.id, now);
+            result.granted += outcome.granted;
+            result.historical += outcome.historical;
+            if (outcome.granted + outcome.historical === 0) {
+              result.skipped += 1;
+            }
           } catch (error) {
             result.failed += 1;
             this.logger.warn(
@@ -187,9 +223,9 @@ export class SubscriptionCreditSchedulerService
         SubscriptionCreditSchedulerService.name,
       );
     }
-    if (result.granted > 0 || result.failed > 0) {
+    if (result.granted > 0 || result.historical > 0 || result.failed > 0) {
       this.logger.log(
-        `Monthly Pro credits: ${result.granted} month(s) granted, ${result.alreadyGranted} already granted, ${result.skipped} skipped, ${result.failed} failed`,
+        `Monthly Pro credits: ${result.granted} month(s) granted, ${result.historical} missed month(s) recorded as expired, ${result.alreadyGranted} up to date, ${result.skipped} skipped, ${result.failed} failed`,
         SubscriptionCreditSchedulerService.name,
       );
     }
@@ -197,27 +233,35 @@ export class SubscriptionCreditSchedulerService
   }
 
   /**
-   * Grants the month of one yearly payment that is due at `now`, in one
+   * Grants the missing months of one yearly payment up to `now`, in one
    * transaction: locks the subscription row (the same lock the Stripe
    * webhook and refunds take), re-checks eligibility under the lock, then
-   * allocates idempotently.
+   * allocates each month idempotently, oldest first. The current month is
+   * granted while the subscription is active; months that already ended
+   * (missed while the scheduler was stopped) are recorded as granted at the
+   * month's start and expired at its end, if the paid term covered them.
    */
-  async grantDueMonth(
+  async grantDueMonths(
     paymentId: string,
     now: Date = new Date(),
   ): Promise<MonthlyGrantOutcome> {
+    const none: MonthlyGrantOutcome = { granted: 0, historical: 0 };
     return this.prisma.$transaction(async (tx) => {
       const link = await tx.paymentTransaction.findUnique({
         where: { id: paymentId },
         select: { subscriptionId: true },
       });
-      if (!link?.subscriptionId) return 'SKIPPED';
+      if (!link?.subscriptionId) return none;
       await tx.$queryRaw`
         SELECT "id" FROM "UserSubscription" WHERE "id" = ${link.subscriptionId} FOR UPDATE`;
 
       const payment = await tx.paymentTransaction.findUnique({
         where: { id: paymentId },
-        include: { subscription: true, event: true },
+        include: {
+          subscription: true,
+          event: true,
+          creditAllocations: { select: { periodIndex: true } },
+        },
       });
       const subscription = payment?.subscription;
       if (
@@ -226,23 +270,38 @@ export class SubscriptionCreditSchedulerService
         payment.status !== PaymentStatus.SUCCEEDED ||
         payment.billingInterval !== BillingInterval.YEARLY ||
         !payment.event ||
-        !GRANTING_EVENTS.some((type) => type === payment.event?.type) ||
-        payment.periodStart.getTime() > now.getTime() ||
-        payment.periodEnd.getTime() <= now.getTime() ||
-        !isProActive(subscription, now)
+        !GRANTING_EVENTS.some((type) => type === payment.event?.type)
       ) {
-        return 'SKIPPED';
+        return none;
       }
 
-      const allocation =
-        await this.wallets.allocateProMonthlyCreditsInTransaction(tx, {
-          authId: subscription.authId,
-          subscriptionId: subscription.id,
-          payment,
-          now,
-        });
-      if (!allocation) return 'SKIPPED';
-      return allocation.created ? 'GRANTED' : 'ALREADY_GRANTED';
+      const outcome: MonthlyGrantOutcome = { granted: 0, historical: 0 };
+      const missing = missingMonths(
+        payment,
+        payment.creditAllocations.map((a) => a.periodIndex),
+        now,
+      );
+      for (const month of missing) {
+        const ended = month.end.getTime() <= now.getTime();
+        // An ended month counts if the paid term covered its start; the
+        // current month needs the term to be active now.
+        const eligible = ended
+          ? isProActive(subscription, month.start)
+          : isProActive(subscription, now);
+        if (!eligible) continue;
+        const allocation =
+          await this.wallets.allocateProMonthCreditsInTransaction(tx, {
+            authId: subscription.authId,
+            subscriptionId: subscription.id,
+            payment,
+            month,
+            now,
+          });
+        if (!allocation?.created) continue;
+        if (ended) outcome.historical += 1;
+        else outcome.granted += 1;
+      }
+      return outcome;
     }, TX_OPTIONS);
   }
 }

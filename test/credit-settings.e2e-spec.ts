@@ -6,7 +6,7 @@ import {
 } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { PrismaPg } from '@prisma/adapter-pg';
-import { PrismaClient, userRole, userStatus } from '@prisma/client';
+import { Prisma, PrismaClient, userRole, userStatus } from '@prisma/client';
 import { mock } from 'jest-mock-extended';
 import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
@@ -21,6 +21,8 @@ import { AllExceptionsFilter } from '../src/common/filters/all-exception.filter'
 import { TransformInterceptor } from '../src/common/interceptors/transform.interceptor';
 import { CustomLoggerService } from '../src/common/services/custom-logger.service';
 import { PrismaService } from '../src/common/services/prisma.service';
+import { creditsForCost } from '../src/credit/credit-ledger.policy';
+import { CreditWalletService } from '../src/credit/credit-wallet.service';
 import { CreditModule } from '../src/credit/credit.module';
 import { RateLimitStore } from '../src/infrastructure/rate-limit/rate-limit.store';
 import {
@@ -709,6 +711,135 @@ describeWithDatabase('AI credit settings (PostgreSQL, full stack)', () => {
       expect(changes[changes.length - 1].newValue).toBe(
         String(rows[0].trialAllowanceCredits),
       );
+    });
+  });
+
+  describe('conversion rate changes', () => {
+    /** A user with `credits` purchased credits (set up in PostgreSQL). */
+    const userWithCredits = async (credits: number) => {
+      const account = await createAccount(userRole.USER);
+      await db.$queryRaw`
+        SELECT "Credit_grant_manual"(${account.id}, 'PURCHASE'::"CreditSource", ${`rate-test:${account.id}`}, ${credits})`;
+      return account.id;
+    };
+    const wallets = () =>
+      (app as INestApplication<App>).get(CreditWalletService, {
+        strict: false,
+      });
+    /** Deducts an AI cost at the rate currently stored in PostgreSQL. */
+    const chargeCost = async (authId: string, usd: string, key: string) => {
+      const [{ rate }] = await db.$queryRaw<{ rate: number }[]>`
+        SELECT "openRouterUsdMicrosPerCredit" AS rate FROM "CreditSettings"`;
+      return wallets().deduct({
+        authId,
+        credits: creditsForCost(new Prisma.Decimal(usd), rate),
+        idempotencyKey: key,
+        cost: { usd, usdMicrosPerCredit: rate },
+      });
+    };
+    const deductionsOf = (authId: string) =>
+      db.$queryRaw<
+        { credits: string; costUsd: string; usdMicrosPerCredit: number }[]
+      >`
+        SELECT (t."overageChangeCredits" - t."amountCredits")::text AS credits,
+               t."costUsd"::text AS "costUsd", t."usdMicrosPerCredit"
+        FROM "CreditTransaction" t JOIN "CreditWallet" w ON w."id" = t."walletId"
+        WHERE w."authId" = ${authId} AND t."type" = 'DEDUCTION'
+        ORDER BY t."sequence"`;
+
+    it('stores and audits a new rate; later deductions use it and earlier ones keep theirs', async () => {
+      const admin = await createAccount(userRole.ADMIN);
+      const user = await userWithCredits(100);
+
+      // $0.025 at the default $0.005 per credit: 5 credits.
+      await chargeCost(user, '0.025', 'before-change');
+
+      const response = await patchSettings(
+        { openRouterUsdMicrosPerCredit: 2500 },
+        bearerFor(admin),
+      ).expect(200);
+      expect(dataOf(response)).toMatchObject({
+        openRouterUsdMicrosPerCredit: 2500,
+        openRouterUsdPerCredit: '0.0025',
+      });
+      await expect(settingsRows()).resolves.toEqual([
+        expect.objectContaining({ openRouterUsdMicrosPerCredit: 2500 }),
+      ]);
+      await expect(auditEvents()).resolves.toEqual([
+        expect.objectContaining({
+          actionedBy: admin.id,
+          details: [
+            {
+              fieldName: 'openRouterUsdMicrosPerCredit',
+              oldValue: '5000',
+              newValue: '2500',
+            },
+          ],
+        }),
+      ]);
+
+      // The same cost now converts at $0.0025 per credit: 10 credits.
+      await chargeCost(user, '0.025', 'after-change');
+      // A fractional cost at the new rate.
+      await chargeCost(user, '0.0000123', 'fractional');
+
+      await expect(deductionsOf(user)).resolves.toEqual([
+        {
+          credits: '5.000000',
+          costUsd: '0.025000000000',
+          usdMicrosPerCredit: 5000,
+        },
+        {
+          credits: '10.000000',
+          costUsd: '0.025000000000',
+          usdMicrosPerCredit: 2500,
+        },
+        {
+          credits: '0.004920',
+          costUsd: '0.000012300000',
+          usdMicrosPerCredit: 2500,
+        },
+      ]);
+      await expect(wallets().getBalance(user)).resolves.toMatchObject({
+        availableCredits: '84.99508',
+      });
+
+      // Changing the rate again never rewrites history.
+      await patchSettings(
+        { openRouterUsdMicrosPerCredit: 10000 },
+        bearerFor(admin),
+      ).expect(200);
+      await expect(deductionsOf(user)).resolves.toMatchObject([
+        { credits: '5.000000', usdMicrosPerCredit: 5000 },
+        { credits: '10.000000', usdMicrosPerCredit: 2500 },
+        { credits: '0.004920', usdMicrosPerCredit: 2500 },
+      ]);
+    });
+
+    it('refuses a deduction whose credits do not match its cost at the recorded rate', async () => {
+      const user = await userWithCredits(100);
+
+      await expect(
+        wallets().deduct({
+          authId: user,
+          credits: 4,
+          idempotencyKey: 'wrong-conversion',
+          cost: { usd: '0.025', usdMicrosPerCredit: 5000 },
+        }),
+      ).rejects.toMatchObject({ status: 400 });
+      // PostgreSQL enforces the same conversion on the ledger.
+      await chargeCost(user, '0.025', 'right-conversion');
+      await expect(
+        db.$executeRaw`UPDATE "CreditTransaction" SET "usdMicrosPerCredit" = 2500
+          WHERE "type" = 'DEDUCTION' AND "costUsd" IS NOT NULL`,
+      ).rejects.toThrow();
+      await expect(deductionsOf(user)).resolves.toEqual([
+        {
+          credits: '5.000000',
+          costUsd: '0.025000000000',
+          usdMicrosPerCredit: 5000,
+        },
+      ]);
     });
   });
 

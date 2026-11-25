@@ -1,3 +1,4 @@
+import type { AiUsageReport } from '../ai.gateway';
 import type {
   AiImageInput,
   AiOperation,
@@ -19,11 +20,7 @@ export interface StructuredGenerationResponse {
   value: unknown;
   responseId?: string;
   model: string;
-  usage?: {
-    promptTokens?: number;
-    completionTokens?: number;
-    totalTokens?: number;
-  };
+  usage?: AiUsageReport;
 }
 
 export interface StructuredAiProvider {
