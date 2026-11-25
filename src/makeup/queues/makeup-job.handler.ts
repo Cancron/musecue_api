@@ -122,6 +122,11 @@ export class MakeupJobHandler implements JobHandler<MakeupAiJob> {
     if (!claim.count) return;
 
     try {
+      // An earlier attempt of this run may have been interrupted after its
+      // response was recorded: that usage can no longer be charged.
+      if (data.billable) {
+        await this.credits.closePendingForRun(this.prisma, data.runId);
+      }
       // A billable request is only made while the user can still pay for it
       // (available credits or session overage room); the cost is charged
       // when the result is published.
@@ -522,7 +527,11 @@ export class MakeupJobHandler implements JobHandler<MakeupAiJob> {
       await this.prisma.$transaction(async (tx) => {
         if (!(await canPublishRun(tx, data, startedAt))) return;
         await write(tx);
-        if (usage) await this.credits.chargeInTransaction(tx, usage.id);
+        if (usage) {
+          await this.credits.chargeInTransaction(tx, usage.id);
+          // Any other pending usage of this run (earlier attempts) is closed.
+          await this.credits.closePendingForRun(tx, data.runId);
+        }
         await this.completeRun(tx, data.runId, result, startedAt, metadata);
       });
     } catch (error) {

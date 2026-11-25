@@ -295,3 +295,32 @@ export function creditsForCost(
     .dividedBy(usdMicrosPerCredit)
     .toDecimalPlaces(CREDIT_DECIMAL_PLACES, Prisma.Decimal.ROUND_HALF_UP);
 }
+
+export interface OverageRoomInput {
+  /** The session's limit: fixed when it first used overage, else the setting. */
+  sessionLimit: CreditAmount;
+  /** Overage the session has used so far. */
+  sessionUsed: CreditAmount;
+  /** The user's unpaid overage across all sessions. */
+  walletOutstanding: CreditAmount;
+  /** CreditSettings.sessionOverageAllowanceCredits now. */
+  allowance: CreditAmount;
+  /**
+   * Whether the session was started with credits: it spends available
+   * credits in this deduction, or has spent some before.
+   */
+  funded: boolean;
+}
+
+/**
+ * Overage a deduction for a makeup session may use beyond the balance: the
+ * session's remaining allowance, and never more than the user's remaining
+ * allowance across all sessions (so several sessions cannot each add the
+ * allowance). A session that was never funded with credits gets none.
+ */
+export function overageRoomFor(input: OverageRoomInput): CreditAmount {
+  if (!input.funded) return ZERO_CREDITS;
+  const session = sessionOverageRoom(input.sessionLimit, input.sessionUsed);
+  const wallet = sessionOverageRoom(input.allowance, input.walletOutstanding);
+  return minCredits(session, wallet);
+}

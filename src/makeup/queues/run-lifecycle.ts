@@ -84,6 +84,12 @@ export async function failRun(
       },
     });
     if (!changed.count) return;
+    // A failed run is never charged: close usage still pending for it (e.g.
+    // recorded by an attempt that was interrupted before publishing).
+    await tx.aiUsage.updateMany({
+      where: { aiRunId: runId, chargeStatus: 'PENDING' },
+      data: { chargeStatus: 'NOT_CHARGED' },
+    });
     if (
       run.operation === 'PERSONALIZATION' ||
       run.operation === 'GUIDE_GENERATION'

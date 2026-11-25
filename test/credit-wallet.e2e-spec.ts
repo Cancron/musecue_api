@@ -6,6 +6,7 @@ import type { CustomLoggerService } from '../src/common/services/custom-logger.s
 import type { PrismaService } from '../src/common/services/prisma.service';
 import { CreditExpirySweepService } from '../src/credit/credit-expiry-sweep.service';
 import { CreditSettingsService } from '../src/credit/credit-settings.service';
+import { CreditUsageService } from '../src/credit/credit-usage.service';
 import { CreditWalletService } from '../src/credit/credit-wallet.service';
 import {
   TEST_DATABASE_URL,
@@ -562,50 +563,88 @@ describeWithDatabase('AI credit wallet and ledger (PostgreSQL)', () => {
       await reconcile(alice);
     });
 
-    it('fixes a session limit when it first uses overage; later settings changes apply to new sessions', async () => {
+    it("limits overage to funded sessions and to the allowance across all of the user's sessions", async () => {
       const admin = await newUser();
       const alice = await newUser();
       const first = await newSession(alice);
       const second = await newSession(alice);
+      await allocate(alice, CreditSource.PURCHASE, 1);
 
+      // The first session is funded: 1 credit from the balance + 2 overage.
       await wallets.deduct({
         authId: alice,
-        credits: 1,
+        credits: 3,
         idempotencyKey: 'first-1',
         sessionId: first,
       });
+      // The second session never had credits: no overage at all.
+      await expect(
+        wallets.deduct({
+          authId: alice,
+          credits: '0.1',
+          idempotencyKey: 'second-1',
+          sessionId: second,
+        }),
+      ).rejects.toMatchObject(INSUFFICIENT);
+
+      // Lowering the allowance to 2 stops further overage for the user, even
+      // though the first session's own limit (5) is not used up.
       await settings.updateSettings(
         { sessionOverageAllowanceCredits: 2 },
         { actionedBy: admin },
       );
+      await expect(
+        wallets.deduct({
+          authId: alice,
+          credits: '0.5',
+          idempotencyKey: 'first-2',
+          sessionId: first,
+        }),
+      ).rejects.toMatchObject(INSUFFICIENT);
 
-      // The first session keeps its limit of 5 (4 left)...
-      await wallets.deduct({
-        authId: alice,
-        credits: 4,
-        idempotencyKey: 'first-2',
-        sessionId: first,
-      });
-      // ...the second session gets the new limit of 2.
+      // With an allowance of 4 the first session may use 2 more.
+      await settings.updateSettings(
+        { sessionOverageAllowanceCredits: 4 },
+        { actionedBy: admin },
+      );
       await expect(
         wallets.deduct({
           authId: alice,
           credits: '2.000001',
-          idempotencyKey: 'second-1',
-          sessionId: second,
+          idempotencyKey: 'first-3',
+          sessionId: first,
         }),
       ).rejects.toMatchObject(INSUFFICIENT);
       await wallets.deduct({
         authId: alice,
         credits: 2,
-        idempotencyKey: 'second-2',
-        sessionId: second,
+        idempotencyKey: 'first-4',
+        sessionId: first,
       });
 
       await expect(wallets.getBalance(alice)).resolves.toMatchObject({
-        outstandingOverageCredits: '7',
+        availableCredits: '0',
+        outstandingOverageCredits: '4',
       });
+      const rows = await client.creditSessionOverage.findMany({
+        where: { sessionId: { in: [first, second] } },
+      });
+      expect(
+        rows.map((row) => [
+          row.sessionId,
+          row.limitCredits.toFixed(),
+          row.overageCredits.toFixed(),
+        ]),
+      ).toEqual([[first, '5', '4']]);
       await reconcile(alice);
+
+      // PostgreSQL refuses any write that raises the overage past the allowance.
+      await expect(
+        client.$transaction(async (tx) => {
+          await tx.$executeRaw`UPDATE "CreditWallet" SET "outstandingOverageCredits" = 4.5
+            WHERE "authId" = ${alice}`;
+        }),
+      ).rejects.toThrow();
       await settings.updateSettings(
         { sessionOverageAllowanceCredits: 5 },
         { actionedBy: admin },
@@ -873,6 +912,11 @@ describeWithDatabase('AI credit wallet and ledger (PostgreSQL)', () => {
       const sweeper = new CreditExpirySweepService(
         wallets,
         mock<CustomLoggerService>(),
+        new CreditUsageService(
+          client as unknown as PrismaService,
+          settings,
+          wallets,
+        ),
       );
       const t0 = new Date(Date.now() - 48 * HOUR);
       const idle = [await newUser(), await newUser()];
@@ -991,6 +1035,8 @@ describeWithDatabase('AI credit wallet and ledger (PostgreSQL)', () => {
       );
 
       const session = await newSession(bob);
+      // A funded session that goes into overage: 0.5 credit + 1.5 overage.
+      await grant(bob, 'PURCHASE', 'bob-start', '0.5');
       await wallets.deduct({
         authId: bob,
         credits: 2,

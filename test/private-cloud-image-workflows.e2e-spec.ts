@@ -49,12 +49,15 @@ jest.setTimeout(60_000);
  * requests may be made, and no usage is recorded or charged. A plain object,
  * so jest.resetAllMocks() cannot change it.
  */
-const creditsNotUnderTest = {
+const creditsNotUnderTestStub = {
   hasSpendableCredits: () => Promise.resolve(true),
+  closePendingForRun: () => Promise.resolve(0),
   recordUsage: () => Promise.resolve(null),
   chargeInTransaction: () => Promise.resolve(undefined),
   close: () => Promise.resolve(undefined),
-} as unknown as CreditUsageService;
+} satisfies Partial<Record<keyof CreditUsageService, unknown>>;
+const creditsNotUnderTest =
+  creditsNotUnderTestStub as unknown as CreditUsageService;
 
 type ImageFormat = 'jpeg' | 'png' | 'webp';
 

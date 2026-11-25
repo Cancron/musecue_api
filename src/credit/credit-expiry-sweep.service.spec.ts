@@ -5,6 +5,7 @@ import {
   CREDIT_EXPIRY_MAX_BATCHES,
   CreditExpirySweepService,
 } from './credit-expiry-sweep.service';
+import type { CreditUsageService } from './credit-usage.service';
 import type { CreditWalletService } from './credit-wallet.service';
 
 const batch = (wallets: number, expiredAllocations = wallets, failed = 0) => ({
@@ -12,17 +13,26 @@ const batch = (wallets: number, expiredAllocations = wallets, failed = 0) => ({
   expiredAllocations,
   failedWallets: failed,
 });
+/** A sweep's result: its batches' totals plus reconciled AI usages. */
+const swept = (
+  wallets: number,
+  expiredAllocations = wallets,
+  failed = 0,
+  reconciledUsages = 0,
+) => ({ ...batch(wallets, expiredAllocations, failed), reconciledUsages });
 
 describe('CreditExpirySweepService', () => {
   const wallets = mock<CreditWalletService>();
   const logger = mock<CustomLoggerService>();
+  const usage = mock<CreditUsageService>();
   const originalEnv = { ...process.env };
   let sweeper: CreditExpirySweepService;
 
   beforeEach(() => {
     jest.resetAllMocks();
     process.env = { ...originalEnv };
-    sweeper = new CreditExpirySweepService(wallets, logger);
+    sweeper = new CreditExpirySweepService(wallets, logger, usage);
+    usage.reconcileStaleUsage.mockResolvedValue(0);
   });
 
   afterEach(async () => {
@@ -84,11 +94,9 @@ describe('CreditExpirySweepService', () => {
         .mockResolvedValueOnce(batch(CREDIT_EXPIRY_BATCH_SIZE))
         .mockResolvedValueOnce(batch(7));
 
-      await expect(sweeper.sweep(now)).resolves.toEqual({
-        wallets: 2 * CREDIT_EXPIRY_BATCH_SIZE + 7,
-        expiredAllocations: 2 * CREDIT_EXPIRY_BATCH_SIZE + 7,
-        failedWallets: 0,
-      });
+      await expect(sweeper.sweep(now)).resolves.toEqual(
+        swept(2 * CREDIT_EXPIRY_BATCH_SIZE + 7),
+      );
       expect(wallets.expireAllDueCredits.mock.calls).toEqual(
         Array(3).fill([{ now, batchSize: CREDIT_EXPIRY_BATCH_SIZE }]),
       );
@@ -121,11 +129,11 @@ describe('CreditExpirySweepService', () => {
     it('never throws, logs the failure and retries on the next sweep', async () => {
       wallets.expireAllDueCredits.mockRejectedValueOnce(new Error('down'));
 
-      await expect(sweeper.sweep(now)).resolves.toEqual(batch(0));
+      await expect(sweeper.sweep(now)).resolves.toEqual(swept(0));
       expect(logger.warn.mock.calls).toHaveLength(1);
 
       wallets.expireAllDueCredits.mockResolvedValueOnce(batch(1));
-      await expect(sweeper.sweep(now)).resolves.toEqual(batch(1));
+      await expect(sweeper.sweep(now)).resolves.toEqual(swept(1));
     });
 
     it('does not run two sweeps at once in one process', async () => {
@@ -139,7 +147,7 @@ describe('CreditExpirySweepService', () => {
       const first = sweeper.sweep(now);
       await expect(sweeper.sweep(now)).resolves.toBeNull();
       release(batch(0));
-      await expect(first).resolves.toEqual(batch(0));
+      await expect(first).resolves.toEqual(swept(0));
     });
 
     it('shutdown waits for the batch in progress, then stops sweeping', async () => {
@@ -153,6 +161,8 @@ describe('CreditExpirySweepService', () => {
         .mockResolvedValue(batch(CREDIT_EXPIRY_BATCH_SIZE));
 
       const sweep = sweeper.sweep(now);
+      // Let the sweep reach its first batch (after reconciling usage).
+      await new Promise((resolve) => setImmediate(resolve));
       let stopped = false;
       const shutdown = sweeper.onModuleDestroy().then(() => {
         stopped = true;
@@ -167,6 +177,14 @@ describe('CreditExpirySweepService', () => {
       });
       expect(wallets.expireAllDueCredits.mock.calls).toHaveLength(1);
       await expect(sweeper.sweep(now)).resolves.toBeNull();
+    });
+
+    it('reconciles AI usage left pending by interrupted runs', async () => {
+      wallets.expireAllDueCredits.mockResolvedValue(batch(0));
+      usage.reconcileStaleUsage.mockResolvedValue(3);
+
+      await expect(sweeper.sweep(now)).resolves.toEqual(swept(0, 0, 0, 3));
+      expect(logger.log.mock.calls).toHaveLength(1);
     });
 
     it('stays quiet when nothing was due', async () => {

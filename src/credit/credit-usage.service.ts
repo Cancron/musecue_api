@@ -10,7 +10,6 @@ import {
   creditsForCost,
   formatCredits,
   parseUsdCost,
-  sessionOverageRoom,
   ZERO_CREDITS,
 } from './credit-ledger.policy';
 import { CreditSettingsService } from './credit-settings.service';
@@ -79,29 +78,55 @@ export class CreditUsageService {
 
   /**
    * Whether the user can still pay for AI work in this session: available
-   * credits, or room left in the session's overage allowance. Checked before
-   * a provider request is made.
+   * credits, or overage room for this session (a session started with
+   * credits, within its own and the user's overage allowance). Checked
+   * before a provider request is made; the charge re-checks under the lock.
    */
   async hasSpendableCredits(
     authId: string,
     sessionId: string,
     now: Date = new Date(),
   ): Promise<boolean> {
-    const balance = await this.wallets.getBalance(authId, now);
-    if (/[1-9]/.test(balance.availableCredits)) return true;
-    const overage = await this.prisma.creditSessionOverage.findUnique({
-      where: { sessionId },
-      select: { limitCredits: true, overageCredits: true },
+    const spendable = await this.wallets.spendableForSession(
+      authId,
+      sessionId,
+      now,
+    );
+    return (
+      /[1-9]/.test(spendable.availableCredits) ||
+      /[1-9]/.test(spendable.overageRoomCredits)
+    );
+  }
+
+  /**
+   * Closes the PENDING usages of a run (NOT_CHARGED), e.g. of an earlier
+   * attempt that was interrupted between recording its response and
+   * publishing it. A run's charge is made by the publishing transaction only,
+   * so a usage that is still pending when the run moves on is never charged.
+   */
+  async closePendingForRun(client: Tx, aiRunId: string): Promise<number> {
+    const { count } = await client.aiUsage.updateMany({
+      where: { aiRunId, chargeStatus: AiUsageChargeStatus.PENDING },
+      data: { chargeStatus: AiUsageChargeStatus.NOT_CHARGED },
     });
-    const limit =
-      overage?.limitCredits ??
-      new Prisma.Decimal(
-        (await this.settings.getSettings()).sessionOverageAllowanceCredits,
-      );
-    return sessionOverageRoom(
-      limit,
-      overage?.overageCredits ?? ZERO_CREDITS,
-    ).gt(0);
+    return count;
+  }
+
+  /**
+   * Reconciles usages left PENDING by an interrupted worker (for example the
+   * process died between recording a response and publishing it): those
+   * whose run has completed or failed, or no longer exists, are closed as
+   * NOT_CHARGED. Their run was charged at most once, by its publication.
+   */
+  async reconcileStaleUsage(): Promise<number> {
+    return this.prisma.$executeRaw`
+      UPDATE "AiUsage" u SET "chargeStatus" = 'NOT_CHARGED',
+          "updatedAt" = (now() AT TIME ZONE 'UTC')
+      WHERE u."chargeStatus" = 'PENDING'
+        AND NOT EXISTS (
+          SELECT 1 FROM "AiRun" r
+          WHERE r."id" = u."aiRunId" AND r."status" IN ('QUEUED', 'PROCESSING')
+        )`;
   }
 
   /**

@@ -264,39 +264,36 @@ describe('CreditUsageService', () => {
     });
 
     it.each([
-      ['available credits', '0.5', null, true],
-      ['no credits but overage room', '0', { used: '2', limit: '5' }, true],
-      [
-        'no credits and the overage used up',
-        '0',
-        { used: '5', limit: '5' },
-        false,
-      ],
-      [
-        'no credits and a fresh session (configured allowance)',
-        '0',
-        null,
-        true,
-      ],
+      ['available credits', '0.5', '0', true],
+      ['no credits but overage room for this session', '0', '2.5', true],
+      ['no credits and no overage room', '0', '0', false],
     ])(
       'with %s, a request can be made: %p',
-      async (_case, available, overage, expected) => {
-        wallets.getBalance.mockResolvedValue({
-          availableCredits: available,
-        } as never);
-        prisma.creditSessionOverage.findUnique.mockResolvedValue(
-          overage
-            ? ({
-                limitCredits: d(overage.limit),
-                overageCredits: d(overage.used),
-              } as never)
-            : null,
-        );
+      async (_case, availableCredits, overageRoomCredits, expected) => {
+        wallets.spendableForSession.mockResolvedValue({
+          availableCredits,
+          overageRoomCredits,
+        });
 
         await expect(
           service.hasSpendableCredits('user-1', 'session-1', NOW),
         ).resolves.toBe(expected);
+        expect(wallets.spendableForSession.mock.calls).toEqual([
+          ['user-1', 'session-1', NOW],
+        ]);
       },
     );
+
+    it('closes the pending usages of a run (e.g. an interrupted attempt)', async () => {
+      prisma.aiUsage.updateMany.mockResolvedValue({ count: 2 });
+
+      await expect(service.closePendingForRun(prisma, 'run-1')).resolves.toBe(
+        2,
+      );
+      expect(prisma.aiUsage.updateMany.mock.calls[0]?.[0]).toEqual({
+        where: { aiRunId: 'run-1', chargeStatus: 'PENDING' },
+        data: { chargeStatus: 'NOT_CHARGED' },
+      });
+    });
   });
 });

@@ -1,5 +1,6 @@
 import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { CustomLoggerService } from '../common/services/custom-logger.service';
+import { CreditUsageService } from './credit-usage.service';
 import { CreditWalletService } from './credit-wallet.service';
 
 const DEFAULT_SWEEP_INTERVAL_MS = 60_000;
@@ -13,6 +14,8 @@ export interface CreditExpirySweepResult {
   wallets: number;
   expiredAllocations: number;
   failedWallets: number;
+  /** AI usages left pending by interrupted runs, closed as not charged. */
+  reconciledUsages: number;
 }
 
 /**
@@ -42,6 +45,7 @@ export class CreditExpirySweepService implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly wallets: CreditWalletService,
     private readonly logger: CustomLoggerService,
+    private readonly usage: CreditUsageService,
   ) {}
 
   onModuleInit(): void {
@@ -93,8 +97,10 @@ export class CreditExpirySweepService implements OnModuleInit, OnModuleDestroy {
       wallets: 0,
       expiredAllocations: 0,
       failedWallets: 0,
+      reconciledUsages: 0,
     };
     try {
+      total.reconciledUsages = await this.usage.reconcileStaleUsage();
       for (let batch = 0; batch < CREDIT_EXPIRY_MAX_BATCHES; batch += 1) {
         if (this.stopping) break;
         const result = await this.wallets.expireAllDueCredits({
@@ -119,9 +125,13 @@ export class CreditExpirySweepService implements OnModuleInit, OnModuleDestroy {
         CreditExpirySweepService.name,
       );
     }
-    if (total.expiredAllocations > 0 || total.failedWallets > 0) {
+    if (
+      total.expiredAllocations > 0 ||
+      total.failedWallets > 0 ||
+      total.reconciledUsages > 0
+    ) {
       this.logger.log(
-        `Credit expiry sweep: ${total.expiredAllocations} allocation(s) expired in ${total.wallets} wallet(s), ${total.failedWallets} wallet(s) failed`,
+        `Credit expiry sweep: ${total.expiredAllocations} allocation(s) expired in ${total.wallets} wallet(s), ${total.failedWallets} wallet(s) failed, ${total.reconciledUsages} interrupted AI usage(s) reconciled`,
         CreditExpirySweepService.name,
       );
     }

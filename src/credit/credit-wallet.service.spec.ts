@@ -445,27 +445,110 @@ describe('CreditWalletService', () => {
       });
     });
 
-    it('keeps the session limit fixed once the session has used overage', async () => {
-      prisma.makeupSession.findFirst.mockResolvedValue({
-        id: 'session-1',
-      } as never);
+    /**
+     * The wallet's last ledger sequence, and whether the session already
+     * spent from the balance (a DEDUCTION with a negative amount).
+     */
+    const givenLedger = (lastSequence: number, sessionFunded: boolean) =>
+      prisma.creditTransaction.findFirst.mockImplementation(((args: {
+        where: { type?: string };
+      }) =>
+        Promise.resolve(
+          args.where.type === 'DEDUCTION'
+            ? sessionFunded
+              ? { id: 'earlier-deduction' }
+              : null
+            : { sequence: lastSequence },
+        )) as never);
+    const sessionRow = (limit: string, used: string) =>
       prisma.creditSessionOverage.findUnique.mockResolvedValue({
         id: 'overage-1',
         walletId: WALLET_ID,
         sessionId: 'session-1',
-        limitCredits: d(2),
-        overageCredits: d('1.5'),
+        limitCredits: d(limit),
+        overageCredits: d(used),
         settledCredits: d(0),
         createdAt: NOW,
         updatedAt: NOW,
       });
-      givenWallet({ outstandingOverageCredits: d('1.5') }, 4);
 
-      // The settings now allow 5, but this session keeps its limit of 2.
-      await expect(
-        service.deduct({ ...deduction, credits: '1', sessionId: 'session-1' }),
-      ).rejects.toMatchObject(INSUFFICIENT);
-      expect(settings.getSettings.mock.calls).toHaveLength(0);
+    describe('session overage rules', () => {
+      beforeEach(() => {
+        prisma.makeupSession.findFirst.mockResolvedValue({
+          id: 'session-1',
+        } as never);
+        prisma.creditAllocation.findMany.mockResolvedValue([]);
+      });
+
+      it('keeps the session limit fixed once the session has used overage', async () => {
+        prisma.creditWallet.findUniqueOrThrow.mockResolvedValue(
+          wallet({ outstandingOverageCredits: d('1.5') }),
+        );
+        givenLedger(4, true);
+        sessionRow('2', '1.5');
+
+        // The settings allow 5, but this session keeps its limit of 2.
+        await expect(
+          service.deduct({
+            ...deduction,
+            credits: '1',
+            sessionId: 'session-1',
+          }),
+        ).rejects.toMatchObject(INSUFFICIENT);
+        await expect(
+          service.deduct({
+            ...deduction,
+            credits: '0.5',
+            sessionId: 'session-1',
+          }),
+        ).resolves.toMatchObject({
+          transaction: { overageChangeCredits: '0.5' },
+        });
+      });
+
+      it('gives no overage to a session that was never funded with credits', async () => {
+        prisma.creditWallet.findUniqueOrThrow.mockResolvedValue(wallet());
+        givenLedger(2, false);
+        prisma.creditSessionOverage.findUnique.mockResolvedValue(null);
+
+        await expect(
+          service.deduct({
+            ...deduction,
+            credits: '0.1',
+            sessionId: 'session-1',
+          }),
+        ).rejects.toMatchObject(INSUFFICIENT);
+        expect(prisma.creditTransaction.create.mock.calls).toHaveLength(0);
+      });
+
+      it('caps a session by the overage the user has left across all sessions', async () => {
+        // Another session already used 4 of the user's allowance of 5.
+        prisma.creditWallet.findUniqueOrThrow.mockResolvedValue(
+          wallet({ outstandingOverageCredits: d(4) }),
+        );
+        givenLedger(6, true);
+        prisma.creditSessionOverage.findUnique.mockResolvedValue(null);
+
+        await expect(
+          service.deduct({
+            ...deduction,
+            credits: '1.5',
+            sessionId: 'session-1',
+          }),
+        ).rejects.toMatchObject(INSUFFICIENT);
+        await expect(
+          service.deduct({
+            ...deduction,
+            credits: '1',
+            sessionId: 'session-1',
+          }),
+        ).resolves.toMatchObject({
+          transaction: {
+            overageChangeCredits: '1',
+            outstandingOverageAfterCredits: '5',
+          },
+        });
+      });
     });
 
     it('refuses a session that does not belong to the user (404)', async () => {

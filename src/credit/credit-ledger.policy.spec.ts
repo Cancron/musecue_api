@@ -2,6 +2,7 @@ import { CreditSource, Prisma } from '@prisma/client';
 import {
   assertAllocationExpiry,
   creditsForCost,
+  overageRoomFor,
   parseUsdCost,
   compareSpendingOrder,
   CreditRuleViolation,
@@ -335,6 +336,56 @@ describe('credit ledger policy', () => {
       [undefined],
     ])('reports no usable cost for %p', (value) => {
       expect(parseUsdCost(value)).toBeNull();
+    });
+  });
+
+  describe('overageRoomFor', () => {
+    const room = (input: {
+      sessionLimit?: string;
+      sessionUsed?: string;
+      walletOutstanding?: string;
+      allowance?: string;
+      funded?: boolean;
+    }) =>
+      formatCredits(
+        overageRoomFor({
+          sessionLimit: d(input.sessionLimit ?? '5'),
+          sessionUsed: d(input.sessionUsed ?? '0'),
+          walletOutstanding: d(input.walletOutstanding ?? '0'),
+          allowance: d(input.allowance ?? '5'),
+          funded: input.funded ?? true,
+        }),
+      );
+
+    it('is the whole allowance for a funded session of a user without overage', () => {
+      expect(room({})).toBe('5');
+    });
+
+    it("is the session's remaining allowance", () => {
+      expect(room({ sessionUsed: '3.5', walletOutstanding: '3.5' })).toBe(
+        '1.5',
+      );
+    });
+
+    it('never exceeds what the user has left across sessions', () => {
+      expect(room({ walletOutstanding: '4' })).toBe('1');
+      expect(room({ walletOutstanding: '5' })).toBe('0');
+      // The allowance was lowered below what is outstanding.
+      expect(room({ walletOutstanding: '4', allowance: '2' })).toBe('0');
+    });
+
+    it("keeps a session's fixed limit", () => {
+      expect(
+        room({
+          sessionLimit: '2',
+          sessionUsed: '1.5',
+          walletOutstanding: '1.5',
+        }),
+      ).toBe('0.5');
+    });
+
+    it('is zero for a session never funded with credits', () => {
+      expect(room({ funded: false })).toBe('0');
     });
   });
 });

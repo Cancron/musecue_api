@@ -19,9 +19,9 @@ import {
   parseCreditAmount,
   planDeduction,
   planOverageSettlement,
-  sessionOverageRoom,
   ZERO_CREDITS,
   creditsForCost,
+  overageRoomFor,
   parseUsdCost,
 } from './credit-ledger.policy';
 import { CreditSettingsService } from './credit-settings.service';
@@ -652,24 +652,20 @@ export class CreditWalletService {
     let overageLimit = ZERO_CREDITS;
     let overageRoom = ZERO_CREDITS;
     if (sessionId !== undefined) {
-      const row = await tx.creditSessionOverage.findUnique({
-        where: { sessionId },
-      });
-      if (row && row.walletId !== cursor.walletId) {
-        throw new CreditConflictError(
-          'The session overage belongs to another user',
-        );
-      }
-      overageRow = row;
-      overageLimit =
-        row?.limitCredits ??
-        new Prisma.Decimal(
-          (await this.settings.getSettings(tx)).sessionOverageAllowanceCredits,
-        );
-      overageRoom = sessionOverageRoom(
-        overageLimit,
-        row?.overageCredits ?? ZERO_CREDITS,
+      const available = allocations.reduce(
+        (sum, allocation) => sum.plus(allocation.remainingCredits),
+        ZERO_CREDITS,
       );
+      const overage = await this.sessionOverage(
+        tx,
+        cursor.walletId,
+        cursor.overage,
+        sessionId,
+        available,
+      );
+      overageRow = overage.row;
+      overageLimit = overage.limit;
+      overageRoom = overage.room;
     }
 
     const plan = planDeduction(allocations, credits, overageRoom, now);
@@ -730,6 +726,96 @@ export class CreditWalletService {
 
     await this.saveWallet(tx, cursor);
     return { duplicate: false, transaction };
+  }
+
+  /**
+   * What a makeup session can still spend at `now`: the user's available
+   * credits and the session's overage room (see sessionOverage). Read-only;
+   * the deduction re-checks the same rules under the wallet lock.
+   */
+  async spendableForSession(
+    authId: string,
+    sessionId: string,
+    now: Date = new Date(),
+  ): Promise<{ availableCredits: string; overageRoomCredits: string }> {
+    const wallet = await this.prisma.creditWallet.findUnique({
+      where: { authId },
+      select: { id: true, outstandingOverageCredits: true },
+    });
+    if (!wallet) return { availableCredits: '0', overageRoomCredits: '0' };
+    const open = await this.prisma.creditAllocation.findMany({
+      where: {
+        walletId: wallet.id,
+        remainingCredits: { gt: 0 },
+        OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
+      },
+      select: { remainingCredits: true },
+    });
+    const available = open.reduce(
+      (sum, allocation) => sum.plus(allocation.remainingCredits),
+      ZERO_CREDITS,
+    );
+    const { room } = await this.sessionOverage(
+      this.prisma,
+      wallet.id,
+      wallet.outstandingOverageCredits,
+      sessionId,
+      available,
+    );
+    return {
+      availableCredits: formatCredits(available),
+      overageRoomCredits: formatCredits(room),
+    };
+  }
+
+  /**
+   * The overage a session may still use (overageRoomFor): its own remaining
+   * allowance (the limit is fixed when the session first uses overage),
+   * capped by the user's remaining allowance across all sessions, and only
+   * for a session started with credits: one that spends available credits
+   * now, or already spent some (a DEDUCTION from the balance for it).
+   */
+  private async sessionOverage(
+    client: Tx,
+    walletId: string,
+    walletOutstanding: CreditAmount,
+    sessionId: string,
+    available: CreditAmount,
+  ) {
+    const row = await client.creditSessionOverage.findUnique({
+      where: { sessionId },
+    });
+    if (row && row.walletId !== walletId) {
+      throw new CreditConflictError(
+        'The session overage belongs to another user',
+      );
+    }
+    const allowance = new Prisma.Decimal(
+      (await this.settings.getSettings(client)).sessionOverageAllowanceCredits,
+    );
+    const funded =
+      available.gt(0) ||
+      (await client.creditTransaction.findFirst({
+        where: {
+          walletId,
+          sessionId,
+          type: CreditTransactionType.DEDUCTION,
+          amountCredits: { lt: 0 },
+        },
+        select: { id: true },
+      })) !== null;
+    const limit = row?.limitCredits ?? allowance;
+    return {
+      row,
+      limit,
+      room: overageRoomFor({
+        sessionLimit: limit,
+        sessionUsed: row?.overageCredits ?? ZERO_CREDITS,
+        walletOutstanding,
+        allowance,
+        funded,
+      }),
+    };
   }
 
   /**
