@@ -98,6 +98,7 @@ const USER_DATA_TABLES = [
   'AuthChallenge',
   'InfrastructureJob',
   'MfaEnrollment',
+  'MfaRecoveryCode',
 ] as const;
 
 describeWithDatabase('Account erasure (PostgreSQL)', () => {
@@ -318,6 +319,17 @@ describeWithDatabase('Account erasure (PostgreSQL)', () => {
             failedAttempts: 1,
             failureWindowStartedAt: new Date(),
           },
+        },
+        // MFA recovery codes (stored as keyed hashes): one used, one not.
+        mfaRecoveryCodes: {
+          create: [
+            { batchId: `batch-${tag}`, codeHash: 'c'.repeat(64) },
+            {
+              batchId: `batch-${tag}`,
+              codeHash: 'd'.repeat(64),
+              usedAt: new Date(),
+            },
+          ],
         },
         // A background job of the PostgreSQL queue driver (a failed email
         // kept for diagnosis).

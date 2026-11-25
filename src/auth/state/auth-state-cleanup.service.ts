@@ -7,6 +7,8 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { WINSTON_MODULE_PROVIDER } from 'nest-winston';
 import type { Logger } from 'winston';
+import { MFA_RECOVERY_CODES } from '../mfa/mfa.constants';
+import { MfaCredentialsRepository } from '../mfa/mfa-credentials.repository';
 import { MfaEnrollmentRepository } from '../mfa/mfa-enrollment.repository';
 import { AuthChallengeRepository } from './auth-challenge.repository';
 import { OAuthStateRepository } from './oauth-state.repository';
@@ -16,7 +18,8 @@ export const AUTH_STATE_CLEANUP_INTERVAL_MS = 60 * 60_000;
 
 /**
  * Removes expired authentication state (refresh sessions, one-time codes,
- * OAuth states, finished MFA enrollments) every hour. Expired rows never authenticate anything; the
+ * OAuth states, finished MFA enrollments, MFA recovery codes replaced more
+ * than 30 days ago) every hour. Expired rows never authenticate anything; the
  * sweep only keeps the tables small.
  */
 @Injectable()
@@ -29,6 +32,7 @@ export class AuthStateCleanupService implements OnModuleInit, OnModuleDestroy {
     private readonly challenges: AuthChallengeRepository,
     private readonly oauthStates: OAuthStateRepository,
     private readonly mfaEnrollments: MfaEnrollmentRepository,
+    private readonly mfaCredentials: MfaCredentialsRepository,
     private readonly config: ConfigService,
     @Inject(WINSTON_MODULE_PROVIDER) private readonly logger: Logger,
   ) {}
@@ -53,6 +57,9 @@ export class AuthStateCleanupService implements OnModuleInit, OnModuleDestroy {
       await this.challenges.deleteExpired(now);
       await this.oauthStates.deleteExpired(now);
       await this.mfaEnrollments.deleteStale(now);
+      await this.mfaCredentials.deleteInvalidatedBefore(
+        new Date(now.getTime() - MFA_RECOVERY_CODES.INVALIDATED_RETENTION_MS),
+      );
     } catch (error) {
       this.logger.warn('Expired authentication state could not be removed', {
         context: 'AuthStateCleanup',

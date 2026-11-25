@@ -16,6 +16,45 @@ export interface MfaStatusView {
     /** Incorrect codes allowed before enrollment is blocked. */
     remainingAttempts: number;
   } | null;
+  /** Recovery codes (counts only, never the codes); null while MFA is off. */
+  recovery: {
+    /** Unused codes of the current set. */
+    remainingCodes: number;
+    generatedAt: Date | null;
+  } | null;
+  /** MFA verification attempts; null while MFA is off. */
+  verification: {
+    remainingAttempts: number;
+    /** While blocked after too many incorrect codes. */
+    blockedUntil: Date | null;
+  } | null;
+}
+
+/**
+ * The confirmed enrollment: the status plus the first recovery codes, the
+ * only time they are returned.
+ */
+export interface MfaActivationView extends MfaStatusView {
+  recoveryCodes: string[];
+}
+
+export type MfaVerificationMethod = 'totp' | 'recovery_code';
+
+/** POST /v1/auth/mfa/verify. */
+export interface MfaVerificationView {
+  verified: true;
+  method: MfaVerificationMethod;
+  /** Unused recovery codes left (regenerate before they run out). */
+  remainingRecoveryCodes: number;
+}
+
+/** POST /v1/auth/mfa/recovery-codes: the new set, returned only this once. */
+export interface MfaRecoveryCodesView {
+  recoveryCodes: string[];
+  generatedAt: Date;
+  remainingRecoveryCodes: number;
+  /** The factor that authorized the regeneration. */
+  verifiedWith: MfaVerificationMethod;
 }
 
 /**

@@ -5,6 +5,7 @@ import type { Logger } from 'winston';
 import { InMemoryMfaEnrollments } from '../../../test/support/in-memory-mfa-enrollments';
 import config from '../../common/config/app.config';
 import type { ActivityLogService } from '../../common/services/activity-log.service';
+import { MfaRecoveryCodeHasher } from './mfa-recovery-code.hasher';
 import { MfaSecretCipher } from './mfa-secret.cipher';
 import { MfaService } from './mfa.service';
 import { totpCode, totpTimeStep } from './totp';
@@ -38,6 +39,7 @@ async function rejection(promise: Promise<unknown>) {
 describe('MfaService (mfa)', () => {
   let store: InMemoryMfaEnrollments;
   let cipher: MfaSecretCipher;
+  let hasher: MfaRecoveryCodeHasher;
   let activityLog: ReturnType<typeof mock<ActivityLogService>>;
   let logger: ReturnType<typeof mock<Logger>>;
   let service: MfaService;
@@ -46,14 +48,21 @@ describe('MfaService (mfa)', () => {
   beforeEach(() => {
     config.jwt_refresh_secret = 'mfa-service-spec-refresh-secret-0123456789';
     store = new InMemoryMfaEnrollments();
-    cipher = new MfaSecretCipher(
-      new ConfigService({
-        MFA_ENCRYPTION_KEY: 'mfa-service-spec-dedicated-key-0123456789',
-      }),
-    );
+    const configService = new ConfigService({
+      MFA_ENCRYPTION_KEY: 'mfa-service-spec-dedicated-key-0123456789',
+    });
+    cipher = new MfaSecretCipher(configService);
+    hasher = new MfaRecoveryCodeHasher(configService);
     activityLog = mock<ActivityLogService>();
     logger = mock<Logger>();
-    service = new MfaService(store.asRepository(), cipher, activityLog, logger);
+    service = new MfaService(
+      store.asRepository(),
+      store.asCredentialsRepository(),
+      cipher,
+      hasher,
+      activityLog,
+      logger,
+    );
   });
   afterAll(() => {
     config.jwt_refresh_secret = originalRefreshSecret;
@@ -73,6 +82,8 @@ describe('MfaService (mfa)', () => {
             blockedUntil: null,
             remainingAttempts: 5,
           },
+          recovery: null,
+          verification: null,
         },
       );
     });
@@ -186,12 +197,16 @@ describe('MfaService (mfa)', () => {
         now,
       );
 
-      expect(status).toEqual({
+      const { recoveryCodes, ...statusWithoutCodes } = status;
+      expect(statusWithoutCodes).toEqual({
         enabled: true,
         method: 'totp',
         enabledAt: now,
         enrollment: null,
+        recovery: { remainingCodes: 10, generatedAt: now },
+        verification: { remainingAttempts: 5, blockedUntil: null },
       });
+      expect(recoveryCodes).toHaveLength(10);
       const stored = store.get(authId);
       expect(stored.account).toMatchObject({
         mfaEnabled: true,
@@ -211,13 +226,21 @@ describe('MfaService (mfa)', () => {
             changes: [
               { fieldName: 'mfaEnabled', oldValue: 'false', newValue: 'true' },
               { fieldName: 'mfaMethod', oldValue: null, newValue: 'totp' },
+              {
+                fieldName: 'mfaRecoveryCodesRemaining',
+                oldValue: null,
+                newValue: '10',
+              },
             ],
             metadata: { ...META, actionedBy: authId },
           }),
           expect.anything(),
         ],
       ]);
-      await expect(service.getStatus(authId, now)).resolves.toEqual(status);
+      // The status never contains the recovery codes again.
+      await expect(service.getStatus(authId, now)).resolves.toEqual(
+        statusWithoutCodes,
+      );
     });
 
     it('accepts a code for the rest of its 30-second step', async () => {
@@ -520,11 +543,13 @@ describe('MfaService (mfa)', () => {
       // The key changed after the enrollment started.
       const rotated = new MfaService(
         store.asRepository(),
+        store.asCredentialsRepository(),
         new MfaSecretCipher(
           new ConfigService({
             MFA_ENCRYPTION_KEY: 'a-different-key-0123456789abcdefghij',
           }),
         ),
+        hasher,
         activityLog,
         logger,
       );
@@ -541,7 +566,9 @@ describe('MfaService (mfa)', () => {
       const user = store.addUser();
       const unconfigured = new MfaService(
         store.asRepository(),
+        store.asCredentialsRepository(),
         new MfaSecretCipher(new ConfigService({ MFA_ENCRYPTION_KEY: 'short' })),
+        hasher,
         activityLog,
         logger,
       );

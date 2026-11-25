@@ -82,3 +82,29 @@ export function decryptStoredSecret(
     decipher.final(),
   ]).toString('utf8');
 }
+
+/**
+ * The documented stored form of an MFA recovery code: HMAC-SHA-256 (hex)
+ * under HKDF-SHA-256(root key, salt `musecue-derived-secrets`, info
+ * `musecue/mfa-recovery-code/v1`) over `<user id>\0<code>`, where the code is
+ * upper-case without hyphens or spaces.
+ */
+export function recoveryCodeHash(
+  rootKey: string,
+  authId: string,
+  code: string,
+): string {
+  const key = Buffer.from(
+    hkdfSync(
+      'sha256',
+      rootKey,
+      'musecue-derived-secrets',
+      'musecue/mfa-recovery-code/v1',
+      32,
+    ),
+  );
+  const normalized = code.replace(/[\s-]/g, '').toUpperCase();
+  return createHmac('sha256', key)
+    .update(`${authId}\u0000${normalized}`, 'utf8')
+    .digest('hex');
+}

@@ -21,10 +21,19 @@ import {
 import { UserRole } from '../interfaces/auth.interface';
 import { AuthUtilsService } from '../services/auth-utils.service';
 import type { RateLimitStore } from '../../infrastructure/rate-limit/rate-limit.store';
+import { MfaCredentialsRepository } from './mfa-credentials.repository';
 import { MfaEnrollmentRepository } from './mfa-enrollment.repository';
+import { MfaRecoveryCodeHasher } from './mfa-recovery-code.hasher';
+import { MfaVerificationService } from './mfa-verification.service';
 import { MfaSecretCipher } from './mfa-secret.cipher';
 import { MfaController } from './mfa.controller';
-import type { MfaEnrollmentView, MfaStatusView } from './mfa.interface';
+import type {
+  MfaActivationView,
+  MfaEnrollmentView,
+  MfaRecoveryCodesView,
+  MfaStatusView,
+  MfaVerificationView,
+} from './mfa.interface';
 import { MfaService } from './mfa.service';
 import { totpCode, totpTimeStep } from './totp';
 
@@ -76,8 +85,17 @@ describe('MFA enrollment routes (mfa, HTTP)', () => {
       controllers: [MfaController],
       providers: [
         MfaService,
+        MfaVerificationService,
         AuthGuard,
         { provide: MfaEnrollmentRepository, useValue: store.asRepository() },
+        {
+          provide: MfaCredentialsRepository,
+          useValue: store.asCredentialsRepository(),
+        },
+        {
+          provide: MfaRecoveryCodeHasher,
+          useValue: new MfaRecoveryCodeHasher(new ConfigService({})),
+        },
         {
           provide: MfaSecretCipher,
           useValue: new MfaSecretCipher(new ConfigService({})),
@@ -282,5 +300,138 @@ describe('MFA enrollment routes (mfa, HTTP)', () => {
       .get('/v1/auth/mfa')
       .set('Authorization', as(user.account.authId))
       .expect(401);
+  });
+
+  describe('recovery codes', () => {
+    const CODE_PATTERN = /[0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}/;
+
+    /** A user with MFA enabled over HTTP; the codes from the confirmation. */
+    async function enabled() {
+      const user = store.addUser();
+      const auth = as(user.account.authId);
+      const { secret } = dataOf<MfaEnrollmentView>(
+        await http()
+          .post('/v1/auth/mfa/enrollment')
+          .set('Authorization', auth)
+          .expect(201),
+      );
+      const confirmed = await http()
+        .post('/v1/auth/mfa/enrollment/confirm')
+        .set('Authorization', auth)
+        .send({ code: currentCode(secret) })
+        .expect(200);
+      return {
+        user,
+        auth,
+        secret,
+        codes: dataOf<MfaActivationView>(confirmed).recoveryCodes,
+      };
+    }
+    const verify = (auth: string, body: object) =>
+      http().post('/v1/auth/mfa/verify').set('Authorization', auth).send(body);
+    const regenerate = (auth: string, body: object) =>
+      http()
+        .post('/v1/auth/mfa/recovery-codes')
+        .set('Authorization', auth)
+        .send(body);
+
+    it('returns the codes in the confirmation only, never in a later response', async () => {
+      const { auth, codes } = await enabled();
+      expect(codes).toHaveLength(10);
+
+      const status = await http()
+        .get('/v1/auth/mfa')
+        .set('Authorization', auth)
+        .expect(200);
+      expect(dataOf<MfaStatusView>(status).recovery?.remainingCodes).toBe(10);
+      expect(JSON.stringify(status.body)).not.toMatch(CODE_PATTERN);
+
+      const verified = await verify(auth, { recoveryCode: codes[0] }).expect(
+        200,
+      );
+      expect(verified.headers['cache-control']).toBe('no-store');
+      expect(dataOf<MfaVerificationView>(verified)).toEqual({
+        verified: true,
+        method: 'recovery_code',
+        remainingRecoveryCodes: 9,
+      });
+      expect(JSON.stringify(verified.body)).not.toMatch(CODE_PATTERN);
+
+      // Refusals never echo the code either.
+      const reused = await verify(auth, { recoveryCode: codes[0] }).expect(400);
+      expect(JSON.stringify(reused.body)).not.toContain(codes[0]);
+      expect(messageOf(reused)).toBe('Invalid or expired authentication code');
+    });
+
+    it('regenerates with a second factor, returning the new codes once', async () => {
+      const { auth, codes } = await enabled();
+      const response = await regenerate(auth, {
+        recoveryCode: codes[0],
+      }).expect(201);
+      expect(response.headers['cache-control']).toBe('no-store');
+      const fresh = dataOf<MfaRecoveryCodesView>(response);
+      expect(fresh).toMatchObject({
+        remainingRecoveryCodes: 10,
+        verifiedWith: 'recovery_code',
+      });
+      expect(fresh.recoveryCodes).toHaveLength(10);
+      await verify(auth, { recoveryCode: codes[1] }).expect(400);
+      await verify(auth, { recoveryCode: fresh.recoveryCodes[1] }).expect(200);
+      // Regeneration always needs a factor.
+      await regenerate(auth, {}).expect(400);
+    });
+
+    it.each([
+      [{}, 'send exactly one of code or recoveryCode'],
+      [
+        { code: '123456', recoveryCode: 'ABCD-2345-WXYZ' },
+        'send exactly one of code or recoveryCode',
+      ],
+      [
+        { recoveryCode: 'ABCD-2345' },
+        'recoveryCode must look like XXXX-XXXX-XXXX',
+      ],
+      [{ recoveryCode: 12 }, 'recoveryCode must be a string'],
+      [{ code: '12345' }, 'code must be a 6-digit authenticator code'],
+    ])(
+      'rejects the malformed factor %j with 400, without counting it',
+      async (body, expected) => {
+        const { user, auth } = await enabled();
+        const response = await verify(auth, body).expect(400);
+        expect(messageOf(response)).toContain(expected);
+        expect(store.get(user.account.authId).counter.failedAttempts).toBe(0);
+      },
+    );
+
+    it("never lets a request use or regenerate another account's codes", async () => {
+      const owner = await enabled();
+      const intruder = await enabled();
+
+      await verify(intruder.auth, { recoveryCode: owner.codes[0] }).expect(400);
+      const named = await verify(intruder.auth, {
+        recoveryCode: owner.codes[0],
+        userId: owner.user.account.authId,
+      }).expect(400);
+      expect(messageOf(named)).toContain('userId should not exist');
+      await regenerate(intruder.auth, {
+        recoveryCode: owner.codes[0],
+      }).expect(400);
+      expect(
+        store
+          .get(owner.user.account.authId)
+          .recoveryCodes.every(
+            (c) => c.usedAt === null && c.invalidatedAt === null,
+          ),
+      ).toBe(true);
+
+      await http()
+        .post('/v1/auth/mfa/verify')
+        .send({ recoveryCode: owner.codes[0] })
+        .expect(401);
+      await http()
+        .post('/v1/auth/mfa/recovery-codes')
+        .send({ recoveryCode: owner.codes[0] })
+        .expect(401);
+    });
   });
 });

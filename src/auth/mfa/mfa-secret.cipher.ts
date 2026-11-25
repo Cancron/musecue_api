@@ -1,16 +1,13 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import config from '../../common/config/app.config';
 import {
   decryptWithKey,
-  deriveKeyFromRoot,
   encryptWithKey,
   SECRET_PURPOSES,
 } from '../../common/security/derived-secrets';
-import {
-  MFA_ENCRYPTION_KEY_ENV,
-  MFA_ENCRYPTION_KEY_MIN_LENGTH,
-} from './mfa.constants';
+import { MfaEncryptionUnavailableError, mfaKey } from './mfa-keys';
+
+export { MfaEncryptionUnavailableError };
 
 /**
  * Where an encrypted authenticator secret is stored. Part of the associated
@@ -18,14 +15,6 @@ import {
  * back) without failing authentication.
  */
 export type MfaSecretSlot = 'enrollment' | 'active';
-
-/** No usable key: MFA operations fail closed (never store plaintext). */
-export class MfaEncryptionUnavailableError extends Error {
-  constructor() {
-    super('MFA secret encryption is not configured');
-    this.name = 'MfaEncryptionUnavailableError';
-  }
-}
 
 /**
  * Encrypts authenticator (TOTP) secrets for PostgreSQL with AES-256-GCM.
@@ -54,17 +43,6 @@ export class MfaSecretCipher {
   }
 
   private key(): Buffer {
-    const dedicated = this.configService.get<string>(MFA_ENCRYPTION_KEY_ENV);
-    if (dedicated) {
-      if (dedicated.length < MFA_ENCRYPTION_KEY_MIN_LENGTH) {
-        throw new MfaEncryptionUnavailableError();
-      }
-      return deriveKeyFromRoot(dedicated, SECRET_PURPOSES.MFA_SECRET);
-    }
-    if (!config.jwt_refresh_secret) throw new MfaEncryptionUnavailableError();
-    return deriveKeyFromRoot(
-      config.jwt_refresh_secret,
-      SECRET_PURPOSES.MFA_SECRET,
-    );
+    return mfaKey(this.configService, SECRET_PURPOSES.MFA_SECRET);
   }
 }

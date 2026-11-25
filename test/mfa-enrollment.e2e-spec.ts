@@ -42,6 +42,11 @@ interface StatusView {
     blockedUntil: string | null;
     remainingAttempts: number;
   } | null;
+  recovery: { remainingCodes: number; generatedAt: string | null } | null;
+  verification: {
+    remainingAttempts: number;
+    blockedUntil: string | null;
+  } | null;
 }
 interface EnrollmentView {
   method: string;
@@ -212,6 +217,8 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
         blockedUntil: null,
         remainingAttempts: 5,
       },
+      recovery: null,
+      verification: null,
     });
 
     startClock();
@@ -259,12 +266,22 @@ describeWithDatabase('MFA enrollment (e2e, PostgreSQL)', () => {
     travel(28 * SECOND);
     const confirmedAt = clock;
     const confirmed = await api.confirm({ code }).expect(200);
-    expect(data<StatusView>(confirmed)).toEqual({
+    const { recoveryCodes, ...confirmedStatus } = data<
+      StatusView & { recoveryCodes: string[] }
+    >(confirmed);
+    expect(confirmedStatus).toEqual({
       enabled: true,
       method: 'totp',
       enabledAt: new Date(confirmedAt).toISOString(),
       enrollment: null,
+      recovery: {
+        remainingCodes: 10,
+        generatedAt: new Date(confirmedAt).toISOString(),
+      },
+      verification: { remainingAttempts: 5, blockedUntil: null },
     });
+    // The one-time recovery codes (covered by test/mfa-recovery.e2e-spec.ts).
+    expect(recoveryCodes).toHaveLength(10);
 
     // After: enabled, with the secret encrypted in authSecurity.mfaSecret.
     const after = await security(user.id);

@@ -32,6 +32,7 @@ model authUser {
   authChallenges     AuthChallenge[]
   infrastructureJobs InfrastructureJob[]
   mfaEnrollment      MfaEnrollment?
+  mfaRecoveryCodes   MfaRecoveryCode[]
 
   @@index([email, id, providerId])
   @@index([username])
@@ -42,23 +43,28 @@ model authUser {
 // ================================
 
 model authSecurity {
-  id                 String     @id @default(uuid())
-  authId             String     @unique
-  failedAttempts     Int        @default(0)
-  lastFailedAt       DateTime?
-  lockExpiresAt      DateTime?
-  mfaEnabled         Boolean    @default(false)
-  mfaMethod          mfaMethod?
+  id                        String     @id @default(uuid())
+  authId                    String     @unique
+  failedAttempts            Int        @default(0)
+  lastFailedAt              DateTime?
+  lockExpiresAt             DateTime?
+  mfaEnabled                Boolean    @default(false)
+  mfaMethod                 mfaMethod?
   // Confirmed authenticator secret, encrypted (AES-256-GCM, bound to the
   // user); never stored or returned in plaintext. See src/auth/mfa.
-  mfaSecret          String?
-  mfaEnabledAt       DateTime?
+  mfaSecret                 String?
+  mfaEnabledAt              DateTime?
   // Last accepted TOTP time step (unix time / 30 s): a code of this or an
   // earlier step is never accepted again.
-  mfaLastUsedStep    Int?
-  createdAt          DateTime   @default(now())
-  updatedAt          DateTime   @updatedAt
-  lastPasswordChange DateTime?
+  mfaLastUsedStep           Int?
+  // Incorrect MFA verification codes (authenticator or recovery code): 5
+  // within 15 minutes block verification until mfaBlockedUntil.
+  mfaFailedAttempts         Int        @default(0)
+  mfaFailureWindowStartedAt DateTime?
+  mfaBlockedUntil           DateTime?
+  createdAt                 DateTime   @default(now())
+  updatedAt                 DateTime   @updatedAt
+  lastPasswordChange        DateTime?
 
   // Relations
   authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
@@ -176,4 +182,32 @@ model MfaEnrollment {
   authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
 
   @@index([expiresAt])
+}
+
+// ================================
+// MFA Recovery Code Model
+// ================================
+
+// One-time codes that replace the authenticator app for one MFA verification.
+// A set of 10 (one `batchId`) is issued when MFA is enabled and on every
+// regeneration; the plaintext codes are shown once and only an HMAC of the
+// user and the code is stored. A code works while `usedAt` and
+// `invalidatedAt` are both null; using it sets `usedAt`, and a regeneration
+// sets `invalidatedAt` on every earlier code. A trigger (see the migration)
+// makes both irreversible and the hash immutable.
+model MfaRecoveryCode {
+  id            String    @id @default(uuid())
+  authId        String
+  batchId       String
+  // HMAC-SHA-256 (hex) of the user and the normalized code.
+  codeHash      String    @db.Char(64)
+  createdAt     DateTime  @default(now())
+  usedAt        DateTime?
+  invalidatedAt DateTime?
+
+  authUser authUser @relation(fields: [authId], references: [id], onDelete: Cascade)
+
+  @@unique([authId, codeHash])
+  @@index([authId, invalidatedAt, usedAt])
+  @@index([invalidatedAt])
 }

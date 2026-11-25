@@ -29,6 +29,26 @@ export const MFA_ENROLLMENT = {
   BLOCK_MS: 15 * 60_000,
 } as const;
 
+/** Verifying MFA (authenticator or recovery code) of an enabled account. */
+export const MFA_VERIFICATION = {
+  /** Incorrect codes allowed within FAILURE_WINDOW_MS ... */
+  MAX_FAILED_ATTEMPTS: 5,
+  FAILURE_WINDOW_MS: 15 * 60_000,
+  /** ... before verification is blocked for this long. */
+  BLOCK_MS: 15 * 60_000,
+} as const;
+
+export const MFA_RECOVERY_CODES = {
+  /** Codes issued per set (on enabling MFA and on every regeneration). */
+  COUNT: 10,
+  /** Characters per code: 12 x 5 bits = 60 bits of entropy each. */
+  LENGTH: 12,
+  /** Displayed in groups (XXXX-XXXX-XXXX); hyphens are optional when typed. */
+  GROUP_SIZE: 4,
+  /** Replaced (invalidated) codes are deleted after this long. */
+  INVALIDATED_RETENTION_MS: 30 * 24 * 60 * 60_000,
+} as const;
+
 /** Optional dedicated root key for authenticator secrets (>= 32 characters). */
 export const MFA_ENCRYPTION_KEY_ENV = 'MFA_ENCRYPTION_KEY';
 export const MFA_ENCRYPTION_KEY_MIN_LENGTH = 32;

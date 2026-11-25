@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import type { mfaMethod, Prisma, userStatus } from '@prisma/client';
 import { PrismaService } from '../../common/services/prisma.service';
 import { MFA_ENROLLMENT } from './mfa.constants';
+import { insertRecoveryCodes } from './mfa-credentials.repository';
 
 /** The account data MFA decisions need. */
 export interface MfaAccount {
@@ -41,6 +42,8 @@ export interface MfaActivation {
   /** The time step of the code that confirmed it (never accepted again). */
   lastUsedStep: number;
   enabledAt: Date;
+  /** Hashes of the first set of recovery codes. */
+  recoveryCodeHashes: string[];
 }
 
 /** A user's MFA state, read and written under the user's row lock. */
@@ -50,7 +53,10 @@ export interface LockedMfaAccount {
   /** The transaction, for writes that must commit together (audit log). */
   readonly tx: Prisma.TransactionClient;
   saveEnrollment(state: MfaEnrollmentState): Promise<void>;
-  /** Stores the confirmed secret, enables MFA and removes the enrollment. */
+  /**
+   * Stores the confirmed secret and the first recovery codes, enables MFA
+   * (with a fresh verification counter) and removes the enrollment.
+   */
   activate(activation: MfaActivation): Promise<void>;
 }
 
@@ -149,6 +155,9 @@ export class MfaEnrollmentRepository {
             mfaSecret: activation.encryptedSecret,
             mfaEnabledAt: activation.enabledAt,
             mfaLastUsedStep: activation.lastUsedStep,
+            mfaFailedAttempts: 0,
+            mfaFailureWindowStartedAt: null,
+            mfaBlockedUntil: null,
           };
           // Accounts created before authSecurity existed have no row yet.
           await tx.authSecurity.upsert({
@@ -157,6 +166,17 @@ export class MfaEnrollmentRepository {
             update: data,
           });
           await tx.mfaEnrollment.deleteMany({ where: { authId } });
+          // Codes of an earlier MFA setup never work again.
+          await tx.mfaRecoveryCode.updateMany({
+            where: { authId, invalidatedAt: null },
+            data: { invalidatedAt: activation.enabledAt },
+          });
+          await insertRecoveryCodes(
+            tx,
+            authId,
+            activation.recoveryCodeHashes,
+            activation.enabledAt,
+          );
         },
       };
       return { result: await work(locked) };

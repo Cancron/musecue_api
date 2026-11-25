@@ -7,9 +7,14 @@ import {
   ActivityLogService,
   type ActivityLogMetadata,
 } from '../../common/services/activity-log.service';
-import { MFA_TOTP } from './mfa.constants';
+import { MFA_TOTP, MFA_VERIFICATION } from './mfa.constants';
+import {
+  MfaCredentialsRepository,
+  type RecoveryCodeSummary,
+} from './mfa-credentials.repository';
 import {
   enrollmentStatus,
+  type FailureCounter,
   isBlocked,
   isExpired,
   recordFailure,
@@ -23,11 +28,16 @@ import {
   type MfaAccount,
   type MfaEnrollmentState,
 } from './mfa-enrollment.repository';
+import { MfaRecoveryCodeHasher } from './mfa-recovery-code.hasher';
 import {
   MfaEncryptionUnavailableError,
   MfaSecretCipher,
 } from './mfa-secret.cipher';
-import type { MfaEnrollmentView, MfaStatusView } from './mfa.interface';
+import type {
+  MfaActivationView,
+  MfaEnrollmentView,
+  MfaStatusView,
+} from './mfa.interface';
 import { generateTotpSecret, otpauthUrl, verifyTotp } from './totp';
 
 /** Outcomes decided inside the locked transaction, turned into HTTP errors after it commits. */
@@ -55,7 +65,9 @@ const refuse = (refusal: Refusal): { ok: false } & Refusal => ({
 export class MfaService {
   constructor(
     private readonly enrollments: MfaEnrollmentRepository,
+    private readonly credentials: MfaCredentialsRepository,
     private readonly cipher: MfaSecretCipher,
+    private readonly recoveryCodes: MfaRecoveryCodeHasher,
     private readonly activityLog: ActivityLogService,
     @Inject(WINSTON_MODULE_PROVIDER) private readonly logger: Logger,
   ) {}
@@ -67,7 +79,10 @@ export class MfaService {
     const state = await this.enrollments.read(authId);
     if (!state) throw this.accountUnavailable();
     this.assertActive(state.account);
-    return this.statusView(state.account, state.enrollment, now);
+    const summary = state.account.mfaEnabled
+      ? await this.credentials.summary(authId)
+      : null;
+    return this.statusView(state.account, state.enrollment, now, summary);
   }
 
   /**
@@ -120,16 +135,17 @@ export class MfaService {
 
   /**
    * Confirms the pending enrollment with the authenticator's current code:
-   * stores the secret encrypted in authSecurity.mfaSecret and enables MFA.
-   * Wrong, expired (earlier time step) and reused codes are refused and
-   * counted; the 5th within 15 minutes blocks enrollment.
+   * stores the secret encrypted in authSecurity.mfaSecret, enables MFA and
+   * issues the first 10 recovery codes (stored as hashes; returned only in
+   * this response). Wrong, expired (earlier time step) and reused codes are
+   * refused and counted; the 5th within 15 minutes blocks enrollment.
    */
   async confirmEnrollment(
     authId: string,
     code: string,
     meta: ActivityLogMetadata,
     now: Date = new Date(),
-  ): Promise<MfaStatusView> {
+  ): Promise<MfaActivationView> {
     const outcome = await this.locked(authId, async (locked) => {
       const { account, enrollment } = locked;
       if (account.mfaEnabled) return refuse({ kind: 'ALREADY_ENABLED' });
@@ -157,11 +173,13 @@ export class MfaService {
       const step = verifyTotp(secret, code, now);
       if (step === null) return this.countFailure(locked, now);
 
+      const recovery = this.recoveryCodes.issue(authId);
       await locked.activate({
         encryptedSecret: this.encrypt(authId, 'active', secret),
         method: 'totp',
         lastUsedStep: step,
         enabledAt: now,
+        recoveryCodeHashes: recovery.hashes,
       });
       await this.activityLog.logActivity(
         {
@@ -172,6 +190,11 @@ export class MfaService {
           changes: [
             { fieldName: 'mfaEnabled', oldValue: 'false', newValue: 'true' },
             { fieldName: 'mfaMethod', oldValue: null, newValue: 'totp' },
+            {
+              fieldName: 'mfaRecoveryCodesRemaining',
+              oldValue: null,
+              newValue: String(recovery.codes.length),
+            },
           ],
           metadata: { ...meta, actionedBy: authId },
         },
@@ -186,13 +209,25 @@ export class MfaService {
             mfaMethod: 'totp' as const,
             mfaEnabledAt: now,
           },
+          recoveryCodes: recovery.codes,
         },
       };
     });
     if (!outcome.ok) throw this.refusalError(outcome, now);
 
     this.logger.info('MFA enabled', { context: 'MfaService', userId: authId });
-    return this.statusView(outcome.value.account, EMPTY_ENROLLMENT, now);
+    const { account, recoveryCodes } = outcome.value;
+    return {
+      ...this.statusView(account, EMPTY_ENROLLMENT, now, {
+        counter: {
+          failedAttempts: 0,
+          failureWindowStartedAt: null,
+          blockedUntil: null,
+        },
+        recovery: { remaining: recoveryCodes.length, generatedAt: now },
+      }),
+      recoveryCodes,
+    };
   }
 
   /** Counts an incorrect code (committed with the transaction, before the error is returned). */
@@ -258,13 +293,26 @@ export class MfaService {
     account: MfaAccount,
     enrollment: MfaEnrollmentState,
     now: Date,
+    summary: { counter: FailureCounter; recovery: RecoveryCodeSummary } | null,
   ): MfaStatusView {
     if (account.mfaEnabled) {
+      const counter = summary?.counter;
       return {
         enabled: true,
         method: account.mfaMethod,
         enabledAt: account.mfaEnabledAt,
         enrollment: null,
+        recovery: {
+          remainingCodes: summary?.recovery.remaining ?? 0,
+          generatedAt: summary?.recovery.generatedAt ?? null,
+        },
+        verification: {
+          remainingAttempts: counter
+            ? remainingAttempts(counter, now, MFA_VERIFICATION)
+            : MFA_VERIFICATION.MAX_FAILED_ATTEMPTS,
+          blockedUntil:
+            counter && isBlocked(counter, now) ? counter.blockedUntil : null,
+        },
       };
     }
     const status = enrollmentStatus(enrollment, now);
@@ -281,6 +329,8 @@ export class MfaService {
         blockedUntil: status === 'BLOCKED' ? enrollment.blockedUntil : null,
         remainingAttempts: remainingAttempts(enrollment, now),
       },
+      recovery: null,
+      verification: null,
     };
   }
 

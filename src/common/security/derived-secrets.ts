@@ -25,6 +25,8 @@ export const SECRET_PURPOSES = {
   // Long-lived authenticator secrets. The root key is MFA_ENCRYPTION_KEY when
   // configured (see MfaSecretCipher), otherwise JWT_REFRESH_SECRET.
   MFA_SECRET: 'musecue/mfa-totp-secret/v1',
+  // HMAC of MFA recovery codes (same root key as MFA_SECRET).
+  MFA_RECOVERY_CODE: 'musecue/mfa-recovery-code/v1',
 } as const;
 
 export type SecretPurpose =

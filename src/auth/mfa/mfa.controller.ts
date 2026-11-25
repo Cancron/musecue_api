@@ -17,8 +17,9 @@ import { AuthGuard } from '../../common/guards/auth.guard';
 import { EmptyBodyPipe } from '../../privacy/dto/privacy-export.dto';
 import { requestMetadata } from '../../subscription/request-metadata';
 import type { IAccessTokenPayload } from '../interfaces/auth.interface';
-import { ConfirmMfaEnrollmentDto } from './mfa.dto';
+import { ConfirmMfaEnrollmentDto, factorOf, VerifyMfaDto } from './mfa.dto';
 import { MfaService } from './mfa.service';
+import { MfaVerificationService } from './mfa-verification.service';
 
 interface AuthenticatedRequest extends Request {
   user: IAccessTokenPayload;
@@ -27,14 +28,18 @@ interface AuthenticatedRequest extends Request {
 /**
  * Optional authenticator-app MFA of the signed-in user. Every route acts on
  * the access token's own account; none accepts an account ID. Responses are
- * never cached (the enrollment response contains the secret).
+ * never cached (the enrollment response contains the secret, confirmation
+ * and regeneration responses the recovery codes).
  */
 @ApiTags('auth')
 @ApiBearerAuth('JWT-auth')
 @UseGuards(AuthGuard)
 @Controller('v1/auth/mfa')
 export class MfaController {
-  constructor(private readonly mfa: MfaService) {}
+  constructor(
+    private readonly mfa: MfaService,
+    private readonly verification: MfaVerificationService,
+  ) {}
 
   /** Whether MFA is enabled, and the progress of an enrollment. */
   @Get()
@@ -60,7 +65,10 @@ export class MfaController {
     return this.mfa.startEnrollment(req.user.userId);
   }
 
-  /** Confirms the enrollment with the authenticator's current 6-digit code and enables MFA. */
+  /**
+   * Confirms the enrollment with the authenticator's current 6-digit code,
+   * enables MFA and returns the 10 recovery codes (this one time only).
+   */
   @Post('enrollment/confirm')
   @HttpCode(HttpStatus.OK)
   @Throttle({ default: THROTTLER_CONFIG.STRICT })
@@ -73,6 +81,43 @@ export class MfaController {
     return this.mfa.confirmEnrollment(
       req.user.userId,
       dto.code,
+      requestMetadata(req),
+    );
+  }
+
+  /**
+   * Verifies the second factor: the authenticator's current code or an
+   * unused recovery code (consumed). Each code works once.
+   */
+  @Post('verify')
+  @HttpCode(HttpStatus.OK)
+  @Throttle({ default: THROTTLER_CONFIG.STRICT })
+  @Header('Cache-Control', 'no-store')
+  @Header('Pragma', 'no-cache')
+  verify(@Body() dto: VerifyMfaDto, @Req() req: AuthenticatedRequest) {
+    return this.verification.verify(
+      req.user.userId,
+      factorOf(dto),
+      requestMetadata(req),
+    );
+  }
+
+  /**
+   * Replaces the recovery codes with 10 new ones (returned this one time
+   * only) after verifying the second factor; all earlier codes stop working.
+   */
+  @Post('recovery-codes')
+  @HttpCode(HttpStatus.CREATED)
+  @Throttle({ default: THROTTLER_CONFIG.STRICT })
+  @Header('Cache-Control', 'no-store')
+  @Header('Pragma', 'no-cache')
+  regenerateRecoveryCodes(
+    @Body() dto: VerifyMfaDto,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    return this.verification.regenerateRecoveryCodes(
+      req.user.userId,
+      factorOf(dto),
       requestMetadata(req),
     );
   }

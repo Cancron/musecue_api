@@ -19,7 +19,7 @@ The companion mobile application and detailed product specifications live in `..
 - a provider-neutral AI gateway with OpenRouter live mode, multimodal private-image input, strict structured output, runtime validation, bounded retries, and deterministic mock mode
 - a single Pro subscription plan: admin-configured monthly/yearly pricing and free trial, one-time trial activation, date-based Pro access through `ProAccessGuard`, payment/lifecycle records protected by database rules, and Stripe checkout for the monthly and yearly options with webhook-verified activation, automatic renewals, failed-payment handling and recovery, cancellation at period end, and refunds made in Stripe with immediate access revocation (see "Subscriptions" and "Stripe checkout" under API); requesting refunds from MuseCue and disputes are not implemented yet
 - personal data export: an authenticated user can request an asynchronous ZIP archive of their own account, profile, makeup history, subscription records and private photos, poll its status, and download it through a signed link valid for at most 15 minutes; archives expire 24 hours after export and are deleted by a scheduled retention sweep (see "Personal data export" under API)
-- optional multi-factor authentication with an authenticator app (TOTP): the signed-in owner starts an enrollment, confirms it within 10 minutes with a current 6-digit code, and can check whether MFA is enabled; the secret is stored only encrypted, and 5 incorrect codes within 15 minutes block enrollment for 15 minutes (see "Multi-factor authentication (MFA)" under API). Sign-in does not require the second factor yet
+- optional multi-factor authentication with an authenticator app (TOTP): the signed-in owner starts an enrollment, confirms it within 10 minutes with a current 6-digit code, and can check whether MFA is enabled; the secret is stored only encrypted, and 5 incorrect codes within 15 minutes block enrollment for 15 minutes. Enabling MFA issues 10 one-time recovery codes (shown once, stored as keyed hashes) that can replace the authenticator for an MFA verification, and can be regenerated (see "Multi-factor authentication (MFA)" under API). Sign-in does not require the second factor yet
 - account deletion: the owner confirms their identity (password and an emailed code, or the code alone for accounts without a password), the account is blocked and every token invalidated at once (`PENDING_DELETION`), and a background sweep hard-deletes the account and all its data and files (including its refresh sessions, one-time codes and queued or retained background jobs), keeping payment records detached (see "Account deletion" under API)
 
 Migration `20260827174107_add_makeup_workflow` adds the makeup aggregate and removes the dormant job-tracker and subscription starter domains.
@@ -31,7 +31,7 @@ Intentionally deferred:
 - additional S3-compatible storage providers (the provider interface is in place; see "Private image storage")
 - generated preview images (recommendation reasoning is live, while the existing curated preview-image contract remains in place)
 - production retention/deletion automation and AI cost accounting
-- MFA beyond enrollment: a second-factor step at sign-in (password and Google), disabling or resetting MFA, recovery codes and re-encrypting secrets under a new `MFA_ENCRYPTION_KEY`
+- MFA at sign-in: a second-factor step after password and Google sign-in (it should call `MfaVerificationService`), disabling or resetting MFA, and re-keying secrets and recovery codes under a new `MFA_ENCRYPTION_KEY`
 
 ## Requirements and setup
 
@@ -556,7 +556,9 @@ MFA routes act on the bearer token's own account (see "Multi-factor authenticati
 | ------ | --------------------------------- | --------------------------------------------------------- |
 | `GET`  | `/v1/auth/mfa`                    | Whether MFA is enabled, and the enrollment's progress     |
 | `POST` | `/v1/auth/mfa/enrollment`         | Start (or restart) an enrollment: new authenticator secret |
-| `POST` | `/v1/auth/mfa/enrollment/confirm` | Confirm with the current 6-digit code and enable MFA      |
+| `POST` | `/v1/auth/mfa/enrollment/confirm` | Confirm with the current 6-digit code and enable MFA; returns the recovery codes once |
+| `POST` | `/v1/auth/mfa/verify`             | Verify the second factor: authenticator code or recovery code |
+| `POST` | `/v1/auth/mfa/recovery-codes`     | Replace all recovery codes (needs a second factor); returns the new codes once |
 
 Makeup routes require a bearer token:
 
@@ -650,7 +652,8 @@ user; no route accepts an account ID (a `userId` in a body is rejected with
    and restarts the 10 minutes.
 2. `POST /v1/auth/mfa/enrollment/confirm` with `{ "code": "123456" }` (exactly
    6 digits) enables MFA with the code currently shown by the app and returns
-   the status below with `enabled: true`. A code is accepted only during its
+   the status below with `enabled: true`, plus `recoveryCodes`: 10 unique
+   one-time codes (see "Recovery codes"). A code is accepted only during its
    own 30-second step (no clock-drift window), and at most once.
 3. `GET /v1/auth/mfa` returns the status:
 
@@ -669,7 +672,10 @@ user; no route accepts an account ID (a `userId` in a body is rejected with
    ```
 
    `enrollment.status` is `NONE`, `PENDING`, `EXPIRED` or `BLOCKED`; once MFA is
-   enabled, `enrollment` is `null` and `method` is `totp`.
+   enabled, `enrollment` is `null`, `method` is `totp`, and the status also
+   reports `recovery: { remainingCodes, generatedAt }` and
+   `verification: { remainingAttempts, blockedUntil }` (both `null` while MFA
+   is off). The status never contains a secret or a recovery code.
 
 Refusals of `POST /v1/auth/mfa/enrollment/confirm` (and of starting, where
 they apply):
@@ -710,8 +716,64 @@ least 32 characters). When that is unset, it is derived from
 `JWT_REFRESH_SECRET`. Set `MFA_ENCRYPTION_KEY` before users enroll, keep it in
 your secret store, and do not change it: confirmed secrets cannot be decrypted
 under a different key, and re-encryption is not implemented yet. Without the
-dedicated key, rotating `JWT_REFRESH_SECRET` has the same effect. A pending
-enrollment that can no longer be decrypted answers `410` (start again).
+dedicated key, rotating `JWT_REFRESH_SECRET` has the same effect. Recovery
+codes are hashed under a key derived from the same root, so changing it also
+makes every recovery code unusable. A pending enrollment that can no longer be
+decrypted answers `410` (start again).
+
+#### Recovery codes and MFA verification
+
+Enabling MFA returns 10 recovery codes such as `7K3M-Q9TD-X2WB` (12 characters
+of Crockford base32, 60 random bits each), in the confirmation response only.
+Each replaces the authenticator app for one MFA verification. They are never
+returned again: the status only counts them, and no other response, log entry
+or database column contains them. The app should ask the user to store them
+safely; a lost confirmation response cannot be repeated (regenerate instead).
+
+`POST /v1/auth/mfa/verify` checks the second factor of the signed-in user's
+own account. The body is exactly one of `{ "code": "123456" }` (the
+authenticator's current code) or `{ "recoveryCode": "7K3M-Q9TD-X2WB" }`
+(hyphens, spaces and case do not matter; O, I and L are read as 0, 1 and 1):
+
+```json
+{ "verified": true, "method": "recovery_code", "remainingRecoveryCodes": 9 }
+```
+
+- A recovery code works once; an authenticator code once per 30-second step
+  (the code that enabled MFA is already used).
+- Invalid, already used, replaced and other accounts' codes all answer `400
+  Invalid or expired authentication code` and count as incorrect. 5 incorrect
+  codes within 15 minutes block verification (and regeneration) for 15
+  minutes (`429`, even for a valid code); a successful verification resets
+  the count. Malformed bodies (`400` validation errors) are not counted.
+- `409 MFA is not enabled for this account`; `503` when the MFA key is not
+  usable.
+
+`POST /v1/auth/mfa/recovery-codes` (same body) verifies the second factor and
+replaces every recovery code with 10 new ones, returned in this `201` response
+only (`{ recoveryCodes, generatedAt, remainingRecoveryCodes, verifiedWith }`).
+All earlier codes, used or not, stop working in the same transaction. Only a
+valid second factor can regenerate codes, so a stolen access token alone
+cannot mint codes that bypass MFA. A recovery code used for this is consumed.
+
+Storage: `MfaRecoveryCode` rows hold only `codeHash`, an HMAC-SHA-256 of the
+user ID and the normalized code under a key derived (HKDF) from the MFA root
+key (`MFA_ENCRYPTION_KEY`, else `JWT_REFRESH_SECRET`). The key is not in the
+database, so a database copy does not reveal or allow guessing the codes, and
+a code only matches for its own account. `usedAt` records the consumption and
+`invalidatedAt` the replacement; a trigger makes both permanent and the hash
+immutable, and a CHECK constraint accepts only a 64-character hex hash. A
+code is consumed by one conditional `UPDATE` (unused and not replaced) under
+the user's row lock, so of concurrent requests with the same code exactly one
+succeeds. Replaced codes are deleted 30 days after their replacement by the
+hourly authentication-state sweep, and all codes with the account on erasure.
+Use and regeneration are recorded in the activity log as the change of the
+remaining count, never with a code.
+
+`MfaVerificationService.verify` is the building block for a second-factor
+step at sign-in, which is not implemented yet: today `POST
+/v1/auth/mfa/verify` only confirms the factor (for example before a sensitive
+action in the app) and does not change what an access token allows.
 
 ### Subscriptions
 
@@ -1104,6 +1166,7 @@ TEST_DATABASE_URL=... TEST_REDIS_URL=redis://127.0.0.1:6379 REDIS_ENABLED=true n
 npx jest private-cloud   # private image storage unit tests
 npm test -- --runInBand mfa   # MFA unit tests (TOTP, encryption, enrollment rules, HTTP contract)
 TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json --runInBand test/mfa-enrollment   # MFA enrollment over HTTP on temporary PostgreSQL schemas
+TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json --runInBand test/mfa-recovery   # recovery codes: issuance, hashing, verification, concurrency, regeneration, no leaks
 TEST_DATABASE_URL=... npx jest --config ./test/jest-e2e.json test/private-cloud   # storage workflows + cleanup ledger on PostgreSQL (mocked Supabase)
 npm run test:e2e
 npx prisma generate
