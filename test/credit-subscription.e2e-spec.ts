@@ -4,13 +4,19 @@ import request from 'supertest';
 import { UserRole } from '../src/auth/interfaces/auth.interface';
 import { AuthUtilsService } from '../src/auth/services/auth-utils.service';
 import { CreditExpirySweepService } from '../src/credit/credit-expiry-sweep.service';
+import { addMonthsClamped } from '../src/credit/credit-subscription.policy';
 import { CreditWalletService } from '../src/credit/credit-wallet.service';
 import { RateLimitStore } from '../src/infrastructure/rate-limit/rate-limit.store';
 import { addBillingInterval } from '../src/subscription/billing.validation';
+import { SubscriptionCreditSchedulerService } from '../src/subscription/subscription-credit-scheduler.service';
 import { FakeStripeApi } from './support/fake-stripe-api';
 import { freezeTime } from './support/freeze-time';
 import { describeWithDatabase } from './support/migrated-schema';
-import { createUser, DAY_MS } from './support/subscription-fixtures';
+import {
+  createUser,
+  DAY_MS,
+  recordPayment,
+} from './support/subscription-fixtures';
 import {
   createStripeTestApp,
   dataOf,
@@ -20,6 +26,7 @@ import {
 jest.setTimeout(120_000);
 
 const MINUTE = 60_000;
+const HOUR = 60 * MINUTE;
 /** Billing boundaries of a monthly subscription bought at T0. */
 const T0 = new Date('2026-06-01T10:00:00.000Z');
 const T1 = addBillingInterval(T0, BillingInterval.MONTHLY); // 2026-07-01
@@ -32,6 +39,7 @@ interface ProAllocationRow {
   sourceReference: string;
   granted: string;
   remaining: string;
+  periodIndex: number;
   periodStartsAt: Date;
   expiresAt: Date;
   expiredAt: Date | null;
@@ -55,7 +63,8 @@ interface LedgerRow {
 }
 
 /**
- * Monthly Pro credits end to end: checkout, renewals, failed payments and
+ * Pro credits end to end, monthly and annual subscriptions: checkout,
+ * renewals, failed payments, refunds, the monthly grant scheduler and
  * signed Stripe webhooks over the real HTTP stack on a migrated PostgreSQL
  * schema, with Stripe replaced by FakeStripeApi (behind the real SDK) and
  * `Date` frozen at controlled points around the billing boundaries.
@@ -93,12 +102,14 @@ describeWithDatabase(
     // Stripe flows at controlled times
     // ------------------------------------------------------------------
 
-    /** Buys monthly Pro at `at` (checkout + signed webhook). */
-    const subscribe = async (userId: string, at: Date) => {
+    /** Buys Pro at `at` (checkout + signed webhook); monthly by default. */
+    const subscribe = async (
+      userId: string,
+      at: Date,
+      interval: 'MONTHLY' | 'YEARLY' = 'MONTHLY',
+    ) => {
       freezeTime(at);
-      const started = await harness
-        .startCheckout(userId, 'MONTHLY')
-        .expect(201);
+      const started = await harness.startCheckout(userId, interval).expect(201);
       const checkout = await harness.client.checkoutSession.findUniqueOrThrow({
         where: { id: dataOf(started).checkoutSessionId },
       });
@@ -165,7 +176,7 @@ describeWithDatabase(
     const proAllocationsOf = (userId: string) =>
       harness.client.$queryRaw<ProAllocationRow[]>`
         SELECT a."sourceReference", a."grantedCredits"::text AS granted,
-               a."remainingCredits"::text AS remaining, a."periodStartsAt",
+               a."remainingCredits"::text AS remaining, a."periodIndex", a."periodStartsAt",
                a."expiresAt", a."expiredAt", a."grantedAt", a."subscriptionId",
                a."paymentId", w."authId" AS "allocationOwner",
                p."status"::text AS "paymentStatus", p."providerPaymentId",
@@ -220,6 +231,7 @@ describeWithDatabase(
             sourceReference: `pro:${payment.id}`,
             granted: '1000.000000',
             remaining: '1000.000000',
+            periodIndex: 0,
             periodStartsAt: T0,
             expiresAt: T1,
             expiredAt: null,
@@ -603,29 +615,276 @@ describeWithDatabase(
       });
     });
 
-    describe('scope', () => {
-      it('yearly subscriptions do not receive monthly Pro credits yet', async () => {
+    describe('annual subscriptions', () => {
+      const YEAR_END = addBillingInterval(T0, BillingInterval.YEARLY);
+      /** Start of month k of the paid year bought at T0 (k = 12: year end). */
+      const month = (k: number) =>
+        k === 12 ? YEAR_END : addMonthsClamped(T0, k);
+      let scheduler: SubscriptionCreditSchedulerService;
+      beforeAll(() => {
+        scheduler = harness.app.get(SubscriptionCreditSchedulerService, {
+          strict: false,
+        });
+      });
+
+      it('an annual purchase allocates the first month only (1000 credits, not 12000)', async () => {
         const userId = await createUser(harness.client);
-        freezeTime(T0);
-        const started = await harness
-          .startCheckout(userId, 'YEARLY')
-          .expect(201);
-        const checkout = await harness.client.checkoutSession.findUniqueOrThrow(
-          {
-            where: { id: dataOf(started).checkoutSessionId },
-          },
+
+        const { firstInvoiceId } = await subscribe(userId, T0, 'YEARLY');
+
+        const subscription = await subscriptionOf(userId);
+        const [payment] = subscription.payments;
+        expect(payment).toMatchObject({
+          billingInterval: 'YEARLY',
+          status: 'SUCCEEDED',
+          providerPaymentId: firstInvoiceId,
+          periodStart: T0,
+          periodEnd: YEAR_END,
+        });
+        await expect(proAllocationsOf(userId)).resolves.toEqual([
+          expect.objectContaining({
+            sourceReference: `pro:${payment.id}`,
+            granted: '1000.000000',
+            periodIndex: 0,
+            periodStartsAt: T0,
+            expiresAt: month(1),
+            grantedAt: T0,
+            subscriptionId: subscription.id,
+            paymentId: payment.id,
+            allocationOwner: userId,
+            paymentPeriodStart: T0,
+            paymentPeriodEnd: YEAR_END,
+          }),
+        ]);
+        await expect(ledgerOf(userId)).resolves.toEqual([
+          expect.objectContaining({
+            type: 'ALLOCATION',
+            amount: '1000.000000',
+            balanceAfter: '1000.000000',
+          }),
+        ]);
+        await expect(
+          wallets.getBalance(userId, after(T0, DAY_MS)),
+        ).resolves.toMatchObject({
+          availableCredits: '1000',
+          nextExpiration: { expiresAt: month(1).toISOString() },
+        });
+        // The scheduler finds the first month already granted.
+        await expect(scheduler.run(after(T0, DAY_MS))).resolves.toMatchObject({
+          granted: 0,
+        });
+      });
+
+      it('grants each month when it begins and expires the previous month at its end, for the whole paid year', async () => {
+        const userId = await createUser(harness.client);
+        await subscribe(userId, T0, 'YEARLY');
+        await grantInPostgres(userId, 'REFERRAL', 5);
+        await wallets.deduct({
+          authId: userId,
+          credits: 100,
+          idempotencyKey: 'month-0-run',
+          now: after(T0, 3 * DAY_MS),
+        });
+        // The administrator changes the allowance during month 0: it applies
+        // from month 1, then changes back from month 2.
+        await setProAllowance(1200);
+        await scheduler.run(after(month(1), MINUTE));
+        await setProAllowance(1000);
+        for (let k = 2; k < 12; k += 1) {
+          await scheduler.run(after(month(k), MINUTE));
+        }
+        // After the paid year: nothing more is granted, the last month expires.
+        await expect(
+          scheduler.run(after(YEAR_END, DAY_MS)),
+        ).resolves.toMatchObject({ checked: 0, granted: 0 });
+        await sweeper.sweep(after(YEAR_END, DAY_MS));
+
+        const allocations = await proAllocationsOf(userId);
+        expect(allocations).toHaveLength(12);
+        allocations.forEach((a, k) => {
+          expect({
+            index: a.periodIndex,
+            period: [a.periodStartsAt, a.expiresAt],
+            granted: a.granted,
+            grantedAt: a.grantedAt,
+            remaining: a.remaining,
+          }).toEqual({
+            index: k,
+            period: [month(k), month(k + 1)],
+            granted: k === 1 ? '1200.000000' : '1000.000000',
+            grantedAt: k === 0 ? T0 : after(month(k), MINUTE),
+            remaining: '0.000000',
+          });
+        });
+        expect(allocations[11].expiresAt).toEqual(YEAR_END);
+
+        const ledger = await ledgerOf(userId);
+        const expirations = ledger.filter(
+          (t) => t.type === 'EXPIRATION' && t.source === 'SUBSCRIPTION',
         );
-        const sessionId = checkout.providerSessionId as string;
-        api.completeSession(sessionId, { periodStart: T0 });
-        const event = api.signedEvent('checkout.session.completed', sessionId);
-        await harness.sendWebhook(event.payload, event.signature).expect(200);
+        expect(expirations.map((t) => [t.amount, t.effectiveAt])).toEqual([
+          ['-900.000000', month(1)],
+          ['-1200.000000', month(2)],
+          ...Array.from({ length: 10 }, (_, i) => [
+            '-1000.000000',
+            month(i + 3),
+          ]),
+        ]);
+        expect(ledger.filter((t) => t.type === 'ALLOCATION')).toHaveLength(13);
+        // Only the referral credits remain after the year.
+        expect(ledger[ledger.length - 1].balanceAfter).toBe('5.000000');
+        await expect(
+          wallets.getBalance(userId, after(YEAR_END, DAY_MS)),
+        ).resolves.toMatchObject({
+          availableCredits: '5',
+          availableBySource: { SUBSCRIPTION: '0', REFERRAL: '5' },
+        });
+      });
+
+      it('grants nothing between paid years; a yearly renewal starts a new year of monthly grants', async () => {
+        const userId = await createUser(harness.client);
+        const { stripeSubscriptionId } = await subscribe(userId, T0, 'YEARLY');
+        await scheduler.run(after(month(11), MINUTE));
+
+        // The year has ended and the renewal is not paid yet: nothing is due.
+        await expect(
+          scheduler.run(after(YEAR_END, MINUTE)),
+        ).resolves.toMatchObject({ checked: 0, granted: 0 });
+        await expect(proAllocationsOf(userId)).resolves.toHaveLength(2);
+
+        const renewal = api.renewSubscription(stripeSubscriptionId)
+          .id as string;
+        await deliverInvoice('invoice.paid', renewal, after(YEAR_END, HOUR));
+        const nextMonth = addMonthsClamped(YEAR_END, 1);
+        await scheduler.run(after(nextMonth, MINUTE));
+
+        const subscription = await subscriptionOf(userId);
+        expect(subscription.payments.map((p) => p.periodStart)).toEqual([
+          T0,
+          YEAR_END,
+        ]);
+        const allocations = await proAllocationsOf(userId);
+        expect(
+          allocations.map((a) => [
+            a.providerPaymentId,
+            a.periodIndex,
+            a.periodStartsAt,
+            a.expiresAt,
+          ]),
+        ).toEqual([
+          [expect.any(String), 0, T0, month(1)],
+          [expect.any(String), 11, month(11), YEAR_END],
+          [renewal, 0, YEAR_END, nextMonth],
+          [renewal, 1, nextMonth, addMonthsClamped(YEAR_END, 2)],
+        ]);
+        // The old year's last month expired at the year end.
+        await expect(ledgerOf(userId)).resolves.toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              type: 'EXPIRATION',
+              amount: '-1000.000000',
+              effectiveAt: YEAR_END,
+            }),
+          ]),
+        );
+      });
+
+      it('stops the monthly grants when the yearly payment is refunded', async () => {
+        const userId = await createUser(harness.client);
+        const { firstInvoiceId } = await subscribe(userId, T0, 'YEARLY');
+        await scheduler.run(after(month(1), MINUTE));
+
+        freezeTime(after(month(1), 2 * DAY_MS));
+        api.refundInvoice(firstInvoiceId);
+        const refunded = api.signedChargeEvent(
+          'charge.refunded',
+          api.chargeOf(firstInvoiceId),
+        );
+        await harness
+          .sendWebhook(refunded.payload, refunded.signature)
+          .expect(200);
         jest.useRealTimers();
 
-        await expect(subscriptionOf(userId)).resolves.toMatchObject({
-          status: 'PRO',
-          billingInterval: 'YEARLY',
-        });
-        await expect(proAllocationsOf(userId)).resolves.toEqual([]);
+        for (let k = 2; k < 12; k += 1) {
+          // The refunded year is no longer eligible: not tried (no failed
+          // grant), and skipped when asked directly. (Other tests'
+          // subscribers in this schema may legitimately be granted.)
+          const result = await scheduler.run(after(month(k), MINUTE));
+          expect(result?.failed).toBe(0);
+          await expect(
+            scheduler.grantDueMonth(
+              (await subscriptionOf(userId)).payments[0].id,
+              after(month(k), MINUTE),
+            ),
+          ).resolves.toBe('SKIPPED');
+        }
+        await expect(proAllocationsOf(userId)).resolves.toHaveLength(2);
+        await expect(
+          subscriptionOf(userId).then((s) => s.payments[0].status),
+        ).resolves.toBe('REFUNDED');
+      });
+
+      it('never grants a month twice: redelivered events, repeated and concurrent runs, duplicate payments', async () => {
+        const userId = await createUser(harness.client);
+        const { firstInvoiceId, checkoutEvent } = await subscribe(
+          userId,
+          T0,
+          'YEARLY',
+        );
+        await deliverInvoice('invoice.paid', firstInvoiceId, after(T0, MINUTE));
+        await redeliver(checkoutEvent, after(T0, 2 * MINUTE));
+
+        // Month 1: repeated runs, and grants attempted concurrently (as by
+        // several instances), including for the whole payment list.
+        const monthOne = after(month(1), MINUTE);
+        const [payment] = (await subscriptionOf(userId)).payments;
+        const [runResult, ...outcomes] = await Promise.all([
+          scheduler.run(monthOne),
+          ...Array.from({ length: 6 }, () =>
+            scheduler.grantDueMonth(payment.id, monthOne),
+          ),
+        ]);
+        await scheduler.run(monthOne);
+        await scheduler.run(after(monthOne, HOUR));
+        // Exactly one grant in total, whichever caller made it.
+        expect(
+          outcomes.filter((outcome) => outcome === 'GRANTED').length +
+            (runResult?.granted ?? 0),
+        ).toBe(1);
+
+        // A second, duplicate yearly charge for an overlapping period is kept
+        // for its refund but granted no access, so it never funds credits.
+        const duplicate = await recordPayment(
+          harness.client,
+          (await subscriptionOf(userId)).id,
+          {
+            provider: 'stripe',
+            billingInterval: 'YEARLY',
+            periodStart: after(T0, DAY_MS),
+            periodEnd: addBillingInterval(
+              after(T0, DAY_MS),
+              BillingInterval.YEARLY,
+            ),
+          },
+        );
+        await scheduler.run(after(month(2), MINUTE));
+        await expect(
+          scheduler.grantDueMonth(duplicate.id, after(month(2), MINUTE)),
+        ).resolves.toBe('SKIPPED');
+
+        const allocations = await proAllocationsOf(userId);
+        expect(allocations.map((a) => [a.paymentId, a.periodIndex])).toEqual([
+          [payment.id, 0],
+          [payment.id, 1],
+          [payment.id, 2],
+        ]);
+        await expect(ledgerOf(userId)).resolves.toMatchObject([
+          { type: 'ALLOCATION' },
+          { type: 'EXPIRATION', effectiveAt: month(1) },
+          { type: 'ALLOCATION' },
+          { type: 'EXPIRATION', effectiveAt: month(2) },
+          { type: 'ALLOCATION' },
+        ]);
       });
     });
   },

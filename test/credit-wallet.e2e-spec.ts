@@ -1129,9 +1129,27 @@ describeWithDatabase('AI credit wallet and ledger (PostgreSQL)', () => {
       );
       await expect(
         attempt({ periodEnd: inHours(24 * 40, periodStart) }),
-      ).rejects.toThrow(/exactly the paid period/);
+      ).rejects.toThrow(/exactly one month of the paid period/);
       await expect(attempt({ paymentId: 'no-such-payment' })).rejects.toThrow(
         /require a succeeded payment/,
+      );
+      // A succeeded payment that never granted access (e.g. a duplicate
+      // charge kept for its refund) never funds credits.
+      const duplicate = await recordPayment(client, paid.subscriptionId, {
+        billingInterval: 'MONTHLY',
+        periodStart: inHours(-5 * 24),
+        periodEnd: addBillingInterval(inHours(-5 * 24), 'MONTHLY'),
+      });
+      await expect(
+        attempt({
+          paymentId: duplicate.id,
+          periodStart: duplicate.periodStart,
+          periodEnd: duplicate.periodEnd,
+        }),
+      ).rejects.toThrow(/payment that granted Pro access/);
+      // A monthly payment has only month 0.
+      await expect(attempt({ periodIndex: 1 })).rejects.toThrow(
+        /outside the paid period/,
       );
       await expect(
         client.creditWallet.count({ where: { authId: alice } }),

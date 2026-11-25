@@ -7,6 +7,7 @@ import { ActivityLogService } from '../common/services/activity-log.service';
 import { ProAccessGuard } from './pro-access.guard';
 import { SubscriptionAccessService } from './subscription-access.service';
 import { SubscriptionBillingService } from './subscription-billing.service';
+import { SubscriptionCreditSchedulerService } from './subscription-credit-scheduler.service';
 import { SubscriptionPlanController } from './subscription-plan.controller';
 import { SubscriptionPlanService } from './subscription-plan.service';
 import { SubscriptionTrialService } from './subscription-trial.service';
@@ -36,6 +37,8 @@ import { STRIPE_CLIENT, StripeGateway } from './stripe/stripe.gateway';
     SubscriptionAccessService,
     SubscriptionBillingService,
     SubscriptionTrialService,
+    // Monthly Pro credits for yearly subscriptions (scheduled).
+    SubscriptionCreditSchedulerService,
     ActivityLogService,
     AuthGuard,
     RolesGuard,

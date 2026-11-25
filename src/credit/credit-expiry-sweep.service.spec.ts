@@ -25,8 +25,8 @@ describe('CreditExpirySweepService', () => {
     sweeper = new CreditExpirySweepService(wallets, logger);
   });
 
-  afterEach(() => {
-    sweeper.onModuleDestroy();
+  afterEach(async () => {
+    await sweeper.onModuleDestroy();
     jest.useRealTimers();
     process.env = originalEnv;
   });
@@ -140,6 +140,33 @@ describe('CreditExpirySweepService', () => {
       await expect(sweeper.sweep(now)).resolves.toBeNull();
       release(batch(0));
       await expect(first).resolves.toEqual(batch(0));
+    });
+
+    it('shutdown waits for the batch in progress, then stops sweeping', async () => {
+      let release: (value: ReturnType<typeof batch>) => void = () => {};
+      wallets.expireAllDueCredits
+        .mockReturnValueOnce(
+          new Promise((resolve) => {
+            release = resolve;
+          }),
+        )
+        .mockResolvedValue(batch(CREDIT_EXPIRY_BATCH_SIZE));
+
+      const sweep = sweeper.sweep(now);
+      let stopped = false;
+      const shutdown = sweeper.onModuleDestroy().then(() => {
+        stopped = true;
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(stopped).toBe(false);
+
+      release(batch(CREDIT_EXPIRY_BATCH_SIZE));
+      await shutdown;
+      await expect(sweep).resolves.toMatchObject({
+        wallets: CREDIT_EXPIRY_BATCH_SIZE,
+      });
+      expect(wallets.expireAllDueCredits.mock.calls).toHaveLength(1);
+      await expect(sweeper.sweep(now)).resolves.toBeNull();
     });
 
     it('stays quiet when nothing was due', async () => {

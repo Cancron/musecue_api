@@ -25,14 +25,17 @@ export interface AllocateCreditsInput {
   now?: Date;
 }
 
-/** The credits of one paid Pro period (see allocateSubscriptionCredits). */
+/** The credits of one month of a paid Pro period (allocateSubscriptionCredits). */
 export interface SubscriptionCreditsInput {
   authId: string;
   subscriptionId: string;
   /** The SUCCEEDED PaymentTransaction that paid for the period. */
   paymentId: string;
+  /** Month of the paid period (default 0): 0..11 for a yearly payment. */
+  periodIndex?: number;
+  /** Start of that month. */
   periodStart: Date;
-  /** The billing boundary: the credits expire here. */
+  /** End of that month, its billing boundary: the credits expire here. */
   periodEnd: Date;
   credits: CreditAmountInput;
   now?: Date;
@@ -76,7 +79,9 @@ export interface CreditAllocationView {
   /** SUBSCRIPTION credits only: the paid Pro period they belong to. */
   subscriptionId: string | null;
   paymentId: string | null;
-  /** Start of the paid period; it ends at `expiresAt`. */
+  /** Month of the paid period: 0 (monthly) or 0..11 (yearly). */
+  periodIndex: number | null;
+  /** Start of the month; it ends at `expiresAt`. */
   periodStartsAt: string | null;
 }
 

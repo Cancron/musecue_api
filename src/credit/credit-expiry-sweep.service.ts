@@ -32,6 +32,8 @@ export interface CreditExpirySweepResult {
 export class CreditExpirySweepService implements OnModuleInit, OnModuleDestroy {
   private timer?: ReturnType<typeof setInterval>;
   private running = false;
+  private stopping = false;
+  private current?: Promise<unknown>;
 
   /**
    * Settings are read from the process environment (ConfigModule loads the
@@ -51,8 +53,15 @@ export class CreditExpirySweepService implements OnModuleInit, OnModuleDestroy {
     void this.sweep();
   }
 
-  onModuleDestroy(): void {
+  /**
+   * Graceful shutdown: no new sweeps, the current sweep stops after its
+   * current batch, and shutdown waits for it before the database
+   * connections close. The next startup's sweep continues.
+   */
+  async onModuleDestroy(): Promise<void> {
+    this.stopping = true;
     clearInterval(this.timer);
+    await this.current;
   }
 
   sweepIntervalMs(): number {
@@ -67,8 +76,19 @@ export class CreditExpirySweepService implements OnModuleInit, OnModuleDestroy {
    * is already running in this process. Never throws.
    */
   async sweep(now: Date = new Date()): Promise<CreditExpirySweepResult | null> {
-    if (this.running) return null;
+    if (this.running || this.stopping) return null;
     this.running = true;
+    const sweep = this.sweepBatches(now);
+    this.current = sweep;
+    try {
+      return await sweep;
+    } finally {
+      this.running = false;
+      this.current = undefined;
+    }
+  }
+
+  private async sweepBatches(now: Date): Promise<CreditExpirySweepResult> {
     const total: CreditExpirySweepResult = {
       wallets: 0,
       expiredAllocations: 0,
@@ -76,6 +96,7 @@ export class CreditExpirySweepService implements OnModuleInit, OnModuleDestroy {
     };
     try {
       for (let batch = 0; batch < CREDIT_EXPIRY_MAX_BATCHES; batch += 1) {
+        if (this.stopping) break;
         const result = await this.wallets.expireAllDueCredits({
           now,
           batchSize: CREDIT_EXPIRY_BATCH_SIZE,
@@ -97,8 +118,6 @@ export class CreditExpirySweepService implements OnModuleInit, OnModuleDestroy {
         `Credit expiry sweep failed (${error instanceof Error ? error.name : typeof error}); it will retry`,
         CreditExpirySweepService.name,
       );
-    } finally {
-      this.running = false;
     }
     if (total.expiredAllocations > 0 || total.failedWallets > 0) {
       this.logger.log(

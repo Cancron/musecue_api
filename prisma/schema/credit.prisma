@@ -90,13 +90,17 @@ model CreditAllocation {
   updatedAt        DateTime     @updatedAt
 
   // SUBSCRIPTION allocations only (required for them, NULL otherwise): the
-  // paid Pro period they belong to. A database trigger checks at insert that
-  // the payment SUCCEEDED, belongs to this subscription and to the wallet's
-  // user, and that periodStartsAt/expiresAt are its billing period. One
-  // allocation per payment. subscriptionId has no foreign key (like the
-  // payment's own link, it must not block account erasure).
+  // month of a paid Pro period they belong to. A monthly payment funds one
+  // month (periodIndex 0); a yearly payment funds twelve monthly allocations
+  // (periodIndex 0..11), each granted when its month begins. A database
+  // trigger checks at insert that the payment SUCCEEDED, belongs to this
+  // subscription and to the wallet's user, and that periodStartsAt/expiresAt
+  // are exactly that month (src/credit/credit-subscription.policy.ts). One
+  // allocation per payment and month. subscriptionId has no foreign key
+  // (like the payment's own link, it must not block account erasure).
   subscriptionId String?
-  paymentId      String?   @unique
+  paymentId      String?
+  periodIndex    Int?
   periodStartsAt DateTime?
 
   wallet       CreditWallet             @relation(fields: [walletId], references: [id], onDelete: Cascade)
@@ -108,6 +112,7 @@ model CreditAllocation {
   // Target of the composite foreign keys that keep ledger rows in the
   // allocation's wallet.
   @@unique([id, walletId])
+  @@unique([paymentId, periodIndex])
   @@index([walletId, expiresAt])
   @@index([subscriptionId])
 }

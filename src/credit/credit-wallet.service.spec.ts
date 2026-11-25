@@ -58,6 +58,7 @@ describe('CreditWalletService', () => {
     updatedAt: NOW,
     subscriptionId: null,
     paymentId: null,
+    periodIndex: null,
     periodStartsAt: null,
     ...overrides,
   });
@@ -144,6 +145,7 @@ describe('CreditWalletService', () => {
         // Only SUBSCRIPTION credits are linked to a paid period.
         subscriptionId: null,
         paymentId: null,
+        periodIndex: null,
         periodStartsAt: null,
       });
       const [tx] = written();
@@ -564,6 +566,7 @@ describe('CreditWalletService', () => {
         expiresAt: PERIOD_END,
         subscriptionId,
         paymentId: 'pay-1',
+        periodIndex: 0,
         periodStartsAt: PERIOD_START,
       });
     const sameAllocation = {
@@ -614,6 +617,7 @@ describe('CreditWalletService', () => {
         grantedAt: NOW,
         subscriptionId: 'sub-1',
         paymentId: 'pay-1',
+        periodIndex: 0,
         periodStartsAt: PERIOD_START,
       });
       const [allocationTx] = written();
@@ -627,11 +631,6 @@ describe('CreditWalletService', () => {
     });
 
     it.each([
-      [
-        'a yearly payment (not supported yet)',
-        payment({ billingInterval: 'YEARLY' }),
-        1000,
-      ],
       ['a period that has already ended', payment({ periodEnd: NOW }), 1000],
       ['an allowance of 0', payment(), 0],
     ])('allocates nothing for %s', async (_case, paid, allowance) => {
@@ -647,6 +646,37 @@ describe('CreditWalletService', () => {
       ).resolves.toBeNull();
       expect(prisma.creditAllocation.create.mock.calls).toHaveLength(0);
       expect(prisma.creditTransaction.create.mock.calls).toHaveLength(0);
+    });
+
+    it("allocates only the current month of a yearly payment, with that month's boundaries", async () => {
+      givenAllowance(1000);
+      const yearStart = new Date('2026-08-20T08:00:00.000Z');
+
+      await service.allocateProMonthlyCreditsInTransaction(prisma, {
+        authId: AUTH_ID,
+        subscriptionId: 'sub-1',
+        payment: {
+          id: 'pay-1',
+          billingInterval: 'YEARLY',
+          periodStart: yearStart,
+          periodEnd: new Date('2027-08-20T08:00:00.000Z'),
+        },
+        // In the fourth month of the paid year (Nov 20 - Dec 20).
+        now: NOW,
+      });
+
+      expect(prisma.creditAllocation.create.mock.calls).toHaveLength(1);
+      expect(
+        prisma.creditAllocation.create.mock.calls[0]?.[0].data,
+      ).toMatchObject({
+        source: CreditSource.SUBSCRIPTION,
+        sourceReference: 'pro:pay-1:3',
+        grantedCredits: d(1000),
+        paymentId: 'pay-1',
+        periodIndex: 3,
+        periodStartsAt: new Date('2026-11-20T08:00:00.000Z'),
+        expiresAt: new Date('2026-12-20T08:00:00.000Z'),
+      });
     });
 
     it('returns the existing allocation when the same payment is allocated again', async () => {

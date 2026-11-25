@@ -225,8 +225,9 @@ export async function givenFreeRecord(client: PrismaClient, authId: string) {
 
 /**
  * A SUCCEEDED monthly payment for the calendar month starting at
- * `periodStart`, on the user's subscription (created if missing). Paid
- * periods are what SUBSCRIPTION credits must be linked to.
+ * `periodStart`, on the user's subscription (created if missing), with the
+ * event that records it granted Pro access. Such payments are what
+ * SUBSCRIPTION credits must be linked to.
  */
 export async function givenPaidMonth(
   client: PrismaClient,
@@ -241,6 +242,15 @@ export async function givenPaidMonth(
     billingInterval: BillingInterval.MONTHLY,
     periodStart,
     periodEnd,
+  });
+  // The payment granted Pro access, as the webhook records it.
+  await client.subscriptionEvent.create({
+    data: {
+      subscriptionId: subscription.id,
+      type: 'CREATED',
+      paymentId: payment.id,
+      occurredAt: periodStart,
+    },
   });
   return {
     subscriptionId: subscription.id,

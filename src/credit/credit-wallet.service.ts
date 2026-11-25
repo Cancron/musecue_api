@@ -1,6 +1,5 @@
 import { Injectable } from '@nestjs/common';
 import {
-  BillingInterval,
   CreditSource,
   CreditTransactionType,
   Prisma,
@@ -24,6 +23,7 @@ import {
   ZERO_CREDITS,
 } from './credit-ledger.policy';
 import { CreditSettingsService } from './credit-settings.service';
+import { creditMonthAt } from './credit-subscription.policy';
 import { CreditConflictError, InsufficientCreditsError } from './credit.errors';
 import type {
   AllocateCreditsInput,
@@ -40,10 +40,11 @@ import type {
 
 type Tx = Prisma.TransactionClient;
 
-/** The paid Pro period a SUBSCRIPTION allocation belongs to. */
+/** The month of a paid Pro period a SUBSCRIPTION allocation belongs to. */
 interface AllocationLink {
   subscriptionId: string;
   paymentId: string;
+  periodIndex: number;
   periodStartsAt: Date;
 }
 
@@ -214,12 +215,14 @@ export class CreditWalletService {
   }
 
   /**
-   * Allocates the credits of one paid Pro period: SUBSCRIPTION credits linked
-   * to the subscription and the payment, valid for the payment's billing
-   * period (they expire at its end, the billing boundary). Keyed by the
-   * payment (`pro:<paymentId>`, one allocation per payment), so repeating it
-   * returns the existing allocation. The database refuses it unless the
-   * payment SUCCEEDED and belongs to this user's subscription and period.
+   * Allocates the credits of one month of a paid Pro period: SUBSCRIPTION
+   * credits linked to the subscription, the payment and the month
+   * (`periodIndex`), valid from the month's start and expiring at its end
+   * (the billing boundary). Keyed by payment and month (`pro:<paymentId>`
+   * for month 0, `pro:<paymentId>:<k>` otherwise; unique in the database),
+   * so repeating it returns the existing allocation. The database refuses it
+   * unless the payment SUCCEEDED, belongs to this user's subscription, and
+   * the dates are exactly that month of the paid period.
    */
   async allocateSubscriptionCredits(
     input: SubscriptionCreditsInput,
@@ -238,12 +241,15 @@ export class CreditWalletService {
   }
 
   /**
-   * The monthly Pro allowance for a successful payment, inside the payment's
-   * transaction (used by the Stripe webhook when it records a payment).
-   * Allocates CreditSettings.proMonthlyAllowanceCredits (default 1000) for
-   * the payment's period. Nothing is allocated for yearly payments (not
-   * supported yet), when the allowance is 0, or when the period has already
-   * ended. Returns the allocation, or null when nothing was allocated.
+   * The monthly Pro allowance due at `now` for a successful payment, inside
+   * the caller's transaction: CreditSettings.proMonthlyAllowanceCredits
+   * (default 1000) for the month of the paid period that has not ended yet
+   * (the only month of a monthly payment; one of the twelve months of a
+   * yearly payment, see credit-subscription.policy). Used by the Stripe
+   * webhook when it records a payment and by the monthly grant scheduler for
+   * later months of yearly payments. Idempotent per payment and month.
+   * Nothing is allocated when the allowance is 0 or the period has ended.
+   * Returns the allocation, or null when nothing was allocated.
    */
   async allocateProMonthlyCreditsInTransaction(
     tx: Tx,
@@ -251,16 +257,17 @@ export class CreditWalletService {
   ): Promise<AllocationResult | null> {
     const now = input.now ?? new Date();
     const { payment } = input;
-    if (payment.billingInterval !== BillingInterval.MONTHLY) return null;
-    if (payment.periodEnd.getTime() <= now.getTime()) return null;
+    const month = creditMonthAt(payment, now);
+    if (!month) return null;
     const { proMonthlyAllowanceCredits } = await this.settings.getSettings(tx);
     if (proMonthlyAllowanceCredits <= 0) return null;
     return this.allocateSubscriptionCreditsInTransaction(tx, {
       authId: input.authId,
       subscriptionId: input.subscriptionId,
       paymentId: payment.id,
-      periodStart: payment.periodStart,
-      periodEnd: payment.periodEnd,
+      periodIndex: month.index,
+      periodStart: month.start,
+      periodEnd: month.end,
       credits: proMonthlyAllowanceCredits,
       now,
     });
@@ -276,16 +283,28 @@ export class CreditWalletService {
     if (input.periodStart.getTime() >= input.periodEnd.getTime()) {
       throw AppError.badRequest('The paid period must end after it starts');
     }
+    const periodIndex = input.periodIndex ?? 0;
+    if (!Number.isInteger(periodIndex) || periodIndex < 0 || periodIndex > 11) {
+      throw AppError.badRequest('periodIndex must be a month from 0 to 11');
+    }
     return this.validatedRequest(
       {
         authId: input.authId,
         source: CreditSource.SUBSCRIPTION,
-        sourceReference: `pro:${paymentId}`,
+        sourceReference:
+          periodIndex === 0
+            ? `pro:${paymentId}`
+            : `pro:${paymentId}:${periodIndex}`,
         credits: input.credits,
         expiresAt: input.periodEnd,
         now: input.now,
       },
-      { subscriptionId, paymentId, periodStartsAt: input.periodStart },
+      {
+        subscriptionId,
+        paymentId,
+        periodIndex,
+        periodStartsAt: input.periodStart,
+      },
     );
   }
 
@@ -400,7 +419,8 @@ export class CreditWalletService {
         (existing.expiresAt?.getTime() ?? null) ===
           (expiresAt?.getTime() ?? null) &&
         existing.paymentId === (link?.paymentId ?? null) &&
-        existing.subscriptionId === (link?.subscriptionId ?? null);
+        existing.subscriptionId === (link?.subscriptionId ?? null) &&
+        existing.periodIndex === (link?.periodIndex ?? null);
       if (!same) {
         throw new CreditConflictError(
           'This credit source was already allocated with different terms or to another user',
@@ -433,6 +453,7 @@ export class CreditWalletService {
         grantedAt: now,
         subscriptionId: link?.subscriptionId ?? null,
         paymentId: link?.paymentId ?? null,
+        periodIndex: link?.periodIndex ?? null,
         periodStartsAt: link?.periodStartsAt ?? null,
       },
     });
@@ -915,6 +936,7 @@ export class CreditWalletService {
       grantedAt: row.grantedAt.toISOString(),
       subscriptionId: row.subscriptionId,
       paymentId: row.paymentId,
+      periodIndex: row.periodIndex,
       periodStartsAt: row.periodStartsAt?.toISOString() ?? null,
     };
   }

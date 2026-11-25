@@ -88,6 +88,7 @@ describe('SubscriptionTrialService', () => {
           grantedAt: now.toISOString(),
           subscriptionId: null,
           paymentId: null,
+          periodIndex: null,
           periodStartsAt: null,
         },
       }),

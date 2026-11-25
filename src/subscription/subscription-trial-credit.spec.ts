@@ -91,6 +91,7 @@ describe('SubscriptionTrialService trial credits', () => {
             grantedAt: now.toISOString(),
             subscriptionId: null,
             paymentId: null,
+            periodIndex: null,
             periodStartsAt: null,
           },
         }),
