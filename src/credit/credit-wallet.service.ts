@@ -447,8 +447,10 @@ export class CreditWalletService {
   }
 
   /**
-   * Expiry sweep across wallets (for a scheduled job): processes up to
-   * `batchSize` wallets with due allocations, each in its own transaction.
+   * Expiry sweep across wallets (run by CreditExpirySweepService): processes
+   * up to `batchSize` wallets with due allocations, oldest expiry first, each
+   * in its own transaction. A wallet that fails is counted and skipped, so it
+   * cannot stop the others from being expired.
    */
   async expireAllDueCredits(
     options: { now?: Date; batchSize?: number } = {},
@@ -457,21 +459,27 @@ export class CreditWalletService {
     const due = await this.prisma.creditAllocation.findMany({
       where: { expiresAt: { lte: now }, remainingCredits: { gt: 0 } },
       select: { walletId: true },
+      orderBy: [{ expiresAt: 'asc' }, { id: 'asc' }],
       distinct: ['walletId'],
       take: options.batchSize ?? SWEEP_BATCH_DEFAULT,
     });
 
     let expiredAllocations = 0;
+    let failedWallets = 0;
     for (const { walletId } of due) {
-      expiredAllocations += await this.write(async (tx) => {
-        const cursor = await this.lockExistingWallet(tx, { id: walletId });
-        if (!cursor) return 0;
-        const expired = await this.expireDue(tx, cursor, now);
-        await this.saveWallet(tx, cursor);
-        return expired;
-      });
+      try {
+        expiredAllocations += await this.write(async (tx) => {
+          const cursor = await this.lockExistingWallet(tx, { id: walletId });
+          if (!cursor) return 0;
+          const expired = await this.expireDue(tx, cursor, now);
+          await this.saveWallet(tx, cursor);
+          return expired;
+        });
+      } catch {
+        failedWallets += 1;
+      }
     }
-    return { wallets: due.length, expiredAllocations };
+    return { wallets: due.length, expiredAllocations, failedWallets };
   }
 
   // ------------------------------------------------------------------

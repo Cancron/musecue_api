@@ -3,6 +3,7 @@ import { AuthGuard } from '../common/guards/auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { ActivityLogService } from '../common/services/activity-log.service';
 import { CreditSettingsController } from './credit-settings.controller';
+import { CreditExpirySweepService } from './credit-expiry-sweep.service';
 import { CreditSettingsService } from './credit-settings.service';
 import { CreditWalletService } from './credit-wallet.service';
 
@@ -16,6 +17,7 @@ import { CreditWalletService } from './credit-wallet.service';
   providers: [
     CreditSettingsService,
     CreditWalletService,
+    CreditExpirySweepService,
     ActivityLogService,
     AuthGuard,
     RolesGuard,

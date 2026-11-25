@@ -1,3 +1,5 @@
+import { Reflector } from '@nestjs/core';
+import type { CreditWalletService } from '../credit/credit-wallet.service';
 import { ExecutionContext, UnauthorizedException } from '@nestjs/common';
 import {
   BillingInterval,
@@ -55,14 +57,20 @@ const paid = (
  */
 describe('ProAccessGuard', () => {
   const prisma = mockDeep<PrismaService>();
+  const credits = mock<CreditWalletService>();
   const guard = new ProAccessGuard(
     new SubscriptionAccessService(prisma, mock<SubscriptionPlanService>()),
+    credits,
+    new Reflector(),
   );
   let stored: Row | null;
 
   const contextFor = (request: Record<string, unknown>) =>
     ({
       switchToHttp: () => ({ getRequest: () => request }),
+      // A route without @RequireCredits(): the Pro decision applies.
+      getHandler: () => function handler() {},
+      getClass: () => class Controller {},
     }) as unknown as ExecutionContext;
 
   /** Runs the guard for `user-1` at `now`; returns the request on success. */

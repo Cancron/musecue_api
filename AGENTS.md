@@ -17,6 +17,7 @@ This NestJS service is the application authority for MuseCue — AI makeup guida
 - Validate all request DTOs with `class-validator` and all AI outputs against explicit runtime schemas.
 - Successful API responses are wrapped once by `TransformInterceptor`; controllers return domain data directly.
 - Pro feature endpoints must use `@UseGuards(AuthGuard, ProAccessGuard)` (import `SubscriptionModule`). Do not decide Pro access in feature services or read `UserSubscription` directly for it; use the decision on `req.proAccess` or `SubscriptionAccessService`.
+- Credit-gated endpoints add `@RequireCredits()` to `ProAccessGuard`; it admits users with available credits from any source, regardless of Pro status (`req.creditAccess`). Only `POST /v1/sessions` uses it. Read and change credits through `CreditWalletService`, never the credit tables directly (the database rejects inconsistent ledger writes).
 
 ## Authentication
 

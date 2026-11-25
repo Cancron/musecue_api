@@ -4,6 +4,7 @@ import { mock } from 'jest-mock-extended';
 import { ActivityLogService } from '../src/common/services/activity-log.service';
 import type { CustomLoggerService } from '../src/common/services/custom-logger.service';
 import type { PrismaService } from '../src/common/services/prisma.service';
+import { CreditExpirySweepService } from '../src/credit/credit-expiry-sweep.service';
 import { CreditSettingsService } from '../src/credit/credit-settings.service';
 import { CreditWalletService } from '../src/credit/credit-wallet.service';
 import {
@@ -837,6 +838,143 @@ describeWithDatabase('AI credit wallet and ledger (PostgreSQL)', () => {
       await expect(wallets.getBalance(alice, later)).resolves.toMatchObject({
         availableBySource: { SUBSCRIPTION: '0' },
       });
+    });
+  });
+
+  describe('expiry of idle wallets (scheduled sweep)', () => {
+    it('records an EXPIRATION at the expiry time for wallets nobody touches, exactly once', async () => {
+      const sweeper = new CreditExpirySweepService(
+        wallets,
+        mock<CustomLoggerService>(),
+      );
+      const t0 = new Date(Date.now() - 48 * HOUR);
+      const idle = [await newUser(), await newUser()];
+      for (const [i, user] of idle.entries()) {
+        await allocate(user, CreditSource.TRIAL, 50, {
+          expiresAt: inHours(1 + i, t0),
+          now: t0,
+        });
+        await allocate(user, CreditSource.REFERRAL, 5, { now: t0 });
+      }
+      const active = await newUser();
+      await allocate(active, CreditSource.SUBSCRIPTION, 10, {
+        expiresAt: inHours(24),
+      });
+
+      const result = await sweeper.sweep();
+      expect(result?.expiredAllocations).toBeGreaterThanOrEqual(2);
+      await expect(sweeper.sweep()).resolves.toMatchObject({
+        expiredAllocations: 0,
+      });
+
+      for (const [i, user] of idle.entries()) {
+        const [expiration] = await wallets.listTransactions(user, { take: 1 });
+        expect(expiration).toMatchObject({
+          type: 'EXPIRATION',
+          amountCredits: '-50',
+          balanceAfterCredits: '5',
+          effectiveAt: inHours(1 + i, t0).toISOString(),
+        });
+        const wallet = await reconcile(user);
+        expect(wallet.balance).toBe('5.000000');
+      }
+      // Unexpired credits are untouched.
+      await expect(wallets.listTransactions(active)).resolves.toHaveLength(1);
+    });
+  });
+
+  describe('manual grants in PostgreSQL ("Credit_grant_manual")', () => {
+    const grant = (
+      authId: string,
+      source: string,
+      reference: string,
+      credits: string,
+    ) =>
+      client.$queryRaw<{ id: string }[]>`
+        SELECT "Credit_grant_manual"(${authId}, ${source}::"CreditSource", ${reference}, ${credits}::numeric) AS id`;
+
+    it('writes a consistent, traceable allocation of non-expiring credits', async () => {
+      const alice = await newUser();
+      const [{ id }] = await grant(alice, 'PURCHASE', 'ticket-1', '12.5');
+
+      const [allocation] = await wallets.listAllocations(alice);
+      expect(allocation).toMatchObject({
+        id,
+        source: 'PURCHASE',
+        sourceReference: 'ticket-1',
+        grantedCredits: '12.5',
+        remainingCredits: '12.5',
+        expiresAt: null,
+      });
+      const [transaction] = await wallets.listTransactions(alice);
+      expect(transaction).toMatchObject({
+        sequence: 1,
+        type: 'ALLOCATION',
+        amountCredits: '12.5',
+        balanceAfterCredits: '12.5',
+        allocationId: id,
+        reference: 'manual-grant',
+      });
+      // Timestamps are stored in UTC like the application's.
+      expect(
+        Math.abs(new Date(allocation.grantedAt).getTime() - Date.now()),
+      ).toBeLessThan(60_000);
+      await reconcile(alice);
+    });
+
+    it('adds to a wallet with history and is idempotent for the same grant', async () => {
+      const alice = await newUser();
+      await allocate(alice, CreditSource.PURCHASE, 2);
+      await wallets.deduct({ authId: alice, credits: 1, idempotencyKey: 'a' });
+
+      const [first] = await grant(alice, 'REFERRAL', 'referral-7', '3');
+      const [again] = await grant(alice, 'REFERRAL', ' referral-7 ', '3');
+
+      expect(again.id).toBe(first.id);
+      await expect(available(alice)).resolves.toBe('4');
+      const wallet = await reconcile(alice);
+      expect(wallet.tx_count).toBe(3);
+    });
+
+    it.each([
+      ['a trial grant', 'TRIAL', 'x', '5'],
+      ['a subscription grant', 'SUBSCRIPTION', 'x', '5'],
+      ['zero credits', 'PURCHASE', 'x', '0'],
+      ['negative credits', 'PURCHASE', 'x', '-1'],
+      ['more than 6 decimal places', 'PURCHASE', 'x', '0.0000001'],
+      ['an empty reference', 'PURCHASE', '  ', '5'],
+    ])('rejects %s', async (_case, source, reference, credits) => {
+      const alice = await newUser();
+      await expect(grant(alice, source, reference, credits)).rejects.toThrow();
+      await expect(available(alice)).resolves.toBe('0');
+    });
+
+    it('rejects unknown users, reusing a grant for another user or amount, and wallets with unpaid overage', async () => {
+      const alice = await newUser();
+      const bob = await newUser();
+      await expect(grant('missing', 'PURCHASE', 'x', '1')).rejects.toThrow(
+        /does not exist/,
+      );
+      await grant(alice, 'PURCHASE', 'shared-ref', '5');
+      await expect(grant(bob, 'PURCHASE', 'shared-ref', '5')).rejects.toThrow(
+        /already granted/,
+      );
+      await expect(grant(alice, 'PURCHASE', 'shared-ref', '6')).rejects.toThrow(
+        /already granted/,
+      );
+
+      const session = await newSession(bob);
+      await wallets.deduct({
+        authId: bob,
+        credits: 2,
+        idempotencyKey: 'overage',
+        sessionId: session,
+      });
+      await expect(
+        grant(bob, 'PURCHASE', 'after-overage', '5'),
+      ).rejects.toThrow(/unpaid session overage/);
+      await expect(available(alice)).resolves.toBe('5');
+      await reconcile(bob);
     });
   });
 

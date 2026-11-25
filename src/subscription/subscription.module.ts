@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { CreditModule } from '../credit/credit.module';
 import Stripe from 'stripe';
 import { AuthGuard } from '../common/guards/auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
@@ -23,6 +24,8 @@ import {
 import { STRIPE_CLIENT, StripeGateway } from './stripe/stripe.gateway';
 
 @Module({
+  // ProAccessGuard decides credit eligibility on @RequireCredits() routes.
+  imports: [CreditModule],
   controllers: [
     SubscriptionPlanController,
     SubscriptionController,
@@ -61,7 +64,9 @@ import { STRIPE_CLIENT, StripeGateway } from './stripe/stripe.gateway';
     StripeWebhookService,
   ],
   // Modules with Pro feature endpoints import SubscriptionModule and use
-  // @UseGuards(AuthGuard, ProAccessGuard).
-  exports: [SubscriptionAccessService, ProAccessGuard],
+  // @UseGuards(AuthGuard, ProAccessGuard). CreditModule is re-exported
+  // because the guard is instantiated in the importing module and needs
+  // CreditWalletService for @RequireCredits() routes.
+  exports: [SubscriptionAccessService, ProAccessGuard, CreditModule],
 })
 export class SubscriptionModule {}

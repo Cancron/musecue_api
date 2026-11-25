@@ -18,7 +18,7 @@ The companion mobile application and detailed product specifications live in `..
 - `AiRun` audit records containing operation, provider, model, prompt version, latency, progress, result/error, and status
 - a provider-neutral AI gateway with OpenRouter live mode, multimodal private-image input, strict structured output, runtime validation, bounded retries, and deterministic mock mode
 - a single Pro subscription plan: admin-configured monthly/yearly pricing and free trial, one-time trial activation, date-based Pro access through `ProAccessGuard`, payment/lifecycle records protected by database rules, and Stripe checkout for the monthly and yearly options with webhook-verified activation, automatic renewals, failed-payment handling and recovery, cancellation at period end, and refunds made in Stripe with immediate access revocation (see "Subscriptions" and "Stripe checkout" under API); requesting refunds from MuseCue and disputes are not implemented yet
-- AI credits: administrator-managed credit settings (trial allowance, Pro monthly allowance, OpenRouter cost per credit, per-session overage), stored in PostgreSQL from the start and audited, and a persistent per-user credit wallet and append-only ledger (allocations by source with expiry, exact fractional balances, deductions with session overage, expirations) protected by database rules (see "AI credit settings" and "AI credit wallet and ledger" under API); nothing grants or charges credits yet
+- AI credits: administrator-managed credit settings (trial allowance, Pro monthly allowance, OpenRouter cost per credit, per-session overage), stored in PostgreSQL from the start and audited, and a persistent per-user credit wallet and append-only ledger (allocations by source with expiry, exact fractional balances, deductions with session overage, expirations) protected by database rules, with a scheduled expiry sweep; creating a makeup session requires available credits (see "AI credit settings", "AI credit wallet and ledger" and "Credit access to makeup sessions" under API); nothing grants or charges credits in the application yet
 - personal data export: an authenticated user can request an asynchronous ZIP archive of their own account, profile, makeup history, subscription records and private photos, poll its status, and download it through a signed link valid for at most 15 minutes; archives expire 24 hours after export and are deleted by a scheduled retention sweep (see "Personal data export" under API)
 - account deletion: the owner confirms their identity (password and an emailed code, or the code alone for accounts without a password), the account is blocked and every token invalidated at once (`PENDING_DELETION`), and a background sweep hard-deletes the account and all its data and files (including its refresh sessions, one-time codes and queued or retained background jobs), keeping payment records detached (see "Account deletion" under API)
 
@@ -30,7 +30,7 @@ Intentionally deferred:
 - copying images stored on the filesystem before the Supabase migration into the bucket (they remain readable through the `local` provider while its directory is present)
 - additional S3-compatible storage providers (the provider interface is in place; see "Private image storage")
 - generated preview images (recommendation reasoning is live, while the existing curated preview-image contract remains in place)
-- production retention/deletion automation and AI cost accounting (granting trial/Pro allowances, charging AI runs, credit purchases and referrals, user-facing credit routes and a scheduled expiry sweep; the credit settings and the wallet/ledger foundation exist)
+- production retention/deletion automation and AI cost accounting (granting trial/Pro allowances, charging AI runs, credit purchases and referrals, and user-facing credit routes; purchased and referral credits can be granted manually in PostgreSQL)
 
 ## Requirements and setup
 
@@ -553,7 +553,7 @@ Makeup routes require a bearer token:
 
 | Method   | Route                                                              | Purpose                                            |
 | -------- | ------------------------------------------------------------------ | -------------------------------------------------- |
-| `POST`   | `/v1/sessions`                                                     | Create an owner-scoped session                     |
+| `POST`   | `/v1/sessions`                                                     | Create an owner-scoped session (requires credits)  |
 | `GET`    | `/v1/sessions?scope=active\|completed\|all`                        | List the user's sessions                           |
 | `GET`    | `/v1/sessions/:sessionId`                                          | Read the full session aggregate                    |
 | `DELETE` | `/v1/sessions/:sessionId`                                          | Delete a completed session                         |
@@ -694,7 +694,7 @@ Pro feature endpoints are protected by `ProAccessGuard`, applied after `AuthGuar
 handler(@Req() req: ProAccessRequest) { /* req.proAccess: status, accessSource, accessExpiresAt */ }
 ```
 
-The guard delegates to `SubscriptionAccessService`, the single Pro access decision. An active free trial and an active paid term unlock the same features, each within its own `[startedAt, expiresAt)` window. Without access, the guard returns `403` with `An active Pro subscription or free trial is required` and the handler does not run. Requests that did not pass `AuthGuard` are rejected with `401`, and lookup errors never grant access. No makeup endpoint uses the guard yet.
+The guard delegates to `SubscriptionAccessService`, the single Pro access decision. An active free trial and an active paid term unlock the same features, each within its own `[startedAt, expiresAt)` window. Without access, the guard returns `403` with `An active Pro subscription or free trial is required` and the handler does not run. Requests that did not pass `AuthGuard` are rejected with `401`, and lookup errors never grant access. Routes marked `@RequireCredits()` are decided by available credits instead of Pro status. Only `POST /v1/sessions` is marked; see "Credit access to makeup sessions". No makeup endpoint uses the Pro decision yet.
 
 ### Stripe checkout
 
@@ -935,7 +935,7 @@ Migration `20261113120000_add_stripe_checkout` adds `PaymentCustomer` and `Check
 
 Not implemented yet: immediate cancellation (including canceling a past-due subscription to stop Stripe's retries), undoing a cancellation (a cancellation reversed in Stripe is not reflected), the customer portal (so users cannot update their card in-app; Stripe's own emails and hosted invoice page can be used), exposing the past-due state in `GET /v1/subscription`, requesting refunds from MuseCue, disputes (`charge.dispute.*`), canceling the Stripe subscription automatically when a payment is refunded, revoking an active free trial on refund (a trial is not a payment and keeps running), reactions to other `customer.subscription.updated` changes (e.g. `unpaid`), and automatic refunds or cancellation of duplicate payments and subscriptions. Renewal delays within Stripe's retry window (up to 3 days) are handled. If a renewal for an older period arrives after a newer one, the older period is recorded but cannot be merged into the term: the database allows one payment per term change.
 
-Database tests (`test/auth-state.e2e-spec.ts`, `test/postgres-job-queue.e2e-spec.ts`, `test/postgres-mode.e2e-spec.ts`, `test/rate-limit-contract.e2e-spec.ts` (PostgreSQL part), `test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`, `test/privacy-export.e2e-spec.ts`, `test/account-deletion.e2e-spec.ts`, `test/account-erasure.e2e-spec.ts`, `test/stripe-checkout.e2e-spec.ts`, `test/stripe-renewal.e2e-spec.ts`, `test/stripe-payment-failure.e2e-spec.ts`, `test/stripe-cancellation.e2e-spec.ts`, `test/stripe-refund.e2e-spec.ts`, `test/subscription-billing.e2e-spec.ts`, `test/stripe-webhook-reliability.e2e-spec.ts`, `test/stripe-payment-lifecycle.e2e-spec.ts`, `test/credit-settings.e2e-spec.ts`, `test/credit-wallet.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
+Database tests (`test/auth-state.e2e-spec.ts`, `test/postgres-job-queue.e2e-spec.ts`, `test/postgres-mode.e2e-spec.ts`, `test/rate-limit-contract.e2e-spec.ts` (PostgreSQL part), `test/subscription-plan.*.e2e-spec.ts`, `test/user-subscription.*.e2e-spec.ts`, `test/subscription-trial.e2e-spec.ts`, `test/subscription-status.e2e-spec.ts`, `test/pro-access.e2e-spec.ts`, `test/trial-lifecycle.e2e-spec.ts`, `test/billing.e2e-spec.ts`, `test/subscription-security.e2e-spec.ts`, `test/privacy-export.e2e-spec.ts`, `test/account-deletion.e2e-spec.ts`, `test/account-erasure.e2e-spec.ts`, `test/stripe-checkout.e2e-spec.ts`, `test/stripe-renewal.e2e-spec.ts`, `test/stripe-payment-failure.e2e-spec.ts`, `test/stripe-cancellation.e2e-spec.ts`, `test/stripe-refund.e2e-spec.ts`, `test/subscription-billing.e2e-spec.ts`, `test/stripe-webhook-reliability.e2e-spec.ts`, `test/stripe-payment-lifecycle.e2e-spec.ts`, `test/credit-settings.e2e-spec.ts`, `test/credit-wallet.e2e-spec.ts`, `test/credit-access.e2e-spec.ts`) run only when `TEST_DATABASE_URL` is set, and are reported as skipped otherwise. Each test builds a temporary schema from the migration files and drops it afterwards, so the database user needs `CREATE` permission:
 
 ```bash
 TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json test/subscription-plan test/user-subscription test/subscription-trial test/subscription-status test/pro-access test/trial-lifecycle test/billing test/subscription-security test/privacy-export test/account-deletion test/account-erasure
@@ -1007,7 +1007,7 @@ TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --
 
 ### AI credit wallet and ledger
 
-Foundation only: `CreditWalletService` (exported by `CreditModule`) keeps every user's credits in PostgreSQL, but no route or feature calls it yet. Trial activation, Pro renewals, purchases, referrals and AI runs will allocate and deduct through it.
+`CreditWalletService` (exported by `CreditModule`) keeps every user's credits in PostgreSQL. `POST /v1/sessions` reads the balance. Nothing in the application allocates or deducts credits yet: trial activation, Pro renewals, purchases, referrals and AI runs will do so through this service.
 
 | Table                    | Contents                                                                                                   |
 | ------------------------ | ---------------------------------------------------------------------------------------------------------- |
@@ -1021,7 +1021,7 @@ Rules (migration `20261124120000_add_credit_wallet_ledger`):
 
 - **Amounts** are exact decimals with up to 6 fractional digits (`NUMERIC(20,6)`, `Prisma.Decimal` in code, decimal strings in results). Amounts with more digits are rejected, never rounded.
 - **Sources and expiry.** `TRIAL` and `SUBSCRIPTION` allocations must have an `expiresAt` after they are granted. `PURCHASE` and `REFERRAL` allocations never expire. A user has at most one `TRIAL` allocation, and a `(source, sourceReference)` event can be allocated only once, to one user. Repeating the same allocation returns the existing one; reusing the event with other terms or for another user is a `409`.
-- **Expired credits never count.** `getBalance` excludes them at read time. Every wallet operation first expires due allocations with an `EXPIRATION` transaction dated at `expiresAt`. `expireAllDueCredits()` does the same across wallets; it is not scheduled yet.
+- **Expired credits never count.** `getBalance` excludes them at read time. Every wallet operation first expires due allocations with an `EXPIRATION` transaction dated at `expiresAt`. `CreditExpirySweepService` also records expirations for wallets nobody uses, so every expired credit appears in the ledger. It runs at startup and then every `CREDIT_EXPIRY_SWEEP_INTERVAL_MS` (default 60000, minimum 10000; not under `NODE_ENV=test`). It is safe on several instances at once, and a wallet whose expiry fails is retried by the next sweep without blocking the others.
 - **Spending** uses the soonest-expiring credits first, then non-expiring ones. A deduction that does not fit is refused as a whole (`402 Insufficient credits`). Deductions are idempotent per user and key.
 - **Session overage.** A deduction for one of the user's makeup sessions may exceed the balance by up to `sessionOverageAllowanceCredits`. The session keeps the limit that applied when it first used overage. New allocations repay outstanding overage first (`OVERAGE_SETTLEMENT`), so a wallet never has both a balance and unpaid overage.
 - **Concurrency.** Every change runs in one transaction that locks the user's wallet row (`SELECT ... FOR UPDATE`), so concurrent operations for a user are applied one at a time. Unique constraints reject duplicates that could otherwise race (the same source event for two users, a second trial, a reused sequence number).
@@ -1036,6 +1036,31 @@ Tests:
 ```bash
 npm test -- --runInBand credit   # includes credit-ledger.policy and credit-wallet.service unit tests
 TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json --runInBand test/credit-wallet
+```
+
+### Credit access to makeup sessions
+
+`POST /v1/sessions` requires available credits: unexpired, unused credits from any source (`TRIAL`, `SUBSCRIPTION`, `PURCHASE` or `REFERRAL`). Any positive amount is enough. Without credits the response is `403` with the message `Insufficient credits`, and no session is created. The check is made by `ProAccessGuard` in credit mode (`@UseGuards(ProAccessGuard)` plus `@RequireCredits()`) and does not consult the Pro subscription. Purchased and referral credits, which never expire, therefore keep working after a Pro subscription ends. Subscription and trial credits stop counting at their `expiresAt`.
+
+- Every other route, including all other makeup routes, is not restricted by credits.
+- A new, free account has no credits (no wallet), and logging in never adds any.
+- Creating a session does not use credits. Charging AI work is not implemented yet, so a user with any credits can create sessions.
+- Nothing in the application grants credits yet. Until trial and Pro allowances are granted automatically, trial users and Pro subscribers also get `403` unless they have credits.
+
+Purchased and referral credits can be granted manually in PostgreSQL (migration `20261125120000_credit_manual_grant`):
+
+```sql
+SELECT "Credit_grant_manual"('<authUser id>', 'PURCHASE', 'support-ticket-123', 100);
+SELECT "Credit_grant_manual"('<authUser id>', 'REFERRAL', 'referral-456', 25.5);
+```
+
+Plain `INSERT`s into the credit tables are rejected, because the database requires balances to match the ledger. The function writes the wallet, the allocation (never expiring), an `ALLOCATION` ledger transaction with reference `manual-grant` and its entry, under the wallet lock. The `(source, reference)` pair identifies the grant, so repeating a call returns the existing allocation instead of adding credits again. Reusing a reference for another user or amount is refused. Amounts must be positive with at most 6 decimal places. The function refuses wallets with unpaid session overage (grant through `CreditWalletService.allocate` instead, which repays it).
+
+Tests:
+
+```bash
+npm test -- --runInBand credit   # includes the guard's credit mode and the route metadata
+TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/musecue_test npx jest --config ./test/jest-e2e.json --runInBand test/credit-access
 ```
 
 ## Domain

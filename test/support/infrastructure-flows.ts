@@ -386,6 +386,10 @@ export async function makeupFlow(
     );
   const runIds: string[] = [];
 
+  // Creating a session requires credits; grant purchased credits directly in
+  // PostgreSQL (purchases are not implemented in the application yet).
+  await ctx.client.$queryRaw`
+    SELECT "Credit_grant_manual"(${user.id}, 'PURCHASE'::"CreditSource", ${`makeup-flow:${user.id}`}, 10)`;
   const session = data<{ id: string }>(
     await http().post('/v1/sessions').set('Authorization', auth).expect(201),
   );

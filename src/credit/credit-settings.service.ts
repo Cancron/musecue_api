@@ -52,11 +52,22 @@ export class CreditSettingsService implements OnModuleInit {
     private readonly logger: CustomLoggerService,
   ) {}
 
-  /** Makes sure the configuration row exists when the application starts. */
+  /**
+   * Makes sure the configuration row exists when the application starts.
+   * Best effort: if it fails, startup continues and the row is re-created
+   * with the defaults on the first read (readStored).
+   */
   async onModuleInit(): Promise<void> {
-    if (await this.ensureStored()) {
-      this.logger.log(
-        'Stored the default AI credit settings (no configuration row existed)',
+    try {
+      if (await this.ensureStored()) {
+        this.logger.log(
+          'Stored the default AI credit settings (no configuration row existed)',
+          CreditSettingsService.name,
+        );
+      }
+    } catch (error) {
+      this.logger.warn(
+        `Could not check the AI credit settings at startup (${error instanceof Error ? error.name : typeof error}); they are stored on first use`,
         CreditSettingsService.name,
       );
     }

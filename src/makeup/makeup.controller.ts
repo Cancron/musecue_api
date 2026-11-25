@@ -24,6 +24,10 @@ import { memoryStorage } from 'multer';
 import { THROTTLER_CONFIG } from '../common/config/throttler.config';
 import { AuthGuard } from '../common/guards/auth.guard';
 import {
+  ProAccessGuard,
+  RequireCredits,
+} from '../subscription/pro-access.guard';
+import {
   AskQuestionDto,
   CompleteStepDto,
   ListSessionsDto,
@@ -62,7 +66,15 @@ function setPrivateNoStoreHeaders(response: Response): void {
 export class MakeupController {
   constructor(private readonly makeup: MakeupService) {}
 
+  /**
+   * Creating a session requires available credits from any source (trial,
+   * subscription, purchase or referral); without them the response is
+   * 403 "Insufficient credits". Creating a session does not use credits.
+   * The other makeup routes are not restricted by credits.
+   */
   @Post('sessions')
+  @UseGuards(ProAccessGuard)
+  @RequireCredits()
   createSession(@Req() req: AuthenticatedRequest) {
     return this.makeup.createSession(req.user.userId);
   }

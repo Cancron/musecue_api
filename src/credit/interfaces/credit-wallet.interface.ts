@@ -84,6 +84,9 @@ export interface DeductionResult {
 }
 
 export interface ExpirationSweepResult {
+  /** Wallets with due allocations that this batch processed. */
   wallets: number;
   expiredAllocations: number;
+  /** Wallets whose expiry failed (retried by the next sweep). */
+  failedWallets: number;
 }
